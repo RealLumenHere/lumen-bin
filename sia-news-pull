@@ -1,0 +1,13 @@
+#!/bin/bash
+# Pull scored news prompts from sia into the fleet research queue.
+# Runs via systemd timer every 2 min. Move semantics: fetch then delete on sia.
+# 2026-07-11: rsync output no longer captured into $n (aq#188 'integer expected' fix).
+set -u
+SRC="sia@100.111.15.120:~/sia-news/out/research_prompts/"
+DST="/home/lumen/scratch/research_prompts/"
+LOG="/home/lumen/scratch/sia-news-pull.log"
+rsync -a --remove-source-files --include='news_*.txt' --exclude='*' "$SRC" "$DST" >>"$LOG" 2>&1
+n=$(ls "$DST" 2>/dev/null | grep -c '^news_.*\.txt$' || true)
+case "$n" in ''|*[!0-9]*) n=0;; esac
+[ "$n" -gt 0 ] && echo "$(date -Is) pulled, queue now has $n news prompts" >> "$LOG"
+exit 0

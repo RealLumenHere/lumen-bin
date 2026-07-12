@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+lumen_busy — Redis-backed mutex for Claude Code's synchronous chat model.
+
+Usage:
+    lumen_busy set    "task=<name>" "phase=<phase>" [key=val ...]
+    lumen_busy update "phase=<phase>" [key=val ...]
+    lumen_busy check              # exit 0 + state JSON if busy, exit 1 if not
+    lumen_busy clear              # remove the key
+    lumen_busy status             # human-readable status
+
+When Frank messages mid-task, this tells me what I was doing so I can
+resume instead of starting fresh. Also serves as crash recovery.
+
+State keys stored in Redis hash "lumen:busy":
+    task       — short description (e.g. "audit fleet_status.py")
+    phase      — current phase (e.g. "running mypy", "writing tests")
+    step       — progress indicator (e.g. "3/52 tests passed")
+    pid        — background PID if delegated
+    started_at — ISO-8601 timestamp (PT)
+    state_file — path to partial results on disk (optional)
+"""
+import json
+import os
+import redis as redis_mod
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone, timedelta
+
+REDIS_HOST = os.environ.get("LUMEN_REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("LUMEN_REDIS_PORT", "6379"))
+REDIS_DB   = int(os.environ.get("LUMEN_REDIS_DB", "0"))
+HASH_KEY   = "lumen:busy"
+
+PT_OFFSET = timedelta(hours=-7)
+def pt_now():
+    return (datetime.now(timezone.utc) + PT_OFFSET).isoformat(timespec="seconds")
+
+try:
+    r = redis_mod.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_timeout=2)
+    r.ping()
+except redis_mod.ConnectionError:
+    # Redis not available — bail silently; we don't want to break anything
+    # when Redis is down. Just return a "not busy" signal.
+    class _NullRedis:
+        def hgetall(self, _k): return {}
+        def hset(self, *_a, **_kw): pass
+        def hdel(self, *_a): pass
+        def delete(self, _k): pass
+        def exists(self, _k): return 0
+        def hget(self, *_a): return None
+        def expire(self, *_a): pass
+    r = _NullRedis()
+
+
+def cmd_set(args):
+    """Initialize or fully replace the busy state."""
+    pairs = _parse_kv(args)
+    pairs["started_at"] = pt_now()
+    # Add sensible defaults
+    pairs.setdefault("pid", str(os.getpid()))
+    # Clear all existing fields first
+    r.delete(HASH_KEY)
+    r.hset(HASH_KEY, mapping=pairs)
+    r.expire(HASH_KEY, 86400)  # auto-expire after 24h safety net
+    print(f"🟢 BUSY: {pairs.get('task', '?')} — {pairs.get('phase', 'starting')}")
+    sys.exit(0)
+
+
+def cmd_update(args):
+    """Update specific fields without clearing others."""
+    pairs = _parse_kv(args)
+    if not pairs:
+        print("⚠️  No fields to update. Usage: lumen_busy update phase=<phase>")
+        sys.exit(1)
+    r.hset(HASH_KEY, mapping={k: str(v) for k, v in pairs.items()})
+    # Refresh the TTL
+    r.expire(HASH_KEY, 86400)
+    print(f"🔄 Updated: {', '.join(f'{k}={v}' for k, v in pairs.items())}")
+    sys.exit(0)
+
+
+def cmd_check(*_):
+    """Check if busy. Exit 0 + JSON if busy, exit 1 if not."""
+    raw = r.hgetall(HASH_KEY)
+    if not raw:
+        print(json.dumps({"busy": False}))
+        sys.exit(1)
+    decoded = {k.decode() if isinstance(k, bytes) else k:
+               v.decode() if isinstance(v, bytes) else v
+               for k, v in raw.items()}
+    print(json.dumps({"busy": True, **decoded}))
+    sys.exit(0)
+
+
+def cmd_clear(*_):
+    """Clear the busy state."""
+    r.delete(HASH_KEY)
+    print("✅ Busy state cleared.")
+    sys.exit(0)
+
+
+def cmd_status():
+    """Human-readable status."""
+    raw = r.hgetall(HASH_KEY)
+    if not raw:
+        print("🟢 IDLE — no busy state set.")
+        sys.exit(0)
+    decoded = {k.decode() if isinstance(k, bytes) else k:
+               v.decode() if isinstance(v, bytes) else v
+               for k, v in raw.items()}
+    print("🔴 BUSY STATE (redis hash lumen:busy):")
+    for k, v in decoded.items():
+        print(f"   {k}: {v}")
+    sys.exit(0)
+
+
+def cmd_task_start(args):
+    """
+    Start a background task with busy tracking.
+    Usage: lumen_busy task_start <task_name> <command> [args...]
+    Spawns a detached subprocess. Clears busy state when it exits.
+    """
+    if len(args) < 2:
+        print("Usage: lumen_busy task_start <task_name> <command> [args...]")
+        sys.exit(1)
+
+    task_name = args[0]
+    command = list(args[1:])
+
+    # Write a wrapper script that runs the command then clears the key
+    wrapper = (
+        'import sys, subprocess\n'
+        'import redis as r_mod\n'
+        f'r = r_mod.Redis(host={REDIS_HOST!r}, port={REDIS_PORT}, db={REDIS_DB}, socket_timeout=2)\n'
+        'try:\n'
+        f'    proc = subprocess.run({command!r}, capture_output=False)\n'
+        'finally:\n'
+        '    try: r.delete("lumen:busy")\n'
+        '    except Exception: pass\n'
+        f'sys.exit(proc.returncode)\n'
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", wrapper],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Parent — set busy state and return immediately
+    r.hset(HASH_KEY, mapping={
+        "task": task_name,
+        "phase": "background",
+        "pid": str(proc.pid),
+        "started_at": pt_now(),
+    })
+    r.expire(HASH_KEY, 86400)
+    print(f"🟢 BUSY: {task_name} (PID {proc.pid}) — running in background")
+    print(f"   Auto-clears on completion.")
+    sys.exit(0)
+
+
+def _parse_kv(args):
+    """Parse 'key=value' pairs from arg list. Returns dict."""
+    pairs = {}
+    for a in args:
+        if "=" in a:
+            k, _, v = a.partition("=")
+            pairs[k.strip()] = v.strip()
+    return pairs
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip())
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    rest = sys.argv[2:]
+
+    commands = {
+        "set": cmd_set,
+        "update": cmd_update,
+        "check": cmd_check,
+        "clear": cmd_clear,
+        "status": cmd_status,
+        "task_start": cmd_task_start,
+    }
+
+    if cmd not in commands:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(1)
+
+    # Dispatch — only commands that need args get them
+    noarg_cmds = {"check", "clear", "status"}
+    if cmd in noarg_cmds:
+        commands[cmd]()
+    else:
+        commands[cmd](rest)
+
+
+if __name__ == "__main__":
+    main()

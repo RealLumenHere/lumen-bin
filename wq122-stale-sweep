@@ -1,0 +1,11 @@
+#!/bin/bash
+# wq122: quarantine research prompts/reports generated from pre-2026-06 archive
+# entries during the 2026-07-12 first-sync flood. Idempotent.
+Q=/home/lumen/scratch/research_quarantine_wq122; mkdir -p $Q
+STALE_URLS=$(ssh -o BatchMode=yes sia@100.111.15.120 'docker exec miniflux-db psql -U miniflux -t -A -c "SELECT url FROM entries WHERE feed_id >= 22 AND published_at < '\''2026-06-01'\''"')
+for f in /home/lumen/scratch/research_prompts/news_*.txt /home/lumen/scratch/research_prompts_done/news_*.txt /home/lumen/scratch/research/news_*.md; do
+  [ -f "$f" ] || continue
+  src=$(grep -m1 -oP "Source article: \K\S+" "$f" 2>/dev/null || grep -m1 -oP "https?://\S+" "$f")
+  echo "$STALE_URLS" | grep -qxF "$src" && { mv "$f" $Q/; echo "QUARANTINED $(basename $f)"; }
+done
+echo "swept $(date -Is), quarantine total: $(ls $Q | wc -l)"

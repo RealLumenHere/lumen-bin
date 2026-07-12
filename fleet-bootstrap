@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# fleet-bootstrap — generate a ready-to-flash cloud-init user-data file
+# for a new Lumen fleet node.
+#
+# Usage:
+#   fleet-bootstrap <hostname>
+#     [--ts-key tskey-auth-xxxxx]   # if omitted, reads $TS_AUTHKEY env or prompts
+#     [--gh-user franks-gh]         # GitHub username for SSH key import
+#     [--out /path/to/user-data]    # output path (default: ./user-data)
+#
+# What it produces:
+#   - A populated user-data YAML you can:
+#     a) Copy to a USB stick alongside an empty 'meta-data' file (rename USB label CIDATA), OR
+#     b) Pass as user-data in Ubuntu autoinstall
+#
+# On first boot the new machine: installs Tailscale, joins tailnet, opens SSH,
+# imports your GitHub SSH keys, phones home to ntfy. Zero manual SSH after.
+set -euo pipefail
+
+TEMPLATE=/home/lumen/bootstrap/user-data.yaml.template
+
+HOSTNAME=""
+TS_KEY="${TS_AUTHKEY:-}"
+GH_USER="${GITHUB_USER:-FrankStupak}"   # Frank's GitHub handle (verified: github.com/FrankStupak.keys returns 2 keys)
+OUT="./user-data"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ts-key) TS_KEY="$2"; shift 2 ;;
+    --gh-user) GH_USER="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) HOSTNAME="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$HOSTNAME" ]]; then
+  echo "error: hostname required. usage: fleet-bootstrap <hostname>" >&2
+  exit 1
+fi
+
+if [[ -z "$TS_KEY" ]]; then
+  echo "Tailscale auth key not set. Get one at:" >&2
+  echo "  https://login.tailscale.com/admin/settings/keys" >&2
+  echo "Use a reusable key with the tag:lumen-fleet tag (or whatever tag matches your ACL)." >&2
+  read -r -p "Paste auth key (tskey-auth-...): " TS_KEY
+fi
+
+# Fetch GitHub keys to embed inline (in case GitHub is unreachable on first boot)
+GH_KEY_LINE=""
+if command -v curl &>/dev/null; then
+  FIRST_KEY=$(curl -sf "https://github.com/${GH_USER}.keys" | head -1 || true)
+  if [[ -n "$FIRST_KEY" ]]; then
+    GH_KEY_LINE="$FIRST_KEY"
+  fi
+fi
+if [[ -z "$GH_KEY_LINE" ]]; then
+  echo "warning: could not fetch GitHub keys for $GH_USER — first-boot SSH access will rely on ssh_import_id" >&2
+  GH_KEY_LINE="# (no inline GitHub key — relies on ssh_import_id on first boot)"
+fi
+
+# Generate output
+sed -e "s|__HOSTNAME__|${HOSTNAME}|g" \
+    -e "s|__TS_AUTHKEY__|${TS_KEY}|g" \
+    -e "s|__GITHUB_USERNAME__|${GH_USER}|g" \
+    -e "s|__SSH_KEY_LINE__|${GH_KEY_LINE}|g" \
+    "$TEMPLATE" > "$OUT"
+
+# Also write an empty meta-data file alongside if writing to a directory
+OUT_DIR=$(dirname "$OUT")
+if [[ -d "$OUT_DIR" && ! -f "$OUT_DIR/meta-data" ]]; then
+  echo "instance-id: ${HOSTNAME}-$(date +%Y%m%d)" > "$OUT_DIR/meta-data"
+  echo "local-hostname: ${HOSTNAME}" >> "$OUT_DIR/meta-data"
+fi
+
+echo "✓ generated: $OUT"
+echo "✓ meta-data: $OUT_DIR/meta-data"
+echo ""
+echo "To use:"
+echo "  1. Format a USB stick FAT32, label it CIDATA"
+echo "  2. Copy both user-data and meta-data to the stick"
+echo "  3. Insert into target machine alongside Ubuntu install USB"
+echo "  4. Boot; Ubuntu will pick up the config on first boot"
+echo ""
+echo "  OR pass --user-data ${OUT} to a virt-install / autoinstall run"
+echo ""
+echo "On success, $HOSTNAME will appear at:"
+echo "  https://ntfy.lumennode.uk/lumen-fleet  (boot notification)"
+echo "  https://login.tailscale.com/admin/machines  (tailnet)"

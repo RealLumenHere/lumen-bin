@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""wq — Lumen autonomous work queue. Atomic claim + lease/visibility-timeout + add-time dedup.
+Collision-safe across parallel agents. Lease semantics: a claim holds a lease (default 240 min);
+expired leases auto-revert to open at next claim (SQS visibility-timeout pattern). Long jobs
+MUST 'wq heartbeat <id>' to extend. Legacy claims (lease_expires NULL) never auto-expire."""
+import sqlite3, sys, os, argparse, datetime, socket, re
+DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
+DEFAULT_TTL_MIN = 240
+FMT = "%Y-%m-%d %H:%M:%S"
+def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
+def now(): return utcnow().strftime(FMT)
+def lease_from(minutes): return (utcnow() + datetime.timedelta(minutes=minutes)).strftime(FMT)
+def norm_title(t): return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+def conn():
+    c = sqlite3.connect(DB, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+def init():
+    c = conn()
+    c.execute("""CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, lane TEXT DEFAULT 'auto',
+        pri INTEGER DEFAULT 2, title TEXT, detail TEXT, deps TEXT DEFAULT '',
+        status TEXT DEFAULT 'open', claimed_by TEXT, claimed_at TEXT,
+        done_at TEXT, notes TEXT DEFAULT '', created_at TEXT)""")
+    cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+    if "lease_expires" not in cols:
+        c.execute("ALTER TABLE tasks ADD COLUMN lease_expires TEXT")
+    c.commit(); c.close()
+def deps_met(c, deps):
+    if not deps.strip(): return True
+    for d in [x.strip() for x in deps.split(',') if x.strip()]:
+        r = c.execute("SELECT status FROM tasks WHERE id=?", (d,)).fetchone()
+        if not r or r[0] != 'done': return False
+    return True
+def cmd_add(a):
+    c = conn()
+    if not a.force:
+        nt = norm_title(a.title)
+        for rid, rtitle, rstatus, rlane in c.execute(
+                "SELECT id,title,status,lane FROM tasks WHERE status!='done'").fetchall():
+            if norm_title(rtitle) == nt:
+                print(f"DUPLICATE — task {rid} [{rlane}/{rstatus}] already has this title:\n  {rtitle}\nUse --force to add anyway.")
+                c.close(); sys.exit(1)
+    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,created_at) VALUES(?,?,?,?,?,?)",
+              (a.lane, a.pri, a.title, a.detail or '', a.deps or '', now()))
+    c.commit(); print(f"added task {c.execute('SELECT last_insert_rowid()').fetchone()[0]} [{a.lane}]"); c.close()
+def cmd_claim(a):
+    if a.lane == 'user':
+        print("REFUSED: 'user' lane is Frank-only — never agent-claimable"); sys.exit(1)
+    agent = a.agent or f"{socket.gethostname()}:{os.getpid()}"
+    c = conn()
+    c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    t_now = now()
+    c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, lease_expires=NULL
+                 WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL AND lease_expires < ?""",
+              (a.lane, t_now))
+    reclaimed = c.execute("SELECT changes()").fetchone()[0]
+    rows = c.execute("SELECT id,deps FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(a.lane,)).fetchall()
+    pick = next((rid for rid, deps in rows if deps_met(c, deps)), None)
+    if pick is None:
+        c.execute("COMMIT"); c.close()
+        if reclaimed: print(f"(reclaimed {reclaimed} expired lease(s))")
+        print(f"NONE — lane '{a.lane}' empty or all remaining blocked on deps"); return
+    lease = lease_from(a.ttl)
+    c.execute("UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=? WHERE id=?",
+              (agent, t_now, lease, pick))
+    c.execute("COMMIT")
+    t = c.execute("SELECT id,pri,title,detail,deps FROM tasks WHERE id=?", (pick,)).fetchone()
+    c.close()
+    if reclaimed: print(f"(reclaimed {reclaimed} expired lease(s))")
+    print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — lease until {lease}Z (ttl {a.ttl}m; heartbeat to extend)")
+    print(f"TITLE: {t[2]}\nDEPS: {t[4] or 'none'}\n---\n{t[3]}")
+def cmd_heartbeat(a):
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    r = c.execute("SELECT status, claimed_by FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not r or r[0] != 'claimed':
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: task {a.id} is not claimed (status={r[0] if r else 'missing'})"); sys.exit(1)
+    lease = lease_from(a.ttl)
+    c.execute("UPDATE tasks SET lease_expires=? WHERE id=?", (lease, a.id))
+    c.execute("COMMIT"); c.close()
+    print(f"heartbeat {a.id}: lease extended to {lease}Z (holder {r[1]})")
+def cmd_done(a):
+    c = conn(); c.execute("UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL WHERE id=?", (now(), a.notes or '', a.id)); c.commit()
+    print(f"done {a.id}"); c.close()
+def cmd_release(a):
+    c = conn(); c.execute("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, lease_expires=NULL WHERE id=?", (a.id,)); c.commit()
+    print(f"released {a.id}"); c.close()
+def cmd_block(a):
+    c = conn(); c.execute("UPDATE tasks SET status='blocked', notes=?, lease_expires=NULL WHERE id=?", (a.reason, a.id)); c.commit()
+    print(f"blocked {a.id}: {a.reason}"); c.close()
+def cmd_list(a):
+    c = conn(); lane = a.lane
+    q = "SELECT id,lane,pri,status,title,claimed_by,deps,lease_expires FROM tasks"
+    q += " WHERE lane=?" if lane else ""
+    q += " ORDER BY lane,pri,id"
+    rows = c.execute(q, (lane,) if lane else ()).fetchall(); c.close()
+    if not rows: print("(empty)"); return
+    t_now = now()
+    for r in rows:
+        cb = f" <{r[5]}>" if r[5] else ""
+        dep = f" deps={r[6]}" if r[6] else ""
+        lz = ""
+        if r[3] == 'claimed':
+            if r[7] is None: lz = " lease=legacy(none)"
+            elif r[7] < t_now: lz = f" lease=EXPIRED@{r[7]}Z"
+            else: lz = f" lease={r[7]}Z"
+        print(f"[{r[0]:>3}] {r[1]:<4} p{r[2]} {r[3]:<8} {r[4][:70]}{cb}{dep}{lz}")
+def cmd_show(a):
+    c = conn(); cur = c.execute("SELECT * FROM tasks WHERE id=?", (a.id,)); r = cur.fetchone(); cols=[d[0] for d in cur.description]; c.close()
+    if not r: print("no such task"); return
+    for k,v in zip(cols,r): print(f"{k:13}: {v}")
+def cmd_edit(a):
+    c = conn(); fields=[]; vals=[]
+    for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),("status",a.status)):
+        if val is not None: fields.append(f"{col}=?"); vals.append(val)
+    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status"); c.close(); return
+    vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals); c.commit()
+    print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}"); c.close()
+p = argparse.ArgumentParser()
+sub = p.add_subparsers(dest="cmd")
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.set_defaults(f=cmd_claim)
+s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.set_defaults(f=cmd_heartbeat)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.set_defaults(f=cmd_done)
+s=sub.add_parser("release"); s.add_argument("id",type=int); s.set_defaults(f=cmd_release)
+s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.set_defaults(f=cmd_block)
+s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.set_defaults(f=cmd_list)
+s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.set_defaults(f=cmd_edit)
+init()
+a = p.parse_args()
+if not getattr(a,"cmd",None): p.print_help(); sys.exit(0)
+a.f(a)

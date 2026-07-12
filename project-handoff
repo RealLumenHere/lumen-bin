@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+project-handoff — write a session handoff file for a project.
+
+Captures: what was done, what's next, blockers, context for the next session.
+Reads from project state in projects.json + accepts free-form notes.
+
+Usage:
+    project-handoff <id> --did "what got done"
+                         --next "what's next"
+                         [--blocker "..."]
+                         [--note "additional context"]
+                         [--files "list,of,files,touched"]
+
+    project-handoff <id> --show       # print last handoff
+    project-handoff --list            # list all handoffs
+
+Files live at /home/lumen/projects/_handoffs/<id>.md (append-only log).
+"""
+import argparse, json, sys
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+PROJECTS_FILE = Path("/home/lumen/projects.json")
+HANDOFFS_DIR  = Path("/home/lumen/projects/_handoffs")
+PT = ZoneInfo("America/Los_Angeles")
+
+
+def load_projects():
+    return json.loads(PROJECTS_FILE.read_text())
+
+
+def find_project(pid):
+    for p in load_projects()["projects"]:
+        if p["id"] == pid:
+            return p
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("--did",     action="append", help="What got done this session (repeat for multiple)")
+    ap.add_argument("--next",    dest="next_step", action="append", help="Next concrete action (repeat for multiple)")
+    ap.add_argument("--blocker", action="append", help="Blocker (repeat for multiple)")
+    ap.add_argument("--note",    action="append", help="Additional context line")
+    ap.add_argument("--files",   help="Comma-separated files touched")
+    ap.add_argument("--show",    action="store_true", help="Show full handoff log for project")
+    ap.add_argument("--last",    action="store_true", help="Show last handoff for project")
+    ap.add_argument("--list",    action="store_true", help="List all projects with handoffs")
+    args = ap.parse_args()
+
+    HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.list:
+        for f in sorted(HANDOFFS_DIR.glob("*.md")):
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=PT)
+            print(f"  {f.stem:25}  {mtime.strftime('%Y-%m-%d %H:%M %Z')}")
+        return
+
+    if not args.id:
+        ap.print_help()
+        sys.exit(1)
+
+    proj = find_project(args.id)
+    if not proj:
+        print(f"unknown project: {args.id}", file=sys.stderr)
+        sys.exit(1)
+
+    handoff_file = HANDOFFS_DIR / f"{args.id}.md"
+
+    if args.show:
+        if handoff_file.exists():
+            print(handoff_file.read_text())
+        else:
+            print(f"no handoffs yet for {args.id}")
+        return
+
+    if args.last:
+        if handoff_file.exists():
+            content = handoff_file.read_text()
+            # Last entry is after the last "## " header
+            entries = content.split("\n## ")
+            if len(entries) > 1:
+                print("## " + entries[-1])
+            else:
+                print(content)
+        else:
+            print(f"no handoffs yet for {args.id}")
+        return
+
+    # Write a new handoff entry
+    if not args.did and not args.next_step:
+        print("need at least --did or --next", file=sys.stderr)
+        sys.exit(1)
+
+    now = datetime.now(PT)
+    header = f"## {now.strftime('%Y-%m-%d %H:%M %Z')}"
+
+    lines = [header, ""]
+    lines.append(f"**Project state:** `{proj['status']}` / health `{proj['health']}`")
+    lines.append(f"**Summary:** {proj['summary']}")
+    lines.append("")
+
+    if args.did:
+        lines.append(f"### Done this session")
+        for d in args.did:
+            lines.append(f"- {d.strip()}")
+        lines.append("")
+
+    if args.next_step:
+        lines.append(f"### Next")
+        for n in args.next_step:
+            lines.append(f"- {n.strip()}")
+        lines.append("")
+
+    if args.blocker:
+        lines.append(f"### Blockers")
+        for b in args.blocker:
+            lines.append(f"- ⚠ {b}")
+        lines.append("")
+
+    if args.files:
+        lines.append(f"### Files touched")
+        for f in args.files.split(","):
+            lines.append(f"- `{f.strip()}`")
+        lines.append("")
+
+    if args.note:
+        lines.append(f"### Context")
+        for n in args.note:
+            lines.append(f"- {n}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    entry = "\n".join(lines)
+
+    if handoff_file.exists():
+        existing = handoff_file.read_text()
+        # Prepend new entry after the title
+        if existing.startswith("# "):
+            title_end = existing.find("\n\n")
+            if title_end > 0:
+                new_content = existing[:title_end+2] + entry + "\n" + existing[title_end+2:]
+            else:
+                new_content = existing + "\n" + entry
+        else:
+            new_content = f"# Handoff log: {proj['name']}\n\n" + entry + "\n" + existing
+        handoff_file.write_text(new_content)
+    else:
+        handoff_file.write_text(f"# Handoff log: {proj['name']}\n\n" + entry)
+
+    # Also bump project last_touched + next_step in projects.json
+    if args.next_step:
+        import subprocess
+        subprocess.run(["project-touch", args.id, "--next", args.next_step[0]],
+                       check=False)
+    else:
+        import subprocess
+        subprocess.run(["project-touch", args.id], check=False)
+
+    print(f"handoff written: {handoff_file}")
+    print(f"entry length: {len(entry)} chars")
+
+
+if __name__ == "__main__":
+    main()

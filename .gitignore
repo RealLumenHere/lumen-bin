@@ -1,0 +1,14 @@
+# wq#137 lumen-bin repo
+# Backups
+*.bak*
+*.bak.*
+# Plaintext-cred scripts — EXCLUDED until creds externalized (see wq#137 report)
+fleet-provision-ssh
+overnight_boot_gate.sh
+# Keys / secrets
+*.key
+*.pem
+*_ed25519*
+.env
+__pycache__/
+*.pyc

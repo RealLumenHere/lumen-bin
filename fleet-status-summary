@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# fleet-status-summary - plain-English one-screen fleet health summary
+# Collects systemd/journal/Redis data, pre-computes quota percentages,
+# then asks llm fleet model to summarise. Cheap fast cerebras model;
+# arithmetic done in shell to avoid small-model hallucination.
+# Usage: fleet-status-summary
+set -euo pipefail
+
+LLM=/home/lumen/.local/bin/llm
+MODEL=mistral
+
+FLEET_UNITS=(
+  lumen-fleet-pbox
+  lumen-fleet-cerebras
+  lumen-fleet-sambanova
+  lumen-fleet-mistral
+  lumen-fleet-openrouter
+  lumen-fleet-qwen
+)
+
+# Per-provider daily caps - mirrors /home/lumen/agent/lumen_quota_manager.py PROVIDERS.
+# Sentinel 999999 / 999999999 means effectively unlimited and is skipped.
+declare -A RPD_CAP=(
+  [pbox]=999999 [cerebras]=1700 [sambanova]=999999 [mistral]=999999
+  [openrouter]=1000 [qwen]=2000 [deepseek]=999999 [gemini]=250
+)
+declare -A TPD_CAP=(
+  [pbox]=999999999 [cerebras]=1000000 [sambanova]=999999999 [mistral]=33000000
+  [openrouter]=999999999 [qwen]=999999999 [deepseek]=999999999 [gemini]=999999999
+)
+
+DATA=""
+for unit in "${FLEET_UNITS[@]}"; do
+    state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+    last="$(journalctl -u "$unit" --since "1 hour ago" --no-pager -n 1 -o cat 2>/dev/null | tail -n 1)"
+    [[ -z "$last" ]] && last="(no entries in last 1h)"
+    DATA+="${unit}: state=${state} | last1h=${last:0:200}"$'\n'
+done
+
+DATA+="--- quota:"$'\n'
+TODAY="$(date -u +%Y-%m-%d)"
+for prov in pbox cerebras sambanova mistral openrouter qwen deepseek gemini; do
+    rpd="$(redis-cli -n 2 get quota:${prov}:rpd:${TODAY} 2>/dev/null)"; rpd="${rpd:-0}"
+    tpd="$(redis-cli -n 2 get quota:${prov}:tpd:${TODAY} 2>/dev/null)"; tpd="${tpd:-0}"
+    rcap="${RPD_CAP[$prov]}"; tcap="${TPD_CAP[$prov]}"
+
+    if [[ "$rcap" -lt 100000 ]]; then
+        rpct=$(( rpd * 100 / rcap ))
+        if (( rpct >= 50 )); then rpd_tag="WARN(${rpct}%)"; else rpd_tag="ok(${rpct}%)"; fi
+    else
+        rpd_tag="ok(unlimited)"
+    fi
+    if [[ "$tcap" -lt 100000000 ]]; then
+        tpct=$(( tpd * 100 / tcap ))
+        if (( tpct >= 50 )); then tpd_tag="WARN(${tpct}%)"; else tpd_tag="ok(${tpct}%)"; fi
+    else
+        tpd_tag="ok(unlimited)"
+    fi
+
+    DATA+="${prov}: rpd=${rpd} ${rpd_tag} | tpd=${tpd} ${tpd_tag}"$'\n'
+done
+
+SYSTEM="You are a homelab operations assistant for the Lumen fleet.
+Summarise the fleet status data below for the operator. Total length: 15 lines or fewer.
+Plain text. No markdown headings, no bold, no bullet hierarchy. Output structure:
+
+  Line 1: one-sentence overall verdict (HEALTHY / DEGRADED / DOWN) + one-line reason.
+  Next: per-provider one-liners showing systemd state. Mention errors prominently.
+  End: 2-3 lines on quota - ONLY mention providers tagged WARN(xx%). Skip ok lines.
+       If no providers are WARN, write a single line: All quotas nominal.
+
+DO NOT do arithmetic. Use the pre-computed tags exactly. Do not recompute percentages."
+
+printf "FLEET STATUS DATA:\n%s\n" "$DATA" | "$LLM" -m "$MODEL" --no-stream -s "$SYSTEM" "Summarise per the rules."

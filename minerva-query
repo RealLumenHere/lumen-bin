@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+minerva-query — read-only research-metadata query CLI over the pgvector DB
+(wq#96, proposal 80344916ac87; native replacement for wrapping s4rath/query-db).
+
+Safety (defense in depth, mirroring query-db's design without its dep tree):
+  1. session forced read-only: SET default_transaction_read_only = on
+  2. statement gate: single statement, must start with SELECT or WITH
+  3. connection user is 'lumen' — no superuser paths added
+
+Usage:
+  minerva-query list                          # named queries
+  minerva-query run <name> [args...]          # run a named query
+  minerva-query sql "SELECT ... "             # freeform read-only SQL
+  minerva-query ask "how many docs per category?"   # NL->SQL via LiteLLM (gated by 1+2)
+  add --json for machine-readable output (pipelines/eval)
+"""
+import os, re, sys, json, pathlib, argparse
+
+ENV = {}
+for line in pathlib.Path("/home/lumen/agent/.env").read_text().splitlines():
+    if line and not line.startswith("#") and "=" in line:
+        k, v = line.split("=", 1); ENV[k.strip()] = v.strip().strip('"').strip("'")
+
+NAMED = {
+  "counts":      ("Docs + total bytes", "SELECT count(*) AS docs, sum(size_bytes) AS bytes, count(embedding) AS embedded FROM research_docs"),
+  "categories":  ("Docs per category", "SELECT category, count(*) AS docs, sum(size_bytes) AS bytes FROM research_docs GROUP BY category ORDER BY docs DESC"),
+  "recent":      ("N most recent docs (arg1=N, default 10)", "SELECT filename, category, mtime, size_bytes FROM research_docs ORDER BY mtime DESC LIMIT %s"),
+  "find":        ("Docs by filename ILIKE (arg1=pattern)", "SELECT filename, category, mtime, size_bytes FROM research_docs WHERE filename ILIKE %s ORDER BY mtime DESC LIMIT 50"),
+  "errors":      ("Recent index errors (arg1=N, default 10)", "SELECT * FROM research_docs_errors ORDER BY 1 DESC LIMIT %s"),
+  "unembedded":  ("Docs missing embeddings", "SELECT filename, mtime, size_bytes FROM research_docs WHERE embedding IS NULL ORDER BY mtime DESC LIMIT 100"),
+  "size_top":    ("Largest docs (arg1=N, default 10)", "SELECT filename, category, size_bytes FROM research_docs ORDER BY size_bytes DESC LIMIT %s"),
+}
+DEFAULT_ARGS = {"recent": ["10"], "errors": ["10"], "size_top": ["10"], "find": ["%"]}
+
+RE_OK = re.compile(r"^\s*(SELECT|WITH)\b", re.I)
+def gate(sql):
+    s = sql.strip().rstrip(";")
+    if ";" in s: raise SystemExit("REFUSED: multiple statements")
+    if not RE_OK.match(s): raise SystemExit("REFUSED: only SELECT/WITH allowed")
+    return s
+
+def connect():
+    import psycopg2
+    conn = psycopg2.connect(host=ENV["LUMEN_PGVECTOR_HOST"], port=int(ENV["LUMEN_PGVECTOR_PORT"]),
+        dbname=ENV["LUMEN_PGVECTOR_DB"], user=ENV["LUMEN_PGVECTOR_USER"], password=ENV["LUMEN_PGVECTOR_PASSWORD"])
+    cur = conn.cursor()
+    cur.execute("SET default_transaction_read_only = on")
+    conn.commit()
+    return conn
+
+def run_sql(sql, params=(), as_json=False):
+    conn = connect(); cur = conn.cursor()
+    cur.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    conn.close()
+    if as_json:
+        print(json.dumps({"columns": cols, "rows": [[str(c) if c is not None else None for c in r] for r in rows]}, default=str))
+    else:
+        w = [max(len(str(c)), max((len(str(r[i])) for r in rows), default=0)) for i, c in enumerate(cols)]
+        print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(cols)))
+        for r in rows: print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)))
+        print(f"({len(rows)} rows)")
+
+def nl_to_sql(question):
+    import requests
+    schema = ("Table research_docs(id bigint, filepath text, filename text, category text, "
+              "mtime timestamptz, size_bytes int, content text, content_hash text, "
+              "embedding vector(768), indexed_at timestamptz). "
+              "Table research_docs_errors(filepath text, error text, ts timestamptz).")
+    model = os.environ.get("MINERVA_QUERY_MODEL", "deepseek-v4-flash")
+    assert not model.startswith("messenger-")
+    r = requests.post("http://127.0.0.1:4000/v1/chat/completions",
+        headers={"Authorization": f"Bearer {ENV['LITELLM_MASTER_KEY']}"},
+        json={"model": model, "max_tokens": 600, "temperature": 0,
+              "messages": [
+                {"role": "system", "content": "You write a single PostgreSQL SELECT statement. Output ONLY the SQL, no markdown, no explanation. Never write INSERT/UPDATE/DELETE/DDL. Schema: " + schema},
+                {"role": "user", "content": question}]},
+        timeout=120)
+    r.raise_for_status()
+    sql = r.json()["choices"][0]["message"]["content"].strip()
+    sql = re.sub(r"^```(?:sql)?|```$", "", sql, flags=re.M).strip()
+    return sql
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["list", "run", "sql", "ask"])
+    ap.add_argument("args", nargs="*")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    if a.cmd == "list":
+        for k, (desc, _) in NAMED.items(): print(f"  {k:12} {desc}")
+        return
+    if a.cmd == "run":
+        if not a.args or a.args[0] not in NAMED: raise SystemExit(f"unknown query; see: minerva-query list")
+        name = a.args[0]; params = a.args[1:] or DEFAULT_ARGS.get(name, [])
+        run_sql(NAMED[name][1], tuple(params), a.json); return
+    if a.cmd == "sql":
+        if not a.args: raise SystemExit("sql: statement required")
+        run_sql(gate(" ".join(a.args)), (), a.json); return
+    if a.cmd == "ask":
+        q = " ".join(a.args)
+        sql = gate(nl_to_sql(q))
+        print(f"-- {sql}", file=sys.stderr)
+        run_sql(sql, (), a.json); return
+
+if __name__ == "__main__":
+    main()

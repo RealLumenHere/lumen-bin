@@ -1,0 +1,97 @@
+#!/bin/bash
+# handoff — Lumen session-continuity system.
+# Subcommands:
+#   verify        live-state snapshot (never stale; embedded at top of HANDOFF.md)
+#   new <slug>    scaffold a dated per-session archive file for the agent to fill
+#   close         print end-of-session checklist + regenerate HANDOFF verify block
+#   help
+set -uo pipefail
+HANDOFF=/home/lumen/HANDOFF.md
+SDIR=/home/lumen/sessions
+mkdir -p "$SDIR"
+pt(){ TZ=America/Los_Angeles date "$@"; }
+# svc NAME -> real liveness regardless of mechanism (systemd unit OR docker container)
+svc(){ local n="$1" st d; st=$(systemctl is-active "$n" 2>/dev/null)
+  [ "$st" = active ] && { echo "active (systemd)"; return; }
+  d=$(sudo -n docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$n" 2>/dev/null)
+  [ -n "$d" ] && { echo "$d (docker)"; return; }
+  echo "${st:-unknown} (no systemd unit or container named $n)"; }
+
+verify(){
+  echo "===== VERIFY NOW — live state @ $(pt '+%Y-%m-%d %H:%M %Z') (trust THIS over prose) ====="
+  echo "## vault HA"
+  bash /home/lumen/bin/wadjet-ha-failback.sh status 2>/dev/null | sed 's/^/  /' || echo "  (ha status unavailable)"
+  { [ -f /home/lumen/ha/AUTO_PROMOTE_ENABLED ] && echo "  auto_promote: ARMED"; } || echo "  auto_promote: DISARMED"
+  echo -n "  ha_monitor_timer: "; systemctl is-active wadjet-ha-monitor.timer 2>/dev/null || true
+  echo "## key services (Lumen)"
+  for u in cloudflared desktop-commander-mcp lumen-agent litellm; do
+    printf "  %-24s %s\n" "$u:" "$(svc "$u")"
+  done
+  echo "## public vault"
+  echo -n "  vault.lumennode.uk: "; curl -sS -m6 -o /dev/null -w '%{http_code}\n' https://vault.lumennode.uk/ 2>/dev/null || echo unreachable
+  echo "## recent episodes"
+  python3 /home/lumen/minerva/lumen_episode.py recall "recent session work" 2>/dev/null | head -6 | sed 's/^/  /' || echo "  (none)"
+  echo "## triage queue (aq — /home/lumen/agents/alert-queue)"
+  if [ -f /home/lumen/agents/alert-queue/alerts.db ]; then
+    echo "  open: $(/home/lumen/bin/aq open-count 2>/dev/null || echo '?') (aq triage for detail)"
+  else
+    echo "  MISSING — run monitoring-stack Phase 4"
+  fi
+  echo "## agent registry (single source of truth: /home/lumen/agents/REGISTRY.yaml)"
+  if [ -f /home/lumen/agents/REGISTRY.yaml ]; then
+    python3 - <<'PYEOF' 2>/dev/null || echo "  (registry unreadable)"
+import yaml
+d=yaml.safe_load(open('/home/lumen/agents/REGISTRY.yaml'))
+n=sum(len(d.get(s,{})) for s in ('correctors','alerters','feeds'))
+corr=len(d.get('correctors',{})); al=len(d.get('alerters',{})); fe=len(d.get('feeds',{}))
+oi=d.get('open_items',{})
+print(f"  agents: {n} (correctors {corr} / alerters {al} / feeds {fe})")
+print(f"  last_verified: {d.get('meta',{}).get('last_verified','?')}")
+print(f"  open_items: {len(oi)} -> {', '.join(sorted(oi.keys()))}")
+PYEOF
+  else
+    echo "  MISSING — run monitoring-stack Phase 0"
+  fi
+  echo "===== END VERIFY ====="
+}
+
+new(){
+  local slug="${1:-session}"; local f="$SDIR/SESSION_$(date +%Y%m%d_%H%M%S)_${slug}.md"
+  cat > "$f" <<TPL
+# SESSION $(pt '+%Y-%m-%d %H:%M %Z') — ${slug}
+_Per-session archive. Append-only. Referenced by pointer from HANDOFF.md; read on-demand._
+
+## Goal / mandate (verbatim from Frank)
+
+## What changed this session (files, services, config — with paths)
+
+## VERBATIM constraints & decisions (the compression-fragile stuff — do/don't, rejected options + why)
+
+## Blockers hit + how resolved (or still open)
+
+## Resources touched (scripts, creds refs, hosts, ports)
+
+## Relevant chat context the next agent needs
+
+## Next actions (priority-ordered)
+TPL
+  echo "$f"
+}
+
+close(){
+  echo "END-OF-SESSION CHECKLIST:"
+  echo "  1. Finish/append the session file in $SDIR (constraints VERBATIM, not paraphrased)."
+  echo "  2. Update HANDOFF.md: refresh Blockers + Next actions + Verbatim constraints; point to the session file."
+  echo "  3. Restore/confirm every service touched (or flag unrestorable)."
+  echo "  4. lumen_episode.py commit  (+ lumen_state.py ingest for any changed facts, then state-regen)."
+  echo "  5. Run: handoff verify   — confirm the live snapshot is clean."
+  echo
+  verify
+}
+
+case "${1:-help}" in
+  verify) verify ;;
+  new) shift; new "${1:-session}" ;;
+  close) close ;;
+  *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

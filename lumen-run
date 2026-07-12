@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# lumen-run — launch/track long jobs over Commander so they survive the
+# dc_stateless_leak_patch process-group reaping (episode d65a39411849).
+#
+# WHY: the mcpw/supergateway gateway is stateless and reaps the child
+# process-group when an MCP call closes/flaps. nohup/setsid/disown do NOT
+# survive this (SIGKILL to the pgroup / cgroup can't be caught). systemd-run
+# reparents the job to PID 1's tree, outside the gateway's reach.
+#
+# The user systemd manager is unreachable here (no XDG_RUNTIME_DIR/DBUS) and
+# lumen has Linger=no, so --user is a dead end. We use the SYSTEM manager via
+# passwordless sudo (verified available).
+#
+# Jobs are tracked by UNIT NAME, never by PID — a stable handle owned by
+# systemd that any later (stateless) Commander call can query. This is the
+# fold-in for the mcpw session-affinity fix: cross-call PID persistence is
+# not needed, so it stops being a problem.
+set -euo pipefail
+
+GUARD_HOST=lumen
+[ "$(hostname)" = "$GUARD_HOST" ] || { echo "lumen-run: WRONG HOST $(hostname), refusing (expected $GUARD_HOST)" >&2; exit 9; }
+
+usage() {
+  cat >&2 <<USAGE
+usage:
+  lumen-run start [--name NAME] [--mem SIZE] [--cpu QUOTA] -- CMD [ARGS...]
+      Launch CMD as a detached system transient unit (runs as lumen).
+      Prints: UNIT=<name>
+      --name  slug for the unit (default: job); final unit = lumen-job-<slug>-<epoch>
+      --mem   MemoryMax, e.g. 8G (guards the T5810 against OOM kills)
+      --cpu   CPUQuota, e.g. 200%
+      --root  run the unit as root (default: run as lumen)
+  lumen-run status UNIT     -> RUNNING | DONE:0 | FAILED:<code> | GONE
+  lumen-run log    UNIT     -> full journal for the unit
+  lumen-run wait   UNIT [S] -> poll until terminal or S seconds (default 3600)
+  lumen-run list            -> active lumen-job-* units
+USAGE
+  exit 64
+}
+
+cmd="${1:-}"; shift || usage
+case "$cmd" in
+  start)
+    name=job; mem=""; cpu=""; runas=(--uid=lumen --gid=lumen)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name) name="$2"; shift 2;;
+        --mem)  mem="$2";  shift 2;;
+        --cpu)  cpu="$2";  shift 2;;
+        --root) runas=(); shift;;
+        --) shift; break;;
+        *) echo "lumen-run: unknown arg $1" >&2; usage;;
+      esac
+    done
+    [ $# -gt 0 ] || { echo "lumen-run: no command given" >&2; usage; }
+    slug=$(printf '%s' "$name" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')
+    unit="lumen-job-${slug}-$(date +%s)"
+    props=(--property=OOMPolicy=continue)
+    [ -n "$mem" ] && props+=(--property=MemoryMax="$mem")
+    [ -n "$cpu" ] && props+=(--property=CPUQuota="$cpu")
+    # Build the command string safely, append durable completion sentinel,
+    # and propagate the REAL exit code as the unit's exit status.
+    inner=$(printf '%q ' "$@")
+    wrapped="{ ${inner}; }; rc=\$?; echo \"LUMEN_JOB_EXIT=\$rc\"; exit \$rc"
+    sudo -n systemd-run --unit="$unit" --collect "${runas[@]}" "${props[@]}" \
+        /bin/bash -c "$wrapped" >/dev/null
+    echo "UNIT=${unit}"
+    ;;
+  status)
+    unit="${1:?unit required}"
+    if systemctl is-active --quiet "$unit"; then echo "RUNNING"; exit 0; fi
+    line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -a 'LUMEN_JOB_EXIT=' | tail -1 || true)
+    if [ -n "$line" ]; then
+      rc="${line##*LUMEN_JOB_EXIT=}"
+      [ "$rc" = "0" ] && echo "DONE:0" || echo "FAILED:${rc}"
+    else
+      # no active unit and no sentinel: either never ran or journal rotated
+      systemctl show "$unit" -p LoadState 2>/dev/null | grep -q 'not-found' \
+        && echo "GONE" || echo "RUNNING"
+    fi
+    ;;
+  log)   unit="${1:?unit required}"; journalctl -u "$unit" --no-pager -o cat 2>/dev/null;;
+  wait)
+    unit="${1:?unit required}"; budget="${2:-3600}"; waited=0
+    while systemctl is-active --quiet "$unit"; do
+      sleep 3; waited=$((waited+3))
+      [ "$waited" -ge "$budget" ] && { echo "TIMEOUT after ${budget}s (still RUNNING)"; exit 124; }
+    done
+    line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -a 'LUMEN_JOB_EXIT=' | tail -1 || true)
+    rc="${line##*LUMEN_JOB_EXIT=}"; [ -n "$line" ] || rc="?"
+    [ "$rc" = "0" ] && echo "DONE:0" || echo "FAILED:${rc}"
+    ;;
+  list)  systemctl list-units 'lumen-job-*' --all --no-legend --no-pager 2>/dev/null || true;;
+  *) usage;;
+esac

@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+pt — Frank's Leantime CLI.
+
+Replaces project-touch + project-handoff. Talks to Leantime via JSON-RPC.
+
+Quick reference:
+  pt ls                                # list all projects
+  pt todo [id_or_substr]               # list OPEN work (what needs doing)
+  pt show <id_or_substr>               # show one project + open tickets
+  pt next <id_or_substr> "..."         # add a 'next step' ticket
+  pt buy <id_or_substr> "..."          # add a shopping-list ticket
+  pt wait <id_or_substr> "..."         # add a waiting-on ticket
+  pt blocker <id_or_substr> "..."      # add a blocker ticket
+  pt done <ticket_id>                  # mark ticket done
+  pt log <id_or_substr> "..."          # append a step to the project log
+  pt inbox "..."                       # add to the Inbox
+  pt idea "..."                        # park an idea in Ideas Parking Lot
+  pt research "..."                    # queue an item for the research agents
+  pt url                               # print Leantime URL
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+LEANTIME_URL  = "http://127.0.0.1:8125/api/jsonrpc"
+LEANTIME_HOST = "leantime.lumennode.uk"
+API_KEY_FILE  = Path("/home/lumen/leantime/.api-key")
+
+# Ticket status codes (from Leantime DB inspection)
+ST_NEW = 3
+ST_TODO = 3
+ST_IN_PROGRESS = 4
+ST_DONE = 0
+ST_BLOCKED = 1
+
+PRIORITY_CRITICAL = 1
+PRIORITY_HIGH = 2
+PRIORITY_MEDIUM = 3
+PRIORITY_LOW = 4
+
+
+def rpc(method, params=None):
+    """Call a Leantime JSON-RPC method."""
+    if not API_KEY_FILE.exists():
+        print(f"ERROR: API key file not found at {API_KEY_FILE}", file=sys.stderr)
+        sys.exit(1)
+    key = API_KEY_FILE.read_text().strip()
+    body = json.dumps({
+        "method": method,
+        "jsonrpc": "2.0",
+        "id": "1",
+        "params": params or {}
+    }).encode()
+    req = urllib.request.Request(
+        LEANTIME_URL, data=body,
+        headers={
+            "x-api-key": key,
+            "Host": LEANTIME_HOST,
+            "Content-Type": "application/json",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read())
+            if "error" in resp:
+                print(f"API error: {resp['error']}", file=sys.stderr)
+                sys.exit(1)
+            return resp.get("result")
+    except urllib.error.HTTPError as e:
+        print(f"HTTP {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def find_project(needle):
+    """Find a project by id, exact name, or substring."""
+    projects = rpc("leantime.rpc.projects.projects.getAllProjects") or []
+    # exact id
+    if needle.isdigit():
+        for p in projects:
+            if str(p["id"]) == needle:
+                return p
+    # exact name match
+    for p in projects:
+        if p["name"].lower() == needle.lower():
+            return p
+    # substring match
+    matches = [p for p in projects if needle.lower() in p["name"].lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"ambiguous '{needle}'. matches:", file=sys.stderr)
+        for p in matches:
+            print(f"  [{p['id']}] {p['name']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"no project matched '{needle}'", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_ls(args):
+    projects = rpc("leantime.rpc.projects.projects.getAllProjects") or []
+    projects.sort(key=lambda p: (p["state"] or 0, p["id"]))
+    for p in projects:
+        state = "active" if (p["state"] or 0) == 0 else "closed"
+        print(f"  [{p['id']:3}] [{state:6}] {p['name']}")
+
+
+def cmd_show(args):
+    p = find_project(args.project)
+    print(f"\n[{p['id']}] {p['name']}")
+    print(f"  client: {p.get('clientName', '—')}")
+    print(f"  state: {'active' if (p.get('state') or 0) == 0 else 'closed'}")
+    print()
+    tickets = rpc("leantime.rpc.tickets.tickets.getAll",
+                  {"searchCriteria": {"currentProject": p["id"]}}) or []
+    if not tickets:
+        print("  (no tickets)")
+        return
+    print("  Tickets:")
+    by_status = {}
+    for t in tickets:
+        by_status.setdefault(int(t.get("status") or 0), []).append(t)
+    status_names = {3: "NEW", 1: "BLOCKED", 4: "IN PROGRESS",
+                    2: "WAITING APPROVAL", 0: "DONE", -1: "ARCHIVED"}
+    for status in sorted(by_status.keys()):
+        print(f"\n  [{status_names.get(status, str(status))}]")
+        for t in by_status[status]:
+            tags = t.get("tags") or ""
+            tag_str = f" #{tags}" if tags else ""
+            print(f"    [{t['id']:4}] {t['headline']}{tag_str}")
+
+
+def add_ticket(project_id, headline, tags, status=ST_TODO, priority=PRIORITY_MEDIUM,
+               description=""):
+    """Wrapper for ticket creation via API."""
+    values = {
+        "projectId": project_id,
+        "headline": headline,
+        "description": description,
+        "type": "task",
+        "status": str(status),
+        "priority": str(priority),
+        "tags": tags,
+        "userId": 1,
+        "editorId": "1",
+    }
+    result = rpc("leantime.rpc.tickets.tickets.addTicket", {"values": values})
+    return result
+
+
+def cmd_next(args):
+    p = find_project(args.project)
+    add_ticket(p["id"], "→ " + args.text, tags="next-step")
+    print(f"✓ added next-step to [{p['id']}] {p['name']}")
+
+
+def cmd_buy(args):
+    p = find_project(args.project)
+    add_ticket(p["id"], "🛒 " + args.text, tags="shopping", priority=PRIORITY_HIGH)
+    print(f"✓ added shopping item to [{p['id']}] {p['name']}")
+
+
+def cmd_wait(args):
+    p = find_project(args.project)
+    add_ticket(p["id"], "⏳ " + args.text, tags="waiting", status=ST_BLOCKED,
+               priority=PRIORITY_HIGH)
+    print(f"✓ added waiting-on to [{p['id']}] {p['name']}")
+
+
+def cmd_blocker(args):
+    p = find_project(args.project)
+    add_ticket(p["id"], "⚠ " + args.text, tags="blocker", status=ST_BLOCKED,
+               priority=PRIORITY_CRITICAL)
+    print(f"✓ added blocker to [{p['id']}] {p['name']}")
+
+
+def cmd_done(args):
+    result = rpc("leantime.rpc.tickets.tickets.patch",
+                 {"id": int(args.ticket), "params": {"status": str(ST_DONE)}})
+    print(f"✓ ticket {args.ticket} → done")
+
+
+def cmd_log(args):
+    """Append a step entry as a TODO ticket tagged 'log'."""
+    p = find_project(args.project)
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    ts = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M")
+    add_ticket(p["id"], f"📝 {ts}: {args.text}", tags="log",
+               status=ST_DONE, description=args.text)
+    print(f"✓ logged to [{p['id']}] {p['name']}")
+
+
+def cmd_inbox(args):
+    p = find_project("📥 Inbox")
+    add_ticket(p["id"], "📌 " + args.text, tags="inbox", priority=PRIORITY_HIGH)
+    print(f"✓ added to Inbox")
+
+
+def cmd_idea(args):
+    p = find_project("💡 Ideas Parking Lot")
+    add_ticket(p["id"], "💡 " + args.text, tags="idea", priority=PRIORITY_LOW)
+    print(f"✓ parked idea")
+
+
+def cmd_research(args):
+    p = find_project("🔬 Research Queue")
+    add_ticket(p["id"], "🔬 " + args.text, tags="research", priority=PRIORITY_MEDIUM)
+    print(f"✓ queued for research")
+
+
+def cmd_todo(args):
+    """List open (actionable) tickets across projects; excludes #log journal entries."""
+    projects = rpc("leantime.rpc.projects.projects.getAllProjects") or []
+    pstate = {p["id"]: (p.get("state") or 0) for p in projects}
+    pname  = {p["id"]: p["name"] for p in projects}
+    only = find_project(args.project)["id"] if getattr(args, "project", None) else None
+    tickets = rpc("leantime.rpc.tickets.tickets.getAll", {"searchCriteria": {}}) or []
+    OPEN = {1, 2, 3, 4}
+    st_name = {3: "NEW", 1: "BLOCKED", 4: "WIP", 2: "APPROVAL"}
+    pr_name = {1: "CRIT", 2: "HIGH", 3: "MED", 4: "LOW", 5: "LOW"}
+    buckets = {}
+    for t in tickets:
+        if int(t.get("status") or 0) not in OPEN:
+            continue
+        if "log" in (t.get("tags") or "").split(","):
+            continue
+        pid = int(t.get("projectId") or 0)
+        if pstate.get(pid, 0) != 0:
+            continue
+        if only is not None and pid != only:
+            continue
+        buckets.setdefault(pid, []).append(t)
+    if not buckets:
+        print("\n  (nothing open — you're clear)\n")
+        return
+    total = sum(len(v) for v in buckets.values())
+    print(f"\n  OPEN WORK — {total} item(s)\n")
+    for pid in sorted(buckets):
+        print(f"  [{pid}] {pname.get(pid, '?')}")
+        rows = sorted(buckets[pid],
+                      key=lambda t: (int(t.get("priority") or 3), int(t.get("status") or 3)))
+        for t in rows:
+            st = int(t.get("status") or 0)
+            pr = int(t.get("priority") or 3)
+            hl = t["headline"]
+            if len(hl) > 88:
+                hl = hl[:87] + "\u2026"
+            print(f"      [{t['id']:>3}] {st_name.get(st, '?'):8} {pr_name.get(pr, 'MED'):4}  {hl}")
+        print()
+
+
+def cmd_url(args):
+    print("https://leantime.lumennode.uk")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    sp.add_parser("ls", help="list all projects")
+    sp.add_parser("url", help="print Leantime URL")
+
+    pt_todo = sp.add_parser("todo", help="list open work across projects")
+    pt_todo.add_argument("project", nargs="?", help="optional project id/substr filter")
+
+    for name, fn, help_ in [
+        ("show",     cmd_show,     "show a project + its tickets"),
+    ]:
+        p = sp.add_parser(name, help=help_)
+        p.add_argument("project", help="project id or name substring")
+
+    for name, fn, help_ in [
+        ("next",     cmd_next,     "add a next-step ticket"),
+        ("buy",      cmd_buy,      "add a shopping ticket"),
+        ("wait",     cmd_wait,     "add a waiting-on ticket"),
+        ("blocker",  cmd_blocker,  "add a blocker ticket"),
+        ("log",      cmd_log,      "append a step to the project log"),
+    ]:
+        p = sp.add_parser(name, help=help_)
+        p.add_argument("project", help="project id or name substring")
+        p.add_argument("text",    help="ticket text")
+
+    for name, fn, help_ in [
+        ("inbox",    cmd_inbox,    "add to the Inbox"),
+        ("idea",     cmd_idea,     "park an idea"),
+        ("research", cmd_research, "queue research item"),
+    ]:
+        p = sp.add_parser(name, help=help_)
+        p.add_argument("text",    help="ticket text")
+
+    p = sp.add_parser("done", help="mark a ticket done")
+    p.add_argument("ticket", help="ticket id")
+
+    args = ap.parse_args()
+    cmd_map = {
+        "ls": cmd_ls, "show": cmd_show, "next": cmd_next, "buy": cmd_buy,
+        "wait": cmd_wait, "blocker": cmd_blocker, "done": cmd_done,
+        "log": cmd_log, "inbox": cmd_inbox, "idea": cmd_idea,
+        "research": cmd_research, "url": cmd_url, "todo": cmd_todo,
+    }
+    cmd_map[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

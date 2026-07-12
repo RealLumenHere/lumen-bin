@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+et_report.py — Effective-Tokens (ET) fleet cost report.
+
+Reads token usage that LiteLLM already ships to Langfuse (ClickHouse
+default.observations) and computes the model-agnostic Effective-Tokens metric
+from the GitHub agentic-token-savings work (proposal a9c03f7ed112):
+
+    ET_raw = non_cached_input*1.0 + cache_read*0.1 + output*4.0
+    ET     = ET_raw * model_multiplier(model)     # multiplier defaults 1.0
+
+Output tokens are weighted 4x (they drive both latency and cost); cache reads
+are discounted to 0.1x. non_cached_input uses if(input>=cache_read, input-
+cache_read, input) because cache-read accounting is inconsistent across
+providers (some report 'input' inclusive of cache_read, some separate) — this
+guard keeps ET non-negative under both conventions.
+
+Langfuse also computes real total_cost, so this reports ET (pricing-free
+structural proxy) AND actual USD side by side.
+
+Zero infra change: read-only query against the existing langfuse-clickhouse
+container via docker exec. No gateway/LiteLLM change, no per-call callback.
+Appends one snapshot row per run to /home/lumen/logs/et_report.jsonl.
+
+Usage: et_report.py [--days N] [--multipliers path.json] [--no-log]
+"""
+import argparse, json, subprocess, sys, datetime, pathlib
+
+CH_CONTAINER = "langfuse-clickhouse"
+JSONL = pathlib.Path("/home/lumen/logs/et_report.jsonl")
+DEFAULT_MULTIPLIERS = {}  # keyed by model substring; set relative $/tok weights to fold cost into ET
+
+QUERY = """
+SELECT
+  provided_model_name AS model,
+  count() AS calls,
+  sum(usage_details['input'])                        AS input_tok,
+  sum(usage_details['output'])                       AS output_tok,
+  sum(usage_details['cache_read_input_tokens'])      AS cache_read,
+  sum(usage_details['cache_creation_input_tokens'])  AS cache_creation,
+  toFloat64(sum(total_cost))                         AS usd,
+  toFloat64(sum(
+      if(toFloat64(usage_details['input']) >= toFloat64(usage_details['cache_read_input_tokens']),
+         toFloat64(usage_details['input']) - toFloat64(usage_details['cache_read_input_tokens']),
+         toFloat64(usage_details['input'])) * 1.0
+    + toFloat64(usage_details['cache_read_input_tokens']) * 0.1
+    + toFloat64(usage_details['output']) * 4.0
+  ))                                                 AS et_raw
+FROM default.observations
+WHERE type = 'GENERATION' AND start_time > now() - INTERVAL {days} DAY
+GROUP BY model
+ORDER BY et_raw DESC
+FORMAT JSONEachRow
+"""
+
+
+def mult_for(model, mults):
+    m = (model or "").lower()
+    for k, v in mults.items():
+        if k.lower() in m:
+            return float(v)
+    return 1.0
+
+
+def fetch(days):
+    q = QUERY.format(days=int(days))
+    p = subprocess.run(
+        ["docker", "exec", CH_CONTAINER, "clickhouse-client", "--query", q],
+        capture_output=True, text=True, timeout=60,
+    )
+    if p.returncode != 0:
+        sys.exit(f"clickhouse query failed:\n{p.stderr.strip()}")
+    return [json.loads(l) for l in p.stdout.splitlines() if l.strip()]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--multipliers")
+    ap.add_argument("--no-log", action="store_true")
+    a = ap.parse_args()
+
+    mults = dict(DEFAULT_MULTIPLIERS)
+    if a.multipliers:
+        mults.update(json.loads(pathlib.Path(a.multipliers).read_text()))
+
+    rows = fetch(a.days)
+    for r in rows:
+        for k in ("calls", "input_tok", "output_tok", "cache_read", "cache_creation"):
+            r[k] = int(r.get(k) or 0)
+        r["usd"] = float(r.get("usd") or 0.0)
+        r["et_raw"] = float(r.get("et_raw") or 0.0)
+        r["mult"] = mult_for(r.get("model"), mults)
+        r["et"] = r["et_raw"] * r["mult"]
+
+    rows = [r for r in rows if r["calls"] > 0]
+    tot = {k: sum(r[k] for r in rows) for k in ("calls", "input_tok", "output_tok", "cache_read", "et", "usd")}
+
+    W = 46
+    print(f"\nEffective-Tokens report — last {a.days}d "
+          f"({datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC})")
+    print(f"{'model':{W}s} {'calls':>6s} {'in':>9s} {'out':>9s} {'cacheR':>8s} "
+          f"{'ET':>12s} {'%ET':>5s} {'USD':>8s}")
+    print("-" * (W + 62))
+    for r in sorted(rows, key=lambda x: x["et"], reverse=True):
+        pct = 100 * r["et"] / tot["et"] if tot["et"] else 0
+        print(f"{(r['model'] or '(none)')[:W]:{W}s} {r['calls']:6d} {r['input_tok']:9d} "
+              f"{r['output_tok']:9d} {r['cache_read']:8d} {r['et']:12.0f} {pct:5.1f} {r['usd']:8.4f}")
+    print("-" * (W + 62))
+    print(f"{'FLEET TOTAL':{W}s} {tot['calls']:6d} {tot['input_tok']:9d} "
+          f"{tot['output_tok']:9d} {tot['cache_read']:8d} {tot['et']:12.0f} {100.0:5.1f} {tot['usd']:8.4f}")
+    if tot["et"]:
+        print(f"\n$ per million ET: ${1e6 * tot['usd'] / tot['et']:.4f}   "
+              f"(ET = model-agnostic optimization target; USD = Langfuse ground-truth cost)")
+
+    if not a.no_log:
+        try:
+            JSONL.parent.mkdir(parents=True, exist_ok=True)
+            snap = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "window_days": a.days, "total": tot,
+                    "by_model": {r["model"]: {"calls": r["calls"], "et": round(r["et"]),
+                                              "usd": round(r["usd"], 4)} for r in rows}}
+            with open(JSONL, "a") as f:
+                f.write(json.dumps(snap) + "\n")
+            print(f"\nsnapshot appended -> {JSONL}")
+        except Exception as e:
+            print(f"(jsonl log skipped: {e})", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# litellm-cost — fleet token/cost report over EXISTING Langfuse data (read-only).
+# Built 2026-07-05 (proposal a9c03f7ed112). LiteLLM already logs every call to
+# Langfuse (callbacks enabled 2026-05-18); this reads that data — no new logging.
+# Real per-call cost (total_cost) is the headline; eff_tok = model-agnostic
+# effective-tokens proxy (out*4 + in*1 + cache_read*0.1) for efficiency comparison.
+set -euo pipefail
+D="${1:-7}"   # window in days (default 7)
+CH="docker exec langfuse-clickhouse clickhouse-client"
+q(){ $CH -q "$1" 2>/dev/null; }
+
+echo "==================================================================="
+echo " LiteLLM fleet cost report — last ${D}d   ($(date -u +%Y-%m-%dT%H:%MZ))"
+echo " source: Langfuse clickhouse (observations) — read-only"
+echo "==================================================================="
+
+echo; echo "### TOTALS"
+q "SELECT count(*) AS calls, round(sum(total_cost),4) AS cost_usd,
+   sum(usage_details['input']) AS in_tok, sum(usage_details['output']) AS out_tok,
+   sum(usage_details['cache_read_input_tokens']) AS cache_read_tok
+   FROM observations WHERE start_time > now() - toIntervalDay(${D})
+   FORMAT PrettyCompact"
+
+echo; echo "### BY MODEL (cost desc)"
+q "SELECT provided_model_name AS model, count(*) AS calls,
+   round(sum(total_cost),4) AS cost_usd,
+   sum(usage_details['input']) AS in_tok, sum(usage_details['output']) AS out_tok,
+   round(sum(usage_details['output'])*4 + sum(usage_details['input'])
+         + sum(usage_details['cache_read_input_tokens'])*0.1) AS eff_tok,
+   round(sum(total_cost)/count(*),6) AS usd_per_call
+   FROM observations WHERE start_time > now() - toIntervalDay(${D})
+   GROUP BY model ORDER BY cost_usd DESC LIMIT 20 FORMAT PrettyCompact"
+
+echo; echo "### BY PIPELINE (trace name, cost desc)"
+q "SELECT t.name AS pipeline, count(*) AS calls,
+   round(sum(o.total_cost),4) AS cost_usd,
+   sum(o.usage_details['input']) AS in_tok, sum(o.usage_details['output']) AS out_tok
+   FROM observations o INNER JOIN traces t ON o.trace_id = t.id
+   WHERE o.start_time > now() - toIntervalDay(${D})
+   GROUP BY pipeline ORDER BY cost_usd DESC LIMIT 20 FORMAT PrettyCompact"
+
+echo; echo "### TOP 12 COSTLIEST SINGLE CALLS"
+q "SELECT start_time, provided_model_name AS model, round(total_cost,5) AS cost_usd,
+   usage_details['input'] AS in_tok, usage_details['output'] AS out_tok
+   FROM observations WHERE start_time > now() - toIntervalDay(${D})
+   ORDER BY total_cost DESC LIMIT 12 FORMAT PrettyCompact"
+
+echo; echo "(tip: 'litellm-cost 30' for a 30-day window)"

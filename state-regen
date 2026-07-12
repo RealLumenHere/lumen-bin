@@ -1,0 +1,3 @@
+#!/bin/bash
+# Regenerate the never-stale live fleet-state block from the bi-temporal store.
+cd /home/lumen/minerva && python3 lumen_state_gen.py > /home/lumen/minerva/context/LIVE_FLEET_STATE.md && echo regenerated

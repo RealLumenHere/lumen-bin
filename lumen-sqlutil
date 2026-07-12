@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""lumen-sqlutil — ops tooling for Lumen's archival SQLite stores (wq#91, proposal 152c3f).
+
+Read-only health checks (safe on live WAL DBs), table stats, snapshot exports,
+and backup-gated vacuum. sqlite-utils (pipx, ~/.local/bin) handles rich export;
+health uses stdlib only so the weekly timer has zero deps.
+
+CLI:
+  lumen-sqlutil list                      # curated archival-store roster
+  lumen-sqlutil health [--all|DB...] [--alert]   # PRAGMA quick_check etc.; --alert = ntfy+aq on fail (edge-triggered)
+  lumen-sqlutil tables DB                 # table row counts (sqlite-utils)
+  lumen-sqlutil export DB TABLE [--fmt json|csv] # snapshot to /home/lumen/backups/sqlite-exports/
+  lumen-sqlutil vacuum DB                 # manual only; sqlite3 .backup to /home/lumen/backups/ FIRST
+
+Schema migrations are NOT here — lumen_migrate.py owns those (shipped 2026-07-10).
+"""
+import sys, os, json, sqlite3, subprocess, datetime, pathlib, urllib.request
+
+ROSTER = {
+    "minerva":        "/home/lumen/minerva/minerva.db",
+    "work-queue":     "/home/lumen/agents/work-queue/queue.db",
+    "alert-queue":    "/home/lumen/agents/alert-queue/alerts.db",
+    "intel":          "/home/lumen/agent/intel.db",
+    "github-scout":   "/home/lumen/agent/github_scout.db",
+    "research-cache": "/home/lumen/agent/research_cache.db",
+    "project-engine": "/home/lumen/agent/project_engine.db",
+    "checkpoints":    "/home/lumen/agent/checkpoints.db",
+    "messenger":      "/home/lumen/messenger/data/messenger.db",
+    "scribe":         "/home/lumen/scribe/scribe.db",
+    "dc-handles":     "/home/lumen/.dc-handles.db",
+}
+BACKUP_DIR = pathlib.Path("/home/lumen/backups")
+EXPORT_DIR = BACKUP_DIR / "sqlite-exports"
+STATE_FILE = pathlib.Path("/home/lumen/agents/alert-queue/.sqlite-health-state.json")
+NTFY = "http://localhost:8080/lumen-updates"
+SQLITE_UTILS = os.path.expanduser("~/.local/bin/sqlite-utils")
+
+def now(): return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+def ntfy(msg, prio="high"):
+    try:
+        req = urllib.request.Request(NTFY, data=msg.encode(),
+              headers={"Priority": prio, "Title": "sqlite-health"}, method="POST")
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print(f"ntfy failed: {e}", file=sys.stderr)
+
+def check_db(path):
+    """Read-only health probe. Returns dict; ok=False on any problem."""
+    r = {"path": path, "ok": False}
+    if not os.path.exists(path):
+        r["error"] = "missing"; return r
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=20)
+        cur = con.cursor()
+        qc = cur.execute("PRAGMA quick_check").fetchone()[0]
+        r["quick_check"] = qc
+        r["journal_mode"] = cur.execute("PRAGMA journal_mode").fetchone()[0]
+        pc = cur.execute("PRAGMA page_count").fetchone()[0]
+        ps = cur.execute("PRAGMA page_size").fetchone()[0]
+        fl = cur.execute("PRAGMA freelist_count").fetchone()[0]
+        r["size_mb"] = round(pc*ps/1048576, 2)
+        r["freelist_pct"] = round(100*fl/pc, 1) if pc else 0.0
+        con.close()
+        r["ok"] = (qc == "ok")
+        if not r["ok"]: r["error"] = f"quick_check: {qc[:200]}"
+    except Exception as e:
+        r["error"] = f"{type(e).__name__}: {e}"
+    return r
+
+def cmd_health(argv):
+    alert = "--alert" in argv
+    argv = [a for a in argv if a != "--alert"]
+    if not argv or "--all" in argv:
+        targets = list(ROSTER.values())
+    else:
+        targets = argv
+    results = [check_db(p) for p in targets]
+    prev = {}
+    if alert and STATE_FILE.exists():
+        try: prev = json.loads(STATE_FILE.read_text())
+        except Exception: prev = {}
+    state = {}
+    bad = 0
+    for r in results:
+        mark = "OK " if r["ok"] else "FAIL"
+        extra = f"{r.get('size_mb','?')}MB {r.get('journal_mode','?')} free={r.get('freelist_pct','?')}%" if r["ok"] else r.get("error","")
+        print(f"[{mark}] {r['path']}  {extra}")
+        state[r["path"]] = r["ok"]
+        if not r["ok"]:
+            bad += 1
+            if alert and prev.get(r["path"], True):  # edge: was ok/unknown -> now bad
+                ntfy(f"🔴 SQLite health FAIL: {r['path']} — {r.get('error','')[:150]}")
+        elif alert and prev.get(r["path"], True) is False:  # recovered
+            ntfy(f"🟢 SQLite health recovered: {r['path']}", "default")
+    if alert:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state))
+    print(f"-- {len(results)-bad}/{len(results)} healthy")
+    return 1 if bad else 0
+
+def cmd_tables(argv):
+    if not argv: print("usage: lumen-sqlutil tables DB", file=sys.stderr); return 2
+    return subprocess.run([SQLITE_UTILS, "tables", "--counts", "-t", argv[0]]).returncode
+
+def cmd_export(argv):
+    fmt = "json"
+    if "--fmt" in argv:
+        i = argv.index("--fmt"); fmt = argv[i+1]; argv = argv[:i]+argv[i+2:]
+    if len(argv) < 2: print("usage: lumen-sqlutil export DB TABLE [--fmt json|csv]", file=sys.stderr); return 2
+    db, table = argv[0], argv[1]
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    out = EXPORT_DIR / f"{pathlib.Path(db).stem}.{table}.{now()}.{fmt}"
+    args = [SQLITE_UTILS, "rows", db, table] + (["--csv"] if fmt == "csv" else [])
+    with open(out, "w") as f:
+        rc = subprocess.run(args, stdout=f).returncode
+    if rc == 0: print(f"exported -> {out}")
+    else: out.unlink(missing_ok=True)
+    return rc
+
+def cmd_vacuum(argv):
+    if not argv: print("usage: lumen-sqlutil vacuum DB", file=sys.stderr); return 2
+    db = argv[0]
+    if not os.path.exists(db): print(f"missing: {db}", file=sys.stderr); return 1
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    bak = BACKUP_DIR / f"{pathlib.Path(db).name}.prevacuum.{now()}"
+    con = sqlite3.connect(db, timeout=30)
+    bcon = sqlite3.connect(bak)
+    con.backup(bcon); bcon.close()
+    print(f"backup -> {bak}")
+    con.execute("VACUUM"); con.close()
+    print(f"vacuumed {db}")
+    return 0
+
+def cmd_list(_):
+    for name, p in ROSTER.items():
+        print(f"{name:16s} {p}  {'(present)' if os.path.exists(p) else '(MISSING)'}")
+    return 0
+
+CMDS = {"health": cmd_health, "tables": cmd_tables, "export": cmd_export,
+        "vacuum": cmd_vacuum, "list": cmd_list}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        print(__doc__); sys.exit(2)
+    sys.exit(CMDS[sys.argv[1]](sys.argv[2:]) or 0)
