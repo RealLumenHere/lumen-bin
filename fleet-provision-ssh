@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# fleet-provision-ssh — provision a Lumen fleet node directly over SSH (no USB / cloud-init).
+#
+# Use when the target ALREADY has an OS with SSH reachable (e.g. Ubuntu installed with
+# "Install OpenSSH server" checked, bootstrap password from /home/lumen/.fleet_pw. Does what the cloud-init
+# bootstrap does, but live from Lumen — every step verified, lockout-safe.
+#
+# Usage:
+#   fleet-provision-ssh <hostname> <bootstrap_user@target_ip> [--password 'pw'] [--key-only] [--ts-key tskey-auth-...]
+#     --password   bootstrap SSH password (default: contents of /home/lumen/.fleet_pw). Uses sshpass.
+#     --key-only   skip password; Lumen key auth already works on target.
+#     --ts-key     Tailscale auth key; else read from $TS_AUTHKEY.
+#
+# Lockout-safe: installs Lumen key + verifies key login BEFORE disabling password auth.
+set -euo pipefail
+
+LUMEN_KEY=/home/lumen/.ssh/id_ed25519
+LUMEN_PUB_FILE=/home/lumen/.ssh/id_ed25519.pub
+REMOTE_HELPER=/home/lumen/bootstrap/remote-provision.sh
+DEFAULT_PW="${FLEET_PW:-$(cat /home/lumen/.fleet_pw 2>/dev/null)}"
+TAG='tag:lumen-fleet'
+GH_USER="${GITHUB_USER:-FrankStupak}"
+SSHO='-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o IdentitiesOnly=yes'
+
+HOSTN=''; TARGET=''; PW="$DEFAULT_PW"; TS_KEY="${TS_AUTHKEY:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --password) PW="$2"; shift 2;;
+    --key-only) PW=''; shift;;
+    --ts-key)   TS_KEY="$2"; shift 2;;
+    -h|--help)  sed -n '2,14p' "$0"; exit 0;;
+    *) if [ -z "$HOSTN" ]; then HOSTN="$1"; elif [ -z "$TARGET" ]; then TARGET="$1"; fi; shift;;
+  esac
+done
+
+[ -n "$HOSTN" ] && [ -n "$TARGET" ] || { echo "usage: fleet-provision-ssh <hostname> <user@ip> [--password pw] [--key-only] [--ts-key ...]" >&2; exit 1; }
+[ -n "$TS_KEY" ] || { echo "error: no Tailscale auth key (--ts-key or \$TS_AUTHKEY)" >&2; exit 1; }
+[ -f "$REMOTE_HELPER" ] || { echo "error: missing $REMOTE_HELPER" >&2; exit 1; }
+LUMEN_PUB="$(cat "$LUMEN_PUB_FILE")"
+
+KEYRUN(){ ssh -i "$LUMEN_KEY" -o PasswordAuthentication=no $SSHO "$TARGET" "$@"; }
+if [ -n "$PW" ]; then
+  command -v sshpass >/dev/null || { echo "error: sshpass missing on Lumen (sudo apt install -y sshpass)" >&2; exit 1; }
+  BS(){ sshpass -p "$PW" ssh $SSHO "$TARGET" "$@"; }
+  BSCP(){ sshpass -p "$PW" scp $SSHO "$1" "$TARGET:$2"; }
+else
+  BS(){ KEYRUN "$@"; }
+  BSCP(){ scp -i "$LUMEN_KEY" $SSHO "$1" "$TARGET:$2"; }
+fi
+
+echo "[1/6] connectivity"
+BS 'echo "  connected as $(id -un)@$(hostname)"'
+
+echo "[2/6] push remote helper -> /tmp/remote-provision.sh"
+BSCP "$REMOTE_HELPER" /tmp/remote-provision.sh
+
+echo "[3/6] run provisioning as root (leaves password auth ON)"
+if [ -n "$PW" ]; then
+  sshpass -p "$PW" ssh $SSHO "$TARGET" \
+    "echo '$PW' | sudo -S -p '' bash /tmp/remote-provision.sh '$HOSTN' '$TAG' '$GH_USER' '$TS_KEY' '$LUMEN_PUB'"
+else
+  KEYRUN "sudo -n bash /tmp/remote-provision.sh '$HOSTN' '$TAG' '$GH_USER' '$TS_KEY' '$LUMEN_PUB'"
+fi
+
+echo "[4/6] verify Lumen key login (lockout gate)"
+KEYRUN 'echo "  key-login OK: $(id -un)@$(hostname)"' || { echo "error: key login failed — password auth still ON, NOT hardening. Investigate." >&2; exit 1; }
+
+echo "[5/6] harden sshd -> key-only"
+KEYRUN "printf 'PasswordAuthentication no\nPermitRootLogin no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/99-lumen.conf >/dev/null && sudo systemctl restart ssh"
+KEYRUN 'echo "  post-harden key-login OK"' || echo "  WARNING: key login failed after harden — investigate" >&2
+
+echo "[6/6] phone home"
+KEYRUN "TSIP=\$(tailscale ip -4 2>/dev/null | head -1); LAN=\$(hostname -I | awk '{print \$1}'); curl -sf -d \"\$(hostname) provisioned via SSH: TS=\$TSIP LAN=\$LAN\" https://ntfy.lumennode.uk/lumen-fleet >/dev/null || true; echo '  pinged ntfy'"
+
+echo "✓ $HOSTN provisioned via SSH. Confirm: tailnet machines page shows $TAG; ntfy.lumennode.uk/lumen-fleet."

@@ -2,9 +2,6 @@
 # Backups
 *.bak*
 *.bak.*
-# Plaintext-cred scripts — EXCLUDED until creds externalized (see wq#137 report)
-fleet-provision-ssh
-overnight_boot_gate.sh
 # Keys / secrets
 *.key
 *.pem
@@ -12,3 +9,4 @@ overnight_boot_gate.sh
 .env
 __pycache__/
 *.pyc
+.fleet_pw
