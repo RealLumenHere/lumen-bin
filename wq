@@ -98,7 +98,9 @@ def purge_stale_sessions(c, ttl_min=DEFAULT_TTL_MIN):
     return c.execute("SELECT changes()").fetchone()[0]
 
 def live_sessions_for_base(c, base, exclude_sid):
-    """Registered sessions sharing this base name that currently hold an ACTIVE lease or slock."""
+    """Registered sessions sharing this base name that currently hold an ACTIVE lease or slock.
+    Used by cmd_claim — steady-state check, deliberately unchanged by wq#537 so existing
+    in-flight claims are never retroactively invalidated."""
     t_now = now()
     out = []
     for sid, in c.execute("SELECT session_id FROM agent_sessions WHERE base_name=? AND session_id<>?",
@@ -108,6 +110,26 @@ def live_sessions_for_base(c, base, exclude_sid):
         locks = c.execute("SELECT scope FROM slocks WHERE holder=? AND expires_at >= ?", (sid, t_now)).fetchall()
         if held or locks:
             out.append((sid, [r[0] for r in held], [r[0] for r in locks]))
+    return out
+
+def registered_sessions_for_base(c, base, exclude_sid):
+    """wq#537: ALL registered sessions sharing this base name, regardless of whether either one
+    currently holds a lease or slock. Existence in the registry IS liveness here — by the time
+    this runs, purge_stale_sessions has already dropped rows idle past the lease TTL (and never
+    a row still holding something live), so anything left is either brand new or genuinely
+    holding work. That closes the startup race live_sessions_for_base is blind to: two sessions
+    registering the same base name back-to-back, before either has claimed or locked anything,
+    used to sail straight through because neither was 'holding' yet. Used ONLY by the
+    --register path — cmd_claim keeps the steady-state definition above."""
+    t_now = now()
+    out = []
+    for sid, fs, ls in c.execute(
+            "SELECT session_id, first_seen, last_seen FROM agent_sessions WHERE base_name=? AND session_id<>?",
+            (base, exclude_sid or "")):
+        held = c.execute("""SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'
+                            AND lease_expires IS NOT NULL AND lease_expires >= ?""", (sid, t_now)).fetchall()
+        locks = c.execute("SELECT scope FROM slocks WHERE holder=? AND expires_at >= ?", (sid, t_now)).fetchall()
+        out.append((sid, [r[0] for r in held], [r[0] for r in locks], fs, ls))
     return out
 
 def resolve_identity(a, c=None):
@@ -196,14 +218,23 @@ def cmd_whoami(a):
     purged = purge_stale_sessions(c)
     if not a.register:
         ident, explicit = resolve_identity(a, c)
-        r = is_session(c, ident)
+        r = c.execute("SELECT session_id,base_name,pid,first_seen,last_seen FROM agent_sessions WHERE session_id=?",
+                      (ident,)).fetchone()
         c.execute("COMMIT")
         rows = c.execute("""SELECT session_id,base_name,first_seen,last_seen FROM agent_sessions
                             ORDER BY last_seen DESC""").fetchall()
         c.close()
         print(f"identity : {ident}" + ("" if explicit else "  (fallback — WQ_AGENT not set)"))
-        print(f"status   : {'REGISTERED session (base ' + r[1] + ')' if r else 'UNREGISTERED legacy name'}")
-        if not r:
+        if r:
+            _, base, pid, fs, ls = r
+            print(f"status   : REGISTERED session (base {base})")
+            print(f"           minted {fs}Z, last_seen {ls}Z, by pid {pid} on this host.")
+            print(f"           wq#537: that pid belongs to the one-shot `wq whoami --register`")
+            print(f"           process that minted this id — it exits immediately and will NEVER")
+            print(f"           match a caller's own pid, including this one. It is provenance,")
+            print(f"           not a liveness or identity-match signal.")
+        else:
+            print("status   : UNREGISTERED legacy name")
             print("           -> register with: wq whoami --register <your-agent-name>")
         if rows:
             print(f"\nactive session registry ({len(rows)}):")
@@ -215,15 +246,21 @@ def cmd_whoami(a):
     if not base or base.isdigit():
         c.execute("COMMIT"); c.close()
         print("REFUSED: --register needs a non-numeric agent name (e.g. rabbit5, gh1)"); sys.exit(1)
-    blockers = live_sessions_for_base(c, base, None)
+    blockers = registered_sessions_for_base(c, base, None)
     if blockers and not a.force:
         c.execute("COMMIT"); c.close()
-        print(f"REFUSED: base name '{base}' is already live under a DIFFERENT session:")
-        for sid, held, locks in blockers:
-            print(f"  {sid}  tickets={held or 'none'}  slocks={locks or 'none'}")
+        print(f"REFUSED: base name '{base}' is already registered by a DIFFERENT session:")
+        for sid, held, locks, fs, ls in blockers:
+            print(f"  {sid}  tickets={held or 'none'}  slocks={locks or 'none'}  "
+                  f"first_seen={fs}Z last_seen={ls}Z")
         print("  Two sessions sharing a base name is exactly the failure wq#502 fixes:\n"
               "  every lock check silently inverts and you can take each other's tickets.\n"
-              "  -> Pick a DISTINCT agent name, or wait for that lease to expire.\n"
+              "  wq#537: this now refuses on EXISTENCE, not just an active lease/slock — the old\n"
+              "  check missed the startup window where a second registration lands before the\n"
+              "  first session has claimed or locked anything.\n"
+              "  -> Pick a DISTINCT agent name, or wait for that session to idle out and be purged\n"
+              f"     ({DEFAULT_TTL_MIN}m from its last activity, sooner if it releases everything\n"
+              "     and a future purge pass runs).\n"
               "  -> Only if you are certain that session is dead: --force")
         sys.exit(2)
     sid = f"{base}-{secrets.token_hex(3)}"
