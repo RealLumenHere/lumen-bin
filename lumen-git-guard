@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# lumen-git-guard — local enforcement for github-standards.md §2/§3/§10.
+#
+# WHY: GitHub branch protection and rulesets are 403 on private repos on the free
+# plan (verified 2026-08-12, wq#506), so `main` cannot be protected server-side.
+# This is the local substitute.
+#
+# HONEST LIMITATION (lesson: F-AUT-1 — "denylist alone is theater"): a pre-push
+# hook is bypassable with `git push --no-verify`. It stops the careless mistake,
+# not a determined bypass. `lumen-git-guard audit` is the paired post-hoc check
+# that catches anything that got through; run it on a timer, not on trust.
+#
+#   lumen-git-guard install <repo-path>     install/refresh the pre-push hook
+#   lumen-git-guard audit   <owner/repo> [N]  scan last N (default 40) commits on
+#                                             the default branch for violations
+#   lumen-git-guard status  <repo-path>     is the hook installed and current?
+set -uo pipefail
+HOOK_VERSION=1
+BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+# shellcheck source=lumen-github-identity.sh
+. "$BIN_DIR/lumen-github-identity.sh" || { echo "lumen-git-guard: cannot load lumen-github-identity.sh" >&2; exit 1; }
+
+die(){ printf 'lumen-git-guard: %s\n' "$*" >&2; exit 1; }
+note(){ printf '  %s\n' "$*"; }
+
+write_hook(){
+  local repo="$1" hooks
+  hooks=$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null) || die "not a git repo: $repo"
+  case "$hooks" in /*) ;; *) hooks="$repo/$hooks" ;; esac
+  mkdir -p "$hooks"
+  [ -f "$hooks/pre-push" ] && cp -a "$hooks/pre-push" "$hooks/pre-push.bak.$(date +%Y%m%d_%H%M%S)"
+  cat > "$hooks/pre-push" <<'HOOKEOF'
+#!/usr/bin/env bash
+# Installed by lumen-git-guard (v1). github-standards.md §2/§3/§10.
+# Blocks: direct push to main; ticket ids / board: / emoji in commit subjects;
+# non-Conventional-Commits subjects. Override for a genuine emergency:
+#   LUMEN_GIT_GUARD=off git push ...   (say so in the report if you use it)
+set -uo pipefail
+[ "${LUMEN_GIT_GUARD:-on}" = off ] && { echo "pre-push: guard DISABLED by env — this is logged in your report, right?"; exit 0; }
+fail=0
+say(){ printf 'BLOCKED (%s): %s\n' "$1" "$2" >&2; fail=1; }
+CONV='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .{1,60}$'
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue   # branch delete
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      say "§2" "direct push to ${remote_ref#refs/heads/}. Class A repos take changes via a branch + PR: use /home/lumen/bin/lumen-pr"
+      continue ;;
+  esac
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    range="$local_sha --not --remotes"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    sha=${line%% *}; subj=${line#* }
+    case "$subj" in
+      *wq#*)   say "§3" "commit ${sha:0:8} has a ticket id in the subject — move it to a 'Refs: wq#N' footer: $subj" ;;
+    esac
+    case "$subj" in
+      board:*|status:*|progress:*) say "§10.3" "commit ${sha:0:8} is a coordination/status commit — boards live outside the product repo: $subj" ;;
+    esac
+    printf '%s' "$subj" | grep -qP '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}]' 2>/dev/null && say "§10.5" "commit ${sha:0:8} has emoji in the subject: $subj"
+    printf '%s' "$subj" | grep -qE "$CONV" || say "§3" "commit ${sha:0:8} is not a Conventional Commit subject: $subj"
+  done < <(git log --no-merges --format='%H %s' $range 2>/dev/null)
+done
+
+[ "$fail" -ne 0 ] && { echo "" >&2; echo "See /home/lumen/instructions/playbooks/github-standards.md" >&2; exit 1; }
+exit 0
+HOOKEOF
+  chmod +x "$hooks/pre-push"
+  note "installed $hooks/pre-push (v$HOOK_VERSION)"
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  install) [ $# -ge 1 ] || die "usage: lumen-git-guard install <repo-path>"; write_hook "$1" ;;
+  status)
+    [ $# -ge 1 ] || die "usage: lumen-git-guard status <repo-path>"
+    h=$(git -C "$1" rev-parse --git-path hooks) || die "not a git repo"
+    case "$h" in /*) ;; *) h="$1/$h" ;; esac
+    if [ -x "$h/pre-push" ] && grep -q "lumen-git-guard (v$HOOK_VERSION)" "$h/pre-push"; then
+      note "$1: guard v$HOOK_VERSION installed"
+    else
+      note "$1: guard MISSING or outdated -> lumen-git-guard install $1"; exit 1
+    fi ;;
+  audit)
+    [ $# -ge 1 ] || die "usage: lumen-git-guard audit <owner/repo> [N]"
+    slug=$1; n=${2:-40}
+    resolve_github_token "$slug" || die "no usable GitHub token for $slug"
+    T="$GITHUB_TOKEN"
+    body=$(curl -sS -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$slug/commits?per_page=$n") || die "API error"
+    printf '%s' "$body" | jq -e 'type=="array"' >/dev/null 2>&1 || die "API: $(printf '%s' "$body" | jq -r '.message // "unknown"')"
+    echo "audit $slug (last $n commits on default branch):"
+    printf '%s' "$body" | jq -r '.[] | "\(.sha[0:8]) \(.commit.message | split("\n")[0])"' | \
+    awk -v conv='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\\([a-z0-9._/-]+\\))?!?: .{1,60}$' '
+      { sha=$1; subj=substr($0, index($0," ")+1); bad=""
+        if (subj ~ /wq#/)                       bad=bad" §3:ticket-id-in-subject"
+        if (subj ~ /^(board|status|progress):/) bad=bad" §10.3:coordination-commit"
+        if (subj !~ conv)                       bad=bad" §3:not-conventional"
+        if (bad != "") { print "  VIOLATION " sha bad "  | " subj; v++ } }
+      END { printf("  %d violation(s) in %d commits\n", v+0, NR) }'
+    ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# lumen-ruleset — apply the Class A branch ruleset (github-standards.md §6.12).
+#   lumen-ruleset plan                      # is GitHub Pro active? are rulesets reachable?
+#   lumen-ruleset apply <owner/repo> [--with-ci CONTEXT]
+#   lumen-ruleset show  <owner/repo>
+# Requires branch protection entitlement: public repo on Free, any repo on Pro.
+set -uo pipefail
+CFG=/home/lumen/infra/github/ruleset-class-a.json
+BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+# shellcheck source=lumen-github-identity.sh
+. "$BIN_DIR/lumen-github-identity.sh" || { echo "lumen-ruleset: cannot load lumen-github-identity.sh" >&2; exit 1; }
+gh(){ curl -sS -w '\n%{http_code}' -X "$1" -H "Authorization: Bearer $T" -H "Accept: application/vnd.github+json" "https://api.github.com$2" ${3:+-d "$3"}; }
+split(){ CODE=$(printf '%s' "$1" | tail -1); BODY=$(printf '%s' "$1" | sed '$d'); }
+# wq#525: token is resolved per-repo (falls back to agent/.env GITHUB_TOKEN
+# when a repo has no override in identity-map.conf — see lumen-github-identity.sh).
+
+case "${1:-}" in
+  plan)
+    resolve_github_token "" || exit 1; T="$GITHUB_TOKEN"
+    split "$(gh GET /user)"
+    echo "account : $(printf '%s' "$BODY" | jq -r '.login')"
+    echo "plan    : $(printf '%s' "$BODY" | jq -r '.plan.name // "not visible to this token (needs read:user scope) — use the probe below"')"
+    for r in frankstupak/lumen-plays-pokemon frankstupak/claude-command-center; do
+      resolve_github_token "$r" || { echo "probe   : $r -> no usable token"; continue; }
+      T="$GITHUB_TOKEN"
+      split "$(gh GET "/repos/$r/rulesets")"
+      if [ "$CODE" = 200 ]; then echo "probe   : $r -> RULESETS AVAILABLE ($(printf '%s' "$BODY" | jq 'length') existing) [token: $TOKEN_SOURCE]"
+      else echo "probe   : $r -> HTTP $CODE $(printf '%s' "$BODY" | jq -r '.message // ""') [token: $TOKEN_SOURCE]"; fi
+    done ;;
+  show)
+    [ $# -ge 2 ] || { echo "usage: lumen-ruleset show <owner/repo>" >&2; exit 1; }
+    resolve_github_token "$2" || exit 1; T="$GITHUB_TOKEN"
+    split "$(gh GET "/repos/$2/rulesets")"; [ "$CODE" = 200 ] || { echo "HTTP $CODE: $(printf '%s' "$BODY" | jq -r '.message')" >&2; exit 1; }
+    printf '%s' "$BODY" | jq -r '.[] | "  \(.name)  target=\(.target) enforcement=\(.enforcement) id=\(.id)"'
+    for id in $(printf '%s' "$BODY" | jq -r '.[].id'); do
+      split "$(gh GET "/repos/$2/rulesets/$id")"; printf '%s' "$BODY" | jq -r '"  rules on \(.name): " + ([.rules[].type] | join(", "))'
+    done ;;
+  apply)
+    [ $# -ge 2 ] || { echo "usage: lumen-ruleset apply <owner/repo> [--with-ci CONTEXT]" >&2; exit 1; }
+    repo=$2; payload=$(cat "$CFG")
+    resolve_github_token "$repo" || exit 1; T="$GITHUB_TOKEN"
+    if [ "${3:-}" = "--with-ci" ]; then
+      ctx=${4:?--with-ci needs a check-run name}
+      payload=$(printf '%s' "$payload" | jq --arg c "$ctx" '.rules += [{type:"required_status_checks",parameters:{strict_required_status_checks_policy:false,do_not_enforce_on_create:false,required_status_checks:[{context:$c}]}}]')
+      echo "note: requiring status check '$ctx' — it must have run at least once or PRs will block"
+    fi
+    split "$(gh GET "/repos/$repo/rulesets")"
+    if [ "$CODE" = 200 ] && [ "$(printf '%s' "$BODY" | jq -r '[.[]|select(.name=="class-a-main")]|length')" != 0 ]; then
+      id=$(printf '%s' "$BODY" | jq -r '.[]|select(.name=="class-a-main").id')
+      split "$(gh PUT "/repos/$repo/rulesets/$id" "$payload")"; act=updated
+    else
+      split "$(gh POST "/repos/$repo/rulesets" "$payload")"; act=created
+    fi
+    case "$CODE" in
+      200|201) echo "$act ruleset on $repo: $(printf '%s' "$BODY" | jq -r '.name') enforcement=$(printf '%s' "$BODY" | jq -r '.enforcement')" ;;
+      403) echo "HTTP 403 — branch protection not available on this repo/plan. $(printf '%s' "$BODY" | jq -r '.message')" >&2; exit 1 ;;
+      *)   echo "HTTP $CODE: $(printf '%s' "$BODY" | jq -r '.message // .')" >&2; exit 1 ;;
+    esac ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

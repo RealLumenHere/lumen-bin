@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# lumen-pr — branch + PR helper for Lumen Industries repos.
+#
+# WHY: github-standards.md §2/§5/§11. Every change on a Class A repo arrives via a
+# short-lived branch and a pull request, because the PR is the artifact an outside
+# developer reads to see that a human process happened. This script makes the
+# compliant path the easy path, and refuses the non-compliant one.
+#
+# Usage:
+#   lumen-pr start  <repo-path> <type>/<slug> [--worktree]
+#   lumen-pr commit <repo-path> "<conventional subject>" [--refs wq#N] [--body-file F]
+#   lumen-pr open   <repo-path> --title T --body-file F [--draft] [--allow-second-person]
+#   lumen-pr land   <repo-path> <pr-number> [--timeout SEC]
+#   lumen-pr check  <repo-path>            # what state am I in?
+#
+# Every subcommand is idempotent and exits non-zero with a readable reason.
+# Token: resolved per-repo by lumen-github-identity.sh (wq#525), falling back to
+# GITHUB_TOKEN in /home/lumen/agent/.env. Never printed, never committed.
+set -uo pipefail
+
+BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+# shellcheck source=lumen-github-identity.sh
+. "$BIN_DIR/lumen-github-identity.sh" || { echo "lumen-pr: cannot load lumen-github-identity.sh" >&2; exit 1; }
+
+WORKTREE_ROOT=/home/lumen/scratch/worktrees
+CONV_TYPES='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+SUBJECT_RE="^(${CONV_TYPES})(\([a-z0-9._-]+\))?!?: .{1,60}$"
+BRANCH_RE="^(${CONV_TYPES})/[a-z0-9][a-z0-9-]*$"
+FOOTER_ASSIST='Assisted-by: Claude (Anthropic) via Lumen Industries automation'
+
+die() { printf 'lumen-pr: %s\n' "$*" >&2; exit 1; }
+note() { printf 'lumen-pr: %s\n' "$*"; }
+
+# Never let a token reach stdout/stderr, whatever a remote hands back.
+redact() { sed -E 's#(gh[pousr]_[A-Za-z0-9]{6})[A-Za-z0-9_]*#\1REDACTED#g; s#https://[^@/]*@#https://REDACTED@#g'; }
+
+load_token() {
+  # SLUG is set by need_repo, which every caller of load_token runs first.
+  resolve_github_token "${SLUG:-}" || die "no usable GitHub token for ${SLUG:-this repo}"
+  note "authenticating to $SLUG via $TOKEN_SOURCE"
+}
+
+# --- repo helpers -----------------------------------------------------------
+need_repo() {
+  REPO_PATH="${1:-}"
+  [ -n "$REPO_PATH" ] || die "missing <repo-path>"
+  # `.git` is a directory in a normal clone and a FILE in a linked worktree.
+  # §2 tells parallel agents to work in their own worktree, so both must work.
+  git -C "$REPO_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1 || \
+    die "not a git work tree: $REPO_PATH"
+  REPO_PATH=$(cd "$REPO_PATH" && pwd)
+  local url
+  url=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null) || die "no 'origin' remote in $REPO_PATH"
+  SLUG=$(printf '%s' "$url" | sed -E 's#^git@github\.com:#https://github.com/#; s#^https://[^/]*/##; s#\.git$##')
+  case "$SLUG" in
+    */*) : ;;
+    *) die "cannot parse owner/repo from origin url" ;;
+  esac
+  DEFAULT_BRANCH=$(git -C "$REPO_PATH" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+  [ -n "${DEFAULT_BRANCH:-}" ] || DEFAULT_BRANCH=main
+}
+
+api() { # api <method> <path> [json-body]
+  local method="$1" path="$2" body="${3:-}" out code
+  if [ -n "$body" ]; then
+    out=$(curl -sS -w '\n%{http_code}' -X "$method" \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -d "$body" "https://api.github.com$path" 2>&1)
+  else
+    out=$(curl -sS -w '\n%{http_code}' -X "$method" \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "https://api.github.com$path" 2>&1)
+  fi
+  code=$(printf '%s' "$out" | tail -n1)
+  API_BODY=$(printf '%s' "$out" | sed '$d')
+  API_CODE="$code"
+  case "$code" in 2*) return 0 ;; *) return 1 ;; esac
+}
+
+api_fail() { # api_fail <what>
+  printf 'lumen-pr: %s failed (HTTP %s): %s\n' "$1" "$API_CODE" \
+    "$(printf '%s' "$API_BODY" | jq -r '.message // "no message"' 2>/dev/null | redact)" >&2
+  exit 1
+}
+
+# --- lint helpers -----------------------------------------------------------
+lint_subject() { # lint_subject "<subject>"
+  local s="$1"
+  [ -n "$s" ] || die "empty subject"
+  printf '%s' "$s" | grep -qiE 'wq#|board:' && \
+    die "subject contains an internal ticket/board marker (§3, §10.2-10.3). Put it in the Refs: footer instead:
+      bad : $s
+      good: fix(transit): flee-first policy for Mt Moon   [+ 'Refs: wq#N' footer]"
+  printf '%s' "$s" | grep -qE "$SUBJECT_RE" || \
+    die "subject is not a Conventional Commit (§3). Required: <type>(<scope>)?: <imperative, lowercase, <=60 chars, no trailing period>
+      types: ${CONV_TYPES//|/ }
+      got  : $s"
+  case "$s" in
+    *.) die "subject must not end with a period (§3)" ;;
+  esac
+  return 0
+}
+
+lint_second_person() { # lint_second_person <file-or-string> <label>
+  local text="$1" label="$2"
+  [ "${ALLOW_SECOND_PERSON:-0}" = 1 ] && return 0
+  if printf '%s' "$text" | grep -qiE '(^|[^[:alnum:]])(you|your|yours|you'"'"'re|youre)([^[:alnum:]]|$)'; then
+    printf 'lumen-pr: %s uses second person, which §5 bans — describe the CODE, not the author.\n' "$label" >&2
+    printf '  bad : "your heartbeat disconnects every healthy client"\n' >&2
+    printf '  good: "heartbeat interval races the pong deadline, disconnecting healthy clients"\n' >&2
+    printf '  offending line(s):\n' >&2
+    printf '%s' "$text" | grep -inE '(^|[^[:alnum:]])(you|your|yours)([^[:alnum:]]|$)' | head -5 | sed 's/^/    /' >&2
+    printf '  If this is a false positive (quoted config, upstream text), re-run with --allow-second-person.\n' >&2
+    exit 1
+  fi
+  return 0
+}
+
+lint_body_sections() { # lint_body_sections <body-text>
+  local body="$1" missing=""
+  for s in What Why How Testing; do
+    printf '%s' "$body" | grep -qE "^##[[:space:]]+$s\b" || missing="$missing $s"
+  done
+  printf '%s' "$body" | grep -qE '^##[[:space:]]+Risk' || missing="$missing Risk/rollback"
+  [ -n "$missing" ] && die "PR body is missing required §5 section(s):$missing
+      Required headings: ## What / ## Why / ## How / ## Testing / ## Risk / rollback
+      (add ## Disclosure too when contributing upstream — §4)"
+  return 0
+}
+
+# --- subcommands ------------------------------------------------------------
+cmd_start() {
+  need_repo "${1:-}"; local branch="${2:-}"; shift 2 2>/dev/null || true
+  local want_worktree=0 primary_ok=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --worktree) want_worktree=1; shift ;;
+      --primary)  primary_ok=1; shift ;;
+      *) die "unknown flag for start: $1" ;;
+    esac
+  done
+  [ -n "$branch" ] || die "usage: lumen-pr start <repo-path> <type>/<slug> [--worktree|--primary]"
+
+  # wq#512 SHARED-TREE FENCE. /home/lumen/pokemon is the PRIMARY tree and it belongs to the
+  # pokemon lane, which runs live agents against it continuously. A github-lane agent that
+  # checks out a feature branch there parks the shared tree mid-session — this already
+  # happened once. On a fenced tree, --worktree is the default and moving HEAD is opt-in.
+  case "$(cd "$REPO_PATH" && pwd -P)" in
+    /home/lumen/pokemon)
+      if [ "$want_worktree" = 0 ] && [ "$primary_ok" = 0 ]; then
+        note "FENCED TREE (wq#512): /home/lumen/pokemon is shared with the live pokemon lane."
+        note "defaulting to --worktree. Pass --primary only if you OWN the lpp-tree subsystem"
+        note "(wq claim ... --subsystems lpp-tree) and no sibling agent has work in flight."
+        want_worktree=1
+      elif [ "$primary_ok" = 1 ]; then
+        local wt_count; wt_count=$(git -C "$REPO_PATH" worktree list 2>/dev/null | grep -vc "^$REPO_PATH ")
+        [ "${wt_count:-0}" -gt 0 ] && \
+          die "refusing --primary: $wt_count linked worktree(s) are live, so a sibling agent is
+      mid-ticket. Use --worktree instead, or wait. (git -C $REPO_PATH worktree list)"
+        note "WARNING: moving HEAD in the SHARED primary tree by explicit --primary. Say so in your report."
+      fi ;;
+  esac
+  printf '%s' "$branch" | grep -qE "$BRANCH_RE" || \
+    die "branch name violates §2: expected <type>/<short-kebab-slug>, no ticket IDs, no agent names
+      types: ${CONV_TYPES//|/ }
+      got  : $branch"
+
+  # --worktree: cut the branch in a private linked worktree instead of moving
+  # HEAD in a tree that sibling agents are working in (§2: "each agent works in
+  # its OWN branch/worktree. Two agents never share a branch.").
+  if [ "$want_worktree" = 1 ]; then
+    local wt="$WORKTREE_ROOT/$(basename "$REPO_PATH")-$(printf '%s' "$branch" | tr '/' '-')"
+    if [ -d "$wt" ]; then
+      note "worktree already exists: $wt"
+    else
+      mkdir -p "$WORKTREE_ROOT"
+      git -C "$REPO_PATH" fetch -q origin || die "git fetch failed"
+      if git -C "$REPO_PATH" show-ref --quiet "refs/heads/$branch"; then
+        git -C "$REPO_PATH" worktree add -q "$wt" "$branch" || die "could not add worktree for existing branch $branch"
+      else
+        git -C "$REPO_PATH" worktree add -q -b "$branch" "$wt" "origin/$DEFAULT_BRANCH" || \
+          die "could not add worktree $wt on new branch $branch"
+      fi
+      note "created worktree $wt on $branch from origin/$DEFAULT_BRANCH"
+    fi
+    note "the shared tree at $REPO_PATH was NOT touched (still on $(git -C "$REPO_PATH" branch --show-current))"
+    note "next: work in $wt, then: lumen-pr commit $wt \"<subject>\" --refs wq#N"
+    printf '%s\n' "$wt"
+    return 0
+  fi
+
+  local cur; cur=$(git -C "$REPO_PATH" branch --show-current)
+  if [ "$cur" = "$branch" ]; then note "already on $branch — nothing to do"; return 0; fi
+  if [ "$cur" != "$DEFAULT_BRANCH" ]; then
+    die "HEAD is on '$cur', not '$DEFAULT_BRANCH'. Another agent may have a branch in flight in this
+      shared working tree. Land or abandon it first (lumen-pr check $REPO_PATH)."
+  fi
+  git -C "$REPO_PATH" fetch -q origin || die "git fetch failed"
+  if ! git -C "$REPO_PATH" merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+    note "WARNING: local $DEFAULT_BRANCH has commits not on origin — branching from local HEAD"
+  else
+    git -C "$REPO_PATH" merge --ff-only "origin/$DEFAULT_BRANCH" -q 2>/dev/null || \
+      note "WARNING: could not fast-forward $DEFAULT_BRANCH (dirty tree overlaps incoming changes) — branching from local HEAD"
+  fi
+  if git -C "$REPO_PATH" show-ref --quiet "refs/heads/$branch"; then
+    git -C "$REPO_PATH" checkout -q "$branch" || die "checkout $branch failed"
+    note "branch $branch already existed — checked out"
+  else
+    git -C "$REPO_PATH" checkout -q -b "$branch" || die "could not create branch $branch"
+    note "created $branch from $(git -C "$REPO_PATH" rev-parse --short HEAD)"
+  fi
+  note "uncommitted files carried into the branch (unchanged): $(git -C "$REPO_PATH" status --porcelain | wc -l)"
+  note "next: git -C $REPO_PATH add <only-the-paths-you-touched>  then  lumen-pr commit"
+}
+
+cmd_commit() {
+  need_repo "${1:-}"; local subject="${2:-}"; shift 2 2>/dev/null || true
+  local refs="" body_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --refs) refs="${2:-}"; shift 2 ;;
+      --body-file) body_file="${2:-}"; shift 2 ;;
+      *) die "unknown flag for commit: $1" ;;
+    esac
+  done
+  lint_subject "$subject"
+  local cur; cur=$(git -C "$REPO_PATH" branch --show-current)
+  [ "$cur" = "$DEFAULT_BRANCH" ] && \
+    die "refusing to commit directly to '$DEFAULT_BRANCH' (§2, §10.1). Run: lumen-pr start $REPO_PATH <type>/<slug>"
+  git -C "$REPO_PATH" diff --cached --quiet && \
+    die "nothing staged. Stage ONLY the paths this ticket touched: git -C $REPO_PATH add <paths>  (git add -A is banned, §10.8)"
+  local msg; msg="$subject"
+  if [ -n "$body_file" ]; then
+    [ -r "$body_file" ] || die "cannot read body file: $body_file"
+    msg="$msg
+
+$(cat "$body_file")"
+  fi
+  msg="$msg
+"
+  [ -n "$refs" ] && msg="$msg
+Refs: $refs"
+  msg="$msg
+$FOOTER_ASSIST"
+  printf '%s\n' "$msg" | git -C "$REPO_PATH" commit -q -F - || die "git commit failed"
+  note "committed $(git -C "$REPO_PATH" rev-parse --short HEAD) on $cur"
+  git -C "$REPO_PATH" log -1 --pretty='  %s' 
+  note "staged files in this commit:"
+  git -C "$REPO_PATH" show --stat --oneline HEAD | tail -n +2 | sed 's/^/  /'
+}
+
+cmd_open() {
+  need_repo "${1:-}"; shift
+  local title="" body_file="" draft=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) title="${2:-}"; shift 2 ;;
+      --body-file) body_file="${2:-}"; shift 2 ;;
+      --draft) draft=true; shift ;;
+      --allow-second-person) ALLOW_SECOND_PERSON=1; shift ;;
+      *) die "unknown flag for open: $1" ;;
+    esac
+  done
+  [ -n "$title" ] || die "missing --title"
+  [ -n "$body_file" ] && [ -r "$body_file" ] || die "missing or unreadable --body-file"
+  local body; body=$(cat "$body_file")
+  lint_subject "$title"
+  lint_body_sections "$body"
+  lint_second_person "$title" "PR title"
+  lint_second_person "$body" "PR body"
+
+  local branch; branch=$(git -C "$REPO_PATH" branch --show-current)
+  [ "$branch" = "$DEFAULT_BRANCH" ] && die "on '$DEFAULT_BRANCH' — nothing to open a PR from (§2)"
+  git -C "$REPO_PATH" rev-parse --verify -q "origin/$DEFAULT_BRANCH" >/dev/null || git -C "$REPO_PATH" fetch -q origin
+  [ -n "$(git -C "$REPO_PATH" log --oneline "origin/$DEFAULT_BRANCH..$branch" 2>/dev/null)" ] || \
+    die "branch '$branch' has no commits ahead of origin/$DEFAULT_BRANCH — nothing to review"
+  load_token
+
+  local existing
+  if api GET "/repos/$SLUG/pulls?head=${SLUG%%/*}:$branch&state=open"; then
+    existing=$(printf '%s' "$API_BODY" | jq -r '.[0].number // empty')
+  fi
+
+  git -C "$REPO_PATH" push -q -u origin "$branch" 2>&1 | redact || die "push of $branch failed"
+  note "pushed $branch"
+
+  if [ -n "${existing:-}" ]; then
+    note "PR #$existing already open for $branch — updating title/body"
+    local payload; payload=$(jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b}')
+    api PATCH "/repos/$SLUG/pulls/$existing" "$payload" || api_fail "PR update"
+    printf '%s\n' "$(printf '%s' "$API_BODY" | jq -r '.html_url')"
+    PR_NUMBER="$existing"; return 0
+  fi
+
+  local payload
+  payload=$(jq -n --arg t "$title" --arg b "$body" --arg h "$branch" --arg base "$DEFAULT_BRANCH" \
+    --argjson d "$draft" '{title:$t, body:$b, head:$h, base:$base, draft:$d}')
+  api POST "/repos/$SLUG/pulls" "$payload" || api_fail "PR create"
+  PR_NUMBER=$(printf '%s' "$API_BODY" | jq -r '.number')
+  note "opened PR #$PR_NUMBER"
+  printf '%s\n' "$(printf '%s' "$API_BODY" | jq -r '.html_url')"
+}
+
+cmd_land() {
+  need_repo "${1:-}"; local pr="${2:-}"; shift 2 2>/dev/null || true
+  local timeout=600
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="${2:-600}"; shift 2 ;;
+      *) die "unknown flag for land: $1" ;;
+    esac
+  done
+  [ -n "$pr" ] || die "usage: lumen-pr land <repo-path> <pr-number>"
+  load_token
+  api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR fetch"
+  local state merged head_sha head_ref draft
+  state=$(printf '%s' "$API_BODY" | jq -r '.state')
+  merged=$(printf '%s' "$API_BODY" | jq -r '.merged')
+  draft=$(printf '%s' "$API_BODY" | jq -r '.draft')
+  head_sha=$(printf '%s' "$API_BODY" | jq -r '.head.sha')
+  head_ref=$(printf '%s' "$API_BODY" | jq -r '.head.ref')
+  local title; title=$(printf '%s' "$API_BODY" | jq -r '.title')
+  if [ "$merged" = true ]; then note "PR #$pr is already merged — nothing to do"; return 0; fi
+  [ "$state" = open ] || die "PR #$pr is '$state', not open"
+  [ "$draft" = true ] && die "PR #$pr is a draft — mark it ready before landing (§5)"
+
+  # Wait for checks. A repo with no CI yet has nothing to wait for; say so loudly
+  # rather than silently treating 'no checks' as 'green'.
+  local waited=0 conclusion total
+  while :; do
+    api GET "/repos/$SLUG/commits/$head_sha/check-runs" || api_fail "check-runs fetch"
+    total=$(printf '%s' "$API_BODY" | jq -r '.total_count')
+    if [ "$total" = 0 ]; then
+      note "NO CI CHECKS configured on this repo (§8 not yet satisfied) — landing on review alone"
+      break
+    fi
+    local pending failed
+    pending=$(printf '%s' "$API_BODY" | jq -r '[.check_runs[] | select(.status != "completed")] | length')
+    failed=$(printf '%s' "$API_BODY" | jq -r '[.check_runs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length')
+    if [ "$failed" -gt 0 ]; then
+      printf '%s' "$API_BODY" | jq -r '.check_runs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped") | "  FAILED: \(.name) -> \(.conclusion)  \(.html_url)"' >&2
+      die "PR #$pr has failing checks — fix them, do not merge red (§5)"
+    fi
+    if [ "$pending" = 0 ]; then note "all $total check(s) green"; break; fi
+    [ "$waited" -ge "$timeout" ] && die "timed out after ${timeout}s with $pending check(s) still running"
+    note "waiting on $pending/$total check(s)... (${waited}s)"
+    sleep 15; waited=$((waited + 15))
+  done
+
+  api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR re-fetch"
+  local mergeable_state; mergeable_state=$(printf '%s' "$API_BODY" | jq -r '.mergeable_state')
+  case "$mergeable_state" in
+    dirty) die "PR #$pr has merge conflicts with $DEFAULT_BRANCH — rebase the branch first" ;;
+    blocked) note "WARNING: mergeable_state=blocked (ruleset requirement unmet) — attempting merge anyway" ;;
+  esac
+
+  # Squash merge: the squashed subject becomes the Conventional Commit that
+  # release tooling reads, so it must be the PR title verbatim (§2, §7).
+  # The squashed BODY must carry the §3 footers forward — GitHub's default
+  # squash body is a bullet list of branch subjects, and an empty body drops
+  # `Refs:`/`Assisted-by:` off main's history entirely.
+  local footers
+  if api GET "/repos/$SLUG/pulls/$pr/commits"; then
+    footers=$(printf '%s' "$API_BODY" \
+      | jq -r '.[].commit.message' \
+      | grep -E '^(Refs|Assisted-by|Generated-by|BREAKING CHANGE|Co-authored-by):' \
+      | grep -v 'Co-authored-by:.*[Cc]laude' \
+      | awk '!seen[$0]++')
+  fi
+  [ -n "${footers:-}" ] || footers="$FOOTER_ASSIST"
+  local payload; payload=$(jq -n --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
+    '{merge_method:"squash", commit_title:$t, commit_message:$m, sha:$s}')
+  api PUT "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "squash merge"
+  note "merged PR #$pr as $(printf '%s' "$API_BODY" | jq -r '.sha' | cut -c1-10) (squash)"
+
+  if api DELETE "/repos/$SLUG/git/refs/heads/$head_ref"; then
+    note "deleted remote branch $head_ref"
+  else
+    note "remote branch $head_ref already gone (delete_branch_on_merge)"
+  fi
+
+  # Return the local tree to the default branch and catch it up. In a LINKED
+  # worktree we must not: the default branch is checked out in the primary tree
+  # and git refuses the same branch in two places. Leave it for `worktree remove`.
+  local cur gitdir commondir
+  cur=$(git -C "$REPO_PATH" branch --show-current)
+  gitdir=$(git -C "$REPO_PATH" rev-parse --absolute-git-dir)
+  # --git-common-dir is returned RELATIVE to the repo, not to $PWD, so it must be
+  # resolved from inside $REPO_PATH. Resolving it from the caller's cwd silently
+  # yields an empty string, which makes every primary tree look like a linked
+  # worktree and leaves it parked on the merged branch.
+  commondir=$(cd "$REPO_PATH" && cd "$(git rev-parse --git-common-dir)" && pwd)
+  git -C "$REPO_PATH" fetch -q origin
+  if [ "$gitdir" != "$commondir" ]; then
+    note "linked worktree — leaving it on '$cur'. Clean up with: git -C $REPO_PATH worktree remove $REPO_PATH"
+    return 0
+  fi
+  if [ "$cur" = "$head_ref" ]; then
+    git -C "$REPO_PATH" checkout -q "$DEFAULT_BRANCH" || die "merged, but could not switch back to $DEFAULT_BRANCH — do it by hand"
+  fi
+  git -C "$REPO_PATH" merge --ff-only "origin/$DEFAULT_BRANCH" -q 2>/dev/null \
+    && note "local $DEFAULT_BRANCH fast-forwarded to $(git -C "$REPO_PATH" rev-parse --short HEAD)" \
+    || note "WARNING: could not fast-forward local $DEFAULT_BRANCH (uncommitted work in the tree?) — pull by hand"
+  git -C "$REPO_PATH" branch -q -d "$head_ref" 2>/dev/null \
+    && note "deleted local branch $head_ref" \
+    || note "local branch $head_ref kept (not fully merged locally, or already gone)"
+}
+
+cmd_check() {
+  need_repo "${1:-}"
+  local branch; branch=$(git -C "$REPO_PATH" branch --show-current)
+  printf 'repo    : %s (%s)\n' "$REPO_PATH" "$SLUG"
+  printf 'branch  : %s (default: %s)\n' "$branch" "$DEFAULT_BRANCH"
+  printf 'staged  : %s file(s)\n' "$(git -C "$REPO_PATH" diff --cached --name-only | wc -l)"
+  printf 'dirty   : %s file(s) (may belong to a sibling agent — never git add -A)\n' "$(git -C "$REPO_PATH" status --porcelain | wc -l)"
+  if [ "$branch" != "$DEFAULT_BRANCH" ]; then
+    printf 'ahead   : %s commit(s) vs origin/%s\n' "$(git -C "$REPO_PATH" rev-list --count "origin/$DEFAULT_BRANCH..$branch" 2>/dev/null || echo '?')" "$DEFAULT_BRANCH"
+  fi
+  load_token
+  if api GET "/repos/$SLUG/pulls?state=open"; then
+    printf 'open PRs: %s\n' "$(printf '%s' "$API_BODY" | jq -r 'if length==0 then "none" else (.[] | "#\(.number) \(.title) [\(.head.ref)]") end')"
+  fi
+}
+
+case "${1:-}" in
+  start)  shift; cmd_start "$@" ;;
+  commit) shift; cmd_commit "$@" ;;
+  open)   shift; cmd_open "$@" ;;
+  land)   shift; cmd_land "$@" ;;
+  check)  shift; cmd_check "$@" ;;
+  ''|-h|--help|help)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown subcommand '$1' (start|commit|open|land|check)" ;;
+esac
