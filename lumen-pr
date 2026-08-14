@@ -12,6 +12,14 @@
 #   lumen-pr open   <repo-path> --title T --body-file F [--draft] [--allow-second-person]
 #   lumen-pr land   <repo-path> <pr-number> [--timeout SEC]
 #   lumen-pr check  <repo-path>            # what state am I in?
+#   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
+#
+# wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
+# trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
+# agent to chain `slock acquire -> lumen-pr land -> slock release` by hand; a careful agent
+# following that in good faith breached the lock twice in one session (--ttl 5m was rejected by
+# argparse and the chain used `;`, then a piped acquire returned tail`s exit status through &&).
+# A rule a careful agent cannot execute reliably is a broken rule, not a discipline problem.
 #
 # Every subcommand is idempotent and exits non-zero with a readable reason.
 # Token: resolved per-repo by lumen-github-identity.sh (wq#525), falling back to
@@ -23,6 +31,16 @@ BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 . "$BIN_DIR/lumen-github-identity.sh" || { echo "lumen-pr: cannot load lumen-github-identity.sh" >&2; exit 1; }
 
 WORKTREE_ROOT=/home/lumen/scratch/worktrees
+SLOCK=${LUMEN_PR_SLOCK:-/home/lumen/bin/slock}   # overridable so the guard can test the copy under review
+# Seconds-to-a-minute operation. Short on purpose: a merge that somehow hangs must not park the
+# lock behind it for an hour, which is what stranded a finished, green ticket for 65 minutes.
+GITLOCK_TTL=${LUMEN_PR_GITLOCK_TTL:-10}
+# Resolved ONCE. slock's default holder falls back to hostname:pid when WQ_AGENT is unset, and
+# every slock call is a separate process, so a pid-derived holder would acquire under one name
+# and fail to release under another.
+GITLOCK_HOLDER=${WQ_AGENT:-lumen-pr:$$}
+GITLOCK_SCOPE=""
+GITLOCK_TAKEN=0
 CONV_TYPES='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
 SUBJECT_RE="^(${CONV_TYPES})(\([a-z0-9._-]+\))?!?: .{1,60}$"
 BRANCH_RE="^(${CONV_TYPES})/[a-z0-9][a-z0-9-]*$"
@@ -38,6 +56,69 @@ load_token() {
   # SLUG is set by need_repo, which every caller of load_token runs first.
   resolve_github_token "${SLUG:-}" || die "no usable GitHub token for ${SLUG:-this repo}"
   note "authenticating to $SLUG via $TOKEN_SOURCE"
+}
+
+# --- git lock (wq#532a) -----------------------------------------------------
+# The scope vocabulary is GITHUB_DISPATCH.md's: "<repo>-git", with lpp-git as the established
+# alias for lumen-plays-pokemon. Derived from the SLUG so a linked worktree and its primary tree
+# always resolve to the SAME scope - locking per-worktree would lock nothing.
+gitlock_scope() {
+  local name="${SLUG##*/}"
+  case "$name" in
+    lumen-plays-pokemon) printf 'lpp-git\n' ;;
+    *) printf '%s-git\n' "$name" ;;
+  esac
+}
+
+gitlock_holder_of() { # gitlock_holder_of <scope>  -> holder on stdout, empty if unheld
+  local out
+  out=$("$SLOCK" who "$1" 2>/dev/null) || return 0
+  case "$out" in
+    "(no active locks)"*) return 0 ;;
+  esac
+  printf '%s\n' "$out" | awk 'NR==1{print $2}'
+}
+
+gitlock_acquire() { # gitlock_acquire <scope> <note>
+  local scope="$1" note="${2:-}" pre
+  pre=$(gitlock_holder_of "$scope")
+  if [ -n "$pre" ] && [ "$pre" = "$GITLOCK_HOLDER" ]; then
+    # The caller already wrapped this by hand (the old dispatch idiom). Refresh nothing, and
+    # do NOT release on exit - the lock is theirs to drop, not this script`s.
+    note "git lock '$scope' is already held by $GITLOCK_HOLDER — leaving it to the caller"
+    GITLOCK_SCOPE="$scope"; GITLOCK_TAKEN=0
+    return 0
+  fi
+  # Exit status checked DIRECTLY. No pipe, no `;` chain: a pipeline reports its LAST command`s
+  # status, which is how a DENIED acquire has already been walked straight through.
+  if ! "$SLOCK" acquire "$scope" --ttl "$GITLOCK_TTL" --holder "$GITLOCK_HOLDER" --note "$note"; then
+    die "could not take the git lock '$scope' — another agent is mid-merge on this repo.
+      Wait and re-run; never force it, and never work around it."
+  fi
+  GITLOCK_SCOPE="$scope"; GITLOCK_TAKEN=1
+  trap gitlock_release EXIT INT TERM
+}
+
+gitlock_release() {
+  [ "$GITLOCK_TAKEN" = 1 ] || return 0
+  GITLOCK_TAKEN=0
+  "$SLOCK" release "$GITLOCK_SCOPE" --holder "$GITLOCK_HOLDER" >/dev/null 2>&1 \
+    && note "released git lock '$GITLOCK_SCOPE'" \
+    || note "WARNING: could not release git lock '$GITLOCK_SCOPE' — check: $SLOCK who $GITLOCK_SCOPE"
+}
+
+cmd_gitlock() {
+  need_repo "${1:-}"; local action="${2:-scope}"
+  local scope; scope=$(gitlock_scope)
+  case "$action" in
+    scope)   printf '%s\n' "$scope" ;;
+    status)  local h; h=$(gitlock_holder_of "$scope")
+             printf '%s %s\n' "$scope" "${h:-(unheld)}" ;;
+    acquire) gitlock_acquire "$scope" "lumen-pr gitlock (manual)"; trap - EXIT INT TERM
+             GITLOCK_TAKEN=0 ;;
+    release) GITLOCK_SCOPE="$scope"; GITLOCK_TAKEN=1; gitlock_release ;;
+    *) die "usage: lumen-pr gitlock <repo-path> scope|status|acquire|release" ;;
+  esac
 }
 
 # --- repo helpers -----------------------------------------------------------
@@ -351,6 +432,12 @@ cmd_land() {
     sleep 15; waited=$((waited + 15))
   done
 
+  # wq#532a: the lock goes HERE, not at the top. Everything above is a read or a wait - the CI
+  # poll alone can run for ten minutes, and holding a shared lock across it is the 65-minute
+  # stranding this ticket was filed about. The merge and the local fast-forward are the only
+  # genuinely shared state.
+  gitlock_acquire "$(gitlock_scope)" "lumen-pr land $SLUG #$pr"
+
   api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR re-fetch"
   local mergeable_state; mergeable_state=$(printf '%s' "$API_BODY" | jq -r '.mergeable_state')
   case "$mergeable_state" in
@@ -408,6 +495,8 @@ cmd_land() {
   git -C "$REPO_PATH" branch -q -d "$head_ref" 2>/dev/null \
     && note "deleted local branch $head_ref" \
     || note "local branch $head_ref kept (not fully merged locally, or already gone)"
+  gitlock_release
+  trap - EXIT INT TERM
 }
 
 cmd_check() {
@@ -431,8 +520,9 @@ case "${1:-}" in
   commit) shift; cmd_commit "$@" ;;
   open)   shift; cmd_open "$@" ;;
   land)   shift; cmd_land "$@" ;;
+  gitlock) shift; cmd_gitlock "$@" ;;
   check)  shift; cmd_check "$@" ;;
   ''|-h|--help|help)
     sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (start|commit|open|land|check)" ;;
+  *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock)" ;;
 esac

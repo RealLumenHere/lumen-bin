@@ -515,9 +515,14 @@ def cmd_claim(a):
             + (" on the PROVISIONAL window (no wq call ever followed the claim)" if never_promoted else ""))
     reclaimed = len(expired)
     c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
-    rows = c.execute("SELECT id,deps,subsystems,gate FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(a.lane,)).fetchall()
+    rows = c.execute("SELECT id,deps,subsystems,gate,title FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(a.lane,)).fetchall()
     pick = None; picked_subs = []; skips = []
-    for rid, deps, subsystems, gate in rows:
+    for rid, deps, subsystems, gate, title in rows:
+        # wq#532(d): a [DRAFT] ticket is not work, it is a placeholder for work. `claim` handed
+        # them out repeatedly until agents invented a parking convention by hand. Enforced here
+        # rather than written down, because written down is what failed.
+        if (title or "").lstrip().upper().startswith("[DRAFT]"):
+            skips.append(f"#{rid} [DRAFT] — not claimable until the prefix is removed"); continue
         if not deps_met(c, deps): continue
         ok, why = gate_met(gate)
         if not ok: skips.append(f"#{rid} {why}"); continue
@@ -546,6 +551,11 @@ def cmd_claim(a):
     t = c.execute("SELECT id,pri,title,detail,deps,subsystems FROM tasks WHERE id=?", (pick,)).fetchone()
     c.close()
     for line in reclaim_lines: print(line)
+    for line in skips:
+        # wq#532(d): skipped tickets used to be reported ONLY when the lane came back empty, so a
+        # [DRAFT] or a gated ticket was passed over in total silence whenever anything else was
+        # claimable. A guard nobody can see is indistinguishable from no guard.
+        print(f"(skipped {line})")
     if prov < a.ttl:
         print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — PROVISIONAL lease until {lease}Z ({prov}m)")
         print(f"  wq#530: the first lease is deliberately short. ANY further wq call you make "
