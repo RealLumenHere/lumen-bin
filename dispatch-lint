@@ -25,6 +25,7 @@ from pathlib import Path
 
 WQ_DIR = Path("/home/lumen/agents/work-queue")
 RETIRED = WQ_DIR / "RETIRED_RULES.md"
+UNIVERSAL = WQ_DIR / "UNIVERSAL_RULES.md"
 # The files a fresh agent is actually handed. LANE_BOUNDARIES/EVALUATION_RUBRIC are
 # referenced BY dispatches and carry rules too, so they are linted as well.
 DISPATCH_GLOBS = ("*DISPATCH*.md", "LANE_BOUNDARIES.md", "EVALUATION_RUBRIC.md")
@@ -117,11 +118,86 @@ def lint(path, rules, quiet=False):
     return violations, exemptions
 
 
+def load_universal():
+    """Parse UNIVERSAL_RULES.md. Returns (require, agree, err).
+
+    wq#561. RETIRED_RULES catches a dispatch that still instructs something WRONG. This
+    catches one that never instructs something RIGHT (REQUIRE), or that instructs it with a
+    DIFFERENT value from its siblings (AGREE). Missing and contradictory are kept apart
+    because they need different fixes.
+    """
+    if not UNIVERSAL.exists():
+        return None, None, f"universal-rules table not found: {UNIVERSAL}"
+    require, agree = [], []
+    for lineno, raw in enumerate(UNIVERSAL.read_text().splitlines(), 1):
+        # Column 0 ONLY. The table documents its own format with INDENTED examples
+        # ("REQUIRE :: <id> :: <regex> :: ..."), and stripping first made the parser read
+        # its own documentation as rules — it rejected the file on the doc example's zero
+        # capture groups. Same shape as the quoted_hit rule above: a mechanical property of
+        # the text, not a guess about intent. A rule is flush left; an example is indented.
+        s = raw.rstrip()
+        kind = "REQUIRE" if s.startswith("REQUIRE ::") else "AGREE" if s.startswith("AGREE ::") else None
+        if not kind:
+            continue
+        parts = [p.strip() for p in s.split("::")]
+        if len(parts) < 5:
+            return None, None, f"{UNIVERSAL}:{lineno}: malformed {kind} line (need 5 :: fields)"
+        rid, pattern, scope, guidance = parts[1], parts[2], parts[3], "::".join(parts[4:])
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return None, None, f"{UNIVERSAL}:{lineno}: bad regex for {rid}: {e}"
+        if kind == "AGREE" and rx.groups != 1:
+            return None, None, f"{UNIVERSAL}:{lineno}: AGREE {rid} needs exactly ONE capture group, has {rx.groups}"
+        files = None if scope.upper() == "ALL" else {f.strip() for f in scope.split(",")}
+        (require if kind == "REQUIRE" else agree).append(
+            {"id": rid, "rx": rx, "files": files, "guidance": guidance})
+    if not require and not agree:
+        return None, None, f"{UNIVERSAL} contains no REQUIRE/AGREE lines — refusing to report 'clean'"
+    return require, agree, None
+
+
+def check_universal(files, require, agree, quiet=False):
+    """Returns (missing, disagreements). Only *DISPATCH*.md files are in scope: the rules
+    are about what a fresh agent is HANDED, and LANE_BOUNDARIES/EVALUATION_RUBRIC are
+    reference material an agent is pointed AT, not the prompt it boots from."""
+    dispatches = [p for p in files if "DISPATCH" in p.name]
+    missing, disagree = [], []
+    body = {p: p.read_text() for p in dispatches}
+
+    for rule in require:
+        for p in dispatches:
+            if rule["files"] is not None and p.name not in rule["files"]:
+                continue
+            if not rule["rx"].search(body[p]):
+                missing.append((p.name, rule["id"], rule["guidance"]))
+
+    for rule in agree:
+        seen = {}
+        for p in dispatches:
+            if rule["files"] is not None and p.name not in rule["files"]:
+                continue
+            vals = {m.group(1) for m in rule["rx"].finditer(body[p])}
+            for v in vals:
+                seen.setdefault(v, []).append(p.name)
+        if len(seen) > 1:
+            disagree.append((rule["id"], rule["guidance"], seen))
+    return missing, disagree
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--file")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--quiet", action="store_true")
+    # OPT-IN on purpose (wq#561). Every dispatch violates this on the day it ships, because
+    # the violations ARE the finding — three files never mention the `git add -A` ban and
+    # four disagree about the lease TTL. Making it default would turn wq#565's timer red on
+    # arrival and the red would be read as a broken check rather than a real defect. It goes
+    # default-on in the same change that normalises the six files, which needs a quiet
+    # pokemon lane (wq#561's own constraint).
+    ap.add_argument("--universal", action="store_true",
+                    help="also assert universal rules are PRESENT and CONSISTENT (wq#561)")
     args = ap.parse_args()
 
     rules, err = load_rules()
@@ -149,11 +225,35 @@ def main():
         all_v.extend(v)
         all_e.extend(e)
 
+    u_missing, u_disagree = [], []
+    if args.universal:
+        require, agree, uerr = load_universal()
+        if uerr:
+            # Same fail-closed discipline as the retired table: a check that cannot read
+            # its own config must not print "clean".
+            print(f"dispatch-lint: {uerr}", file=sys.stderr)
+            return 2
+        u_missing, u_disagree = check_universal(files, require, agree)
+
     if all_e and not args.quiet:
         print(f"CITATIONS EXEMPTED ({len(all_e)}) — these NAME a retired rule in order to "
               f"retire it, which is correct. Listed so the exemption is auditable:")
         for fn, n, rid, txt in all_e:
             print(f"  ~ {fn}:{n}  [{rid}]  {txt}")
+        print()
+
+    if u_missing:
+        print(f"UNIVERSAL RULES NEVER STATED ({len(u_missing)}) — wq#561:")
+        for fn, rid, guidance in sorted(u_missing):
+            print(f"  ✗ {fn}  [{rid}]\n      {guidance}")
+        print()
+
+    if u_disagree:
+        print(f"UNIVERSAL RULES STATED INCONSISTENTLY ({len(u_disagree)}) — wq#561:")
+        for rid, guidance, seen in u_disagree:
+            print(f"  ✗ [{rid}] {guidance}")
+            for val, fns in sorted(seen.items()):
+                print(f"      {val!r}: {', '.join(sorted(fns))}")
         print()
 
     if all_v:
@@ -169,6 +269,14 @@ def main():
     if not args.quiet:
         print(f"dispatch-lint: {len(files)} file(s) clean against {len(rules)} retired "
               f"rule(s), {len(all_e)} citation(s) exempted")
+    # wq#561: a universal-rule failure is a failure even when the retired table is clean.
+    # Returning 0 here while the report above lists violations is the fail-open shape this
+    # ticket family keeps finding.
+    if u_missing or u_disagree:
+        if not args.quiet:
+            print(f"dispatch-lint: {len(u_missing)} universal rule(s) never stated, "
+                  f"{len(u_disagree)} stated inconsistently (wq#561)")
+        return 1
     return 0
 
 
