@@ -27,7 +27,14 @@ def run(argv, agent=None, env=None):
     e.pop("WQ_AGENT", None); e.pop("WQ_STRICT", None)
     if agent: e["WQ_AGENT"] = agent
     if env: e.update(env)
-    p = subprocess.run([str(x) for x in argv], capture_output=True, text=True, env=e)
+    try:
+        p = subprocess.run([str(x) for x in argv], capture_output=True, text=True, env=e)
+    except FileNotFoundError:
+        # A tool that does not EXIST on the build under test must read as a red assertion,
+        # not as a traceback. lpp-restart is new in 7e319e7, so every pre-7e319e7 build hits
+        # this — and before this guard the crash killed the run before the score line printed,
+        # which meant the RED half of the red/green could not be produced at all.
+        return 127, f"ENOENT: {argv[0]} does not exist on the build under test"
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 def add(lane, title, pri=2, subs=None):
@@ -75,7 +82,11 @@ sib = out.strip().splitlines()[0] if out.strip() else None
 if sib:
     rc, o2 = run([LPR, "gitlock", sib, "scope"])
     rc2, o3 = run([LPR, "gitlock", "/home/lumen/bin", "scope"])
-    check("C3", o2.strip() == o3.strip(),
+    # Equality ALONE greens on the old build, where both calls return the SAME
+    # "unknown subcommand 'gitlock'" error string. An assertion that two failures match is
+    # not an assertion that anything works, so require a real scope on both sides first.
+    both_ok = rc == 0 and rc2 == 0 and o2.strip().endswith("-git")
+    check("C3", both_ok and o2.strip() == o3.strip(),
           f"a linked worktree resolves to the SAME scope as its primary tree ({o2.strip()})")
 else:
     check("C3", False, "no worktree available to test scope stability")
@@ -120,7 +131,11 @@ t_real  = add("zzF", "actual work", pri=3)
 rc, out = run([WQ, "claim", "--lane", "zzF"], agent="zz-claimer")
 check("F1", rc == 0 and f"CLAIMED {t_real}" in out,
       "claim skips the p1 [DRAFT] and hands out the real p3 instead")
-check("F2", str(t_draft) in out and "DRAFT" in out,
+# The original form (`id in out and "DRAFT" in out`) GREENED ON THE OLD BUILD, because there
+# the draft is the p1 and gets CLAIMED — so its id and its own "[DRAFT]" title both appear in
+# the claim banner. It passed on exactly the defect it exists to catch. Assert the skip NOTICE
+# and the absence of a claim instead.
+check("F2", f"skipped #{t_draft}" in out and f"CLAIMED {t_draft}" not in out,
       "and it SAYS the draft was skipped rather than silently passing over it")
 rc, out = run([WQ, "list", "--lane", "zzF"])
 check("F3", str(t_draft) in out, "the draft is still visible in the queue, just not claimable")
