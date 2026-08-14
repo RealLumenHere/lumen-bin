@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# lpp-restart — the ONLY sanctioned way to restart the live Lumen Plays Pokemon service.
+#
+# WHY (wq#532c): "if RESTART_FREEZE exists, do NOT restart" was prose in POKEMON_DISPATCH.md,
+# and it was violated at 06:22Z on 2026-08-13 by a deliberate `systemctl restart` during the
+# exact window a brand-new detector was recording 16 rewind boots. So was "take the
+# lumen-pokemon-live slock first". Both are now behaviour instead of wording:
+#   1. refuses while the freeze flag exists, unless the caller holds the ticket the flag licenses
+#   2. takes the lumen-pokemon-live lock ITSELF and drops it in a trap
+#   3. verifies the service came back and emitted a fresh event, rather than assuming it did
+#
+# HONEST LIMIT, stated here and not only in a report: this is a GUARD, not a fence. The `lumen`
+# user has blanket NOPASSWD root, so `sudo systemctl restart lumen-pokemon-live` still works and
+# nothing here can stop it. Making it impossible means narrowing that sudo grant, which is
+# Frank's decision and would break a large amount of unrelated fleet tooling. What this buys is
+# that the COMPLIANT path is now the EASY path, and that the non-compliant one has to be typed
+# on purpose.
+set -uo pipefail
+
+UNIT=lumen-pokemon-live
+FREEZE=${LPP_RESTART_FREEZE:-/home/lumen/pokemon/runtime/RESTART_FREEZE}
+EVENTS=${LPP_RESTART_EVENTS:-/home/lumen/pokemon/events}
+SCOPE=lumen-pokemon-live
+SLOCK=${LPP_RESTART_SLOCK:-/home/lumen/bin/slock}
+WQ=${LPP_RESTART_WQ:-/home/lumen/bin/wq}
+TTL=${LPP_RESTART_TTL:-10}
+HOLDER=${WQ_AGENT:-lpp-restart:$$}
+TAKEN=0
+
+die()  { printf 'lpp-restart: %s\n' "$*" >&2; exit 1; }
+note() { printf 'lpp-restart: %s\n' "$*"; }
+release() { [ "$TAKEN" = 1 ] || return 0; TAKEN=0
+            "$SLOCK" release "$SCOPE" --holder "$HOLDER" >/dev/null 2>&1 \
+              && note "released '$SCOPE'" || note "WARNING: could not release '$SCOPE'"; }
+
+TICKET=""; DRYRUN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ticket) TICKET="${2:-}"; shift 2 ;;
+    --dry-run) DRYRUN=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown flag: $1 (use --ticket wq#N, --dry-run)" ;;
+  esac
+done
+TICKET="${TICKET#wq#}"
+
+# ---- 1. the freeze, enforced ------------------------------------------------
+if [ -e "$FREEZE" ]; then
+  LICENSED=$(grep -oE 'wq#[0-9]+' "$FREEZE" 2>/dev/null | head -1 | tr -d 'wq#')
+  printf 'lpp-restart: RESTART FREEZE IS ACTIVE. Contents of %s:\n' "$FREEZE" >&2
+  sed 's/^/  | /' "$FREEZE" >&2
+  [ -n "$LICENSED" ] || die "the freeze names no licensed ticket, so NOTHING may restart.
+      Restarting during a freeze destroys live game progress. Verify against the running
+      service, or say on the board that the ticket cannot be verified without a restart."
+  [ -n "$TICKET" ] || die "freeze licenses wq#$LICENSED only. Re-run with --ticket wq#$LICENSED
+      if that is the ticket being worked; otherwise this restart is not authorised."
+  [ "$TICKET" = "$LICENSED" ] || die "freeze licenses wq#$LICENSED, not wq#$TICKET."
+  # The claim is the proof, not the flag: anyone can pass --ticket.
+  HELD=$("$WQ" show "$LICENSED" 2>/dev/null | awk -F': *' '/^claimed_by/{print $2}')
+  [ "$HELD" = "$HOLDER" ] || die "wq#$LICENSED is claimed by '${HELD:-nobody}', not by '$HOLDER'.
+      The licensed ticket must be CLAIMED BY the session doing the restart."
+  note "freeze active, and wq#$LICENSED is licensed and claimed by $HOLDER — proceeding"
+fi
+
+# ---- 2. the lock, taken by the tool ----------------------------------------
+if ! "$SLOCK" acquire "$SCOPE" --ttl "$TTL" --holder "$HOLDER" \
+       --note "lpp-restart${TICKET:+ wq#$TICKET}"; then
+  die "another session owns the live service right now. Wait, or work on code that needs no restart."
+fi
+TAKEN=1
+trap release EXIT INT TERM
+
+# ---- 3. restart and PROVE it came back -------------------------------------
+BEFORE=$(ls -t "$EVENTS"/live-agent-*.jsonl 2>/dev/null | head -1)
+BEFORE_MTIME=$( [ -n "$BEFORE" ] && stat -c %Y "$BEFORE" || echo 0 )
+if [ "$DRYRUN" = 1 ]; then
+  note "DRY RUN — all gates passed, not restarting. Newest event file: ${BEFORE:-none}"
+  exit 0
+fi
+note "restarting $UNIT"
+sudo -n systemctl restart "$UNIT" || die "systemctl restart failed"
+sleep 5
+systemctl is-active --quiet "$UNIT" || die "$UNIT is NOT active after restart — investigate NOW"
+note "$UNIT active, ExecMainStartTimestamp=$(systemctl show -p ExecMainStartTimestamp --value "$UNIT")"
+
+for _ in $(seq 1 24); do
+  NEW=$(ls -t "$EVENTS"/live-agent-*.jsonl 2>/dev/null | head -1)
+  if [ -n "$NEW" ]; then
+    M=$(stat -c %Y "$NEW")
+    if [ "$NEW" != "$BEFORE" ] || [ "$M" -gt "$BEFORE_MTIME" ]; then
+      note "fresh event observed in $(basename "$NEW") — restart verified, not assumed"
+      exit 0
+    fi
+  fi
+  sleep 5
+done
+die "restarted and active, but NO fresh event in 120s. The service is up and not playing.
+      Say so on the board before anyone treats this restart as successful."

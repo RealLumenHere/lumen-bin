@@ -125,6 +125,51 @@ check("F2", str(t_draft) in out and "DRAFT" in out,
 rc, out = run([WQ, "list", "--lane", "zzF"])
 check("F3", str(t_draft) in out, "the draft is still visible in the queue, just not claimable")
 
+print("\nG. the restart freeze is enforced, not requested (failure 3)")
+print("   NB: lpp-restart is a NEW FILE, so every G assertion is red on the old build purely by")
+print("   non-existence. G is a SPECIFICATION of the gate, not a discrimination test of it.")
+RESTART = os.path.join(D, "lpp-restart")
+FZ = os.path.join(TMP, "RESTART_FREEZE")
+EV = os.path.join(TMP, "events"); os.makedirs(EV, exist_ok=True)
+RENV = {"LPP_RESTART_FREEZE": FZ, "LPP_RESTART_EVENTS": EV,
+        "LPP_RESTART_SLOCK": SLOCK, "LPP_RESTART_WQ": WQ}
+
+rc, out = run([RESTART, "--dry-run"], agent="zz-r", env=RENV)
+check("G1", rc == 0 and "DRY RUN" in out, "no freeze: the gates pass and the lock round-trips")
+rc, out = run([SLOCK, "who", "lumen-pokemon-live"], env=RENV)
+check("G2", "(no active locks)" in out or "lumen-pokemon-live" not in out,
+      "the service lock is RELEASED on exit, not leaked")
+
+open(FZ, "w").write("frozen for the overnight soak\n")
+rc, out = run([RESTART, "--dry-run"], agent="zz-r", env=RENV)
+check("G3", rc != 0 and "names no licensed ticket" in out,
+      "a freeze that licenses nobody stops everyone, including the caller")
+
+t_lic = add("zzG", "the licensed ticket", pri=1)
+open(FZ, "w").write(f"overnight soak, licensed: wq#{t_lic}\n")
+rc, out = run([RESTART, "--dry-run"], agent="zz-r", env=RENV)
+check("G4", rc != 0 and f"licenses wq#{t_lic} only" in out,
+      "a licensed freeze still refuses a caller who does not name the ticket")
+rc, out = run([RESTART, "--dry-run", "--ticket", "wq#999999"], agent="zz-r", env=RENV)
+check("G5", rc != 0, "naming the WRONG ticket is refused")
+
+rc, out = run([RESTART, "--dry-run", "--ticket", f"wq#{t_lic}"], agent="zz-r", env=RENV)
+check("G6", rc != 0 and "claimed by" in out,
+      "naming the RIGHT ticket is not enough — the claim is the proof, and anyone can pass --ticket")
+
+run([WQ, "whoami", "--register", "zz-r"])
+rc, out = run([WQ, "claim", "--lane", "zzG"], agent="zz-r")
+rc, out = run([RESTART, "--dry-run", "--ticket", f"wq#{t_lic}"], agent="zz-r", env=RENV)
+check("G7", rc == 0 and "DRY RUN" in out,
+      "the session that actually holds the licensed ticket gets through")
+rc, out = run([RESTART, "--dry-run", "--ticket", f"wq#{t_lic}"], agent="zz-impostor", env=RENV)
+check("G8", rc != 0, "a different session, same ticket number, is still refused")
+
+run([SLOCK, "acquire", "lumen-pokemon-live", "--holder", "zz-someone-else", "--ttl", "5"])
+rc, out = run([RESTART, "--dry-run", "--ticket", f"wq#{t_lic}"], agent="zz-r", env=RENV)
+check("G9", rc != 0 and "owns the live service" in out,
+      "a contested service lock refuses instead of restarting on top of another session")
+
 print(f"\nprobe_wq532: {len(PASS)} passed / {len(FAIL)} failed")
 if FAIL: print("FAILED: " + ", ".join(FAIL))
 shutil.rmtree(TMP, ignore_errors=True)
