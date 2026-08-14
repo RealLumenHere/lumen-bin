@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""dispatch-lint — fail loudly when a dispatch file still instructs a retired rule.
+
+wq#533. A new agent reads its DISPATCH FILE and the tail of the board. It does not read
+the board's history, so a rule corrected in a board NOTE never reaches it. The board is a
+log; the dispatch file is the law. This checks the law.
+
+  dispatch-lint                 lint every dispatch file
+  dispatch-lint --file F        lint one file
+  dispatch-lint --list          show the retired-rule table
+  dispatch-lint --quiet         only print violations
+
+exit 0 = clean, 1 = at least one violation, 2 = operational problem (config unreadable).
+
+CITATIONS ARE NOT VIOLATIONS. A dispatch SHOULD say "supersedes 'hold it for the branch
+lifetime'" — that history is what stops the next agent re-deriving the old rule from first
+principles. Any line carrying a supersession marker is exempt, and EVERY exemption is
+printed rather than being silently swallowed: an exemption nobody can see is how a guard
+turns into decoration. Exemptions are per LINE, never per file.
+"""
+import argparse
+import re
+import sys
+from pathlib import Path
+
+WQ_DIR = Path("/home/lumen/agents/work-queue")
+RETIRED = WQ_DIR / "RETIRED_RULES.md"
+# The files a fresh agent is actually handed. LANE_BOUNDARIES/EVALUATION_RUBRIC are
+# referenced BY dispatches and carry rules too, so they are linted as well.
+DISPATCH_GLOBS = ("*DISPATCH*.md", "LANE_BOUNDARIES.md", "EVALUATION_RUBRIC.md")
+
+# EXEMPTION RULE: the matched text must appear INSIDE QUOTES.
+#
+# An INSTRUCTION is written as a command; a CITATION is written as a quotation. That is a
+# mechanical difference, and it is the only one I found that actually separates the two.
+#
+# MY FIRST VERSION DID NOT DO THIS AND IT PASSED THE DEFECT. I exempted any line carrying a
+# supersession marker and included "->" in that marker list. The pre-wq532 dispatch line
+#     slock acquire lpp-git  ->  lumen-pr land ...  ->  slock release lpp-git
+# uses "->" as a PIPELINE ARROW inside the instruction, so the linter exempted it and
+# reported the file CLEAN — the exact line whose exact idiom caused three lock breaches.
+# A guard that greens on the defect it exists to catch is worse than no guard, because
+# people trust it. Quoting is not a heuristic about intent; it is a property of the text.
+def quoted_hit(line, rx):
+    """True only if EVERY match of rx on this line sits inside "..." or `...`."""
+    spans = []
+    for q in ('"', '`', "'"):
+        i = 0
+        while True:
+            a = line.find(q, i)
+            if a == -1:
+                break
+            b = line.find(q, a + 1)
+            if b == -1:
+                break
+            spans.append((a, b))
+            i = b + 1
+    hits = list(rx.finditer(line))
+    if not hits:
+        return False
+    return all(any(a < m.start() and m.end() - 1 < b for a, b in spans) for m in hits)
+
+
+def load_rules():
+    if not RETIRED.exists():
+        return None, f"retired-rules table not found: {RETIRED}"
+    rules = []
+    for lineno, raw in enumerate(RETIRED.read_text().splitlines(), 1):
+        s = raw.strip()
+        if not s.startswith("RETIRE"):
+            continue
+        # Separator is `::`, NOT `|` — the patterns are regexes and regexes use `|` for
+        # alternation. The first draft split the very first rule down the middle of its own
+        # alternation group and produced an unterminated subpattern.
+        parts = [p.strip() for p in s.split("::")]
+        if len(parts) < 5:
+            return None, f"{RETIRED}:{lineno}: malformed RETIRE line (need 5 :: fields)"
+        _, rid, pattern, scope, guidance = parts[0], parts[1], parts[2], parts[3], "::".join(parts[4:])
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return None, f"{RETIRED}:{lineno}: bad regex for {rid}: {e}"
+        files = None if scope.upper() == "ALL" else {f.strip() for f in scope.split(",")}
+        rules.append({"id": rid, "rx": rx, "files": files, "guidance": guidance})
+    if not rules:
+        return None, f"{RETIRED} contains no RETIRE lines — refusing to report 'clean'"
+    return rules, None
+
+
+def targets(one=None):
+    if one:
+        p = Path(one)
+        return [p if p.is_absolute() else WQ_DIR / one]
+    out = []
+    for g in DISPATCH_GLOBS:
+        out.extend(sorted(WQ_DIR.glob(g)))
+    # .bak siblings are history, not law. Linting them produces noise nobody can act on.
+    return [p for p in out if ".bak" not in p.name]
+
+
+def lint(path, rules, quiet=False):
+    violations, exemptions = [], []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        return [(path.name, 0, "READ", str(e))], []
+    for rule in rules:
+        if rule["files"] is not None and path.name not in rule["files"]:
+            continue
+        for n, line in enumerate(lines, 1):
+            if not rule["rx"].search(line):
+                continue
+            if quoted_hit(line, rule["rx"]):
+                exemptions.append((path.name, n, rule["id"], line.strip()[:100]))
+            else:
+                violations.append((path.name, n, rule["id"], rule["guidance"]))
+    return violations, exemptions
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--file")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    rules, err = load_rules()
+    if err:
+        # A lint that cannot read its own table must NOT print "clean" — that is the
+        # fail-open failure this whole ticket family keeps finding.
+        print(f"dispatch-lint: {err}", file=sys.stderr)
+        return 2
+
+    if args.list:
+        for r in rules:
+            scope = "ALL" if r["files"] is None else ",".join(sorted(r["files"]))
+            print(f"{r['id']:24} [{scope}]\n    {r['guidance']}")
+        return 0
+
+    files = targets(args.file)
+    if not files:
+        print("dispatch-lint: no dispatch files found — refusing to report clean",
+              file=sys.stderr)
+        return 2
+
+    all_v, all_e = [], []
+    for p in files:
+        v, e = lint(p, rules)
+        all_v.extend(v)
+        all_e.extend(e)
+
+    if all_e and not args.quiet:
+        print(f"CITATIONS EXEMPTED ({len(all_e)}) — these NAME a retired rule in order to "
+              f"retire it, which is correct. Listed so the exemption is auditable:")
+        for fn, n, rid, txt in all_e:
+            print(f"  ~ {fn}:{n}  [{rid}]  {txt}")
+        print()
+
+    if all_v:
+        print(f"RETIRED RULES STILL INSTRUCTED ({len(all_v)}):")
+        for fn, n, rid, guidance in all_v:
+            print(f"  ✗ {fn}:{n}  [{rid}]\n      say instead: {guidance}")
+        print(f"\ndispatch-lint: {len(files)} file(s), {len(all_v)} violation(s), "
+              f"{len(all_e)} citation(s) exempted")
+        print("A rule corrected only on the progress board has NOT been corrected. The next "
+              "agent reads the dispatch file, never your board note (wq#533).")
+        return 1
+
+    if not args.quiet:
+        print(f"dispatch-lint: {len(files)} file(s) clean against {len(rules)} retired "
+              f"rule(s), {len(all_e)} citation(s) exempted")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
