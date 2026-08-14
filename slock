@@ -60,6 +60,25 @@ def default_holder():
     # wq#502: share the wq session identity so slock holders are session-unique too.
     # Two sessions with the same free-text holder made every ownership check invert.
     return os.environ.get("WQ_AGENT", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
+def refuse_if_retired(holder, action):
+    """wq#568 (3): a retired session may not ACQUIRE or EXTEND — this is what actually stops
+    a respawn from landing code, because `lumen-pr land` takes the repo lock itself. DENIED is
+    fail-closed for the retired session and exit 1. `release` stays open on purpose: a retired
+    identity shedding held state is desirable, never dangerous. A missing retired_sessions
+    table (standalone lock DB, or a queue.db that pre-dates wq#568) means nobody is retired —
+    that is absence of the feature, not a reason to deny the living."""
+    try:
+        c = conn()
+        r = c.execute("SELECT retired_at, kind, reason FROM retired_sessions WHERE session_id=?",
+                      (holder,)).fetchone()
+        c.close()
+    except sqlite3.Error:
+        return
+    if r:
+        print(f"DENIED: holder '{holder}' was RETIRED at {r[0]}Z ({r[1]}): {r[2]}")
+        print(f"  A retired session may not {action} a lock. STOP NOW — do not resume work.")
+        print("  (wq#568: if you are an auto-continued agent, end your run immediately.)")
+        sys.exit(1)
 def ticket_for_holder(c, holder, note):
     """The ticket behind a lock, for display. Prefer the note wq#N that wq's own acquire_subs
     writes; fall back to whatever this holder currently has claimed."""
@@ -103,6 +122,7 @@ def waiting_higher_priority(c, scope, my_pri, my_lane):
 
 def cmd_acquire(a):
     holder = a.holder or default_holder()
+    refuse_if_retired(holder, "acquire")
     scope = a.scope.strip().lower()
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
@@ -152,6 +172,7 @@ def cmd_release(a):
     print(f"RELEASED '{scope}'" + (f" (forced, was {r[0]})" if r[0] != holder else ""))
 def cmd_extend(a):
     holder = a.holder or default_holder()
+    refuse_if_retired(holder, "extend")
     scope = a.scope.strip().lower()
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")

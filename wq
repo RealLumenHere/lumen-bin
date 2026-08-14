@@ -32,7 +32,31 @@ parked its TICKET for the same 240m. Three separate mechanisms, deliberately NOT
     should always use it. It REFUSES while the session still holds work (--force overrides).
 agent_activity is an append-only log of every session-touching call: the thresholds above were
 picked from claim->done spans, which are upper bounds on the real inter-call gap, because wq kept
-no history to measure the real one. It does now."""
+no history to measure the real one. It does now.
+
+wq#568 STOP MEANS STOP (2026-08-14): Frank stops an agent; the harness auto-continues it; it
+re-reads dispatch, re-claims and burns money on work nobody asked for. A stop now BITES at the
+chokepoint instead of being asked for in prose: EVERY subcommand — including read-only list/show —
+checks the caller's session at entry against a persistent retired_sessions table and refuses with
+a STOP banner (exit 3) when retired. Retirement atomically reverts the session's claims to open
+and drops its slocks (the residue the orchestrator hand-patched three times on 08-14). Signals:
+  MANUAL       `wq retire <session_id|base_name> [--reason ...]` — operator/orchestrator.
+  AUTO-RESPAWN the zero-false-positive one: `whoami --release` plants a 'deregistered' marker;
+               ANY later wq call under that identity IS the auto-continue signature (clean exit,
+               harness resumes, env still carries the dead id) and upgrades it to retired on the
+               spot. Cannot fire on a live agent — a live agent has not deregistered. Side
+               effect, accepted: a HUMAN reusing a shell after --release eats one refusal; the
+               banner names the remedy (unset WQ_AGENT / register fresh).
+  BUDGETS      WQ_SESSION_MAX_AGE (minutes, default 360 = 6h since first_seen) and
+               WQ_SESSION_MAX_TICKETS (default 8 closed claims). Env-tunable, logged, ntfy'd —
+               for sessions that never exit cleanly. Deliberately NOT the 45m idle threshold:
+               wq#530 measured idle as safe for freeing NAMES and unsafe for freeing WORK.
+               A legitimate marathon session raises the env; it does not edit shared tooling.
+SCOPE, stated rather than discovered: this gates claim/coordinate/land (wq + slock + lumen-pr's
+own lock). It does NOT stop a respawn that only edits local files and never calls wq or slock —
+no chokepoint exists on that path (same structural answer wq#546 gave for releases).
+Metric Frank asked for: refused calls land in agent_activity as RETIRED-REFUSED:<cmd> /
+auto-retire:<kind>; count them to measure how often auto-continue actually happens."""
 import sqlite3, sys, os, argparse, datetime, socket, re, secrets
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 240
@@ -46,6 +70,12 @@ def _envint(name, default):
 PROVISIONAL_MIN = _envint("WQ_PROVISIONAL_MIN", 60)
 STALE_MIN       = _envint("WQ_STALE_MIN", 45)
 ACTIVITY_KEEP   = _envint("WQ_ACTIVITY_KEEP", 5000)
+# wq#568 budget backstops (minutes / count). NOT the idle threshold — see docstring.
+SESSION_MAX_AGE_MIN = _envint("WQ_SESSION_MAX_AGE", 360)
+SESSION_MAX_TICKETS = _envint("WQ_SESSION_MAX_TICKETS", 8)
+# wq#568: ntfy path is env-overridable so the probe can point it at a stub and PROVE the
+# notification fires, instead of asserting it from the source. Production never sets it.
+NTFY_BIN = os.environ.get("WQ_NTFY_BIN", "/home/lumen/bin/ntfy-send")
 SESSION_RE = re.compile(r"^(?P<base>.+)-(?P<sid>[0-9a-f]{6})$")
 STRICT = os.environ.get("WQ_STRICT", "").strip().lower() in ("1", "true", "yes")
 FMT = "%Y-%m-%d %H:%M:%S"
@@ -100,6 +130,13 @@ def init():
     # wq#530: the ttl the claimer asked for, so promotion restores THAT and never overrides an
     # explicit --ttl with the global default. NULL on every pre-existing row = DEFAULT_TTL_MIN.
     if "lease_ttl"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN lease_ttl INTEGER")
+    # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
+    # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
+    # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
+    c.execute("""CREATE TABLE IF NOT EXISTS retired_sessions(
+        session_id TEXT PRIMARY KEY, base_name TEXT, retired_at TEXT,
+        kind TEXT, reason TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_retired_base ON retired_sessions(base_name)")
     c.commit(); c.close()
 
 # ---------------------------------------------------------------- wq#502 identity layer
@@ -187,6 +224,134 @@ def ping(cmd):
         mark_alive(c, ident, cmd)
         c.execute("COMMIT"); c.close()
     except sqlite3.Error:
+        pass
+
+# ---------------------------------------------------------------- wq#568 retirement layer
+def retired_row(c, ident):
+    if not ident: return None
+    return c.execute("SELECT session_id, base_name, retired_at, kind, reason "
+                     "FROM retired_sessions WHERE session_id=?", (ident,)).fetchone()
+
+def _ntfy(title, msg):
+    """Best-effort, bounded. A notification must never be able to fail the command."""
+    try:
+        import subprocess
+        subprocess.run([NTFY_BIN, "-t", "lumen-fleet", "-T", title, msg],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+def release_session_holdings(c, sid):
+    """Revert every claimed ticket to open and drop every slock for this holder. The atomic
+    half of retirement — a respawn cannot land or hold anything, and the orchestrator stops
+    hand-editing status to clean claimed_by residue."""
+    t_now = now()
+    tickets = [r[0] for r in c.execute(
+        "SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'", (sid,))]
+    if tickets:
+        c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
+                     lease_expires=NULL, lease_ttl=NULL
+                     WHERE claimed_by=? AND status='claimed'""", (sid,))
+    locks = [r[0] for r in c.execute("SELECT scope FROM slocks WHERE holder=?", (sid,))]
+    if locks:
+        c.execute("DELETE FROM slocks WHERE holder=?", (sid,))
+    return tickets, locks
+
+def mark_retired(c, sid, base, kind, reason):
+    c.execute("""INSERT INTO retired_sessions(session_id, base_name, retired_at, kind, reason)
+                 VALUES(?,?,?,?,?)
+                 ON CONFLICT(session_id) DO UPDATE SET retired_at=excluded.retired_at,
+                   kind=excluded.kind, reason=excluded.reason""",
+              (sid, base, now(), kind, reason))
+    c.execute("DELETE FROM agent_sessions WHERE session_id=?", (sid,))
+
+def stop_banner(sid, retired_at, kind, reason):
+    b = ("\n================== STOP — SESSION RETIRED ==================\n"
+         f"Session '{sid}' was retired at {retired_at}Z ({kind}):\n"
+         f"  {reason}\n"
+         "THIS SESSION MUST STOP NOW.\n"
+         "Do not claim, do not lock, do not resume work, do not re-register.\n"
+         "If you are an auto-continued agent: END YOUR RUN IMMEDIATELY.\n"
+         "(A human reusing this shell: unset WQ_AGENT, or register a fresh\n"
+         " name in a clean environment. This identity stays dead.)\n"
+         "============================================================")
+    print(b); sys.stderr.write(b + "\n")
+
+def enforce_retirement(a):
+    """wq#568 entry gate — runs before EVERY subcommand, read-only ones included, because a
+    respawn's first act is a wq call and this is where a stop can bite. Ordering inside:
+      1. already-retired          -> log the refusal (the metric), banner, exit 3.
+      2. 'deregistered' marker    -> the auto-continue signature: upgrade to retired, release
+                                     anything --force left behind, ntfy, banner, exit 3.
+      3. live registered session  -> budget backstops (age / closed tickets); trip = retire,
+                                     release, ntfy, banner, exit 3.
+      4. unregistered legacy name -> untouched (wq#530 backcompat, pinned by Frank), UNLESS
+                                     that exact name was explicitly retired (case 1 catches it).
+    The happy path costs one indexed SELECT."""
+    ident = getattr(a, "agent", None) or getattr(a, "by", None) \
+            or os.environ.get("WQ_AGENT", "").strip()
+    if not ident: return
+    ident = ident.strip()
+    try:
+        c = conn()
+        r = retired_row(c, ident)
+        if r:
+            sid, base, rat, kind, reason = r
+            if kind == "deregistered":
+                c.isolation_level = None
+                c.execute("BEGIN IMMEDIATE")
+                tk, lk = release_session_holdings(c, ident)
+                reason = ("auto-continue signature: wq call after clean deregistration "
+                          f"(deregistered {rat}Z, first refused cmd={getattr(a,'cmd','?')})")
+                mark_retired(c, ident, base, "auto-respawn", reason)
+                log_activity(c, ident, "auto-retire:respawn")
+                c.execute("COMMIT"); c.close()
+                _ntfy("wq auto-retire (respawn)",
+                      f"{ident}: wq '{getattr(a,'cmd','?')}' after clean deregistration — "
+                      f"auto-continued agent stopped at the chokepoint."
+                      + (f" released tickets={tk}" if tk else "")
+                      + (f" dropped slocks={lk}" if lk else ""))
+                stop_banner(ident, now(), "auto-respawn", reason)
+            else:
+                c.isolation_level = None
+                c.execute("BEGIN IMMEDIATE")
+                log_activity(c, ident, f"RETIRED-REFUSED:{getattr(a,'cmd','?')}")
+                c.execute("COMMIT"); c.close()
+                stop_banner(ident, rat, kind, reason or "(no reason recorded)")
+            sys.exit(3)
+        row = is_session(c, ident)
+        if row:
+            fs = c.execute("SELECT first_seen FROM agent_sessions WHERE session_id=?",
+                           (ident,)).fetchone()[0]
+            age = idle_minutes(fs)  # minutes since first_seen; None if unparseable
+            done_n = c.execute("SELECT COUNT(*) FROM tasks WHERE claimed_by=? AND status='done'",
+                               (ident,)).fetchone()[0]
+            trip = None
+            if age is not None and age > SESSION_MAX_AGE_MIN:
+                trip = ("auto-age", f"session age {age:.0f}m exceeds WQ_SESSION_MAX_AGE="
+                                    f"{SESSION_MAX_AGE_MIN}m (budget backstop; raise the env "
+                                    f"for a legitimate marathon session)")
+            elif done_n >= SESSION_MAX_TICKETS:
+                trip = ("auto-tickets", f"{done_n} closed claims reaches WQ_SESSION_MAX_TICKETS="
+                                        f"{SESSION_MAX_TICKETS} (budget backstop)")
+            if trip:
+                kind, reason = trip
+                c.isolation_level = None
+                c.execute("BEGIN IMMEDIATE")
+                tk, lk = release_session_holdings(c, ident)
+                mark_retired(c, ident, row[1], kind, reason)
+                log_activity(c, ident, f"auto-retire:{kind}")
+                c.execute("COMMIT"); c.close()
+                _ntfy(f"wq auto-retire ({kind})",
+                      f"{ident}: {reason}."
+                      + (f" released tickets={tk}" if tk else "")
+                      + (f" dropped slocks={lk}" if lk else ""))
+                stop_banner(ident, now(), kind, reason)
+                sys.exit(3)
+        c.close()
+    except sqlite3.Error:
+        # The gate must never brick wq on a broken/locked DB — the underlying command's own
+        # error handling owns that. Failing OPEN here only skips the gate for one call.
         pass
 
 def partition_for_base(c, base, exclude_sid):
@@ -350,6 +515,14 @@ def cmd_whoami(a):
             sys.exit(1)
         log_activity(c, ident, "deregister")
         c.execute("DELETE FROM agent_sessions WHERE session_id=?", (ident,))
+        # wq#568: plant the 'deregistered' marker. This is NOT retirement and fires no alert —
+        # clean exits are normal. It is the tripwire: any LATER wq call under this identity is
+        # the auto-continue signature and upgrades it to retired at the entry gate.
+        c.execute("""INSERT INTO retired_sessions(session_id, base_name, retired_at, kind, reason)
+                     VALUES(?,?,?,?,?)
+                     ON CONFLICT(session_id) DO UPDATE SET retired_at=excluded.retired_at,
+                       kind=excluded.kind, reason=excluded.reason""",
+                  (ident, my_base, now(), "deregistered", "clean deregistration"))
         c.execute("COMMIT"); c.close()
         if held or locks:
             warn(f"--force: deregistered {ident} while it still held tickets={held or 'none'} "
@@ -394,6 +567,19 @@ def cmd_whoami(a):
                 print(f"  {sid:<24} base={bn:<16} {fmt_idle(idle):<11} last={ls}Z  {mark}")
         else:
             print("\nactive session registry: (empty)")
+        # wq#568 (5): RETIRED is shown distinctly from STALE — stale frees a name, retired
+        # kills an identity. 'deregistered' rows are dormant tripwires, labelled as such.
+        c2 = conn()
+        ret = c2.execute("""SELECT session_id, base_name, retired_at, kind, reason
+                            FROM retired_sessions ORDER BY retired_at DESC LIMIT 10""").fetchall()
+        c2.close()
+        if ret:
+            print(f"\nretired / deregistered identities (last {len(ret)}) — wq#568:")
+            for sid, bn, rat, kind, reason in ret:
+                label = ("clean exit; tripwire armed" if kind == "deregistered"
+                         else f"RETIRED ({kind})")
+                print(f"  {sid:<24} base={bn:<16} at={rat}Z  {label}"
+                      + (f" — {reason[:60]}" if reason and kind != "deregistered" else ""))
         return
     base = a.register.strip()
     if not base or base.isdigit():
@@ -668,6 +854,43 @@ def cmd_edit(a):
     if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps"); c.close(); return
     vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals); c.commit()
     print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}"); c.close()
+def cmd_retire(a):
+    """wq#568 (1)(2): retire a session id or every session under a base name. Atomic per
+    target: claims revert to open, slocks drop, registry row goes, retired marker persists.
+    Also sweeps holdings under the literal BARE name (owner_ok's adoption path means bare-name
+    claims legitimately exist) and plants a marker on the bare name itself, so a bare-name
+    respawn hits the same wall. No --force, no confirmation: releasing another session's work
+    is this command's PURPOSE — it is the tool the orchestrator lacked while hand-editing
+    status three times on 08-14. Everything it does is printed."""
+    target = a.target.strip()
+    reason = (a.reason or "retired by operator").strip()
+    if not target:
+        print("REFUSED: retire needs a session id or base name"); sys.exit(1)
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    sids = [r[0] for r in c.execute(
+        "SELECT session_id FROM agent_sessions WHERE session_id=? OR base_name=?",
+        (target, target)).fetchall()]
+    planted = []
+    for sid in sids:
+        base = base_of(c, sid)
+        tk, lk = release_session_holdings(c, sid)
+        mark_retired(c, sid, base, "manual", reason)
+        log_activity(c, sid, "retired:manual")
+        planted.append((sid, tk, lk))
+    if target not in [s for s, _, _ in planted]:
+        # The literal target string (a purged id, or the bare base name) gets its own marker
+        # and its own holdings sweep, so nothing claimable survives under that identity.
+        tk, lk = release_session_holdings(c, target)
+        mark_retired(c, target, base_of(c, target), "manual", reason)
+        planted.append((target, tk, lk))
+    c.execute("COMMIT"); c.close()
+    for sid, tk, lk in planted:
+        print(f"RETIRED {sid}: " + (f"reverted tickets {tk} to open" if tk else "no claims")
+              + (f", dropped slocks {lk}" if lk else ", no slocks")
+              + f" — reason: {reason}")
+    print(f"({len(planted)} identity marker(s) planted; any wq/slock call by them now refuses "
+          f"with the STOP banner)")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
@@ -681,7 +904,10 @@ s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--h
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
 s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
 init()
 a = p.parse_args()
 if not getattr(a,"cmd",None): p.print_help(); sys.exit(0)
+# wq#568: the entry gate runs before EVERY subcommand — a stop bites here or nowhere.
+enforce_retirement(a)
 a.f(a)
