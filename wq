@@ -15,10 +15,37 @@ WQ_AGENT. Two sessions sharing a base name used to make every safety mechanism I
 saw its own name and returned FREE; release_subs let either session drop the other's lock). Now:
 registered sessions are distinct strings, a claim is REFUSED when another live session holds the
 same base name, and heartbeat/done/release/block refuse when the caller is not the claim holder.
-Bare (unregistered) names still work but warn — set WQ_STRICT=1 to make legacy callers refuse."""
+Bare (unregistered) names still work but warn — set WQ_STRICT=1 to make legacy callers refuse.
+
+wq#530 SESSION LIVENESS (2026-08-14): registration alone never expired, so a stopped agent
+parked its base name for the full 240m lease TTL and a session that died in its first minute
+parked its TICKET for the same 240m. Three separate mechanisms, deliberately NOT one:
+  STALENESS (WQ_STALE_MIN, default 45) frees a BASE NAME only. A row is stale when it is idle
+    past the threshold AND holds no live lease/slock AND no task is claimed under its bare base
+    name. Holding anything live means never stale — a quiet agent mid-experiment is not a dead
+    one, and treating it as dead is what released wq#542 out from under a live session.
+  PROVISIONAL LEASE (WQ_PROVISIONAL_MIN, default 60) frees a TICKET. A new claim leases for the
+    provisional window, and ANY subsequent wq call by the holder promotes it to the full ttl
+    (stored per-claim in tasks.lease_ttl). Time alone never releases a claim from an agent that
+    is still talking to wq. Reclaim of an expired provisional lease is LOUD and names the holder.
+  DEREGISTRATION (`wq whoami --release`) is the only zero-false-positive signal, so a clean exit
+    should always use it. It REFUSES while the session still holds work (--force overrides).
+agent_activity is an append-only log of every session-touching call: the thresholds above were
+picked from claim->done spans, which are upper bounds on the real inter-call gap, because wq kept
+no history to measure the real one. It does now."""
 import sqlite3, sys, os, argparse, datetime, socket, re, secrets
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 240
+def _envint(name, default):
+    try:
+        v = int(os.environ.get(name, "").strip() or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+# wq#530: both windows are env-tunable so an operator can react without editing shared tooling.
+PROVISIONAL_MIN = _envint("WQ_PROVISIONAL_MIN", 60)
+STALE_MIN       = _envint("WQ_STALE_MIN", 45)
+ACTIVITY_KEEP   = _envint("WQ_ACTIVITY_KEEP", 5000)
 SESSION_RE = re.compile(r"^(?P<base>.+)-(?P<sid>[0-9a-f]{6})$")
 STRICT = os.environ.get("WQ_STRICT", "").strip().lower() in ("1", "true", "yes")
 FMT = "%Y-%m-%d %H:%M:%S"
@@ -60,10 +87,19 @@ def init():
         session_id TEXT PRIMARY KEY, base_name TEXT NOT NULL, host TEXT, pid INTEGER,
         first_seen TEXT, last_seen TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_base ON agent_sessions(base_name)")
+    # wq#530: append-only activity log. ADDITIVE — no existing table or column changes, so
+    # queue-status, mctl, slock and lumen-sqlutil are untouched.
+    c.execute("""CREATE TABLE IF NOT EXISTS agent_activity(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, base_name TEXT,
+        cmd TEXT, ts TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_agent_activity_sid ON agent_activity(session_id,id)")
     cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
     if "lease_expires" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN lease_expires TEXT")
     if "subsystems"   not in cols: c.execute("ALTER TABLE tasks ADD COLUMN subsystems TEXT DEFAULT ''")
     if "gate"         not in cols: c.execute("ALTER TABLE tasks ADD COLUMN gate TEXT DEFAULT ''")
+    # wq#530: the ttl the claimer asked for, so promotion restores THAT and never overrides an
+    # explicit --ttl with the global default. NULL on every pre-existing row = DEFAULT_TTL_MIN.
+    if "lease_ttl"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN lease_ttl INTEGER")
     c.commit(); c.close()
 
 # ---------------------------------------------------------------- wq#502 identity layer
@@ -84,6 +120,102 @@ def base_of(c, ident):
 
 def touch_session(c, ident):
     c.execute("UPDATE agent_sessions SET last_seen=? WHERE session_id=?", (now(), ident))
+
+# ---------------------------------------------------------------- wq#530 liveness layer
+def log_activity(c, ident, cmd):
+    """Append-only. Never allowed to break the command that emitted it."""
+    try:
+        c.execute("INSERT INTO agent_activity(session_id,base_name,cmd,ts) VALUES(?,?,?,?)",
+                  (ident, base_of(c, ident), cmd, now()))
+        c.execute("DELETE FROM agent_activity WHERE id <= "
+                  "(SELECT MAX(id) FROM agent_activity) - ?", (ACTIVITY_KEEP,))
+    except sqlite3.Error:
+        pass
+
+def idle_minutes(last_seen):
+    try:
+        t = datetime.datetime.strptime(last_seen, FMT).replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return (utcnow() - t).total_seconds() / 60.0
+
+def session_holdings(c, sid, t_now):
+    held = [r[0] for r in c.execute(
+        """SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'
+           AND lease_expires IS NOT NULL AND lease_expires >= ?""", (sid, t_now))]
+    locks = [r[0] for r in c.execute(
+        "SELECT scope FROM slocks WHERE holder=? AND expires_at >= ?", (sid, t_now))]
+    return held, locks
+
+def promote_leases(c, ident):
+    """ANY wq call by the holder is evidence of life: restore every provisional lease it holds
+    to the ttl that claim asked for, and extend the slocks with it so the two never diverge.
+    Only ever LENGTHENS, and never touches a lease that has already expired — that one may
+    already belong to someone else."""
+    if not ident: return 0
+    t_now = now(); n = 0
+    for tid, subsystems, exp, ttl in c.execute(
+            """SELECT id, subsystems, lease_expires, lease_ttl FROM tasks
+               WHERE claimed_by=? AND status='claimed'
+                 AND lease_expires IS NOT NULL AND lease_expires >= ?""", (ident, t_now)).fetchall():
+        full = int(ttl) if ttl else DEFAULT_TTL_MIN
+        target = lease_from(full)
+        if target <= exp: continue
+        c.execute("UPDATE tasks SET lease_expires=? WHERE id=?", (target, tid))
+        subs = parse_subs(subsystems)
+        if subs: acquire_subs(c, subs, ident, full, f"wq#{tid}")
+        n += 1
+    return n
+
+def mark_alive(c, ident, cmd):
+    """One call per subcommand. Registered sessions get last_seen + an activity row; ANY holder
+    (registered or bare) gets its provisional leases promoted."""
+    if not ident: return
+    if is_session(c, ident):
+        touch_session(c, ident)
+        log_activity(c, ident, cmd)
+    promote_leases(c, ident)
+
+def ping(cmd):
+    """Best-effort liveness ping for read-only subcommands. A liveness signal must never be able
+    to fail the command that carries it."""
+    ident = os.environ.get("WQ_AGENT", "").strip()
+    if not ident: return
+    try:
+        c = conn(); c.isolation_level = None
+        c.execute("BEGIN IMMEDIATE")
+        mark_alive(c, ident, cmd)
+        c.execute("COMMIT"); c.close()
+    except sqlite3.Error:
+        pass
+
+def partition_for_base(c, base, exclude_sid):
+    """Split every registry row for this base into BLOCKING and STALE.
+
+    A row is STALE only when all three hold: idle past WQ_STALE_MIN, holding no live lease or
+    slock, and no task claimed under the literal bare base name. The last clause is not
+    paranoia — owner_ok() lets a registered session adopt a claim held under its own bare base
+    name, so two sessions sharing a base while such a claim exists is the one wq#502 inversion
+    that session-unique ids did NOT close."""
+    t_now = now()
+    bare = [r[0] for r in c.execute(
+        """SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'
+           AND lease_expires IS NOT NULL AND lease_expires >= ?""", (base, t_now))]
+    blocking, stale = [], []
+    for sid, fs, ls in c.execute(
+            "SELECT session_id, first_seen, last_seen FROM agent_sessions "
+            "WHERE base_name=? AND session_id<>?", (base, exclude_sid or "")).fetchall():
+        held, locks = session_holdings(c, sid, t_now)
+        idle = idle_minutes(ls)
+        row = (sid, held, locks, fs, ls, idle)
+        if held or locks or idle is None or idle < STALE_MIN or bare:
+            blocking.append(row)
+        else:
+            stale.append(row)
+    return blocking, stale, bare
+
+def fmt_idle(idle):
+    return "idle=?" if idle is None else f"idle={idle:.0f}m"
 
 def purge_stale_sessions(c, ttl_min=DEFAULT_TTL_MIN):
     """(3) sessions idle > lease TTL auto-expire — but NEVER purge one still holding a live
@@ -110,26 +242,6 @@ def live_sessions_for_base(c, base, exclude_sid):
         locks = c.execute("SELECT scope FROM slocks WHERE holder=? AND expires_at >= ?", (sid, t_now)).fetchall()
         if held or locks:
             out.append((sid, [r[0] for r in held], [r[0] for r in locks]))
-    return out
-
-def registered_sessions_for_base(c, base, exclude_sid):
-    """wq#537: ALL registered sessions sharing this base name, regardless of whether either one
-    currently holds a lease or slock. Existence in the registry IS liveness here — by the time
-    this runs, purge_stale_sessions has already dropped rows idle past the lease TTL (and never
-    a row still holding something live), so anything left is either brand new or genuinely
-    holding work. That closes the startup race live_sessions_for_base is blind to: two sessions
-    registering the same base name back-to-back, before either has claimed or locked anything,
-    used to sail straight through because neither was 'holding' yet. Used ONLY by the
-    --register path — cmd_claim keeps the steady-state definition above."""
-    t_now = now()
-    out = []
-    for sid, fs, ls in c.execute(
-            "SELECT session_id, first_seen, last_seen FROM agent_sessions WHERE base_name=? AND session_id<>?",
-            (base, exclude_sid or "")):
-        held = c.execute("""SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'
-                            AND lease_expires IS NOT NULL AND lease_expires >= ?""", (sid, t_now)).fetchall()
-        locks = c.execute("SELECT scope FROM slocks WHERE holder=? AND expires_at >= ?", (sid, t_now)).fetchall()
-        out.append((sid, [r[0] for r in held], [r[0] for r in locks], fs, ls))
     return out
 
 def resolve_identity(a, c=None):
@@ -216,13 +328,47 @@ def cmd_whoami(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
     purged = purge_stale_sessions(c)
+
+    # wq#530 (3): the only zero-false-positive liveness signal is the agent saying so itself.
+    if getattr(a, "release", False):
+        ident, _ = resolve_identity(a, c)
+        if not is_session(c, ident):
+            c.execute("COMMIT"); c.close()
+            print(f"not registered: {ident} — nothing to release (already deregistered, or a bare name)")
+            return
+        my_base = base_of(c, ident)
+        held, locks = session_holdings(c, ident, now())
+        if (held or locks) and not a.force:
+            c.execute("COMMIT"); c.close()
+            print(f"REFUSED: session {ident} still holds work:")
+            print(f"  tickets : {held or 'none'}")
+            print(f"  slocks  : {locks or 'none'}")
+            print("  Deregistering now would leave that work owned by a name the registry no longer\n"
+                  "  knows, which is the state manual releases have been cleaning up all day.\n"
+                  "  -> hand it back first:  wq done <id> --notes ...   or   wq release <id>\n"
+                  "  -> only if it is genuinely abandoned and you know that: --force")
+            sys.exit(1)
+        log_activity(c, ident, "deregister")
+        c.execute("DELETE FROM agent_sessions WHERE session_id=?", (ident,))
+        c.execute("COMMIT"); c.close()
+        if held or locks:
+            warn(f"--force: deregistered {ident} while it still held tickets={held or 'none'} "
+                 f"slocks={locks or 'none'} — those are now owned by an unregistered name.")
+        print(f"DEREGISTERED session: {ident}")
+        print(f"  base name '{my_base}' is free for immediate reuse.")
+        return
+
     if not a.register:
         ident, explicit = resolve_identity(a, c)
         r = c.execute("SELECT session_id,base_name,pid,first_seen,last_seen FROM agent_sessions WHERE session_id=?",
                       (ident,)).fetchone()
+        mark_alive(c, ident, "whoami")
         c.execute("COMMIT")
-        rows = c.execute("""SELECT session_id,base_name,first_seen,last_seen FROM agent_sessions
-                            ORDER BY last_seen DESC""").fetchall()
+        t_now = now(); rows = []
+        for sid, bn, fs, ls in c.execute("""SELECT session_id,base_name,first_seen,last_seen
+                                            FROM agent_sessions ORDER BY last_seen DESC"""):
+            h, lk = session_holdings(c, sid, t_now)
+            rows.append((sid, bn, fs, ls, idle_minutes(ls), h, lk))
         c.close()
         print(f"identity : {ident}" + ("" if explicit else "  (fallback — WQ_AGENT not set)"))
         if r:
@@ -237,8 +383,15 @@ def cmd_whoami(a):
             print("status   : UNREGISTERED legacy name")
             print("           -> register with: wq whoami --register <your-agent-name>")
         if rows:
-            print(f"\nactive session registry ({len(rows)}):")
-            for sid, base, fs, ls in rows: print(f"  {sid:<24} base={base:<18} first={fs}Z last={ls}Z")
+            print(f"\nactive session registry ({len(rows)}) — STALE past {STALE_MIN}m idle (wq#530):")
+            for sid, bn, fs, ls, idle, h, lk in rows:
+                if h or lk:
+                    mark = f"HOLDING tickets={h or 'none'} slocks={lk or 'none'} — never stale"
+                elif idle is not None and idle >= STALE_MIN:
+                    mark = "STALE — holds nothing, its base name is reusable"
+                else:
+                    mark = "live"
+                print(f"  {sid:<24} base={bn:<16} {fmt_idle(idle):<11} last={ls}Z  {mark}")
         else:
             print("\nactive session registry: (empty)")
         return
@@ -246,14 +399,22 @@ def cmd_whoami(a):
     if not base or base.isdigit():
         c.execute("COMMIT"); c.close()
         print("REFUSED: --register needs a non-numeric agent name (e.g. rabbit5, gh1)"); sys.exit(1)
-    blockers = registered_sessions_for_base(c, base, None)
+    blockers, stale, bare = partition_for_base(c, base, None)
     if blockers and not a.force:
         c.execute("COMMIT"); c.close()
         print(f"REFUSED: base name '{base}' is already registered by a DIFFERENT session:")
-        for sid, held, locks, fs, ls in blockers:
+        for sid, held, locks, fs, ls, idle in blockers:
+            why = ("holds live work" if (held or locks)
+                   else f"claim(s) {bare} are held under the BARE name '{base}'" if bare
+                   else f"idle only {fmt_idle(idle)}, under the {STALE_MIN}m stale threshold")
             print(f"  {sid}  tickets={held or 'none'}  slocks={locks or 'none'}  "
-                  f"first_seen={fs}Z last_seen={ls}Z")
-        print("  Two sessions sharing a base name is exactly the failure wq#502 fixes:\n"
+                  f"{fmt_idle(idle)}  -> {why}")
+            print(f"      first_seen={fs}Z last_seen={ls}Z")
+        print("  wq#530: a registration is only stepped over when it is idle past "
+              f"{STALE_MIN}m AND holds\n"
+              "  no lease/slock AND no claim exists under its bare base name. Holding live work\n"
+              "  means NEVER stale — a quiet agent mid-experiment is not a dead one.\n"
+              "  Two sessions sharing a base name is exactly the failure wq#502 fixes:\n"
               "  every lock check silently inverts and you can take each other's tickets.\n"
               "  wq#537: this now refuses on EXISTENCE, not just an active lease/slock — the old\n"
               "  check missed the startup window where a second registration lands before the\n"
@@ -269,6 +430,14 @@ def cmd_whoami(a):
     c.execute("""INSERT INTO agent_sessions(session_id,base_name,host,pid,first_seen,last_seen)
                  VALUES(?,?,?,?,?,?)""", (sid, base, socket.gethostname(), os.getpid(), now(), now()))
     c.execute("COMMIT"); c.close()
+    if stale:
+        # NB: distinct loop names. `sid` is the id just minted three lines above, and rebinding
+        # it here printed the STALE row's id as the new session's — caught by probe A2.
+        print(f"NOTE: stepped over {len(stale)} STALE registration(s) for base '{base}' (wq#530):")
+        for s_sid, _h, _l, _fs, s_ls, s_idle in stale:
+            print(f"  {s_sid}  {fmt_idle(s_idle)} (>{STALE_MIN}m), holding nothing, last={s_ls}Z")
+        print("  They keep their registry rows so the history stays readable; they just no")
+        print("  longer park the name. If one of them is actually alive, say so on the board.")
     if blockers and a.force:
         warn(f"--force used: '{base}' already live as {', '.join(b[0] for b in blockers)}")
     if purged: print(f"(expired {purged} stale session(s) from registry)")
@@ -307,7 +476,7 @@ def cmd_claim(a):
     purge_stale_sessions(c)
     me = is_session(c, agent)
     if me:
-        touch_session(c, agent)
+        mark_alive(c, agent, "claim")
     else:
         warn(f"agent '{agent}' is an UNREGISTERED name. Two sessions sharing it will silently "
              f"take each other's tickets. Register once: wq whoami --register <name>")
@@ -322,10 +491,29 @@ def cmd_claim(a):
               "  name (wq whoami --register <name>) or wait for that session's lease to expire.")
         sys.exit(1)
     # reclaim expired ticket leases AND purge expired slocks (single housekeeping pass)
-    c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, lease_expires=NULL
-                 WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL AND lease_expires < ?""",
-              (a.lane, t_now))
-    reclaimed = c.execute("SELECT changes()").fetchone()[0]
+    # wq#530: a reclaim is never silent again. If a lease expired while its holder was alive
+    # but quiet, the ONLY way anyone finds out today is by noticing their ticket moved — that
+    # is how wq#542 was taken out from under a live session. Name the holder, every time.
+    expired = c.execute("""SELECT id, claimed_by, claimed_at, lease_expires, lease_ttl FROM tasks
+                           WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL
+                             AND lease_expires < ?""", (a.lane, t_now)).fetchall()
+    if expired:
+        c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
+                     lease_expires=NULL, lease_ttl=NULL
+                     WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL
+                       AND lease_expires < ?""", (a.lane, t_now))
+    reclaim_lines = []
+    for tid, holder, cat, exp, ttl in expired:
+        held_for = idle_minutes(cat)
+        gone = idle_minutes(exp)
+        window = int(ttl) if ttl else DEFAULT_TTL_MIN
+        never_promoted = window > PROVISIONAL_MIN and (idle_minutes(cat) or 0) < window
+        reclaim_lines.append(
+            f"RECLAIMED #{tid} from {holder or 'unknown'} — claimed "
+            f"{'?' if held_for is None else f'{held_for:.0f}'}m ago, lease expired "
+            f"{'?' if gone is None else f'{gone:.0f}'}m ago"
+            + (" on the PROVISIONAL window (no wq call ever followed the claim)" if never_promoted else ""))
+    reclaimed = len(expired)
     c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
     rows = c.execute("SELECT id,deps,subsystems,gate FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(a.lane,)).fetchall()
     pick = None; picked_subs = []; skips = []
@@ -340,20 +528,33 @@ def cmd_claim(a):
         pick = rid; picked_subs = subs; break
     if pick is None:
         c.execute("COMMIT"); c.close()
-        if reclaimed: print(f"(reclaimed {reclaimed} expired lease(s))")
+        for line in reclaim_lines: print(line)
         msg = f"NONE — lane '{a.lane}' empty or all remaining blocked"
         if skips: msg += " [skipped: " + "; ".join(skips[:6]) + ("; ..." if len(skips) > 6 else "") + "]"
         print(msg); return
-    lease = lease_from(a.ttl)
-    c.execute("UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=? WHERE id=?",
-              (agent, t_now, lease, pick))
+    # wq#530 (2): the FIRST lease is short. Promotion to the full ttl is driven by heartbeat —
+    # or by any other wq call the holder makes — never by elapsed time alone, because elapsed
+    # time cannot tell a dead session from a working one. A session that dies in its first
+    # minute frees its ticket in PROVISIONAL_MIN instead of parking it for the full ttl.
+    prov = min(PROVISIONAL_MIN, a.ttl)
+    lease = lease_from(prov)
+    c.execute("""UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
+                 lease_ttl=? WHERE id=?""", (agent, t_now, lease, a.ttl, pick))
     if picked_subs:
-        acquire_subs(c, picked_subs, agent, a.ttl, f"wq#{pick}")
+        acquire_subs(c, picked_subs, agent, prov, f"wq#{pick}")
     c.execute("COMMIT")
     t = c.execute("SELECT id,pri,title,detail,deps,subsystems FROM tasks WHERE id=?", (pick,)).fetchone()
     c.close()
-    if reclaimed: print(f"(reclaimed {reclaimed} expired lease(s))")
-    print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — lease until {lease}Z (ttl {a.ttl}m; heartbeat to extend)")
+    for line in reclaim_lines: print(line)
+    if prov < a.ttl:
+        print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — PROVISIONAL lease until {lease}Z ({prov}m)")
+        print(f"  wq#530: the first lease is deliberately short. ANY further wq call you make "
+              f"(heartbeat/list/show/done)")
+        print(f"  promotes it to the full {a.ttl}m. Go silent for {prov}m and this ticket returns "
+              f"to the queue, loudly.")
+        print(f"  Long uninterrupted work with no wq calls: run `wq heartbeat {t[0]}` first.")
+    else:
+        print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — lease until {lease}Z (ttl {a.ttl}m; heartbeat to extend)")
     if picked_subs: print(f"LOCKED subsystems: {', '.join(picked_subs)}")
     print(f"TITLE: {t[2]}\nDEPS: {t[4] or 'none'}\n---\n{t[3]}")
 def cmd_heartbeat(a):
@@ -366,9 +567,9 @@ def cmd_heartbeat(a):
     caller, _ = resolve_identity(a)
     if not owner_ok(c, caller, r[1], "heartbeat", a.id):
         c.execute("COMMIT"); c.close(); sys.exit(1)
-    touch_session(c, caller)
+    mark_alive(c, caller, "heartbeat")
     lease = lease_from(a.ttl)
-    c.execute("UPDATE tasks SET lease_expires=? WHERE id=?", (lease, a.id))
+    c.execute("UPDATE tasks SET lease_expires=?, lease_ttl=? WHERE id=?", (lease, a.ttl, a.id))
     subs = parse_subs(r[2])
     if subs: acquire_subs(c, subs, r[1], a.ttl, f"wq#{a.id}")  # extends held slocks for same holder
     c.execute("COMMIT"); c.close()
@@ -382,14 +583,16 @@ def _finish(a, new_status):
     caller, _ = resolve_identity(a)
     if not owner_ok(c, caller, r[0], new_status if new_status != 'open' else 'release', a.id):
         c.execute("COMMIT"); c.close(); sys.exit(1)
-    touch_session(c, caller)
+    mark_alive(c, caller, {"done": "done", "open": "release", "blocked": "block"}[new_status])
     if r and r[1]:
         release_subs(c, parse_subs(r[1]), r[0] or "")
     if new_status == 'done':
-        c.execute("UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL WHERE id=?",
+        c.execute("UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL, "
+                  "lease_ttl=NULL WHERE id=?",
                   (now(), getattr(a,'notes','') or '', a.id))
     elif new_status == 'open':
-        c.execute("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, lease_expires=NULL WHERE id=?", (a.id,))
+        c.execute("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
+                  "lease_expires=NULL, lease_ttl=NULL WHERE id=?", (a.id,))
     elif new_status == 'blocked':
         c.execute("UPDATE tasks SET status='blocked', notes=?, lease_expires=NULL WHERE id=?", (a.reason, a.id))
     c.execute("COMMIT"); c.close()
@@ -400,6 +603,7 @@ def cmd_preflight(a):
     """Ad-hoc guard: warn if about to touch subsystems with no held lock for this holder."""
     holder = a.holder or os.environ.get("WQ_AGENT", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
     subs = parse_subs(a.subsystems)
+    ping("preflight")
     if not subs: print("no subsystems given"); return
     c = conn(); c.execute("DELETE FROM slocks WHERE expires_at < ?", (now(),)); c.commit()
     t_now = now(); unlocked=[]; foreign=[]
@@ -417,6 +621,7 @@ def cmd_preflight(a):
         sys.exit(2)
     print(f"OK: all of [{', '.join(subs)}] locked by you ({holder}).")
 def cmd_list(a):
+    ping("list")
     c = conn(); lane = a.lane or getattr(a, "lane_flag", None)
     conds = []; params = []
     if lane: conds.append("lane=?"); params.append(lane)
@@ -440,6 +645,7 @@ def cmd_list(a):
             else: lz = f" lease={r[7]}Z"
         print(f"[{r[0]:>3}] {r[1]:<4} p{r[2]} {r[3]:<8} {r[4][:66]}{cb}{dep}{sub}{gt}{lz}")
 def cmd_show(a):
+    ping("show")
     c = conn(); cur = c.execute("SELECT * FROM tasks WHERE id=?", (a.id,)); r = cur.fetchone(); cols=[d[0] for d in cur.description]; c.close()
     if not r: print("no such task"); return
     for k,v in zip(cols,r): print(f"{k:13}: {v}")
@@ -456,7 +662,7 @@ p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.set_defaults(f=cmd_claim)
-s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
+s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
 s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
