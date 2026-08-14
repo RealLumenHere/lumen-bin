@@ -31,9 +31,24 @@ BACKUP = f"/home/lumen/backups/wq523_pre_redaction_{TS}"
 CANONICAL = {
     "/home/lumen/agent/.env",
     "/home/lumen/.git-credentials",
-    "/home/lumen/.secrets/github-lumen.token",
-    "/home/lumen/.secrets/github-lumen-classic.token",
 }
+# wq#565: the fleet convention is one credential per file under /home/lumen/.secrets, and
+# this module's own docstring says "/home/lumen/.secrets/*.token" is canonical. The code
+# said something narrower — two hardcoded filenames — so wq#524's github-frank.token was
+# reported STRAY the moment it was created, in the correct location, by the convention.
+# That is precisely the allowlist-someone-must-remember-to-extend failure the docstring
+# claims this tool avoids BY CONSTRUCTION, sitting inside the tool. Glob the directory so
+# the next correctly-placed secret does not have to be added by hand either.
+CANONICAL_GLOBS = ("/home/lumen/.secrets/*.token",)
+
+
+def canonical_set():
+    import glob as _glob
+    out = set(CANONICAL)
+    for g in CANONICAL_GLOBS:
+        out.update(_glob.glob(g))
+    return out
+
 # Verified false positives — a placeholder in vendored source, and a base64 fragment in a
 # pip RECORD file that merely matches the regex. Redacting either would be vandalism.
 FALSE_POSITIVE = {
@@ -71,10 +86,11 @@ def scan():
 
 def cmd_scan():
     files = scan()
-    stray = [f for f in files if f not in CANONICAL and f not in FALSE_POSITIVE]
+    canonical = canonical_set()
+    stray = [f for f in files if f not in canonical and f not in FALSE_POSITIVE]
     exposed = [f for f in stray if os.stat(f).st_mode & 0o007]
     print(f"pat-scan: {len(files)} file(s) hold a token literal; "
-          f"{len(CANONICAL & set(files))} canonical, {len(FALSE_POSITIVE & set(files))} "
+          f"{len(canonical & set(files))} canonical, {len(FALSE_POSITIVE & set(files))} "
           f"known false positive(s), {len(stray)} STRAY")
     for f in stray:
         mode = oct(os.stat(f).st_mode)[-3:]
@@ -84,16 +100,79 @@ def cmd_scan():
     return 1 if stray else 0
 
 
+def live_fingerprints():
+    """sha256 prefixes of the tokens currently in a canonical home — i.e. the values that
+    would still authenticate today. Never returns a token, only its fingerprint."""
+    live = set()
+    for f in sorted(canonical_set()):
+        try:
+            blob = open(f, "rb").read()
+        except OSError:
+            continue
+        for m in PAT.finditer(blob):
+            live.add(hashlib.sha256(m.group(0)).hexdigest()[:12])
+    return live
+
+
+def cmd_alert():
+    """STANDING CHECK for the timer (wq#565).
+
+    --scan is the full inventory and exits 1 on ANY stray, which on a daily timer is 29
+    lines of known backup residue every morning — an alert that fires every day is one
+    nobody reads. But the ticket is explicit that simply excluding backup dirs is wrong: a
+    LIVE credential in a backup is exactly what wq#523 found. So severity is a property of
+    the file, not of its directory:
+
+      CRITICAL  world-readable (any mode bit in 0o007), or holds a token that STILL
+                authenticates (fingerprint matches one in a canonical home)
+      noted     everything else — counted, never suppressed, but does not alert
+
+    Exit 1 only on CRITICAL. Never prints a token value.
+    """
+    files = scan()
+    canonical = canonical_set()
+    live = live_fingerprints()
+    stray = [f for f in files if f not in canonical and f not in FALSE_POSITIVE]
+
+    critical, noted = [], []
+    for f in stray:
+        try:
+            st = os.stat(f)
+            blob = open(f, "rb").read()
+        except OSError:
+            continue
+        world = bool(st.st_mode & 0o007)
+        fps = {hashlib.sha256(m.group(0)).hexdigest()[:12] for m in PAT.finditer(blob)}
+        hot = fps & live
+        why = []
+        if world:
+            why.append("WORLD-READABLE")
+        if hot:
+            why.append("LIVE token " + ",".join(sorted(hot)))
+        (critical if why else noted).append((f, oct(st.st_mode)[-3:], "; ".join(why)))
+
+    print(f"pat-alert: {len(stray)} stray file(s) — {len(critical)} CRITICAL, "
+          f"{len(noted)} noted (dead tokens in mode-600 backups)")
+    for f, mode, why in critical:
+        print(f"  CRITICAL {mode} {f}  [{why}]")
+    if not critical:
+        print("  no stray file is world-readable or holds a live token")
+    return 1 if critical else 0
+
+
 def main():
     if "--scan" in sys.argv:
         sys.exit(cmd_scan())
+    if "--alert" in sys.argv:
+        sys.exit(cmd_alert())
     files = scan()
+    canonical = canonical_set()
     todo = [f for f in files
-            if f not in CANONICAL and f not in FALSE_POSITIVE and f not in DELETE
+            if f not in canonical and f not in FALSE_POSITIVE and f not in DELETE
             and not f.startswith(EXCLUDE_PREFIX)]
     excluded = [f for f in files if f.startswith(EXCLUDE_PREFIX)]
     print(f"{'APPLY' if APPLY else 'DRY RUN'} — {len(files)} file(s) carry a token literal\n")
-    print(f"  {len(CANONICAL & set(files))} canonical (untouched)")
+    print(f"  {len(canonical & set(files))} canonical (untouched)")
     print(f"  {len(FALSE_POSITIVE & set(files))} verified false positives (untouched)")
     print(f"  {len([f for f in DELETE if os.path.exists(f)])} duplicate credential files -> DELETE")
     print(f"  {len(excluded)} in the 08-10 scrub backup-of-record (untouched; dead tokens, mode 700 — retention is Frank's call)")
