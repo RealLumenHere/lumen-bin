@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""lumen-repo-scope — the single enforcement point for "may an agent touch this repo?"
+
+wq#546. Reads /home/lumen/infra/github/agent-scope.conf. DEFAULT DENY: a repo with no
+ALLOW line cannot be written to. Every wired tool calls `check` and dies on a non-zero
+exit, so the answer lives in ONE file instead of in each tool's memory of a playbook.
+
+  lumen-repo-scope check <owner/repo|path> [--op write|publish|release|visibility]
+        exit 0 = permitted. exit 3 = DENIED (prints the rule that stopped it).
+        exit 4 = config missing/unreadable — DENY, because a fence that fails open is
+                 not a fence. Every caller must treat any non-zero as a refusal.
+  lumen-repo-scope class <owner/repo|path>     -> A | C | D | PUBLIC | UNKNOWN
+  lumen-repo-scope list [allow|never|public]
+  lumen-repo-scope why  <owner/repo|path>      -> human explanation of the verdict
+
+`publish`, `release` and `visibility` are DENIED FOR EVERY REPO WITHOUT EXCEPTION —
+those are human decisions (wq#546 deliverable 3). There is no allowlist that grants them,
+on purpose: an agent that can be told "yes" for one repo will be told "yes" for another.
+"""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+CONF = Path(os.environ.get("LUMEN_REPO_SCOPE_CONF",
+                           "/home/lumen/infra/github/agent-scope.conf"))
+VERBS = ("ALLOW", "NEVER", "PUBLIC")
+# Operations no repo may ever receive from an agent. Not a list of exceptions — a wall.
+HUMAN_ONLY = {"publish", "release", "visibility"}
+EXIT_DENIED, EXIT_CONFIG = 3, 4
+
+
+def load():
+    """-> ({verb: {slug}}, error_or_None). Never raises: callers must see a DENY."""
+    table = {v: set() for v in VERBS}
+    if not CONF.exists():
+        return table, f"scope config not found: {CONF}"
+    try:
+        text = CONF.read_text()
+    except OSError as e:
+        return table, f"scope config unreadable: {e}"
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2 or parts[0].upper() not in VERBS:
+            return table, f"{CONF}:{lineno}: not a valid directive: {raw.strip()!r}"
+        table[parts[0].upper()].add(parts[1])
+    return table, None
+
+
+def slug_of(target):
+    """Accept 'owner/repo' directly, or a repo PATH whose origin we resolve."""
+    t = (target or "").strip()
+    if not t:
+        return None, "empty target"
+    if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", t) and not os.path.isdir(t):
+        return t, None
+    if not os.path.isdir(t):
+        return None, f"not a repo path and not an owner/repo slug: {t!r}"
+    try:
+        url = subprocess.run(["git", "-C", t, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"cannot read origin of {t}: {e}"
+    if not url:
+        return None, f"{t} has no origin remote — cannot determine scope, so DENY"
+    # Strip scheme, any user@host:port, and a trailing .git. Handles both
+    # https://github.com/o/r.git and http://lumen@100.121.17.5:3000/o/r.git and scp-style.
+    u = re.sub(r"^[a-z+]+://", "", url)
+    u = re.sub(r"^[^/@]+@", "", u)
+    u = re.sub(r"\.git$", "", u)
+    u = u.replace(":", "/")
+    parts = [p for p in u.split("/") if p]
+    if len(parts) < 2:
+        return None, f"cannot derive owner/repo from origin {url!r}"
+    return "/".join(parts[-2:]), None
+
+
+def verdict(slug, table, op):
+    """-> (ok, reason). The order matters: NEVER beats ALLOW, always."""
+    if op in HUMAN_ONLY:
+        return False, (
+            f"'{op}' is a HUMAN decision and is denied for EVERY repo, including {slug}. "
+            f"No allowlist grants it (wq#546 §3). A release, a tag or a visibility change "
+            f"needs a ticket that names the repo AND a human who said yes. File and stop.")
+    if slug in table["NEVER"]:
+        return False, (
+            f"{slug} is NEVER (github-standards.md §1 Class D, DO-NOT-TOUCH). No work, no "
+            f"hygiene, no release, no visibility change. If it looks unfinished it is "
+            f"unfinished on purpose. File a ticket and stop.")
+    if slug in table["ALLOW"]:
+        return True, f"{slug} is ALLOW in {CONF}"
+    hint = ""
+    if slug in table["PUBLIC"]:
+        hint = (" It IS listed PUBLIC, which suppresses the visibility sentinel and confers "
+                "NO write permission — those are deliberately different questions.")
+    return False, (
+        f"{slug} is not ALLOWed. DEFAULT IS DENY: a repo absent from {CONF} is off-limits "
+        f"to agents (wq#546, github-standards.md §0a).{hint} A repo looking unpolished is "
+        f"not a licence to polish it — file a ticket and stop. Adding an ALLOW line is "
+        f"Frank's decision, not yours.")
+
+
+def classify(slug, table):
+    if slug in table["NEVER"]:
+        return "D"
+    if slug in table["ALLOW"]:
+        # Class A is the published product; everything else allowed is private ops.
+        return "A" if slug == "frankstupak/lumen-plays-pokemon" else "C"
+    if slug in table["PUBLIC"]:
+        return "PUBLIC"
+    return "UNKNOWN"
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    table, err = load()
+
+    if cmd == "list":
+        if err:
+            print(f"lumen-repo-scope: {err}", file=sys.stderr)
+            return EXIT_CONFIG
+        which = (rest[0].upper() if rest else None)
+        for v in VERBS:
+            if which and v != which:
+                continue
+            for s in sorted(table[v]):
+                print(f"{v} {s}")
+        return 0
+
+    if cmd not in ("check", "class", "why"):
+        print(f"lumen-repo-scope: unknown subcommand {cmd!r} (check|class|list|why)",
+              file=sys.stderr)
+        return 2
+    if not rest:
+        print(f"lumen-repo-scope: {cmd} needs <owner/repo|path>", file=sys.stderr)
+        return 2
+
+    op = "write"
+    args = list(rest)
+    if "--op" in args:
+        i = args.index("--op")
+        if i + 1 >= len(args):
+            print("lumen-repo-scope: --op needs a value", file=sys.stderr)
+            return 2
+        op = args[i + 1].lower()
+        del args[i:i + 2]
+    target = args[0]
+
+    # A broken config DENIES. Stated in the docstring and enforced here: the winforge
+    # failure was a fence that was not consulted; a fence that fails open is the same bug.
+    if err:
+        print(f"lumen-repo-scope: DENIED — {err}\n"
+              f"  A scope config that cannot be read denies everything. Fix the config; "
+              f"do not work around this.", file=sys.stderr)
+        return EXIT_CONFIG
+
+    slug, serr = slug_of(target)
+    if serr:
+        print(f"lumen-repo-scope: DENIED — {serr}", file=sys.stderr)
+        return EXIT_DENIED
+
+    if cmd == "class":
+        print(classify(slug, table))
+        return 0
+
+    ok, reason = verdict(slug, table, op)
+    if cmd == "why":
+        print(f"{slug}: {'PERMITTED' if ok else 'DENIED'} for op={op}\n  {reason}")
+        return 0 if ok else EXIT_DENIED
+    if ok:
+        return 0
+    print(f"lumen-repo-scope: DENIED ({op}) — {reason}", file=sys.stderr)
+    return EXIT_DENIED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

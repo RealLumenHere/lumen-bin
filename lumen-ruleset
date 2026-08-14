@@ -38,6 +38,13 @@ case "${1:-}" in
   apply)
     [ $# -ge 2 ] || { echo "usage: lumen-ruleset apply <owner/repo> [--with-ci CONTEXT]" >&2; exit 1; }
     repo=$2; payload=$(cat "$CFG")
+    # wq#546 SCOPE FENCE. `apply` MUTATES repo settings, so it goes through the same
+    # default-deny gate as lumen-pr. `plan` and `show` are read-only and are not gated.
+    if [ "${LUMEN_RULESET_SCOPE_CHECK:-1}" = 1 ]; then
+      SCOPE_BIN="${LUMEN_RULESET_SCOPE:-$BIN_DIR/lumen-repo-scope}"
+      [ -x "$SCOPE_BIN" ] || { echo "lumen-ruleset: scope checker missing at $SCOPE_BIN — DENIED. A fence that fails open is not a fence (wq#546)." >&2; exit 1; }
+      "$SCOPE_BIN" check "$repo" --op write || { echo "lumen-ruleset: refusing to apply a ruleset to $repo — see the verdict above (wq#546). If it should be in scope, that is Frank's decision: file a ticket and stop." >&2; exit 1; }
+    fi
     resolve_github_token "$repo" || exit 1; T="$GITHUB_TOKEN"
     if [ "${3:-}" = "--with-ci" ]; then
       ctx=${4:?--with-ci needs a check-run name}

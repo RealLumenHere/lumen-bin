@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""gh-audit -- read-only repo scorecard against github-standards.md section 12.
+
+wq#497. Scores each repo owned by --user (default frankstupak) against the
+hygiene checklist in /home/lumen/instructions/playbooks/github-standards.md:
+description, topics, LICENSE, README quick-start, CONTRIBUTING, SECURITY,
+PR/issue templates, CI presence+health, branch ruleset, releases/tags,
+delete-branch-on-merge, stale branches, direct-to-main-since-tag drift, and
+Conventional Commits / wq#-in-subject hygiene. Checks are scoped by repo class
+(A/B/C, section 1 of the standard) so a fork isn't penalized for missing a
+CONTRIBUTING.md that belongs to its upstream.
+
+Usage:
+  gh-audit [--user LOGIN] [--repo NAME] [--json] [--include-archived]
+
+Never mutates anything -- GET and GraphQL read queries only. Token is read
+from /home/lumen/agent/.env (GITHUB_TOKEN), with an optional per-repo
+override from /home/lumen/infra/github/identity-map.conf (same convention as
+lumen-github-identity.sh). The token is never printed or logged.
+"""
+import argparse
+import base64
+import datetime
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ENV_FILE = Path("/home/lumen/agent/.env")
+IDENTITY_MAP = Path("/home/lumen/infra/github/identity-map.conf")
+API = "https://api.github.com"
+GRAPHQL = "https://api.github.com/graphql"
+UA = "lumen-gh-audit"
+
+# github-standards.md section 1 -- repo class drives which checks apply.
+#
+# wq#546: these sets used to be HARDCODED HERE, and CLASS_A still listed winforge,
+# claude-command-center, tiny-whale, lumen-blog and lumen-content long after section 1
+# was corrected to "Class A has exactly ONE member" and winforge moved to Class D.
+# gh-audit is read-only and could not publish anything itself -- what it did was emit a
+# scorecard saying winforge lacked a LICENSE, README, CHANGELOG and release, which is
+# PRECISELY THE INPUT THAT LED AN AGENT TO RUN SECTION 6 ON IT. A machine copy of a
+# corrected table is exactly as dangerous as the wrong table, and nobody checked it
+# because gh-audit is not a playbook.
+#
+# The class now comes from /home/lumen/infra/github/agent-scope.conf via lumen-repo-scope,
+# so there is ONE table. CLASS_B stays local: it is a list of upstream forks, which is a
+# fact about provenance rather than about what agents may publish.
+SCOPE_BIN = "/home/lumen/bin/lumen-repo-scope"
+CLASS_B = {"simpill-utils", "interview-prep", "acp-llm-cli", "supergateway",
+           "agent-orchestrator"}
+
+CONV_TYPES = r"feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+CONV_RE = re.compile(rf"^({CONV_TYPES})(\([a-z0-9._-]+\))?!?: .{{1,72}}$")
+BAN_WQ_RE = re.compile(r"wq#\d+", re.IGNORECASE)
+BAN_BOARD_RE = re.compile(r"\bboard:", re.IGNORECASE)
+MERGE_RE = re.compile(r"^Merge (pull request|branch|remote-tracking branch)")
+
+JUNK_PATTERNS = [
+    (re.compile(r"(^|/)\.env(\.(?!example$|sample$|template$|dist$)[^./]+)?$", re.IGNORECASE),
+     ".env file (excludes .env.example/.sample/.template/.dist)"),
+    (re.compile(r"\.gb$", re.IGNORECASE), "gameboy ROM (*.gb)"),
+    (re.compile(r"\.gbc$", re.IGNORECASE), "gameboy color ROM (*.gbc)"),
+    (re.compile(r"\.nes$", re.IGNORECASE), "NES ROM (*.nes)"),
+    (re.compile(r"\.sfc$", re.IGNORECASE), "SNES ROM (*.sfc)"),
+    (re.compile(r"(^|/)node_modules/"), "node_modules/"),
+    (re.compile(r"\.log$"), "*.log"),
+    (re.compile(r"(^|/)logs?/"), "logs/ directory"),
+    (re.compile(r"(^|/)\.DS_Store$"), ".DS_Store"),
+]
+
+TOKEN_LEAK_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{6})[A-Za-z0-9_]*|github_pat_[A-Za-z0-9_]{6,}")
+
+
+def redact(text):
+    if not text:
+        return text
+    return TOKEN_LEAK_RE.sub(r"\1REDACTED", text)
+
+
+def load_default_token():
+    if not ENV_FILE.is_file():
+        return None
+    for line in ENV_FILE.read_text().splitlines():
+        if line.startswith("GITHUB_TOKEN="):
+            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return val or None
+    return None
+
+
+def load_identity_map():
+    out = {}
+    if not IDENTITY_MAP.is_file():
+        return out
+    for line in IDENTITY_MAP.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        slug, path = line.split("=", 1)
+        out[slug.strip()] = path.strip()
+    return out
+
+
+def resolve_token(slug, default_token, identity_map):
+    mapped = identity_map.get(slug)
+    if mapped:
+        p = Path(mapped)
+        if p.is_file():
+            tok = p.read_text().strip()
+            if tok:
+                return tok, mapped
+    return default_token, str(ENV_FILE)
+
+
+class GhError(Exception):
+    pass
+
+
+def gh_request(url, token, method="GET", data=None, retries=3):
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": UA,
+               "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else None), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                parsed = json.loads(raw) if raw else None
+            except json.JSONDecodeError:
+                parsed = None
+            if e.code in (403, 429) and attempt < retries - 1:
+                retry_after = e.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else (2 ** attempt)
+                time.sleep(min(wait, 15))
+                continue
+            return e.code, parsed, dict(e.headers)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise GhError(redact(str(e)))
+    raise GhError("exhausted retries")
+
+
+def gh_get(path_or_url, token, params=None):
+    url = path_or_url if path_or_url.startswith("http") else f"{API}{path_or_url}"
+    if params:
+        from urllib.parse import urlencode
+        url = f"{url}{'&' if '?' in url else '?'}{urlencode(params)}"
+    status, data, headers = gh_request(url, token)
+    return status, data, headers
+
+
+def gh_get_all_pages(path, token, params=None, per_page=100, max_pages=20):
+    params = dict(params or {})
+    params["per_page"] = per_page
+    out = []
+    page = 1
+    while page <= max_pages:
+        params["page"] = page
+        status, data, _ = gh_get(path, token, params)
+        if status != 200 or not isinstance(data, list):
+            return status, out
+        out.extend(data)
+        if len(data) < per_page:
+            break
+        page += 1
+    return 200, out
+
+
+def graphql(query, variables, token):
+    status, data, _ = gh_request(GRAPHQL, token, method="POST",
+                                  data={"query": query, "variables": variables})
+    if status != 200 or data is None or "errors" in data:
+        return None
+    return data.get("data")
+
+
+REFS_QUERY = """
+query($o:String!, $r:String!, $after:String) {
+  repository(owner:$o, name:$r) {
+    refs(refPrefix:"refs/heads/", first:100, after:$after) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { name target { ... on Commit { committedDate } } }
+    }
+  }
+}
+"""
+
+
+def fetch_branch_dates(owner, repo, token, cap=3000):
+    """Returns (branch_list, capped_bool) via GraphQL -- avoids N+1 REST calls."""
+    branches = []
+    after = None
+    capped = False
+    while True:
+        data = graphql(REFS_QUERY, {"o": owner, "r": repo, "after": after}, token)
+        if data is None or not data.get("repository"):
+            break
+        refs = data["repository"]["refs"]
+        for n in refs["nodes"]:
+            date = None
+            if n.get("target") and n["target"].get("committedDate"):
+                date = n["target"]["committedDate"]
+            branches.append((n["name"], date))
+        if len(branches) >= cap:
+            capped = True
+            break
+        if refs["pageInfo"]["hasNextPage"]:
+            after = refs["pageInfo"]["endCursor"]
+        else:
+            break
+    return branches, capped
+
+
+def list_dir(owner, repo, path, token):
+    """Returns (list-of-names, dict-of-name->type) or (None, None) if not found."""
+    status, data, _ = gh_get(f"/repos/{owner}/{repo}/contents/{path}", token)
+    if status == 404:
+        return [], {}
+    if status != 200 or not isinstance(data, list):
+        return None, None
+    return [x["name"] for x in data], {x["name"]: x["type"] for x in data}
+
+
+def get_file_text(owner, repo, path, token, max_bytes=200_000):
+    status, data, _ = gh_get(f"/repos/{owner}/{repo}/contents/{path}", token)
+    if status != 200 or not isinstance(data, dict) or data.get("type") != "file":
+        return None
+    if data.get("encoding") == "base64" and data.get("content"):
+        try:
+            raw = base64.b64decode(data["content"])
+        except Exception:
+            return None
+        return raw[:max_bytes].decode("utf-8", errors="replace")
+    return None
+
+
+def find_name(names_dict, prefixes):
+    """Case-insensitive match of a root-listing name against known prefixes (README, LICENSE, ...)."""
+    for name, typ in names_dict.items():
+        if typ != "file":
+            continue
+        for p in prefixes:
+            if name.upper().startswith(p.upper()):
+                return name
+    return None
+
+
+_SCOPE_CLASS_CACHE = {}
+
+
+def repo_class(name, owner="frankstupak"):
+    """Class from the shared scope config; CLASS_B (upstream forks) stays local.
+
+    Any failure to reach the scope config returns None -- UNCLASSIFIED, which means the
+    repo is REPORTED but never scored against the full public-product standard. That is
+    the safe direction: an unreadable config must not silently promote a repo to Class A
+    and start telling an agent it is missing a release (wq#546).
+    """
+    if name in CLASS_B:
+        return "B"
+    slug = f"{owner}/{name}"
+    if slug in _SCOPE_CLASS_CACHE:
+        return _SCOPE_CLASS_CACHE[slug]
+    verdict = None
+    try:
+        out = subprocess.run([SCOPE_BIN, "class", slug],
+                             capture_output=True, text=True, timeout=20)
+        got = out.stdout.strip()
+        if out.returncode == 0 and got in ("A", "C", "D"):
+            verdict = got
+        # "PUBLIC" and "UNKNOWN" both mean: not an agent-writable repo. Leave it
+        # unclassified so the full standard is NOT applied to it.
+    except (OSError, subprocess.SubprocessError):
+        verdict = None
+    _SCOPE_CLASS_CACHE[slug] = verdict
+    return verdict
+
+
+def list_repos(user, token, include_archived):
+    # Authenticated /user/repos sees private repos IFF the token belongs to `user`;
+    # falls back to the public-only /users/{login}/repos listing otherwise.
+    status, whoami, _ = gh_get("/user", token) if token else (0, None, None)
+    repos = None
+    note = None
+    if token and status == 200 and whoami and whoami.get("login", "").lower() == user.lower():
+        status2, data = gh_get_all_pages("/user/repos", token, {"affiliation": "owner"})
+        if status2 == 200:
+            repos = data
+    if repos is None:
+        status2, data = gh_get_all_pages(f"/users/{user}/repos", token, {"type": "owner"})
+        if status2 != 200:
+            raise GhError(f"could not list repos for {user}: HTTP {status2}")
+        repos = data
+        note = "authenticated as a different account (or no token) -- only PUBLIC repos are visible"
+    if not include_archived:
+        repos = [r for r in repos if not r.get("archived")]
+    return repos, note
+
+
+def days_ago(iso_date):
+    if not iso_date:
+        return None
+    dt = datetime.datetime.strptime(iso_date, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    return (datetime.datetime.now(datetime.timezone.utc) - dt).days
+
+
+def audit_repo(repo_meta, token, identity_map, default_token):
+    owner = repo_meta["owner"]["login"]
+    name = repo_meta["name"]
+    slug = f"{owner}/{name}"
+    tok, tok_source = resolve_token(slug, default_token, identity_map)
+    default_branch = repo_meta.get("default_branch", "main")
+    cls = repo_class(name)
+    errors = []
+    checks = []  # (key, label, passed:bool|None, scored:bool, note)
+    info = {}
+
+    def add(key, label, passed, scored, note=""):
+        checks.append({"key": key, "label": label, "passed": passed, "scored": scored, "note": note})
+
+    # --- universal: repo metadata already in hand ---
+    info["private"] = repo_meta.get("private")
+    info["homepage"] = repo_meta.get("homepage") or None
+    info["description"] = repo_meta.get("description") or None
+    info["topics"] = repo_meta.get("topics") or []
+    info["archived"] = repo_meta.get("archived")
+
+    full_standard = cls == "A"
+
+    # wq#546: Class D is DO-NOT-TOUCH. It is still INSPECTED (read-only, and knowing its
+    # state is the point of an audit) but it must never be presented as work waiting to be
+    # done -- a scorecard reading "missing LICENSE, missing release" is what an agent acted
+    # on to publish winforge. The banner rides on the record so every consumer sees it.
+    if cls == "D":
+        add("class-d", "Class D DO-NOT-TOUCH: no hygiene, no license, no release, no "
+                       "visibility change. Any gap below is INTENTIONAL. File a ticket "
+                       "and stop (github-standards.md §0a/§1).", None, False)
+
+    if full_standard:
+        add("description", "description set", bool(info["description"]), True)
+        add("topics", "at least 4 topics", len(info["topics"]) >= 4, True,
+            f"{len(info['topics'])} set")
+        add("homepage", "homepage set", bool(info["homepage"]), False,
+            "informational only -- not every repo needs a site")
+        add("license", "LICENSE present", bool(repo_meta.get("license")), True)
+
+    # --- root contents ---
+    try:
+        root_names, root_types = list_dir(owner, name, "", tok)
+    except GhError as e:
+        errors.append(f"root listing: {e}")
+        root_names, root_types = None, None
+
+    if root_types is None:
+        errors.append("could not list repo root contents")
+        root_types = {}
+
+    readme_name = find_name(root_types, ["README"])
+    license_name = find_name(root_types, ["LICENSE", "LICENCE", "COPYING"])
+    contributing_name = find_name(root_types, ["CONTRIBUTING"])
+    security_name = find_name(root_types, ["SECURITY"])
+
+    if full_standard:
+        add("readme_present", "README present", bool(readme_name), True)
+        if readme_name:
+            text = get_file_text(owner, name, readme_name, tok) or ""
+            words = len(text.split())
+            has_quickstart = bool(re.search(r"^#{1,6}\s*.*(quick\s*start|getting started)",
+                                             text, re.IGNORECASE | re.MULTILINE))
+            add("readme_quickstart", "README has a quick-start heading", has_quickstart, True)
+            add("readme_concise", "README is not a 10-minute read (<=2500 words)",
+                words <= 2500, True, f"{words} words")
+        else:
+            add("readme_quickstart", "README has a quick-start heading", False, True)
+            add("readme_concise", "README is not a 10-minute read (<=2500 words)", False, True)
+        add("contributing", "CONTRIBUTING.md present", bool(contributing_name), True)
+        add("security", "SECURITY.md present", bool(security_name), True)
+        # license file may exist even if GitHub's SPDX detector returned null
+        if not repo_meta.get("license") and license_name:
+            for c in checks:
+                if c["key"] == "license":
+                    c["passed"] = True
+                    c["note"] = f"{license_name} present (unrecognized SPDX id)"
+
+    # --- .github dir ---
+    try:
+        gh_names, gh_types = list_dir(owner, name, ".github", tok)
+    except GhError as e:
+        errors.append(f".github listing: {e}")
+        gh_names, gh_types = [], {}
+    gh_names = gh_names or []
+    gh_types = gh_types or {}
+
+    if full_standard:
+        pr_template = "pull_request_template.md" in [n.lower() for n in gh_names] or \
+            bool(find_name(gh_types, ["pull_request_template", "PULL_REQUEST_TEMPLATE"]))
+        add("pr_template", ".github/pull_request_template.md present", pr_template, True)
+        issue_template_dir = gh_types.get("ISSUE_TEMPLATE") == "dir"
+        add("issue_template", ".github/ISSUE_TEMPLATE/ present", issue_template_dir, True)
+
+    # --- CI ---
+    workflows_present = False
+    if gh_types.get("workflows") == "dir":
+        try:
+            wf_names, wf_types = list_dir(owner, name, ".github/workflows", tok)
+            workflows_present = bool(wf_types) and any(
+                n.endswith((".yml", ".yaml")) for n in (wf_types or {}))
+        except GhError as e:
+            errors.append(f"workflows listing: {e}")
+
+    if full_standard:
+        add("ci_present", "CI workflow present", workflows_present, True)
+        ci_green = None
+        if workflows_present:
+            status, runs, _ = gh_get(f"/repos/{owner}/{name}/actions/runs", tok,
+                                      params={"branch": default_branch, "per_page": 1})
+            if status == 200 and runs and runs.get("workflow_runs"):
+                latest = runs["workflow_runs"][0]
+                ci_green = latest.get("conclusion") == "success"
+                info["ci_last_run"] = {"status": latest.get("status"),
+                                        "conclusion": latest.get("conclusion"),
+                                        "run_number": latest.get("run_number")}
+            elif status == 200:
+                info["ci_last_run"] = None
+        add("ci_green", "CI green on default branch", ci_green, workflows_present,
+            "no CI runs yet" if workflows_present and ci_green is None else "")
+
+    # --- ruleset / branch protection ---
+    protection = None
+    status, rulesets, _ = gh_get(f"/repos/{owner}/{name}/rulesets", tok)
+    if status == 200 and isinstance(rulesets, list):
+        active = [rs for rs in rulesets if rs.get("target") == "branch"
+                  and rs.get("enforcement") == "active"]
+        protection = "ruleset" if active else False
+    elif status == 403:
+        status2, prot, _ = gh_get(f"/repos/{owner}/{name}/branches/{default_branch}/protection", tok)
+        if status2 == 200:
+            protection = "branch_protection"
+        elif status2 == 404:
+            protection = False
+        else:
+            protection = None  # unavailable on this plan -- not checkable
+
+    if full_standard:
+        add("ruleset", "ruleset or branch protection on main", bool(protection),
+            protection is not None,
+            "not checkable on this plan (private repo, free tier)" if protection is None else "")
+
+    # --- releases / tags ---
+    status, releases, _ = gh_get(f"/repos/{owner}/{name}/releases", tok, {"per_page": 1})
+    status_t, tags, _ = gh_get(f"/repos/{owner}/{name}/tags", tok, {"per_page": 1})
+    has_release_or_tag = bool(releases) or bool(tags)
+    if full_standard:
+        add("release_or_tag", "at least one release or tag", has_release_or_tag, True)
+        add("delete_branch_on_merge", "delete_branch_on_merge enabled",
+            bool(repo_meta.get("delete_branch_on_merge")), True)
+
+    if cls == "B":
+        add("delete_branch_on_merge", "delete_branch_on_merge enabled",
+            bool(repo_meta.get("delete_branch_on_merge")), True,
+            "section 1/9: our extra on forks")
+
+    # --- direct-to-main-since-tag drift ---
+    since_tag_count = None
+    if tags:
+        tag_sha = tags[0]["commit"]["sha"]
+        status_c, cmp_data, _ = gh_get(f"/repos/{owner}/{name}/compare/{tag_sha}...{default_branch}", tok)
+        if status_c == 200 and cmp_data:
+            since_tag_count = cmp_data.get("ahead_by")
+    info["commits_since_last_tag"] = since_tag_count
+    info["last_tag"] = tags[0]["name"] if tags else None
+    if full_standard:
+        add("no_direct_to_main_since_tag", "no commits landed directly on main since last tag",
+            (since_tag_count == 0) if since_tag_count is not None else None,
+            since_tag_count is not None,
+            "no tags yet -- cannot measure drift" if since_tag_count is None else
+            f"{since_tag_count} commit(s) since {info['last_tag']}")
+
+    # --- commit subject hygiene (sampled, universal) ---
+    status, commits = gh_get_all_pages(f"/repos/{owner}/{name}/commits", tok,
+                                        {"sha": default_branch}, per_page=100, max_pages=1)
+    violations = []
+    sampled = 0
+    if status == 200:
+        for c in commits:
+            msg = (c.get("commit", {}) or {}).get("message", "")
+            subject = msg.splitlines()[0] if msg else ""
+            if not subject or MERGE_RE.match(subject):
+                continue
+            sampled += 1
+            bad = []
+            if not CONV_RE.match(subject):
+                bad.append("not Conventional Commits")
+            if BAN_WQ_RE.search(subject):
+                bad.append("contains wq#")
+            if BAN_BOARD_RE.search(subject):
+                bad.append("contains board:")
+            if bad:
+                violations.append({"sha": c.get("sha", "")[:7], "subject": subject, "reason": bad})
+    info["commit_subjects_sampled"] = sampled
+    info["commit_subject_violations"] = violations
+    add("commit_hygiene", "sampled commit subjects follow Conventional Commits, no wq#/board:",
+        len(violations) == 0 if sampled else None, sampled > 0,
+        f"{len(violations)}/{sampled} violate" if sampled else "no non-merge commits sampled")
+
+    # --- secrets / junk tracked files (universal, whole tree) ---
+    status, tree, _ = gh_get(f"/repos/{owner}/{name}/git/trees/{default_branch}", tok, {"recursive": 1})
+    junk_hits = []
+    tree_truncated = False
+    if status == 200 and tree:
+        tree_truncated = bool(tree.get("truncated"))
+        for entry in tree.get("tree", []):
+            if entry.get("type") != "blob":
+                continue
+            path = entry["path"]
+            for pat, label in JUNK_PATTERNS:
+                if pat.search(path):
+                    junk_hits.append(f"{path} ({label})")
+                    break
+    info["junk_files"] = junk_hits
+    info["tree_truncated"] = tree_truncated
+    add("no_secrets_or_junk", "no tracked secret/junk files (.env, ROMs, node_modules, logs)",
+        len(junk_hits) == 0, True,
+        f"{len(junk_hits)} hit(s)" + (" (tree truncated by API, may be incomplete)" if tree_truncated else ""))
+
+    # --- branches (all classes, GraphQL to avoid N+1) ---
+    try:
+        branches, capped = fetch_branch_dates(owner, name, tok)
+    except Exception as e:
+        errors.append(f"branch listing: {redact(str(e))}")
+        branches, capped = [], False
+    non_default = [b for b in branches if b[0] != default_branch]
+    stale = [b for b in non_default if days_ago(b[1]) is not None and days_ago(b[1]) > 90]
+    info["branch_count"] = len(branches)
+    info["stale_branch_count"] = len(stale)
+    info["stale_branch_names"] = [b[0] for b in stale][:20]
+    info["branch_list_capped"] = capped
+
+    if cls in ("A", "B"):
+        add("stale_branches", "no branches stale >90 days", len(stale) == 0, True,
+            f"{len(stale)}/{len(non_default)} stale" +
+            (" (capped at 3000, more may exist)" if capped else ""))
+
+    scored = [c for c in checks if c["scored"] and c["passed"] is not None]
+    passed = [c for c in scored if c["passed"]]
+    pct = round(100 * len(passed) / len(scored)) if scored else None
+    grade = None
+    if pct is not None:
+        grade = "A" if pct >= 90 else "B" if pct >= 80 else "C" if pct >= 70 else \
+            "D" if pct >= 60 else "F"
+
+    return {
+        "repo": slug,
+        "class": cls or "unclassified",
+        "default_branch": default_branch,
+        "grade": grade,
+        "score_pct": pct,
+        "checks": checks,
+        "info": info,
+        "errors": errors,
+        "token_source": tok_source,
+    }
+
+
+def format_text(results, fleet_note):
+    lines = []
+    if fleet_note:
+        lines.append(f"NOTE: {fleet_note}")
+        lines.append("")
+    for r in results:
+        pct_suffix = f" ({r['score_pct']}%)" if r["score_pct"] is not None else ""
+        lines.append(f"=== {r['repo']}  [class {r['class']}]  "
+                      f"grade: {r['grade'] or 'n/a'}{pct_suffix} ===")
+        if r["errors"]:
+            for e in r["errors"]:
+                lines.append(f"  ERROR: {e}")
+        missing = [c for c in r["checks"] if c["scored"] and c["passed"] is False]
+        na = [c for c in r["checks"] if c["scored"] and c["passed"] is None]
+        info_only = [c for c in r["checks"] if not c["scored"]]
+        if missing:
+            lines.append("  MISSING:")
+            for c in missing:
+                note = f" ({c['note']})" if c["note"] else ""
+                lines.append(f"    - {c['label']}{note}")
+        if na:
+            lines.append("  NOT CHECKABLE:")
+            for c in na:
+                note = f" ({c['note']})" if c["note"] else ""
+                lines.append(f"    - {c['label']}{note}")
+        if info_only:
+            for c in info_only:
+                mark = "n/a" if c["passed"] is None else ("yes" if c["passed"] else "no")
+                note = f" ({c['note']})" if c["note"] else ""
+                lines.append(f"  info: {c['label']}: {mark}{note}")
+        i = r["info"]
+        lines.append(f"  branches: {i['branch_count']} total, {i['stale_branch_count']} stale >90d"
+                      + (" [capped]" if i.get("branch_list_capped") else ""))
+        lines.append(f"  commits since last tag: {i['commits_since_last_tag']} "
+                      f"(last tag: {i['last_tag'] or 'none'})")
+        lines.append(f"  commit subjects sampled: {i['commit_subjects_sampled']}, "
+                      f"violations: {len(i['commit_subject_violations'])}")
+        if i["commit_subject_violations"]:
+            for v in i["commit_subject_violations"][:10]:
+                lines.append(f"    {v['sha']} \"{v['subject']}\" -- {', '.join(v['reason'])}")
+        if i["junk_files"]:
+            lines.append(f"  junk/secret files tracked: {', '.join(i['junk_files'][:10])}")
+        lines.append("")
+
+    lines.append("=== FLEET SUMMARY ===")
+    header = f"{'repo':<38} {'class':<6} {'grade':<6} {'score':<7} {'missing':<8} {'branches(stale)':<16} {'since-tag'}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for r in results:
+        missing_n = len([c for c in r["checks"] if c["scored"] and c["passed"] is False])
+        i = r["info"]
+        branches_col = f"{i['branch_count']}({i['stale_branch_count']})"
+        lines.append(
+            f"{r['repo']:<38} {r['class']:<6} {r['grade'] or '-':<6} "
+            f"{(str(r['score_pct']) + '%') if r['score_pct'] is not None else '-':<7} "
+            f"{missing_n:<8} {branches_col:<16} "
+            f"{i['commits_since_last_tag'] if i['commits_since_last_tag'] is not None else '-'}"
+        )
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read-only repo hygiene scorecard (github-standards.md sec. 12)")
+    ap.add_argument("--user", default="frankstupak")
+    ap.add_argument("--repo", default=None, help="audit a single repo by name (not owner/name)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--include-archived", action="store_true")
+    args = ap.parse_args()
+
+    default_token = load_default_token()
+    identity_map = load_identity_map()
+    if not default_token:
+        print("gh-audit: no GITHUB_TOKEN in /home/lumen/agent/.env -- "
+              "continuing unauthenticated (public repos only, low rate limit)", file=sys.stderr)
+
+    try:
+        repos, fleet_note = list_repos(args.user, default_token, args.include_archived)
+    except GhError as e:
+        print(f"gh-audit: {redact(str(e))}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.repo:
+        repos = [r for r in repos if r["name"] == args.repo]
+        if not repos:
+            print(f"gh-audit: {args.repo} not found for {args.user} "
+                  f"(or excluded as archived; pass --include-archived)", file=sys.stderr)
+            sys.exit(1)
+
+    def run_one(repo_meta):
+        try:
+            return audit_repo(repo_meta, default_token, identity_map, default_token)
+        except GhError as e:
+            return {"repo": repo_meta.get("full_name", repo_meta.get("name")),
+                     "class": "error", "grade": None, "score_pct": None,
+                     "checks": [], "info": {}, "errors": [redact(str(e))]}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(run_one, repos))
+    results.sort(key=lambda r: r["repo"])
+
+    if args.json:
+        print(json.dumps({"fleet_note": fleet_note, "repos": results}, indent=2))
+    else:
+        print(format_text(results, fleet_note))
+
+
+if __name__ == "__main__":
+    main()

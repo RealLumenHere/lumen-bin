@@ -139,6 +139,32 @@ need_repo() {
   esac
   DEFAULT_BRANCH=$(git -C "$REPO_PATH" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
   [ -n "${DEFAULT_BRANCH:-}" ] || DEFAULT_BRANCH=main
+
+  # wq#546 SCOPE FENCE. Every mutating subcommand routes through need_repo, so this is the
+  # one chokepoint that covers start/commit/open/land. DEFAULT DENY: a repo with no ALLOW
+  # line in agent-scope.conf is refused here, including a repo a playbook says is Class A.
+  # A wrong sentence in a doc published winforge; a wrong sentence can no longer push.
+  # LUMEN_PR_SCOPE_CHECK=0 exists for the probe ONLY — never set it to work around a DENY.
+  if [ "${LUMEN_PR_SCOPE_CHECK:-1}" = 1 ] && [ "${SCOPE_OP:-write}" != "none" ]; then
+    local scope_bin="${LUMEN_PR_SCOPE:-$BIN_DIR/lumen-repo-scope}"
+    if [ -x "$scope_bin" ]; then
+      # Pass the PATH, not "$SLUG". lumen-pr's own slug sed only strips `https://`, so a
+      # Gitea origin (http://user@host:3000/owner/repo.git) becomes the ENTIRE URL as the
+      # slug — that is wq#557, and it is why every API call 404s against lumen-bin. Feeding
+      # that string to the fence made the fence DENY the fleet's own tooling repo, which I
+      # hit while landing this very change. lumen-repo-scope does its own derivation
+      # (strips scheme, userinfo, port, .git, scp-form) and is the stricter of the two, so
+      # the SAFETY decision uses the correct owner/repo even while the API path is broken.
+      "$scope_bin" check "$REPO_PATH" --op "${SCOPE_OP:-write}" || \
+        die "refusing to operate on $SLUG — see the scope verdict above.
+      This is github-standards.md §0a made mechanical (wq#546). If you believe the repo
+      SHOULD be in scope, that is Frank's decision: file a ticket and stop. Do not edit
+      /home/lumen/infra/github/agent-scope.conf to unblock yourself."
+    else
+      die "scope checker not found at $scope_bin, so this operation is DENIED.
+      A fence that fails open is not a fence (wq#546). Restore lumen-repo-scope."
+    fi
+  fi
 }
 
 api() { # api <method> <path> [json-body]
@@ -520,8 +546,11 @@ case "${1:-}" in
   commit) shift; cmd_commit "$@" ;;
   open)   shift; cmd_open "$@" ;;
   land)   shift; cmd_land "$@" ;;
-  gitlock) shift; cmd_gitlock "$@" ;;
-  check)  shift; cmd_check "$@" ;;
+  # wq#546: gitlock and check are READ-ONLY inspections. They still resolve a repo, but
+  # refusing to LOOK at an out-of-scope repo would push agents toward raw git, which is the
+  # opposite of a chokepoint. The fence guards mutation; SCOPE_OP=none marks a non-mutation.
+  gitlock) shift; SCOPE_OP=none cmd_gitlock "$@" ;;
+  check)  shift; SCOPE_OP=none cmd_check "$@" ;;
   ''|-h|--help|help)
     sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock)" ;;
