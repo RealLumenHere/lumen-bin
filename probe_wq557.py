@@ -73,8 +73,17 @@ check("B1", "lumen/lumen-bin" in out,
       "the slug resolves to owner/repo instead of the whole origin URL")
 check("B2", "open PRs:" in out,
       "*** the open-PR line PRINTS — this is the line that silently never appeared ***")
-check("B3", "gitea" in out.lower() and "GITEA_TOKEN" in out,
-      "and it authenticated with the Gitea token, not a github.com PAT")
+# wq#524: B3 used to assert the literal string "GITEA_TOKEN", which pinned the SOURCE
+# (agent/.env's variable name) rather than the contract (a Gitea credential, not a
+# github.com PAT). Moving the token to /home/lumen/.secrets/gitea-lumen.token turned it red
+# while the behaviour was correct. Assert the contract from both sides instead: the reported
+# source is Gitea-specific, AND no github.com identity is named on the line.
+_auth = next((l for l in out.splitlines() if "authenticating to" in l), "")
+check("B3", "gitea" in _auth.lower()
+      and ("gitea-lumen.token" in _auth or "GITEA_TOKEN" in _auth)
+      and "github-frank.token" not in _auth
+      and "GITHUB_TOKEN" not in _auth,
+      f"authenticated with a Gitea credential, not a github.com PAT ({_auth.strip()!r})")
 # B4 passes on BOTH builds and is recorded as an invariant, not a discriminator: the old
 # build also exited 0 — by omitting the line entirely. That silence IS the defect, which is
 # why B2 rather than B4 is the load-bearing assertion here.

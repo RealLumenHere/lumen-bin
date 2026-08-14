@@ -22,8 +22,10 @@
 # A rule a careful agent cannot execute reliably is a broken rule, not a discipline problem.
 #
 # Every subcommand is idempotent and exits non-zero with a readable reason.
-# Token: resolved per-repo by lumen-github-identity.sh (wq#525), falling back to
-# GITHUB_TOKEN in /home/lumen/agent/.env. Never printed, never committed.
+# Token: resolved per-repo by lumen-github-identity.sh (wq#525) — identity-map entry,
+# then /home/lumen/.secrets/github-frank.token, then the deprecated GITHUB_TOKEN in
+# /home/lumen/agent/.env (wq#524). Gitea repos take the same ladder from
+# /home/lumen/.secrets/gitea-lumen.token. Never printed, never committed.
 set -uo pipefail
 
 BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
@@ -54,16 +56,30 @@ redact() { sed -E 's#(gh[pousr]_[A-Za-z0-9]{6})[A-Za-z0-9_]*#\1REDACTED#g; s#htt
 
 load_token() {
   # SLUG is set by need_repo, which every caller of load_token runs first.
-  # wq#557: a Gitea repo needs the GITEA_TOKEN, not a github.com PAT. Resolve it from the
-  # same env file rather than inventing a second secrets convention. The variable stays
+  # wq#557: a Gitea repo needs the GITEA_TOKEN, not a github.com PAT. The variable stays
   # named GITHUB_TOKEN downstream so api() has one contract; only the SOURCE differs.
   if [ "${FORGE:-github}" = gitea ]; then
-    # shellcheck disable=SC1091
-    [ -f /home/lumen/agent/.env ] && . /home/lumen/agent/.env
-    [ -n "${GITEA_TOKEN:-}" ] || die "no GITEA_TOKEN in /home/lumen/agent/.env for $SLUG on $FORGE_HOST.
+    # wq#524: same ladder as the github side — .secrets first, agent/.env as the
+    # deprecated fallback. This used to `. /home/lumen/agent/.env`, which dragged
+    # EVERY key in that file (model providers, n8n, ghost, webapp creds) into this
+    # shell and into the environment of every git/curl/jq child it spawns, purely
+    # to read one variable. Extract the one line instead; never source the file.
+    local gitea_file=${GITEA_TOKEN_FILE:-/home/lumen/.secrets/gitea-lumen.token}
+    local gt=""
+    if [ -r "$gitea_file" ]; then
+      gt=$(tr -d '\n\r' < "$gitea_file")
+      [ -n "$gt" ] && TOKEN_SOURCE="$gitea_file"
+    fi
+    if [ -z "$gt" ] && [ -r /home/lumen/agent/.env ]; then
+      gt=$(grep -m1 -E '^GITEA_TOKEN=' /home/lumen/agent/.env | cut -d= -f2- | tr -d '"'\''' | tr -d ' \r')
+      if [ -n "$gt" ]; then
+        TOKEN_SOURCE="/home/lumen/agent/.env (GITEA_TOKEN)"
+        note "DEPRECATED token source $TOKEN_SOURCE — fold it into $gitea_file (mode 600)" >&2
+      fi
+    fi
+    [ -n "$gt" ] || die "no Gitea token for $SLUG on $FORGE_HOST — looked in $gitea_file then /home/lumen/agent/.env (GITEA_TOKEN).
       This repo is on a Gitea forge, so a github.com PAT will not authenticate it."
-    GITHUB_TOKEN="$GITEA_TOKEN"
-    TOKEN_SOURCE="/home/lumen/agent/.env (GITEA_TOKEN)"
+    GITHUB_TOKEN="$gt"
     note "authenticating to $SLUG on $FORGE_HOST (gitea) via $TOKEN_SOURCE"
     return 0
   fi
@@ -158,6 +174,18 @@ need_repo() {
     *)     hostpart=${bare%%/*}; bare=${bare#*/} ;;   # url-form  host[:port]/owner/repo
   esac
   hostpart=${hostpart%%:*}
+  # wq#524: the forge API base, WITH the port, derived from the origin itself. FORGE_HOST
+  # deliberately drops the port one line up (it exists to answer "is this github.com?"), so
+  # it cannot serve as an API base — `http://$FORGE_HOST` is port 80 and nothing is there.
+  # This value used to arrive as GITEA_URL, set only because load_token SOURCED agent/.env:
+  # a hidden coupling between "read a token" and "know the forge URL" that fell over the
+  # instant the token stopped being read that way (HTTP 000 on every Gitea call). The origin
+  # already carries scheme, host and port and is the thing actually being talked to, so
+  # derive it and drop the config dependency. An exported GITEA_URL still overrides.
+  case "$url" in
+    *://*) FORGE_BASE_URL=$(printf '%s' "$url" | sed -E 's#^([a-z+]+://)([^/@]+@)?([^/]+)/.*#\1\3#') ;;
+    *)     FORGE_BASE_URL="http://$hostpart" ;;   # scp-form carries no scheme or port
+  esac
   # Keep only the LAST two path segments: Gitea and GitHub both end .../owner/repo, and a
   # subpath-mounted forge would otherwise leak its prefix into the slug.
   SLUG=$(printf '%s' "$bare" | awk -F/ 'NF>=2{print $(NF-1) "/" $NF}')
@@ -207,7 +235,7 @@ api() { # api <method> <path> [json-body]  — path is forge-relative, e.g. /rep
   # Verified against the live instance (Gitea 1.26.4) rather than from memory.
   local base auth
   if [ "${FORGE:-github}" = gitea ]; then
-    base="${GITEA_URL:-http://$FORGE_HOST}/api/v1"
+    base="${GITEA_URL:-${FORGE_BASE_URL:-http://$FORGE_HOST}}/api/v1"
     auth="Authorization: token $GITHUB_TOKEN"
   else
     base="https://api.github.com"
