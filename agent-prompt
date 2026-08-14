@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""agent-prompt <lane> — print a ready-to-paste dispatch prompt for a NEW agent.
+
+Never goes stale: the name is picked live (against BOTH the session registry and
+every name ever seen on the board, so it can neither collide with a live session
+nor reuse a purged name and confuse the history), and the ticket focus is read
+live from the queue at print time. Behavioural rules are NOT copied in — they
+live in the lane's dispatch file on disk. That is wq#533's point.
+
+    agent-prompt pokemon | fleet | github | fable
+    agent-prompt <lane> --fable      # dispatch a Fable agent onto ANY lane
+    agent-prompt --list
+
+FABLE IS A MODEL CHOICE, NOT ONLY A LANE (wq#580). There is a `fable` lane and a
+FABLE_QUEUE_DISPATCH.md for its staged packs, but in practice Fable gets pointed at
+whichever lane needs it: fable1-810584 ran the wq#560/559/521 investigation on the
+POKEMON lane, not the fable lane. So `fable` is a lane here AND `--fable` is a
+modifier for any lane. Reach for Fable 5 on long-horizon autonomous work, complex
+software engineering, and deep multi-step research.
+"""
+import re
+import subprocess
+import sys
+
+WQ = "/home/lumen/bin/wq"
+BOARD = "/home/lumen/agents/work-queue/boards/LPP_QUEUE_PROGRESS.md"
+
+LANES = {
+    "pokemon": {"prefix": "rabbit", "dispatch": "/home/lumen/agents/work-queue/POKEMON_DISPATCH.md"},
+    "fleet":   {"prefix": "fleet",  "dispatch": None},
+    "github":  {"prefix": "gh",     "dispatch": "/home/lumen/agents/work-queue/GITHUB_DISPATCH.md"},
+    "fable":   {"prefix": "fable",  "dispatch": "/home/lumen/agents/work-queue/FABLE_QUEUE_DISPATCH.md"},
+}
+
+# Printed whenever Fable is being dispatched, so the operator SELECTS THE RIGHT MODEL —
+# the prompt is worthless if it is pasted into a cheaper session. Kept here rather than in
+# a dispatch file because it is advice about which session to open, which is a decision
+# made BEFORE any dispatch file is ever read.
+FABLE_NOTE = (
+    "SELECT FABLE 5 FOR THIS SESSION — the dispatch assumes it.\n"
+    "Fable 5 is the right model for long-horizon autonomous agentic work, complex\n"
+    "software engineering, and deep multi-step research. If this task is none of\n"
+    "those, close this and run the same lane without --fable; a Fable session spent\n"
+    "on a one-file edit is a waste of the window."
+)
+STRIP = ("[lpp] ", "[lpp-mp] ", "[wq] ", "[gh] ", "[sec] ", "[tooling] ", "[monitor] ", "[hw] ")
+
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout
+
+
+def used_numbers(prefix):
+    """Every N ever seen for this prefix — live registry AND board history."""
+    seen = set()
+    pat = re.compile(re.escape(prefix) + r"(\d+)")
+    for blob in (sh(WQ + " whoami 2>&1"), sh(f"grep -ho '{prefix}[0-9]*' {BOARD} 2>/dev/null")):
+        seen.update(int(m) for m in pat.findall(blob))
+    return seen
+
+
+def free_name(prefix):
+    used = used_numbers(prefix)
+    n = (max(used) + 1) if used else 1
+    return f"{prefix}{n}"
+
+
+def claimable(lane):
+    """Parse `wq list` POSITIONALLY. Substring-matching status against the whole
+    line is how an earlier version offered a DONE ticket whose title happened to
+    contain the words 'on an open floor'."""
+    rows = []
+    for line in sh(f"{WQ} list {lane}").splitlines():
+        m = re.match(r"\s*\[\s*(\d+)\]\s+(\S+)\s+(p\d)\s+(\S+)\s+(.*)$", line)
+        if not m:
+            continue
+        tid, _lane, pri, status, title = m.groups()
+        if status != "open" or "deps=" in title:
+            continue
+        for t in STRIP:
+            title = title.replace(t, "")
+        rows.append((tid, pri, title.strip()[:70]))
+    rows.sort(key=lambda r: r[1])
+    return rows
+
+
+def main():
+    argv = [a for a in sys.argv[1:] if a != "--fable"]
+    fable = "--fable" in sys.argv[1:]
+
+    if not argv or argv[0] in ("--list", "-h", "--help"):
+        print("usage: agent-prompt <" + "|".join(LANES) + "> [--fable]")
+        for L, c in LANES.items():
+            print(f"  {L:8} claimable={len(claimable(L)):2}   next agent: {free_name(c['prefix'])}")
+        # ORCH READS THIS EVERY TIME IT SIZES UP THE LANES, which is why the guidance
+        # lives here and not only in a dispatch file nobody opens before choosing a model.
+        print("\nFABLE IS AVAILABLE AND IS A MODEL CHOICE, NOT ONLY A LANE.")
+        print("  agent-prompt fable            the fable lane's staged [FABLE-*] packs")
+        print(f"  agent-prompt <lane> --fable   a Fable agent on ANY lane (next: {free_name('fable')})")
+        print("Reach for Fable 5 on long-horizon autonomous agentic work, complex software")
+        print("engineering, and deep multi-step research — e.g. the wq#560 nav investigation,")
+        print("which fable1 ran on the POKEMON lane. Routine tickets do not need it.")
+        return
+
+    lane = argv[0]
+    if lane not in LANES:
+        print(f"unknown lane '{lane}'. try: {', '.join(LANES)}")
+        return
+
+    # --fable renames the agent (so the board shows WHICH model did the work) but keeps the
+    # lane's own dispatch file: the rules are the LANE's, the model is the operator's choice.
+    prefix = "fable" if (fable or lane == "fable") else LANES[lane]["prefix"]
+    cfg, name, tickets = LANES[lane], free_name(prefix), claimable(lane)
+    bar = "=" * 74
+    print(bar)
+    model = "  model=FABLE 5" if (fable or lane == "fable") else ""
+    print(f"  PASTE BELOW  |  lane={lane}  agent={name}{model}  {sh('date -u +%Y-%m-%dT%H:%MZ').strip()}")
+    print(bar + "\n")
+    if fable or lane == "fable":
+        print(FABLE_NOTE + "\n")
+    print(f"You're an engineering agent on my Lumen fleet. Your name is {name}.\n")
+    print(f"Work the {lane} lane of my work queue to completion, then stop.\n")
+    print("Start here:")
+    print(f"- Register: {WQ} whoami --register {name}")
+    if cfg["dispatch"]:
+        print(f"- Read {cfg['dispatch']} — that's how we work")
+    else:
+        print("- How we work: branch + PR via /home/lumen/bin/lumen-pr, Conventional Commits,")
+        print("  wq#<id> in the Refs footer, a timestamped .bak before editing any file,")
+        print("  lumen_episode.py precheck before state-changing work, never reboot anything.")
+    print(f"- Read the tail of {BOARD} for where things stand")
+    print(f"- Then: {WQ} claim --lane {lane}\n")
+    if tickets:
+        print("Open and claimable right now:")
+        for tid, pri, title in tickets:
+            print(f"  wq#{tid} ({pri})  {title}")
+    else:
+        print("Nothing claimable right now — check with me before starting.")
+    print("\nAn honest partial with a proved root cause beats a green tick. If a ticket's")
+    print("premise is wrong, say so on the board rather than building on it.\n")
+    print(bar)
+
+
+if __name__ == "__main__":
+    main()
