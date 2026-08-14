@@ -499,6 +499,62 @@ cmd_open() {
   printf '%s\n' "$(printf '%s' "$API_BODY" | jq -r '.html_url')"
 }
 
+# wq#563: forge-aware pre-merge mergeability guard. Reads the PR body already in
+# $API_BODY (cmd_land re-fetches immediately before merging) and either dies, warns, or
+# stays silent.
+#
+# THE DEFECT: this used to switch on .mergeable_state unconditionally. That is a GITHUB
+# field. Gitea returns null for it, so BOTH arms of the case were dead on a Gitea repo and
+# the guard silently did nothing — verified against the live instance (1.26.4), not assumed.
+#
+# WHY NOT A ONE-LINE PORT: Gitea exposes .mergeable, a BOOLEAN. That is a different
+# contract from GitHub's enum, and false does NOT mean "conflict" specifically — it also
+# covers unmet branch protection. Mapping false -> "merge conflicts" would print a
+# confident wrong diagnosis, which is worse than the silence it replaces. So the Gitea arm
+# names BOTH candidate causes and refuses to pick one.
+#
+# WHY IT STILL DIES ON false: measured on a deliberately conflicting PR — Gitea's own merge
+# call answers HTTP 405 {"message":"Please try again later"}. That reads as a TRANSIENT
+# fault for a PERMANENT conflict, and an agent obeying it retries forever. Failing here
+# with a real reason is strictly better than passing that message up.
+#
+# UNKNOWN IS NEVER A DIAGNOSIS: null/absent/"unknown" warns and proceeds on both forges.
+# The merge call is authoritative; a guard that guesses is worse than one that abstains.
+# Deliberately NOT polling for it: on Gitea both verdicts were stable and immediate at
+# +0s through +8s on freshly-opened PRs (conflicted false, clean true), so a poll would add
+# latency to the lock-held window — the exact cost wq#532a was filed about — to fix a race
+# never observed. If an unknown is ever seen in the wild, revisit with that evidence.
+mergeability_guard() {
+  local pr="$1" ms mf
+  ms=$(printf '%s' "$API_BODY" | jq -r '.mergeable_state // "null"')
+  mf=$(printf '%s' "$API_BODY" | jq -r 'if has("mergeable") and .mergeable != null then (.mergeable|tostring) else "null" end')
+
+  if [ "${FORGE:-github}" = gitea ]; then
+    case "$mf" in
+      true)  : ;;   # clean
+      false)
+        die "PR #$pr is NOT MERGEABLE into $DEFAULT_BRANCH (gitea reports mergeable=false).
+      Gitea does not say WHICH, and this tool will not guess. It is one of:
+        - a merge conflict with $DEFAULT_BRANCH  -> rebase the branch onto $DEFAULT_BRANCH
+        - an unmet branch-protection requirement -> check required approvals/status checks
+      Do not just retry: gitea's merge endpoint answers 405 'Please try again later' for a
+      permanent conflict, which is why this is caught here instead." ;;
+      *)
+        note "WARNING: gitea did not report mergeability for PR #$pr (mergeable=null) — attempting merge anyway" ;;
+    esac
+    return 0
+  fi
+
+  # GitHub: today's exact behaviour is preserved. dirty dies, blocked warns, everything
+  # else proceeds silently — deliberately unchanged, because lumen-pr is how every lane
+  # lands and this is not the ticket to retune GitHub's thresholds.
+  case "$ms" in
+    dirty) die "PR #$pr has merge conflicts with $DEFAULT_BRANCH — rebase the branch first" ;;
+    blocked) note "WARNING: mergeable_state=blocked (ruleset requirement unmet) — attempting merge anyway" ;;
+    unknown|null) note "WARNING: github has not finished computing mergeability for PR #$pr (mergeable_state=$ms) — attempting merge anyway" ;;
+  esac
+}
+
 cmd_land() {
   need_repo "${1:-}"; local pr="${2:-}"; shift 2 2>/dev/null || true
   local timeout=600
@@ -573,11 +629,7 @@ cmd_land() {
   gitlock_acquire "$(gitlock_scope)" "lumen-pr land $SLUG #$pr"
 
   api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR re-fetch"
-  local mergeable_state; mergeable_state=$(printf '%s' "$API_BODY" | jq -r '.mergeable_state')
-  case "$mergeable_state" in
-    dirty) die "PR #$pr has merge conflicts with $DEFAULT_BRANCH — rebase the branch first" ;;
-    blocked) note "WARNING: mergeable_state=blocked (ruleset requirement unmet) — attempting merge anyway" ;;
-  esac
+  mergeability_guard "$pr"
 
   # Squash merge: the squashed subject becomes the Conventional Commit that
   # release tooling reads, so it must be the PR title verbatim (§2, §7).
