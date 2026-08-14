@@ -7,7 +7,7 @@
 # compliant path the easy path, and refuses the non-compliant one.
 #
 # Usage:
-#   lumen-pr start  <repo-path> <type>/<slug> [--worktree]
+#   lumen-pr start  <repo-path> <type>/<slug> [--worktree|--primary|--adopt]
 #   lumen-pr commit <repo-path> "<conventional subject>" [--refs wq#N] [--body-file F]
 #   lumen-pr open   <repo-path> --title T --body-file F [--draft] [--allow-second-person]
 #   lumen-pr land   <repo-path> <pr-number> [--timeout SEC]
@@ -32,7 +32,11 @@ BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 # shellcheck source=lumen-github-identity.sh
 . "$BIN_DIR/lumen-github-identity.sh" || { echo "lumen-pr: cannot load lumen-github-identity.sh" >&2; exit 1; }
 
-WORKTREE_ROOT=/home/lumen/scratch/worktrees
+# Overridable for the same reason LUMEN_PR_SLOCK is: verifying the worktree guard requires
+# CREATING worktrees, and doing that under the live root would leave test debris in the one
+# directory sibling agents actually work in. Every other path here was already overridable;
+# this one was hardcoded purely by omission (same shape as the wq#562 LOGDIR finding).
+WORKTREE_ROOT=${LUMEN_PR_WORKTREE_ROOT:-/home/lumen/scratch/worktrees}
 SLOCK=${LUMEN_PR_SLOCK:-/home/lumen/bin/slock}   # overridable so the guard can test the copy under review
 # Seconds-to-a-minute operation. Short on purpose: a merge that somehow hangs must not park the
 # lock behind it for an hour, which is what stranded a finished, green ticket for 65 minutes.
@@ -319,18 +323,89 @@ lint_body_sections() { # lint_body_sections <body-text>
   return 0
 }
 
+# --- worktree ownership (wq#598) --------------------------------------------
+# A worktree path is $WORKTREE_ROOT/<repo>-<branch-slug>, and §2 FORBIDS ticket ids and agent
+# names inside a branch name — so the path is derived entirely from a slug that two sessions can
+# independently choose. `-d "$wt"` used to be note-and-proceed, which meant a second session
+# silently inherited whatever a sibling had left in that directory.
+# The owner record lives OUTSIDE the worktree, under $WORKTREE_ROOT/.owners/, so it never appears
+# in the repo's own `git status`; a marker file inside the tree would be untracked noise in every
+# repo we ever clone, and the first agent to `git add -A` would commit it.
+WT_OWNER_DIR="$WORKTREE_ROOT/.owners"
+
+# WQ_AGENT is the only STABLE session identity available here. GITLOCK_HOLDER is not usable for
+# this: it falls back to a pid, and every lumen-pr call is a new process, so a pid-derived owner
+# would never match itself on the next call. Unset WQ_AGENT means we genuinely cannot tell one
+# caller from another, so we claim no ownership at all rather than write a name that matches
+# everybody. NOTE THE DELIBERATE HOLE: two drivers sharing one WQ_AGENT (the wq#594 case) match
+# each other and pass silently. That is correct — wq#594's claim-time notice is what covers it.
+wt_owner_id() { printf '%s' "${WQ_AGENT:-}"; }
+
+wt_owner_write() {
+  local wt="$1" id; id=$(wt_owner_id)
+  [ -n "$id" ] || return 0
+  mkdir -p "$WT_OWNER_DIR" 2>/dev/null || return 0
+  printf 'agent=%s\ncreated=%s\n' "$id" "$(date -u +%FT%TZ)" \
+    > "$WT_OWNER_DIR/$(basename "$wt")" 2>/dev/null || true
+}
+
+wt_owner_read() {
+  local f="$WT_OWNER_DIR/$(basename "$1")"
+  [ -f "$f" ] && sed -n 's/^agent=//p' "$f" | head -1
+}
+
+# Grade by the STATE of the tree, not by ownership alone — the wq#565 precedent (grade by property
+# of the thing, not by which bucket it sits in). Adopting a CLEAN worktree already parked on the
+# branch you asked for cannot lose anyone's work, and refusing there would fire on the one real
+# abandoned worktree on this box today. Adopting a dirty one, or one parked on another branch, can.
+wt_reuse_guard() {
+  local wt="$1" branch="$2" adopt="$3"
+  local owner me cur dirty who
+  owner=$(wt_owner_read "$wt"); me=$(wt_owner_id)
+
+  if [ -n "$me" ] && [ "$owner" = "$me" ]; then
+    note "worktree already exists and is yours ($me): $wt"
+    return 0
+  fi
+
+  cur=$(git -C "$wt" branch --show-current 2>/dev/null) || cur=""
+  [ -n "$cur" ] || cur="(not a git worktree)"
+  dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  who="${owner:-UNKNOWN (predates this guard, or an unregistered caller made it)}"
+
+  if [ "$adopt" = 1 ]; then
+    note "ADOPTING worktree owned by $who: $wt (on $cur, $dirty uncommitted path(s))"
+    wt_owner_write "$wt"; return 0
+  fi
+
+  if [ "$cur" = "$branch" ] && [ "${dirty:-1}" = 0 ]; then
+    note "worktree $wt exists and was made by $who, but it is CLEAN and already on $branch."
+    note "adopting it — nothing of theirs can be lost this way. Say so in your report."
+    wt_owner_write "$wt"; return 0
+  fi
+
+  die "refusing to reuse worktree $wt
+      made by    : $who
+      on branch  : $cur (you asked for $branch)
+      uncommitted: $dirty path(s)
+      A sibling session may be mid-ticket in there. §2 says two agents never share a branch, but a
+      branch slug carries no ticket id and no agent name, so nothing in the path keeps you apart.
+      Pick a different slug, or re-run with --adopt once you have established that tree is stale."
+}
+
 # --- subcommands ------------------------------------------------------------
 cmd_start() {
   need_repo "${1:-}"; local branch="${2:-}"; shift 2 2>/dev/null || true
-  local want_worktree=0 primary_ok=0
+  local want_worktree=0 primary_ok=0 adopt_ok=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --worktree) want_worktree=1; shift ;;
       --primary)  primary_ok=1; shift ;;
+      --adopt)    adopt_ok=1; want_worktree=1; shift ;;
       *) die "unknown flag for start: $1" ;;
     esac
   done
-  [ -n "$branch" ] || die "usage: lumen-pr start <repo-path> <type>/<slug> [--worktree|--primary]"
+  [ -n "$branch" ] || die "usage: lumen-pr start <repo-path> <type>/<slug> [--worktree|--primary|--adopt]"
 
   # wq#512 SHARED-TREE FENCE. /home/lumen/pokemon is the PRIMARY tree and it belongs to the
   # pokemon lane, which runs live agents against it continuously. A github-lane agent that
@@ -362,7 +437,7 @@ cmd_start() {
   if [ "$want_worktree" = 1 ]; then
     local wt="$WORKTREE_ROOT/$(basename "$REPO_PATH")-$(printf '%s' "$branch" | tr '/' '-')"
     if [ -d "$wt" ]; then
-      note "worktree already exists: $wt"
+      wt_reuse_guard "$wt" "$branch" "$adopt_ok"
     else
       mkdir -p "$WORKTREE_ROOT"
       git -C "$REPO_PATH" fetch -q origin || die "git fetch failed"
@@ -372,6 +447,7 @@ cmd_start() {
         git -C "$REPO_PATH" worktree add -q -b "$branch" "$wt" "origin/$DEFAULT_BRANCH" || \
           die "could not add worktree $wt on new branch $branch"
       fi
+      wt_owner_write "$wt"
       note "created worktree $wt on $branch from origin/$DEFAULT_BRANCH"
     fi
     note "the shared tree at $REPO_PATH was NOT touched (still on $(git -C "$REPO_PATH" branch --show-current))"

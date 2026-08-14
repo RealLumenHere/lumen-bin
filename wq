@@ -848,7 +848,57 @@ def cmd_claim(a):
         print(f"  one id share /tmp paths, branch bases and worktrees; atomic claims will not "
               f"save those.")
         print(f"  Check: wq concurrency   |   Fix: unset WQ_AGENT; wq whoami --register <name>")
+    # wq#598: point at the session's own scratch dir, ONCE, on the first claim of the session.
+    # Self-limiting on purpose — the directory's own existence is the "already told you" flag,
+    # so no DB query and no per-claim nagging. wq#594 established that a notice printed on every
+    # claim is noise rather than signal, and this is guidance, not a finding.
+    try:
+        _scr = os.path.join(SCRATCH_ROOT, agent.replace("/", "_"))
+        if not os.path.isdir(_scr):
+            os.makedirs(_scr, mode=0o700, exist_ok=True)
+            print(f"SCRATCH (wq#598): write ad-hoc files under {_scr}/ , not bare /tmp.")
+            print(f"  /tmp is one flat namespace shared by every live session (5 at once here, "
+                  f"most recently)")
+            print(f"  and it records nobody's name, so a clobbered file looks exactly like your "
+                  f"own. Path: wq scratch")
+    except OSError:
+        pass  # scratch is a convenience; never let it fail a claim
     print(f"TITLE: {t[2]}\nDEPS: {t[4] or 'none'}\n---\n{t[3]}")
+SCRATCH_ROOT = os.environ.get("WQ_SCRATCH_ROOT", "/tmp")
+
+def cmd_scratch(a):
+    """wq#598: a per-session scratch directory, so ad-hoc files stop sharing a namespace.
+
+    MEASURED FIRST, and the measurement changed what this is. lumen-pr writes NOTHING to /tmp,
+    and no dispatch document contains a /tmp path — so there was no code owner to fix and no
+    convention to correct. Every colliding file in /tmp was typed by hand by an agent. Of the
+    lumen-owned entries, ~180 carry names any agent would independently pick (a.txt, g.txt,
+    o.txt, v1.txt, red.txt, pre.txt, land.txt, chk.txt), and up to 5 sessions run at once here.
+
+    SO BE HONEST ABOUT WHAT THIS IS: guidance, not enforcement. Nothing can stop an agent
+    typing `> /tmp/a.txt`. What this does is make the correct path one token long and put it in
+    front of the agent at claim time, which is the only moment it is certainly reading.
+
+    The SECOND effect is the one that may matter more than collision-avoidance: /tmp today is
+    unattributable. Nothing records who wrote a file, which is why the wq#594 incident was only
+    ever caught by a human noticing a PR body they had not written. A path under the session id
+    names its writer for free.
+
+    DELIBERATE HOLE, same as the lumen-pr worktree guard: two drivers sharing one WQ_AGENT get
+    the SAME directory and still collide. That is correct — it is what wq#594's notice is for.
+    """
+    ident, explicit = resolve_identity(a)
+    d = os.path.join(SCRATCH_ROOT, ident.replace("/", "_"))
+    if not a.path_only:
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        except OSError as e:
+            print(f"could not create {d}: {e}", file=sys.stderr); sys.exit(1)
+    print(d)
+    if not explicit:
+        print("NOTE: WQ_AGENT is not set, so this path is a hostname:pid fallback that CHANGES "
+              "every call.\n  Register first: wq whoami --register <name>", file=sys.stderr)
+
 def cmd_concurrency(a):
     """wq#594: report ONE session id being driven from TWO places.
 
@@ -1064,6 +1114,7 @@ s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
+s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
 s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
