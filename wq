@@ -56,7 +56,16 @@ SCOPE, stated rather than discovered: this gates claim/coordinate/land (wq + slo
 own lock). It does NOT stop a respawn that only edits local files and never calls wq or slock —
 no chokepoint exists on that path (same structural answer wq#546 gave for releases).
 Metric Frank asked for: refused calls land in agent_activity as RETIRED-REFUSED:<cmd> /
-auto-retire:<kind>; count them to measure how often auto-continue actually happens."""
+auto-retire:<kind>; count them to measure how often auto-continue actually happens.
+
+wq#582 CLAIM BY ID (2026-08-14): `wq claim --id <n>` claims a SPECIFIC ticket. EVERY claim-by-lane
+guard applies with NONE relaxed — deps unmet, another live claim, [DRAFT], blocked/done, gate
+unmet, subsystem held — each REFUSES loudly, and there is deliberately no --force. The lane is
+taken from the TICKET, and housekeeping (expired-lease reclaim) runs against that lane first, so
+a target whose own lease has expired is reclaimed-then-claimed in one call, loudly. An
+out-of-order claim prints a NOTICE naming the lane head it stepped past. ONE eligibility ruling
+(_eligible) serves the lane scan, the --id check and the head notice — a second copy of these
+checks is how the watchdog's L831 happened, and that path is closed here by construction."""
 import sqlite3, sys, os, argparse, datetime, socket, re, secrets
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 240
@@ -676,18 +685,35 @@ def cmd_claim(a):
         print("  Refusing to claim — this is the wq#502 collision guard. Use a DISTINCT agent\n"
               "  name (wq whoami --register <name>) or wait for that session's lease to expire.")
         sys.exit(1)
+    # wq#582: claim a SPECIFIC ticket. Resolve it FIRST so the housekeeping below runs against
+    # the ticket's OWN lane — that is what reclaims the target itself if its lease has expired.
+    lane = a.lane
+    target_id = getattr(a, "id", None)
+    if target_id is not None:
+        trow = c.execute("SELECT id, lane, status FROM tasks WHERE id=?", (target_id,)).fetchone()
+        if not trow:
+            c.execute("COMMIT"); c.close()
+            print(f"REFUSED: no such task {target_id} (wq#582: claim --id takes an existing ticket id)")
+            sys.exit(1)
+        if trow[1] == 'user':
+            c.execute("COMMIT"); c.close()
+            print(f"REFUSED: wq#{target_id} is in the 'user' lane — Frank-only, never agent-claimable")
+            sys.exit(1)
+        if a.lane != 'auto' and a.lane != trow[1]:
+            print(f"NOTICE: --lane {a.lane} ignored — wq#{target_id} lives in lane '{trow[1]}' and the ticket's lane governs")
+        lane = trow[1]
     # reclaim expired ticket leases AND purge expired slocks (single housekeeping pass)
     # wq#530: a reclaim is never silent again. If a lease expired while its holder was alive
     # but quiet, the ONLY way anyone finds out today is by noticing their ticket moved — that
     # is how wq#542 was taken out from under a live session. Name the holder, every time.
     expired = c.execute("""SELECT id, claimed_by, claimed_at, lease_expires, lease_ttl FROM tasks
                            WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL
-                             AND lease_expires < ?""", (a.lane, t_now)).fetchall()
+                             AND lease_expires < ?""", (lane, t_now)).fetchall()
     if expired:
         c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
                      lease_expires=NULL, lease_ttl=NULL
                      WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL
-                       AND lease_expires < ?""", (a.lane, t_now))
+                       AND lease_expires < ?""", (lane, t_now))
     reclaim_lines = []
     for tid, holder, cat, exp, ttl in expired:
         held_for = idle_minutes(cat)
@@ -701,22 +727,71 @@ def cmd_claim(a):
             + (" on the PROVISIONAL window (no wq call ever followed the claim)" if never_promoted else ""))
     reclaimed = len(expired)
     c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
-    rows = c.execute("SELECT id,deps,subsystems,gate,title FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(a.lane,)).fetchall()
-    pick = None; picked_subs = []; skips = []
-    for rid, deps, subsystems, gate, title in rows:
+    rows = c.execute("SELECT id,deps,subsystems,gate,title FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(lane,)).fetchall()
+    pick = None; picked_subs = []; skips = []; head_notice = None
+    def _eligible(rid, deps, subsystems, gate, title):
+        """wq#582: ONE eligibility ruling for the lane scan, the --id check and the head
+        notice. Returns (ok, why, subs, silent) — silent marks deps-unmet, which the scan has
+        always passed over without a skip line. A second copy of these checks is how the
+        watchdog's L831 happened; this closure is the only place they live now."""
         # wq#532(d): a [DRAFT] ticket is not work, it is a placeholder for work. `claim` handed
         # them out repeatedly until agents invented a parking convention by hand. Enforced here
         # rather than written down, because written down is what failed.
         if (title or "").lstrip().upper().startswith("[DRAFT]"):
-            skips.append(f"#{rid} [DRAFT] — not claimable until the prefix is removed"); continue
-        if not deps_met(c, deps): continue
+            return False, "[DRAFT] — not claimable until the prefix is removed", [], False
+        if not deps_met(c, deps):
+            return False, f"deps not met ({deps})", [], True
         ok, why = gate_met(gate)
-        if not ok: skips.append(f"#{rid} {why}"); continue
+        if not ok:
+            return False, why, [], False
         subs = parse_subs(subsystems)
         blocked = subs_free(c, subs, agent, t_now)
         if blocked:
-            skips.append(f"#{rid} subsystem {blocked[0][0]} held by {blocked[0][1]}"); continue
-        pick = rid; picked_subs = subs; break
+            return False, f"subsystem {blocked[0][0]} held by {blocked[0][1]}", [], False
+        return True, "", subs, False
+    if target_id is not None:
+        # Fresh read AFTER housekeeping — the reclaim pass above may just have reverted the
+        # target's own expired lease to open, and that is the intended path for taking over a
+        # dead session's specific ticket: reclaimed LOUDLY above, then claimed here.
+        rid, st_now, holder, deps, subsystems, gate, title = c.execute(
+            "SELECT id, status, claimed_by, deps, subsystems, gate, title FROM tasks WHERE id=?",
+            (target_id,)).fetchone()
+        refuse = None; ok_subs = []
+        if st_now == 'claimed':
+            refuse = f"held by '{holder}' with a live lease — wq#502: never take another session's claim"
+        elif st_now == 'blocked':
+            refuse = "BLOCKED — resolve it or reopen it first"
+        elif st_now == 'done':
+            refuse = "already done"
+        elif st_now != 'open':
+            refuse = f"status={st_now}"
+        else:
+            ok, why, ok_subs, _silent = _eligible(rid, deps, subsystems, gate, title)
+            if not ok:
+                refuse = why
+        if refuse:
+            c.execute("COMMIT"); c.close()
+            for line in reclaim_lines: print(line)
+            print(f"REFUSED: cannot claim wq#{target_id} by id — {refuse}")
+            print("  wq#582: every claim-by-lane guard applies to claim --id, none relaxed, and")
+            print("  there is deliberately no --force.")
+            sys.exit(1)
+        pick = rid; picked_subs = ok_subs
+        for h_rid, h_deps, h_ss, h_gate, h_title in rows:
+            h_ok, _w, _s, _sil = _eligible(h_rid, h_deps, h_ss, h_gate, h_title)
+            if h_ok:
+                if h_rid != pick:
+                    head_notice = (f"NOTICE: out-of-order claim — lane '{lane}' head is "
+                                   f"#{h_rid}; wq#{pick} was claimed BY ID (wq#582), on the record.")
+                break
+    else:
+        for rid, deps, subsystems, gate, title in rows:
+            ok, why, subs, silent = _eligible(rid, deps, subsystems, gate, title)
+            if not ok:
+                if not silent:
+                    skips.append(f"#{rid} {why}")
+                continue
+            pick = rid; picked_subs = subs; break
     if pick is None:
         c.execute("COMMIT"); c.close()
         for line in reclaim_lines: print(line)
@@ -752,6 +827,7 @@ def cmd_claim(a):
     else:
         print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — lease until {lease}Z (ttl {a.ttl}m; heartbeat to extend)")
     if picked_subs: print(f"LOCKED subsystems: {', '.join(picked_subs)}")
+    if head_notice: print(head_notice)
     print(f"TITLE: {t[2]}\nDEPS: {t[4] or 'none'}\n---\n{t[3]}")
 def cmd_heartbeat(a):
     c = conn(); c.isolation_level = None
@@ -894,7 +970,7 @@ def cmd_retire(a):
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
-s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.set_defaults(f=cmd_claim)
+s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
 s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
