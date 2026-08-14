@@ -802,6 +802,10 @@ def cmd_claim(a):
     # or by any other wq call the holder makes — never by elapsed time alone, because elapsed
     # time cannot tell a dead session from a working one. A session that dies in its first
     # minute frees its ticket in PROVISIONAL_MIN instead of parking it for the full ttl.
+    # wq#594: ONE session id driven from TWO places. Captured BEFORE the claim lands so `pick`
+    # is not in its own answer. See cmd_concurrency for why this is a symptom detector and not
+    # an identity check — an identity check is not available at this chokepoint at all.
+    prior_held = [h for h in session_holdings(c, agent, t_now)[0] if h != pick]
     prov = min(PROVISIONAL_MIN, a.ttl)
     lease = lease_from(prov)
     c.execute("""UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
@@ -828,7 +832,94 @@ def cmd_claim(a):
         print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — lease until {lease}Z (ttl {a.ttl}m; heartbeat to extend)")
     if picked_subs: print(f"LOCKED subsystems: {', '.join(picked_subs)}")
     if head_notice: print(head_notice)
+    if prior_held:
+        # NOTE, never REFUSE — decided from the data, not from taste. Across the whole
+        # registered-session era exactly ONE session ever closed a ticket entirely inside
+        # another of its own ticket windows (fleet6-a13cac, wq#565 inside wq#563 — the
+        # incident). But it is not the only co-hold: rabbit17b-6f8be9 took wq#522 and wq#547
+        # 36s apart and closed both in the same second, which is a deliberate pair. Refusing
+        # would have broken that, and a guard that breaks legitimate work gets routed around.
+        print(f"NOTICE (wq#594): you ALREADY HOLD "
+              f"{', '.join('#' + str(h) for h in prior_held)} on a live lease.")
+        print(f"  Normal if you meant to work several at once. If you did NOT claim "
+              f"{'that' if len(prior_held) == 1 else 'those'}, a SECOND instance is driving")
+        print(f"  '{agent}' — a continuation that inherited WQ_AGENT without re-registering. "
+              f"Two drivers under")
+        print(f"  one id share /tmp paths, branch bases and worktrees; atomic claims will not "
+              f"save those.")
+        print(f"  Check: wq concurrency   |   Fix: unset WQ_AGENT; wq whoami --register <name>")
     print(f"TITLE: {t[2]}\nDEPS: {t[4] or 'none'}\n---\n{t[3]}")
+def cmd_concurrency(a):
+    """wq#594: report ONE session id being driven from TWO places.
+
+    WHY THIS IS A SYMPTOM DETECTOR AND NOT AN IDENTITY CHECK, stated here because the next
+    person will reach for the identity check first, as the filing ticket did:
+
+    There is no per-instance signal available at this chokepoint. Every wq call arrives as a
+    freshly-spawned process off ONE shared long-lived gateway, so pid/ppid/sid/pgid are
+    per-CALL and boot_id is per-HOST — none of them names a driver. A nonce minted at first
+    call fails differently and worse: it would have to live in the environment or a file, and
+    a continuation inherits WQ_AGENT through exactly that channel, so it would inherit the
+    nonce meant to disambiguate it. Credential-style distinction is not merely unbuilt here,
+    it is unavailable. What IS observable is the footprint two drivers leave: concurrent
+    holdings under one id. That is what this reports.
+
+    LIMIT, stated rather than discovered later: two drivers that never hold tickets at the
+    same time are invisible to this, and so is a driver that only edits files and never calls
+    wq — the same structural gap wq#568 recorded for its own scope. This narrows the blind
+    spot; it does not close it.
+
+    Exit 1 on a finding so a systemd OnFailure= can fire (wq#565 B5: never pipe it).
+    """
+    c = conn()
+    t_now = now()
+    findings = []
+    live = c.execute("""SELECT claimed_by, id FROM tasks WHERE status='claimed'
+                        AND claimed_by IS NOT NULL AND lease_expires IS NOT NULL
+                        AND lease_expires >= ? ORDER BY claimed_by, id""", (t_now,)).fetchall()
+    held = {}
+    for by, tid in live:
+        held.setdefault(by, []).append(tid)
+    for by, tids in sorted(held.items()):
+        if len(tids) > 1:
+            findings.append(("CO-HELD NOW", by,
+                             f"holds {', '.join('#' + str(t) for t in tids)} on live leases "
+                             f"at the same time"))
+    # Historical shape, kept separate: a ticket claimed AND closed entirely inside another of
+    # the same session's ticket windows. Strictly rarer than co-holding and the sharper signal
+    # — measured across every registered session since wq#502, it matches the wq#594 incident
+    # and nothing else.
+    rows = c.execute("""SELECT id, claimed_by, claimed_at, done_at FROM tasks
+                        WHERE claimed_by IS NOT NULL AND claimed_at IS NOT NULL
+                          AND done_at IS NOT NULL""").fetchall()
+    per = {}
+    for tid, by, ca, da in rows:
+        per.setdefault(by, []).append((tid, ca, da))
+    for by, items in sorted(per.items()):
+        if not SESSION_RE.match(by or ""):
+            continue  # bare pre-wq#502 names shared a base by design; not evidence of anything
+        for outer in items:
+            for inner in items:
+                if outer[0] == inner[0]:
+                    continue
+                if outer[1] < inner[1] and inner[2] < outer[2]:
+                    findings.append(("NESTED CLOSE", by,
+                                     f"#{inner[0]} [{inner[1]} .. {inner[2]}] closed entirely "
+                                     f"inside #{outer[0]} [{outer[1]} .. {outer[2]}]"))
+    c.close()
+    if not findings:
+        print("wq concurrency: no session id shows signs of being driven from two places.")
+        return
+    print(f"wq concurrency: {len(findings)} finding(s) — one session id, possibly two drivers.\n")
+    for kind, by, detail in findings:
+        print(f"  [{kind}] {by}")
+        print(f"      {detail}")
+    print("\nCO-HELD NOW is often legitimate: an agent deliberately working a pair trips it too.")
+    print("NESTED CLOSE is the sharper one — a session that finished a whole ticket inside")
+    print("another of its own ticket windows was almost certainly two instances, not one.")
+    print("If a session did not mean to hold these: unset WQ_AGENT; wq whoami --register <name>.")
+    sys.exit(1)
+
 def cmd_heartbeat(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
@@ -972,6 +1063,7 @@ sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
+s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
 s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
