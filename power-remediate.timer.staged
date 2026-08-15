@@ -1,0 +1,10 @@
+[Unit]
+Description=Run power-remediate every 60 seconds (STAGED — safe to install, ARMED=0 gates all action)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+Unit=power-remediate.service
+
+[Install]
+WantedBy=timers.target

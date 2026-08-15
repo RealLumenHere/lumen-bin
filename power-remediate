@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+power-remediate — Tier-3 unreachable-node auto-remediation (wq#637).
+
+Frank-approved policy: /home/lumen/fleet/specs/POWER_REMEDIATION_POLICY.md
+("I agree with the Policy.", 2026-08-15). This implements it.
+
+Runs once per invocation (systemd timer, 60s cadence — see power-remediate.timer.staged).
+For each ELIGIBLE node: dual-path (LAN + Tailscale, ping + SSH) reachability probe.
+Sustained unreachable >= HOLD_SECONDS (15min) advances a per-node tick-driven state
+machine: down_pending -> wol_sent -> cycled -> human_required. Every stage transition
+past "sustained" is blocked outright if the lumen_state maintenance guard fires.
+
+Design notes (see PR description for full rationale):
+  - The AC-cycle rung delegates to the existing, tested `plug-recover recover <node>`
+    (verified relay on/off via wattage, its own independent ARMED/OPTIN/cooldown gate
+    in /home/lumen/etc/plug-recover.conf) instead of duplicating relay-safety logic.
+  - The AC-cycle rung additionally REFUSES unless the node has evidence it actually
+    boots when AC is restored (`auto_boot_verified` or `ac_restore_validated` PASS in
+    lumen_state) — cycling a node with no confirmed auto-boot path cannot recover it
+    and is just needless hardware wear; today only nephthys has this evidence.
+  - The maintenance guard checks a new `remediation_hold` predicate (canonical,
+    machine-checked) AND a conservative keyword sweep of the free-text `status`
+    predicate as defense-in-depth: the policy's literal guard string
+    ('offline-maintenance') does not appear verbatim anywhere in live lumen_state
+    data — real maintenance markers are prose (e.g. nephthys's current status is
+    "offline — planned maintenance, ..."), so an exact-match guard would silently
+    fail to protect the exact node the policy was written around.
+  - ARMED=0 by default (power-remediate.conf) — observes/logs/alerts only, never
+    sends WoL or a plug command, until a human flips it. Matches this shop's existing
+    convention for this class of danger (plug-recover.conf, fleet-sleeper).
+
+Usage:
+  power-remediate run [--dry-run]     one probe/ladder tick over all eligible nodes
+  power-remediate status              show per-node state machine + config
+  power-remediate selftest            offline unit tests (no network/hardware I/O)
+"""
+import json, os, re, subprocess, sys, time
+
+STATE_DB   = "/home/lumen/minerva/lumen_state.py"
+CONF_PATH  = os.environ.get("POWER_REMEDIATE_CONF", "/home/lumen/etc/power-remediate.conf")
+STATE_PATH = "/home/lumen/var/power-remediate/state.json"
+LOG_PATH   = "/home/lumen/var/power-remediate/power-remediate.log"
+NTFY_SEND  = "/home/lumen/bin/ntfy-send"
+AQ         = "/home/lumen/bin/aq"
+PLUG_RECOVER = "/home/lumen/bin/plug-recover"
+NTFY_TOPIC = "lumen-fleet"
+
+# Policy: eligible nodes ONLY (stateless inference Macs). Anything else is excluded
+# by default, and this hardcoded denylist is a redundant second check, not the
+# primary gate — the primary gate is ELIGIBLE being a closed allowlist.
+ELIGIBLE = {"isis", "hathor", "khepri", "nephthys"}
+NEVER_ELIGIBLE = {"lumen", "maat", "wadjet", "anubis", "thoth"}
+assert ELIGIBLE.isdisjoint(NEVER_ELIGIBLE), "policy allowlist/denylist overlap"
+
+HOLD_SECONDS   = 900     # 15 min sustained-unreachable before the ladder starts
+WOL_WAIT       = 300     # 5 min after WoL before escalating to AC-cycle
+POST_CYCLE_WAIT = 900    # 15 min after AC-cycle before declaring human-required
+CAP_WINDOW     = 86400   # rolling 24h
+CAP_MAX        = 1       # max one auto power-cycle per node per CAP_WINDOW, ever
+
+# Best-effort WoL MAC table — sourced from lumen_state prose fields (no clean `mac`
+# predicate exists fleet-wide as of this build). Nodes absent here simply skip the
+# WoL rung and fall through to the wait + AC-cycle path (WoL is optional per policy:
+# "where the node supports it").
+NODE_MAC = {
+    "nephthys": "00:3e:e1:cc:4b:17",  # lumen_state nephthys.nic, since 2026-06-28
+    "khepri":   "00:3e:e1:c5:75:94",  # lumen_state khepri.hw, since 2026-08-14
+}
+
+HOLD_KEYWORDS = ("maintenance", "quarantine", "parked", "do not", " dead",
+                  "unplug", "never", "bench", "wedge")
+
+_ipre = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+_plugre = re.compile(r"^[Pp]\d{1,2}$")
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}"
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    with open(LOG_PATH, "a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+def load_conf():
+    conf = {"ARMED": "0"}
+    try:
+        with open(CONF_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return conf
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def state_facts(subject):
+    """Parse `lumen_state.py current <subject>` into {predicate: value}.
+    Same parsing convention as plugctl.py's state_facts()."""
+    r = subprocess.run(["python3", STATE_DB, "current", subject],
+                        capture_output=True, text=True, timeout=30,
+                        cwd="/home/lumen/minerva")
+    out = {}
+    for line in r.stdout.splitlines():
+        if "=" in line and "." in line.split("=")[0]:
+            lhs, rhs = line.split("=", 1)
+            pred = lhs.strip().split(".", 1)[1].strip()
+            val = rhs.split("(since")[0].strip()
+            out[pred] = val
+    return out
+
+
+def clean_ip(val):
+    if not val:
+        return None
+    m = _ipre.search(val)
+    return m.group(1) if m else None
+
+
+def probe_icmp(ip, timeout=2):
+    try:
+        r = subprocess.run(["ping", "-c", "1", "-W", str(timeout), ip],
+                            capture_output=True, timeout=timeout + 1)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def probe_ssh(node, ip, timeout=6):
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=no", f"{node}@{ip}", "true"],
+            capture_output=True, timeout=timeout + 3)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def reachable_on(node, ip):
+    """A given interface counts as reachable if EITHER ping or SSH succeeds."""
+    if not ip:
+        return None  # unknown address; caller treats None conservatively
+    return probe_icmp(ip) or probe_ssh(node, ip)
+
+
+def fully_unreachable(node, facts):
+    """True only if BOTH LAN and Tailscale are unreachable (ping+SSH failing on
+    each). Fail-safe: if we can't resolve an address at all, treat as reachable
+    (refuse to advance the ladder) rather than guessing — same philosophy as
+    plugctl.node_pings()."""
+    lan = clean_ip(facts.get("lan_ip"))
+    ts = clean_ip(facts.get("tailscale_ip"))
+    addrs = [a for a in (lan, ts) if a]
+    if not addrs:
+        return False
+    for ip in addrs:
+        if reachable_on(node, ip):
+            return False
+    return True
+
+
+def guard_blocked(facts):
+    """Maintenance guard. Returns (blocked: bool, reason: str|None).
+    Checks the canonical `remediation_hold` predicate first, then falls back to a
+    conservative keyword sweep of the free-text `status` predicate — see module
+    docstring for why the literal-string guard in the policy doc is insufficient
+    against real fleet data."""
+    hold = (facts.get("remediation_hold") or "").strip().lower()
+    if hold and hold not in ("off", "clear", "none", ""):
+        return True, f"remediation_hold={facts['remediation_hold']!r}"
+    status = (facts.get("status") or "").lower()
+    for kw in HOLD_KEYWORDS:
+        if kw in status:
+            return True, f"status contains {kw!r}: {facts.get('status')!r}"
+    return False, None
+
+
+def plug_for(facts):
+    """Return a clean plug token ('p5') or None if the mapping is missing/dirty
+    (e.g. 'UNKNOWN as of ...' or a prose-qualified value) — never guess."""
+    raw = (facts.get("power_plug") or "").strip()
+    if _plugre.match(raw):
+        return raw.lower()
+    return None
+
+
+def auto_boot_confirmed(facts):
+    if (facts.get("auto_boot_verified") or "").strip().lower() == "yes":
+        return True
+    if (facts.get("ac_restore_validated") or "").strip().upper().startswith("PASS"):
+        return True
+    return False
+
+
+def ntfy(title, message, priority="default", dry_run=False):
+    if dry_run:
+        log(f"NTFY(dry) [{priority}] {title}: {message}")
+        return
+    try:
+        subprocess.run([NTFY_SEND, "-t", NTFY_TOPIC, "-p", priority, "-T", title, message],
+                        capture_output=True, timeout=15)
+    except Exception as e:
+        log(f"ntfy-send failed: {e}")
+
+
+def aq_add(key, title, message, priority="default", dry_run=False):
+    if dry_run:
+        log(f"AQ(dry) add power-remediate {key} {title!r}")
+        return
+    try:
+        subprocess.run([AQ, "add", "power-remediate", key, title, message],
+                        capture_output=True, timeout=15)
+    except Exception as e:
+        log(f"aq add failed: {e}")
+
+
+def do_cycle(node, plug, dry_run=False):
+    args = [PLUG_RECOVER, "recover", node]
+    if dry_run:
+        args.append("--dry-run")
+    log(f"{node}: invoking `{' '.join(args)}` (plug {plug})")
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240)
+        log(f"{node}: plug-recover rc={r.returncode} stdout={r.stdout.strip()[-400:]}")
+        return r.returncode
+    except Exception as e:
+        log(f"{node}: plug-recover invocation FAILED: {e}")
+        return -1
+
+
+def do_wol(node, dry_run=False):
+    mac = NODE_MAC.get(node)
+    if not mac:
+        log(f"{node}: no known MAC, WoL skipped (falling through to wait)")
+        return
+    if dry_run:
+        log(f"{node}: WoL(dry) to {mac}")
+        return
+    try:
+        subprocess.run(["wakeonlan", mac], capture_output=True, timeout=10)
+        log(f"{node}: WoL sent to {mac}")
+    except Exception as e:
+        log(f"{node}: wakeonlan failed: {e}")
+
+
+def tick(node, conf, node_state, now, dry_run):
+    facts = state_facts(node)
+    armed = conf.get("ARMED", "0") == "1"
+    up = not fully_unreachable(node, facts)
+
+    if up:
+        if node_state.get("stage"):
+            log(f"{node}: RECOVERED")
+            ntfy(f"power-remediate: {node}", f"🟢 {node} reachable again", dry_run=dry_run)
+            aq_add(f"{node}:unreachable", f"power-remediate: {node} recovered",
+                   "node answered ping/ssh again", dry_run=dry_run)
+        return {}
+
+    first = node_state.get("first_unreachable") or now
+    duration = now - first
+    st = dict(node_state)
+    st["first_unreachable"] = first
+
+    if duration < HOLD_SECONDS:
+        st.setdefault("stage", "down_pending")
+        return st
+
+    blocked, reason = guard_blocked(facts)
+    if blocked:
+        if st.get("stage") != "guard_blocked":
+            log(f"{node}: sustained unreachable ({int(duration)}s) but GUARD BLOCKED: {reason}")
+            aq_add(f"{node}:guard-blocked", f"power-remediate: {node} guarded",
+                   f"unreachable {int(duration)}s but maintenance guard fired: {reason}",
+                   dry_run=dry_run)
+        st["stage"] = "guard_blocked"
+        return st
+
+    stage = node_state.get("stage")
+    last_cycle_ts = node_state.get("last_cycle_ts")
+    if last_cycle_ts is not None and (now - last_cycle_ts) < CAP_WINDOW:
+        if (now - last_cycle_ts) < POST_CYCLE_WAIT:
+            st["stage"] = "cycled"
+            return st
+        if stage != "human_required":
+            log(f"{node}: still unreachable {POST_CYCLE_WAIT}s+ after cycle; "
+                f"24h cap active — STOP, human required, no second cycle")
+            ntfy(f"CRITICAL power-remediate: {node}",
+                 f"🔴 {node} still unreachable after one auto power-cycle. "
+                 f"24h cap prevents another. Human required.",
+                 priority="high", dry_run=dry_run)
+            aq_add(f"{node}:human-required", f"power-remediate: {node} needs a human",
+                   "auto power-cycle exhausted, node still down, 24h cap blocks retry",
+                   priority="high", dry_run=dry_run)
+        st["stage"] = "human_required"
+        st["last_cycle_ts"] = last_cycle_ts
+        return st
+
+    if stage in (None, "down_pending", "guard_blocked"):
+        if not armed:
+            if stage != "observed_disarmed":
+                log(f"{node}: sustained unreachable ({int(duration)}s), guard clear, "
+                    f"would begin remediation ladder — DISARMED (ARMED=0 in {CONF_PATH})")
+                aq_add(f"{node}:disarmed-would-act", f"power-remediate: {node} would act",
+                       "sustained unreachable, guard clear, ARMED=0 so no action taken",
+                       dry_run=dry_run)
+            st["stage"] = "observed_disarmed"
+            return st
+        ntfy(f"power-remediate: {node}",
+             f"🟠 {node} unreachable {int(duration)}s (ping+SSH, LAN+TS) — "
+             f"beginning remediation ladder (WoL, then AC-cycle if still down)",
+             priority="high", dry_run=dry_run)
+        do_wol(node, dry_run=dry_run)
+        st["stage"] = "wol_sent"
+        st["stage_ts"] = now
+        return st
+
+    if stage == "wol_sent":
+        if now - node_state.get("stage_ts", now) < WOL_WAIT:
+            return st
+        plug = plug_for(facts)
+        if plug is None:
+            log(f"{node}: plug mapping missing/ambiguous ({facts.get('power_plug')!r}) "
+                f"— refusing to guess, human required")
+            ntfy(f"CRITICAL power-remediate: {node}",
+                 f"🔴 {node} unreachable and its plug mapping is unknown/ambiguous "
+                 f"({facts.get('power_plug')!r}). Not guessing. Human required.",
+                 priority="high", dry_run=dry_run)
+            aq_add(f"{node}:plug-unknown", f"power-remediate: {node} plug unknown",
+                   f"power_plug fact = {facts.get('power_plug')!r}",
+                   priority="high", dry_run=dry_run)
+            st["stage"] = "human_required"
+            return st
+        if not auto_boot_confirmed(facts):
+            log(f"{node}: no confirmed AC-restore-boot evidence "
+                f"(auto_boot_verified/ac_restore_validated) — cycling would be "
+                f"pointless and just wears hardware; human required instead")
+            ntfy(f"CRITICAL power-remediate: {node}",
+                 f"🔴 {node} unreachable, no confirmed auto-boot-on-AC-restore "
+                 f"evidence — refusing to power-cycle blind. Human required.",
+                 priority="high", dry_run=dry_run)
+            aq_add(f"{node}:no-autoboot-evidence",
+                   f"power-remediate: {node} no auto-boot evidence",
+                   "auto_boot_verified/ac_restore_validated absent; skipped cycle",
+                   priority="high", dry_run=dry_run)
+            st["stage"] = "human_required"
+            return st
+        do_cycle(node, plug, dry_run=dry_run)
+        st["last_cycle_ts"] = now
+        st["stage"] = "cycled"
+        st["stage_ts"] = now
+        return st
+
+    if stage == "cycled":
+        if now - node_state.get("stage_ts", now) < POST_CYCLE_WAIT:
+            return st
+        log(f"{node}: still unreachable {POST_CYCLE_WAIT}s after cycle — human required")
+        ntfy(f"CRITICAL power-remediate: {node}",
+             f"🔴 {node} still unreachable {POST_CYCLE_WAIT}s after AC-cycle. "
+             f"Human required.", priority="high", dry_run=dry_run)
+        aq_add(f"{node}:human-required", f"power-remediate: {node} needs a human",
+               "still down after AC-cycle", priority="high", dry_run=dry_run)
+        st["stage"] = "human_required"
+        return st
+
+    return st  # human_required: stays put, cap already prevents re-cycling
+
+
+def cmd_run(dry_run=False):
+    conf = load_conf()
+    state = load_state()
+    now = time.time()
+    for node in sorted(ELIGIBLE):
+        prev = state.get(node, {})
+        nxt = tick(node, conf, prev, now, dry_run)
+        if nxt:
+            state[node] = nxt
+        elif node in state:
+            del state[node]
+    save_state(state)
+
+
+def cmd_status():
+    conf = load_conf()
+    state = load_state()
+    print(f"ARMED={conf.get('ARMED','0')}  conf={CONF_PATH}")
+    print(f"eligible: {sorted(ELIGIBLE)}")
+    now = time.time()
+    for node in sorted(ELIGIBLE):
+        st = state.get(node)
+        if not st:
+            print(f"  {node}: clear")
+            continue
+        age = int(now - st.get("first_unreachable", now))
+        print(f"  {node}: stage={st.get('stage')} down_for={age}s "
+              f"last_cycle_ts={st.get('last_cycle_ts')}")
+
+
+def selftest():
+    fails = 0
+    def chk(label, got, want):
+        nonlocal fails
+        ok = got == want
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'} {label:52s} want={want!r:8} got={got!r}")
+
+    chk("eligible/denylist disjoint", ELIGIBLE.isdisjoint(NEVER_ELIGIBLE), True)
+    chk("clean plug P5 accepted", plug_for({"power_plug": "P5"}), "p5")
+    chk("clean plug p2 accepted", plug_for({"power_plug": "p2"}), "p2")
+    chk("dirty plug (UNKNOWN) rejected",
+        plug_for({"power_plug": "UNKNOWN as of 2026-08-15T01:28Z"}), None)
+    chk("dirty plug (prose-qualified) rejected",
+        plug_for({"power_plug": "P3 — stated by Frank, re-verify"}), None)
+    chk("missing plug rejected", plug_for({}), None)
+
+    chk("remediation_hold=on blocks", guard_blocked({"remediation_hold": "on — bench work"})[0], True)
+    chk("remediation_hold=off does not block", guard_blocked({"remediation_hold": "off"})[0], False)
+    chk("prose maintenance status blocks",
+        guard_blocked({"status": "offline — planned maintenance, Frank at bench"})[0], True)
+    chk("prose parked status blocks",
+        guard_blocked({"status": "PARKED, off."})[0], True)
+    chk("clean deployed status does not block",
+        guard_blocked({"status": "deployed (Qwen3-32B)"})[0], False)
+    chk("no facts at all does not block", guard_blocked({})[0], False)
+
+    chk("auto_boot_verified=yes confirms", auto_boot_confirmed({"auto_boot_verified": "yes"}), True)
+    chk("ac_restore_validated PASS confirms",
+        auto_boot_confirmed({"ac_restore_validated": "PASS 2026-07-31: ..."}), True)
+    chk("no evidence does not confirm", auto_boot_confirmed({}), False)
+
+    chk("fully_unreachable with no addrs -> False (fail-safe)",
+        fully_unreachable("ghost", {}), False)
+
+    # Maintenance-guard path through the full tick state machine: a guarded node
+    # must NEVER advance to wol_sent/cycled no matter how many sustained-down ticks
+    # it accumulates. (ticket requirement: "simulated offline-maintenance node must
+    # NEVER cycle")
+    import unittest.mock as mock
+    node_state = {}
+    now = 1000000.0
+    with mock.patch(f"{__name__}.fully_unreachable", return_value=True), \
+         mock.patch(f"{__name__}.state_facts",
+                     return_value={"status": "offline — planned maintenance",
+                                   "lan_ip": "192.168.8.176", "power_plug": "P2"}), \
+         mock.patch(f"{__name__}.ntfy"), mock.patch(f"{__name__}.aq_add"), \
+         mock.patch(f"{__name__}.do_wol"), mock.patch(f"{__name__}.do_cycle") as cyc:
+        conf = {"ARMED": "1"}
+        for i in range(40):  # far past HOLD_SECONDS, WOL_WAIT and POST_CYCLE_WAIT
+            now += 120
+            node_state = tick("nephthys", conf, node_state, now, False)
+        chk("guarded node never leaves guard_blocked stage",
+            node_state.get("stage"), "guard_blocked")
+        chk("guarded node: do_cycle never called", cyc.called, False)
+
+    # Same harness, guard clear: node SHOULD progress through the ladder and cycle
+    # exactly once, even armed and run for a long time (cap enforcement).
+    node_state = {}
+    now = 2000000.0
+    with mock.patch(f"{__name__}.fully_unreachable", return_value=True), \
+         mock.patch(f"{__name__}.state_facts",
+                     return_value={"status": "deployed", "lan_ip": "192.168.8.176",
+                                   "power_plug": "P2", "auto_boot_verified": "yes"}), \
+         mock.patch(f"{__name__}.ntfy"), mock.patch(f"{__name__}.aq_add"), \
+         mock.patch(f"{__name__}.do_wol"), mock.patch(f"{__name__}.do_cycle") as cyc:
+        conf = {"ARMED": "1"}
+        for i in range(60):
+            now += 120
+            node_state = tick("nephthys", conf, node_state, now, False)
+        chk("unguarded eligible node cycles exactly once", cyc.call_count, 1)
+        chk("unguarded eligible node ends human_required (no 2nd cycle within cap)",
+            node_state.get("stage"), "human_required")
+
+    print(f"\n{'ALL PASS' if fails == 0 else f'{fails} FAILURE(S)'}")
+    return 1 if fails else 0
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if a[0] == "selftest":
+        return selftest()
+    if a[0] == "status":
+        cmd_status()
+        return 0
+    if a[0] == "run":
+        cmd_run(dry_run="--dry-run" in a)
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
