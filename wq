@@ -104,6 +104,21 @@ def lease_from(minutes): return (utcnow() + datetime.timedelta(minutes=minutes))
 def norm_title(t): return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
 def parse_subs(s):
     return [x.strip().lower() for x in (s or "").replace(",", " ").split() if x.strip()]
+# wq#617: (model, effort) vocabulary. Full CLI ids only (a bare alias like "sonnet" is what
+# the router resolves; the ticket stores what `claude --model` will be handed). Effort names
+# only — the CLI takes low|medium|high|xhigh|max, never integers (FOREMAN_RESEARCH §3).
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+def norm_tuple(model, effort):
+    model = (model or "").strip() or None
+    effort = (effort or "").strip().lower() or None
+    if model and not MODEL_RE.match(model):
+        print(f"REFUSED: bad model id {model!r}"); sys.exit(2)
+    if effort and effort not in EFFORTS:
+        print(f"REFUSED: effort must be one of {'|'.join(EFFORTS)} (names, never integers), got {effort!r}"); sys.exit(2)
+    if effort and not model:
+        print("REFUSED: --effort without --model"); sys.exit(2)
+    return model, effort
 def conn():
     c = sqlite3.connect(DB, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
@@ -139,6 +154,13 @@ def init():
     # wq#530: the ttl the claimer asked for, so promotion restores THAT and never overrides an
     # explicit --ttl with the global default. NULL on every pre-existing row = DEFAULT_TTL_MIN.
     if "lease_ttl"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN lease_ttl INTEGER")
+    # wq#617 (foreman T3): the orchestrator's (model, effort) assignment + the archetype it was
+    # derived from, written INTO the ticket so any dispatcher (fworker, agent-prompt, a human)
+    # reads the same tuple. ADDITIVE — NULL on every pre-existing row = "unassigned, router
+    # decides at dispatch". Values are the CLI strings (claude-sonnet-5 / high), never integers.
+    if "model"        not in cols: c.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
+    if "effort"       not in cols: c.execute("ALTER TABLE tasks ADD COLUMN effort TEXT")
+    if "archetype"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN archetype TEXT")
     # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
     # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
     # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
@@ -655,11 +677,14 @@ def cmd_add(a):
             if norm_title(rtitle) == nt:
                 print(f"DUPLICATE — task {rid} [{rlane}/{rstatus}] already has this title:\n  {rtitle}\nUse --force to add anyway.")
                 c.close(); sys.exit(1)
-    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at) VALUES(?,?,?,?,?,?,?,?)",
-              (a.lane, a.pri, a.title, a.detail or '', a.deps or '', ",".join(subs), a.gate or '', now()))
+    model, effort = norm_tuple(a.model, a.effort)
+    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,model,effort,archetype) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+              (a.lane, a.pri, a.title, a.detail or '', a.deps or '', ",".join(subs), a.gate or '', now(),
+               model, effort, (a.archetype or None)))
     c.commit(); print(f"added task {c.execute('SELECT last_insert_rowid()').fetchone()[0]} [{a.lane}]"
                       + (f" subsystems={','.join(subs)}" if subs else "")
-                      + (f" gate={a.gate}" if a.gate else "")); c.close()
+                      + (f" gate={a.gate}" if a.gate else "")
+                      + (f" model={model}@{effort or '-'}" if model else "")); c.close()
 def cmd_claim(a):
     if a.lane == 'user':
         print("REFUSED: 'user' lane is Frank-only — never agent-claimable"); sys.exit(1)
@@ -1066,9 +1091,18 @@ def cmd_edit(a):
     c = conn(); fields=[]; vals=[]
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
-                    ("gate",a.gate),("deps",a.deps)):
+                    ("gate",a.gate),("deps",a.deps),("archetype",a.archetype)):
         if val is not None: fields.append(f"{col}=?"); vals.append(val)
-    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps"); c.close(); return
+    # wq#617: --model/--effort are validated as a pair; "" clears (back to unassigned).
+    if a.model is not None or a.effort is not None:
+        cur = c.execute("SELECT model,effort FROM tasks WHERE id=?", (a.id,)).fetchone()
+        if not cur: print("no such task"); c.close(); return
+        m = cur[0] if a.model is None else (a.model or None)
+        e = cur[1] if a.effort is None else (a.effort or None)
+        if a.model == "": e = None    # clearing the model clears the pair
+        m, e = norm_tuple(m, e)
+        fields += ["model=?", "effort=?"]; vals += [m, e]
+    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype"); c.close(); return
     vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals); c.commit()
     print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}"); c.close()
 def cmd_retire(a):
@@ -1110,7 +1144,7 @@ def cmd_retire(a):
           f"with the STOP banner)")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
@@ -1122,7 +1156,7 @@ s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
-s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
 init()
 a = p.parse_args()

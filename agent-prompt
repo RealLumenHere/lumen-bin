@@ -9,7 +9,15 @@ live in the lane's dispatch file on disk. That is wq#533's point.
 
     agent-prompt pokemon | fleet | github | fable
     agent-prompt <lane> --fable      # dispatch a Fable agent onto ANY lane
+    agent-prompt <lane> --model claude-opus-5 --effort xhigh   # explicit tuple (wq#617)
     agent-prompt --list
+
+THE HEADER CARRIES THE (model, effort) TUPLE (wq#617, foreman T3). Precedence:
+--model/--effort flags > --fable (= claude-fable-5@high) > the tuple the orchestrator
+wrote into the top claimable ticket's wq `model`,`effort` columns > lane default
+(claude-sonnet-5@high). Effort names only (low|medium|high|xhigh|max). Each claimable
+ticket line shows its own assigned tuple when one is set, so an operator pasting into a
+session sees when a ticket wants a different model than the header.
 
 FABLE IS A MODEL CHOICE, NOT ONLY A LANE (wq#580). There is a `fable` lane and a
 FABLE_QUEUE_DISPATCH.md for its staged packs, but in practice Fable gets pointed at
@@ -59,6 +67,23 @@ def used_numbers(prefix):
     return seen
 
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+LANE_DEFAULT_TUPLE = ("claude-sonnet-5", "high")
+FABLE_TUPLE = ("claude-fable-5", "high")
+
+
+def ticket_tuple(tid):
+    """(model, effort, archetype) the orchestrator wrote into the ticket, or Nones.
+    Read live via `wq show` (the columns are additive; a pre-wq#617 wq prints nothing)."""
+    got = {"model": None, "effort": None, "archetype": None}
+    for line in sh(f"{WQ} show {tid}").splitlines():
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if k in got and v and v != "None":
+            got[k] = v
+    return got["model"], got["effort"], got["archetype"]
+
+
 def free_name(prefix):
     used = used_numbers(prefix)
     n = (max(used) + 1) if used else 1
@@ -84,9 +109,27 @@ def claimable(lane):
     return rows
 
 
+def take_opt(argv, name):
+    """Pop `--name value` (or `--name=value`) out of argv; return the value or None."""
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            v = argv[i + 1]; del argv[i:i + 2]; return v
+        if a.startswith(name + "="):
+            del argv[i]; return a.split("=", 1)[1]
+    return None
+
+
 def main():
     argv = [a for a in sys.argv[1:] if a != "--fable"]
     fable = "--fable" in sys.argv[1:]
+    opt_model = take_opt(argv, "--model")
+    opt_effort = take_opt(argv, "--effort")
+    if opt_effort and opt_effort not in EFFORTS:
+        print(f"--effort must be one of {'|'.join(EFFORTS)} (names, never integers)")
+        return
+    if opt_effort and not opt_model:
+        print("--effort needs --model")
+        return
 
     if not argv or argv[0] in ("--list", "-h", "--help"):
         print("usage: agent-prompt <" + "|".join(LANES) + "> [--fable]")
@@ -111,10 +154,28 @@ def main():
     # lane's own dispatch file: the rules are the LANE's, the model is the operator's choice.
     prefix = "fable" if (fable or lane == "fable") else LANES[lane]["prefix"]
     cfg, name, tickets = LANES[lane], free_name(prefix), claimable(lane)
+    # wq#617: resolve the (model, effort) tuple for the header. The tuple on each ticket is
+    # read here too so the list below shows per-ticket overrides.
+    tuples = {tid: ticket_tuple(tid) for tid, _, _ in tickets}
+    if opt_model:
+        model, effort, src = opt_model, opt_effort, "flag"
+    elif fable or lane == "fable":
+        model, effort, src = FABLE_TUPLE[0], FABLE_TUPLE[1], "fable"
+    else:
+        model, effort, src = LANE_DEFAULT_TUPLE[0], LANE_DEFAULT_TUPLE[1], "lane-default"
+        for tid, _, _ in tickets:            # first assigned ticket in priority order wins
+            m, e, _arch = tuples[tid]
+            if m:
+                model, effort, src = m, e, f"wq#{tid}"
+                break
+    if model == "claude-fable-5":
+        fable = True
+        prefix = "fable"
+        name = free_name(prefix)
     bar = "=" * 74
     print(bar)
-    model = "  model=FABLE 5" if (fable or lane == "fable") else ""
-    print(f"  PASTE BELOW  |  lane={lane}  agent={name}{model}  {sh('date -u +%Y-%m-%dT%H:%MZ').strip()}")
+    tup = f"  model={model}@{effort or '-'} ({src})"
+    print(f"  PASTE BELOW  |  lane={lane}  agent={name}{tup}  {sh('date -u +%Y-%m-%dT%H:%MZ').strip()}")
     print(bar + "\n")
     if fable or lane == "fable":
         print(FABLE_NOTE + "\n")
@@ -133,7 +194,9 @@ def main():
     if tickets:
         print("Open and claimable right now:")
         for tid, pri, title in tickets:
-            print(f"  wq#{tid} ({pri})  {title}")
+            m, e, arch = tuples[tid]
+            tag = f"  [{m}@{e or '-'}{' ' + arch if arch else ''}]" if m else ""
+            print(f"  wq#{tid} ({pri})  {title}{tag}")
     else:
         print("Nothing claimable right now — check with me before starting.")
     print("\nAn honest partial with a proved root cause beats a green tick. If a ticket's")
