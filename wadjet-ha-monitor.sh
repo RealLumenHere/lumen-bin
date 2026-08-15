@@ -37,8 +37,30 @@ probe_maat_ok(){
   return 0
 }
 probe_wadjet_ok(){
-  timeout "$PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/$WADJET_LAN/5432" 2>/dev/null || return 1  # quiet TCP-open; was pg_isready
+  # 2026-08-10 (aq#429, Sobek retarget): the old check was TCP to $WADJET_LAN:5432.
+  # A standby built by pg_basebackup inherits the SOURCE's listen_addresses, so it
+  # listens on 127.0.0.1 ONLY -> that probe can NEVER pass, which after a real
+  # failover made the post-failover branch cry "primary failing" every 30s while
+  # the vault was actually fine. VW runs network_mode=host with DATABASE_URL
+  # 127.0.0.1:5432, so loopback PG is CORRECT and sufficient. Probe PG over SSH
+  # on the standby's own loopback, plus the public VW /alive.
+  timeout "$PROBE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$WADJET_SSH" \
+    "timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/5432'" >/dev/null 2>&1 || return 1
   curl -sf -m "$PROBE_TIMEOUT" -o /dev/null "$VAULT_ORIGIN_WADJET/alive" || return 1
+  return 0
+}
+
+standby_promotable(){
+  # 2026-08-10 (aq#429): HARD PRE-FAILOVER GATE. This is the fix for the
+  # 2026-08-08 06:27 near-miss: a transient Ma'at blip made the monitor fence
+  # Ma'at and attempt promote against RETIRED Wadjet. The vault survived only by
+  # luck (Ma'at SSH was also unreachable, so the fence no-opped). NEVER fence the
+  # live primary until the standby is proven reachable AND in recovery.
+  local out
+  out=$(timeout 20 ssh "${SSH_OPTS[@]}" "$WADJET_SSH" \
+        "sudo -n runuser -u postgres -- psql -tAc 'SELECT pg_is_in_recovery()'" 2>/dev/null \
+        | tr -d '[:space:]')
+  [ "$out" = "t" ] || return 1
   return 0
 }
 
@@ -95,7 +117,13 @@ start_wadjet_vw(){
 do_failover(){
   exec 9>"$LOCK"
   flock -n 9 || { log "failover: lock held, another run in progress"; return 0; }
-  log "=== INITIATING FAILOVER Ma'at -> Wadjet ==="
+  # aq#429 gate: prove the standby can actually take over BEFORE fencing the primary.
+  if ! standby_promotable; then
+    log "FAILOVER BLOCKED: standby $WADJET_SSH not reachable or not in recovery — Ma'at NOT fenced"
+    notify "VAULT FAILOVER BLOCKED" "urgent" "Ma'at failing but standby ($WADJET_LAN) is not promotable (unreachable or not a standby). Ma'at left untouched. MANUAL intervention required."
+    return 1
+  fi
+  log "=== INITIATING FAILOVER Ma'at -> $WADJET_LAN ==="
   notify "VAULT FAILOVER STARTING" "urgent" "Ma'at vault unreachable. Promoting Wadjet to primary."
   fence_maat
   if ! promote_wadjet; then
@@ -152,7 +180,11 @@ if [ ! -e "$ENABLE_FLAG" ]; then
 fi
 
 if [ "$MODE" = "--dry-run" ]; then
-  log "DRY-RUN: threshold reached; WOULD fence Ma'at, promote Wadjet, flip CF origin, start Wadjet VW"
+  if standby_promotable; then
+    log "DRY-RUN: threshold reached; standby GATE PASS — WOULD fence Ma'at, promote $WADJET_LAN, flip CF origin, start standby VW"
+  else
+    log "DRY-RUN: threshold reached; standby GATE FAIL — WOULD BLOCK failover and leave Ma'at untouched"
+  fi
   exit 0
 fi
 

@@ -70,6 +70,10 @@ KEYRUN "printf 'PasswordAuthentication no\nPermitRootLogin no\nKbdInteractiveAut
 KEYRUN 'echo "  post-harden key-login OK"' || echo "  WARNING: key login failed after harden — investigate" >&2
 
 echo "[6/6] phone home"
-KEYRUN "TSIP=\$(tailscale ip -4 2>/dev/null | head -1); LAN=\$(hostname -I | awk '{print \$1}'); curl -sf -d \"\$(hostname) provisioned via SSH: TS=\$TSIP LAN=\$LAN\" https://ntfy.lumennode.uk/lumen-fleet >/dev/null || true; echo '  pinged ntfy'"
+KEYRUN "TSIP=\$(tailscale ip -4 2>/dev/null | head -1); LAN=\$(hostname -I | awk '{print \$1}'); curl -sf -d \"\$(hostname) provisioned via SSH: TS=\$TSIP LAN=\$LAN\" http://100.117.66.102:8080/lumen-fleet >/dev/null || true; echo '  pinged ntfy'"
 
 echo "✓ $HOSTN provisioned via SSH. Confirm: tailnet machines page shows $TAG; ntfy.lumennode.uk/lumen-fleet."
+
+echo "[7/7] storage-truth manifest (wq#421 — born-asserted, never grandfathered)"
+python3 /home/lumen/agents/storage-audit/manifest_add_node.py "$HOSTN" "$TARGET" --replace \
+  || echo "  WARNING: manifest add failed — run manifest_add_node.py manually (mandatory: every provisioned node must be in the storage manifest)" >&2

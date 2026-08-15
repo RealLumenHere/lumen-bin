@@ -1,3 +1,6 @@
 #!/bin/bash
 # Regenerate the never-stale live fleet-state block from the bi-temporal store.
-cd /home/lumen/minerva && python3 lumen_state_gen.py > /home/lumen/minerva/context/LIVE_FLEET_STATE.md && echo regenerated
+cd /home/lumen/minerva && python3 lumen_state_gen.py > /home/lumen/minerva/context/LIVE_FLEET_STATE.md && python3 lumen_state_gen.py --full > /home/lumen/minerva/context/LIVE_FLEET_STATE_FULL.md && echo regenerated
+# Memory V3 P2: keep the recall edge-graph fresh (incremental; only un-edged notes)
+python3 /home/lumen/minerva/lumen_edges.py >/dev/null 2>&1 &
+/home/lumen/bin/system-map-update &

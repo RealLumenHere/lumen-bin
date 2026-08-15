@@ -104,13 +104,20 @@ maybe_detach(){
 }
 
 show_status(){
+  # The WADJET_* vars point at the CURRENT promote target (sobek since 2026-08-10,
+  # aq#429); the names are kept for script compat. Label the output with the REAL
+  # host so nobody reads a healthy Sobek as a healthy Wadjet — the actual Wadjet
+  # box has been powered off since 2026-07-16 and off the tailnet for 25+ days.
+  local SB="${WADJET_SSH##*@}"
+  local SBN="${WADJET_SSH%%@*}"
   echo "primary lock      : $(cat "$HA_DIR/primary" 2>/dev/null)"
+  echo "standby target    : $SBN@$SB  (WADJET_* vars = compat alias, NOT the wadjet host)"
   echo "Ma'at  in_recovery: $(maat_psql 'SELECT pg_is_in_recovery()' 2>/dev/null)"
-  echo "Wadjet in_recovery: $(wadjet_psql 'SELECT pg_is_in_recovery()' 2>/dev/null)"
+  echo "$SBN in_recovery: $(wadjet_psql 'SELECT pg_is_in_recovery()' 2>/dev/null)"
   echo "Ma'at  wal_recv   : $(maat_psql "SELECT status||' from '||sender_host FROM pg_stat_wal_receiver" 2>/dev/null)"
-  echo "Wadjet wal_recv   : $(wadjet_psql "SELECT status||' from '||sender_host FROM pg_stat_wal_receiver" 2>/dev/null)"
+  echo "$SBN wal_recv   : $(wadjet_psql "SELECT status||' from '||sender_host FROM pg_stat_wal_receiver" 2>/dev/null)"
   echo "Ma'at  repl_out   : $(maat_psql "SELECT application_name||' '||state FROM pg_stat_replication" 2>/dev/null)"
-  echo "Wadjet repl_out   : $(wadjet_psql "SELECT application_name||' '||state FROM pg_stat_replication" 2>/dev/null)"
+  echo "$SBN repl_out   : $(wadjet_psql "SELECT application_name||' '||state FROM pg_stat_replication" 2>/dev/null)"
   echo "CF vault origin   : $(grep -A1 'vault.lumennode.uk' "$CF_CONFIG" | grep service | tr -d ' ')"
 }
 
