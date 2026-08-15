@@ -1,0 +1,13 @@
+[Unit]
+Description=Power-remediate — unreachable-node auto-remediation (STAGED — ARMED=0 in conf until Frank flips it)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=lumen
+# ARMED=0 in /home/lumen/etc/power-remediate.conf by default: this unit is safe to
+# install+enable as-is (probes/logs/alerts only, no WoL or plug action, ever) — the
+# real arm switch lives in the conf file, not here.
+ExecStart=/usr/bin/python3 /home/lumen/bin/power-remediate run
+StandardOutput=append:/home/lumen/var/power-remediate/power-remediate.log
+StandardError=append:/home/lumen/var/power-remediate/power-remediate.log
