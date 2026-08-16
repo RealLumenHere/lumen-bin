@@ -23,12 +23,20 @@ GUARD_HOST=lumen
 usage() {
   cat >&2 <<USAGE
 usage:
-  lumen-run start [--name NAME] [--mem SIZE] [--cpu QUOTA] -- CMD [ARGS...]
+  lumen-run start [--name NAME] [--mem SIZE] [--cpu QUOTA] [--mem-high SIZE]
+                  [--tasks-max N] [--oom-policy POLICY] [--timeout-stop-sec SEC]
+                  -- CMD [ARGS...]
       Launch CMD as a detached system transient unit (runs as lumen).
       Prints: UNIT=<name>
       --name  slug for the unit (default: job); final unit = lumen-job-<slug>-<epoch>
       --mem   MemoryMax, e.g. 8G (guards the T5810 against OOM kills)
       --cpu   CPUQuota, e.g. 200%
+      --mem-high        MemoryHigh, e.g. 6G (soft throttle ahead of MemoryMax's hard kill)
+      --tasks-max       TasksMax, e.g. 512
+      --oom-policy      OOMPolicy override (default: continue)
+      --timeout-stop-sec  TimeoutStopSec, e.g. 90 (grace before SIGKILL on stop —
+                          RELIABILITY_SPEC.md §E wants >=60 so a unit's own SessionEnd/
+                          cleanup hooks get to run to a clean 143 instead of a hard kill)
       --root  run the unit as root (default: run as lumen)
   lumen-run status UNIT     -> RUNNING | DONE:0 | FAILED:<code> | GONE
   lumen-run log    UNIT     -> full journal for the unit
@@ -41,12 +49,17 @@ USAGE
 cmd="${1:-}"; shift || usage
 case "$cmd" in
   start)
-    name=job; mem=""; cpu=""; runas=(--uid=lumen --gid=lumen)
+    name=job; mem=""; cpu=""; mem_high=""; tasks_max=""; oom_policy="continue"
+    timeout_stop_sec=""; runas=(--uid=lumen --gid=lumen)
     while [ $# -gt 0 ]; do
       case "$1" in
         --name) name="$2"; shift 2;;
         --mem)  mem="$2";  shift 2;;
         --cpu)  cpu="$2";  shift 2;;
+        --mem-high) mem_high="$2"; shift 2;;
+        --tasks-max) tasks_max="$2"; shift 2;;
+        --oom-policy) oom_policy="$2"; shift 2;;
+        --timeout-stop-sec) timeout_stop_sec="$2"; shift 2;;
         --root) runas=(); shift;;
         --) shift; break;;
         *) echo "lumen-run: unknown arg $1" >&2; usage;;
@@ -55,9 +68,12 @@ case "$cmd" in
     [ $# -gt 0 ] || { echo "lumen-run: no command given" >&2; usage; }
     slug=$(printf '%s' "$name" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')
     unit="lumen-job-${slug}-$(date +%s)"
-    props=(--property=OOMPolicy=continue)
+    props=(--property=OOMPolicy="$oom_policy")
     [ -n "$mem" ] && props+=(--property=MemoryMax="$mem")
     [ -n "$cpu" ] && props+=(--property=CPUQuota="$cpu")
+    [ -n "$mem_high" ] && props+=(--property=MemoryHigh="$mem_high")
+    [ -n "$tasks_max" ] && props+=(--property=TasksMax="$tasks_max")
+    [ -n "$timeout_stop_sec" ] && props+=(--property=TimeoutStopSec="$timeout_stop_sec")
     # Build the command string safely, append durable completion sentinel,
     # and propagate the REAL exit code as the unit's exit status.
     inner=$(printf '%q ' "$@")

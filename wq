@@ -1142,6 +1142,50 @@ def cmd_retire(a):
               + f" — reason: {reason}")
     print(f"({len(planted)} identity marker(s) planted; any wq/slock call by them now refuses "
           f"with the STOP banner)")
+def cmd_reap(a):
+    """wq#647 (RELIABILITY_SPEC.md §E, fq#614): an INDEPENDENT sweep for expired
+    claimed-ticket leases, decoupled from any `wq claim` call. cmd_claim's own
+    reclaim-on-claim housekeeping (search "wq#530: a reclaim is never silent again"
+    above) only ever runs against the ONE lane being claimed, as a side effect of
+    somebody else wanting work in it — a lane nobody happens to claim from can sit on
+    a dead holder's dangling claim indefinitely (fq#614: three same-day drain-deaths,
+    hours-long dangles, only cleared when the orchestrator eventually retired them by
+    hand). `wq reap` sweeps every lane (or one, with --lane) in a single pass and
+    reverts each expired claim the exact same way cmd_claim's housekeeping does —
+    status back to open, lease cleared, expired slocks dropped — then prints one
+    machine-parseable line per reclaim so a caller (harness/reaper.py, run on its own
+    schedule via lumen-run/cron) can post an aq row for each and never lose one to
+    silence. --dry-run reports what WOULD be reaped without mutating anything."""
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    t_now = now()
+    q = ("SELECT id, lane, claimed_by, claimed_at, lease_expires, lease_ttl, title FROM tasks "
+         "WHERE status='claimed' AND lease_expires IS NOT NULL AND lease_expires < ?")
+    params = [t_now]
+    if a.lane:
+        q += " AND lane=?"
+        params.append(a.lane)
+    expired = c.execute(q, params).fetchall()
+    if expired and not a.dry_run:
+        uq = ("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
+              "lease_expires=NULL, lease_ttl=NULL WHERE status='claimed' AND "
+              "lease_expires IS NOT NULL AND lease_expires < ?")
+        uparams = [t_now]
+        if a.lane:
+            uq += " AND lane=?"
+            uparams.append(a.lane)
+        c.execute(uq, uparams)
+        c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
+    c.execute("COMMIT"); c.close()
+    for tid, lane, holder, claimed_at, exp, ttl, title in expired:
+        held_for = idle_minutes(claimed_at)
+        gone = idle_minutes(exp)
+        print(f"REAPED #{tid} lane={lane} holder={holder or 'unknown'} "
+              f"claimed_ago_min={'?' if held_for is None else f'{held_for:.0f}'} "
+              f"lease_expired_ago_min={'?' if gone is None else f'{gone:.0f}'} "
+              f"title={title!r}")
+    suffix = " [dry-run, not applied]" if a.dry_run and expired else ""
+    print(f"reaped {len(expired)} ticket(s){suffix}")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
@@ -1158,6 +1202,7 @@ s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--la
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
 s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
+s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
 init()
 a = p.parse_args()
 if not getattr(a,"cmd",None): p.print_help(); sys.exit(0)
