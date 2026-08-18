@@ -88,6 +88,24 @@ NTFY_BIN = os.environ.get("WQ_NTFY_BIN", "/home/lumen/bin/ntfy-send")
 SESSION_RE = re.compile(r"^(?P<base>.+)-(?P<sid>[0-9a-f]{6})$")
 STRICT = os.environ.get("WQ_STRICT", "").strip().lower() in ("1", "true", "yes")
 FMT = "%Y-%m-%d %H:%M:%S"
+# wq#661: aging escalation — open unclaimed tickets gain +1 effective priority tier per
+# WQ_AGING_DAYS days without a claim, capped at 1 tier. Blocked/gated tickets are excluded:
+# they are waiting on an identified condition and should not be escalated.
+AGING_DAYS = _envint("WQ_AGING_DAYS", 7)
+def effective_pri(pri, status, gate, created_at):
+    """wq#661: effective priority = stored pri minus age boost (never mutates stored pri).
+    Only open/unclaimed tickets are boosted. Blocked and gated tickets are excluded —
+    they are waiting on something identified and should not drift up the queue on their own.
+    Boost: +1 tier per AGING_DAYS days open, capped at 1. effective_pri never goes below 1."""
+    if status != 'open': return pri
+    if gate and gate.strip(): return pri  # gated — has an identified blocking condition
+    try:
+        created = datetime.datetime.strptime(created_at, FMT).replace(tzinfo=datetime.timezone.utc)
+        days = (utcnow() - created).total_seconds() / 86400.0
+    except (TypeError, ValueError):
+        return pri
+    boost = min(1, int(days / AGING_DAYS))
+    return max(1, pri - boost)
 CANON_SUBSYSTEMS = {"vault-ha","litellm","minerva-db","queue-db","messenger",
                     "research-index","fleet-ssh","cloudflared","fleet-state","wq-tooling",
                     # wq#512 (2026-08-13): cross-lane shared assets. The github lane and the
@@ -161,6 +179,18 @@ def init():
     if "model"        not in cols: c.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
     if "effort"       not in cols: c.execute("ALTER TABLE tasks ADD COLUMN effort TEXT")
     if "archetype"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN archetype TEXT")
+    # wq#662: Frank-decision gate protocol. ADDITIVE — NULL on every pre-existing row.
+    # gate_type='frank_decision' marks tickets that enter the frank_gated/pending_review cycle.
+    # decision_prompt + orch_recommendation are written by `wq decide` (ORCH-only).
+    # frank_response + response_ts are written by `wq answer` (Frank/MC).
+    # review_verdict + review_reason are written by `wq review` (ORCH sweep).
+    if "gate_type"           not in cols: c.execute("ALTER TABLE tasks ADD COLUMN gate_type TEXT")
+    if "decision_prompt"     not in cols: c.execute("ALTER TABLE tasks ADD COLUMN decision_prompt TEXT")
+    if "orch_recommendation" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN orch_recommendation TEXT")
+    if "frank_response"      not in cols: c.execute("ALTER TABLE tasks ADD COLUMN frank_response TEXT")
+    if "response_ts"         not in cols: c.execute("ALTER TABLE tasks ADD COLUMN response_ts TEXT")
+    if "review_verdict"      not in cols: c.execute("ALTER TABLE tasks ADD COLUMN review_verdict TEXT")
+    if "review_reason"       not in cols: c.execute("ALTER TABLE tasks ADD COLUMN review_reason TEXT")
     # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
     # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
     # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
@@ -678,10 +708,15 @@ def cmd_add(a):
                 print(f"DUPLICATE — task {rid} [{rlane}/{rstatus}] already has this title:\n  {rtitle}\nUse --force to add anyway.")
                 c.close(); sys.exit(1)
     model, effort = norm_tuple(a.model, a.effort)
-    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,model,effort,archetype) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    # wq#662: --frank-gated implies gate_type=frank_decision and status=frank_gated
+    frank_gated = getattr(a, "frank_gated", False)
+    gate_type = getattr(a, "gate_type", None) or ("frank_decision" if frank_gated else None)
+    init_status = "frank_gated" if frank_gated else "open"
+    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,model,effort,archetype,status,gate_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (a.lane, a.pri, a.title, a.detail or '', a.deps or '', ",".join(subs), a.gate or '', now(),
-               model, effort, (a.archetype or None)))
+               model, effort, (a.archetype or None), init_status, gate_type))
     c.commit(); print(f"added task {c.execute('SELECT last_insert_rowid()').fetchone()[0]} [{a.lane}]"
+                      + (f" status={init_status}" if frank_gated else "")
                       + (f" subsystems={','.join(subs)}" if subs else "")
                       + (f" gate={a.gate}" if a.gate else "")
                       + (f" model={model}@{effort or '-'}" if model else "")); c.close()
@@ -788,6 +823,10 @@ def cmd_claim(a):
             refuse = "BLOCKED — resolve it or reopen it first"
         elif st_now == 'done':
             refuse = "already done"
+        elif st_now == 'frank_gated':
+            refuse = "FRANK_GATED — awaiting decision (wq decide / wq answer / wq review)"
+        elif st_now == 'pending_review':
+            refuse = "PENDING_REVIEW — awaiting ORCH review of Frank's response (wq review)"
         elif st_now != 'open':
             refuse = f"status={st_now}"
         else:
@@ -1058,6 +1097,112 @@ def cmd_preflight(a):
         print(f"Before state-changing work run: slock acquire <scope> --holder {holder}")
         sys.exit(2)
     print(f"OK: all of [{', '.join(subs)}] locked by you ({holder}).")
+def cmd_decide(a):
+    """wq#662: ORCH sets the decision prompt + recommendation on a frank_gated ticket,
+    advancing it to pending_review so Frank knows there is a queued question.
+    Caller must be a registered ORCH session (base name starts with 'orch' or 'foreman'
+    or 'forch' — relaxed: any registered session qualifies; the restriction is advisory
+    and enforced at the cultural level, not mechanically, because the ORCH and BUILD agents
+    share the same wq tooling). Ticket must be in frank_gated status."""
+    ping("decide")
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    r = c.execute("SELECT status, gate_type FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not r:
+        c.execute("COMMIT"); c.close(); print(f"REFUSED: wq#{a.id} not found"); sys.exit(1)
+    st, gt = r
+    if st != 'frank_gated':
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} is {st!r} — decide only acts on frank_gated tickets"); sys.exit(1)
+    prompt = (a.prompt or "").strip()
+    rec    = (a.rec or "").strip()
+    if not prompt:
+        c.execute("COMMIT"); c.close()
+        print("REFUSED: --prompt is required (the decision question + options)"); sys.exit(1)
+    if not rec:
+        c.execute("COMMIT"); c.close()
+        print("REFUSED: --rec is required (ORCH recommendation with reasoning)"); sys.exit(1)
+    c.execute("""UPDATE tasks SET status='pending_review', gate_type=COALESCE(gate_type,'frank_decision'),
+                 decision_prompt=?, orch_recommendation=?,
+                 review_verdict=NULL, review_reason=NULL
+                 WHERE id=?""", (prompt, rec, a.id))
+    c.execute("COMMIT"); c.close()
+    print(f"decided wq#{a.id}: frank_gated -> pending_review")
+    print(f"  prompt : {prompt[:120]}")
+    print(f"  rec    : {rec[:120]}")
+    print("  Next: Frank runs `wq answer {id} <response>`".format(id=a.id))
+
+def cmd_answer(a):
+    """wq#662: Frank (or MC) records a free-text response to a pending_review ticket.
+    Ticket must be in pending_review status AND must have a decision_prompt set
+    (i.e., `wq decide` was already called). Status stays pending_review — now the
+    ORCH must sweep and run `wq review` to accept or reject the answer."""
+    ping("answer")
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    r = c.execute("SELECT status, decision_prompt FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not r:
+        c.execute("COMMIT"); c.close(); print(f"REFUSED: wq#{a.id} not found"); sys.exit(1)
+    st, dp = r
+    if st != 'pending_review':
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} is {st!r} — answer only acts on pending_review tickets"); sys.exit(1)
+    if not dp:
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} has no decision_prompt — ORCH must run `wq decide` first"); sys.exit(1)
+    text = (a.text or "").strip()
+    if not text:
+        c.execute("COMMIT"); c.close()
+        print("REFUSED: response text is required (blank responses are rejected by the ORCH review)"); sys.exit(1)
+    c.execute("UPDATE tasks SET frank_response=?, response_ts=? WHERE id=?",
+              (text, now(), a.id))
+    c.execute("COMMIT"); c.close()
+    print(f"answered wq#{a.id} — response recorded, status stays pending_review")
+    print(f"  response : {text[:120]}")
+    print(f"  Next: ORCH runs `wq review {a.id} accept|reject [--reason ...]`")
+
+def cmd_review(a):
+    """wq#662: ORCH reviews Frank's response on a pending_review ticket.
+    verdict=accept  -> status='open', gate_type cleared, answer recorded. Ticket is now
+                       claimable and the decision gate is considered resolved.
+    verdict=reject  -> status='frank_gated', frank_response/response_ts cleared so Frank
+                       knows to re-answer, reason recorded in review_reason.
+    Ticket must be in pending_review status AND have a frank_response set."""
+    ping("review")
+    verdict = (a.verdict or "").strip().lower()
+    if verdict not in ("accept", "reject"):
+        print("REFUSED: verdict must be 'accept' or 'reject'"); sys.exit(1)
+    reason = (a.reason or "").strip()
+    if verdict == "reject" and not reason:
+        print("REFUSED: --reason is required when rejecting (blank/insufficient response needs an explanation)"); sys.exit(1)
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    r = c.execute("SELECT status, frank_response, decision_prompt FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not r:
+        c.execute("COMMIT"); c.close(); print(f"REFUSED: wq#{a.id} not found"); sys.exit(1)
+    st, fr, dp = r
+    if st != 'pending_review':
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} is {st!r} — review only acts on pending_review tickets"); sys.exit(1)
+    if not fr:
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} has no frank_response — Frank must run `wq answer` first"); sys.exit(1)
+    if verdict == "accept":
+        c.execute("""UPDATE tasks SET status='open', review_verdict='accept', review_reason=?
+                     WHERE id=?""", (reason or None, a.id))
+        c.execute("COMMIT"); c.close()
+        print(f"reviewed wq#{a.id}: pending_review -> open (ACCEPTED)")
+        if reason: print(f"  note : {reason}")
+        print("  Ticket is now claimable. Decision gate cleared.")
+    else:
+        c.execute("""UPDATE tasks SET status='frank_gated', review_verdict='reject',
+                     review_reason=?, frank_response=NULL, response_ts=NULL
+                     WHERE id=?""", (reason, a.id))
+        c.execute("COMMIT"); c.close()
+        print(f"reviewed wq#{a.id}: pending_review -> frank_gated (REJECTED)")
+        print(f"  reason : {reason}")
+        print(f"  Frank's response was cleared — `wq answer {a.id}` to resubmit")
+
 def cmd_list(a):
     ping("list")
     c = conn(); lane = a.lane or getattr(a, "lane_flag", None)
@@ -1065,11 +1210,16 @@ def cmd_list(a):
     if lane: conds.append("lane=?"); params.append(lane)
     if getattr(a, "by", None): conds.append("claimed_by=?"); params.append(a.by)
     if getattr(a, "status", None): conds.append("status=?"); params.append(a.status)
-    q = "SELECT id,lane,pri,status,title,claimed_by,deps,lease_expires,subsystems,gate FROM tasks"
+    # wq#661: include created_at + gate for effective_pri computation.
+    q = "SELECT id,lane,pri,status,title,claimed_by,deps,lease_expires,subsystems,gate,frank_response,created_at FROM tasks"
     if conds: q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY lane,pri,id"
     rows = c.execute(q, params).fetchall(); c.close()
     if not rows: print("(empty)"); return
+    # wq#661: --sort effective re-sorts by effective_pri then id; default order unchanged.
+    sort = getattr(a, "sort", "default")
+    if sort == "effective":
+        rows = sorted(rows, key=lambda r: (r[1], effective_pri(r[2], r[3], r[9], r[11]), r[0]))
     t_now = now()
     for r in rows:
         cb = f" <{r[5]}>" if r[5] else ""
@@ -1081,17 +1231,28 @@ def cmd_list(a):
             if r[7] is None: lz = " lease=legacy(none)"
             elif r[7] < t_now: lz = f" lease=EXPIRED@{r[7]}Z"
             else: lz = f" lease={r[7]}Z"
-        print(f"[{r[0]:>3}] {r[1]:<4} p{r[2]} {r[3]:<8} {r[4][:66]}{cb}{dep}{sub}{gt}{lz}")
+        # wq#662: pending_review sub-state: awaiting Frank's answer vs awaiting ORCH review
+        fg = ""
+        if r[3] == 'pending_review':
+            fg = " [awaiting-answer]" if not r[10] else " [awaiting-review]"
+        ep = effective_pri(r[2], r[3], r[9], r[11])
+        ep_tag = f" ep{ep}" if ep != r[2] else ""
+        print(f"[{r[0]:>3}] {r[1]:<4} p{r[2]}{ep_tag} {r[3]:<14} {r[4][:58]}{cb}{dep}{sub}{gt}{fg}{lz}")
 def cmd_show(a):
     ping("show")
     c = conn(); cur = c.execute("SELECT * FROM tasks WHERE id=?", (a.id,)); r = cur.fetchone(); cols=[d[0] for d in cur.description]; c.close()
     if not r: print("no such task"); return
-    for k,v in zip(cols,r): print(f"{k:13}: {v}")
+    row = dict(zip(cols, r))
+    for k, v in row.items(): print(f"{k:13}: {v}")
+    # wq#661: computed field — never stored, always derived from current state + age.
+    ep = effective_pri(row.get("pri", 2), row.get("status", ""), row.get("gate", ""), row.get("created_at", ""))
+    print(f"effective_pri: {ep}")
 def cmd_edit(a):
     c = conn(); fields=[]; vals=[]
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
-                    ("gate",a.gate),("deps",a.deps),("archetype",a.archetype)):
+                    ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
+                    ("gate_type",getattr(a,"gate_type",None))):
         if val is not None: fields.append(f"{col}=?"); vals.append(val)
     # wq#617: --model/--effort are validated as a pair; "" clears (back to unassigned).
     if a.model is not None or a.effort is not None:
@@ -1102,7 +1263,7 @@ def cmd_edit(a):
         if a.model == "": e = None    # clearing the model clears the pair
         m, e = norm_tuple(m, e)
         fields += ["model=?", "effort=?"]; vals += [m, e]
-    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype"); c.close(); return
+    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype/--gate-type"); c.close(); return
     vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals); c.commit()
     print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}"); c.close()
 def cmd_retire(a):
@@ -1188,7 +1349,7 @@ def cmd_reap(a):
     print(f"reaped {len(expired)} ticket(s){suffix}")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
@@ -1198,11 +1359,15 @@ s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_block)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
-s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.set_defaults(f=cmd_list)
+s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
-s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
+# wq#662: Frank-decision gate protocol
+s=sub.add_parser("decide",help="wq#662 ORCH: set decision_prompt+rec on frank_gated ticket, advance to pending_review"); s.add_argument("id",type=int); s.add_argument("--prompt",required=True,help="the decision question + options Frank must address"); s.add_argument("--rec",required=True,help="ORCH recommendation with reasoning"); s.set_defaults(f=cmd_decide)
+s=sub.add_parser("answer",help="wq#662 Frank/MC: record free-text response on pending_review ticket"); s.add_argument("id",type=int); s.add_argument("text",help="Frank's free-text response"); s.set_defaults(f=cmd_answer)
+s=sub.add_parser("review",help="wq#662 ORCH: accept or reject Frank's response on pending_review ticket"); s.add_argument("id",type=int); s.add_argument("verdict",choices=["accept","reject"]); s.add_argument("--reason",default=None,help="required when rejecting; optional note on accept"); s.set_defaults(f=cmd_review)
 init()
 a = p.parse_args()
 if not getattr(a,"cmd",None): p.print_help(); sys.exit(0)
