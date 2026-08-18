@@ -88,6 +88,24 @@ NTFY_BIN = os.environ.get("WQ_NTFY_BIN", "/home/lumen/bin/ntfy-send")
 SESSION_RE = re.compile(r"^(?P<base>.+)-(?P<sid>[0-9a-f]{6})$")
 STRICT = os.environ.get("WQ_STRICT", "").strip().lower() in ("1", "true", "yes")
 FMT = "%Y-%m-%d %H:%M:%S"
+# wq#661: aging escalation — open unclaimed tickets gain +1 effective priority tier per
+# WQ_AGING_DAYS days without a claim, capped at 1 tier. Blocked/gated tickets are excluded:
+# they are waiting on an identified condition and should not be escalated.
+AGING_DAYS = _envint("WQ_AGING_DAYS", 7)
+def effective_pri(pri, status, gate, created_at):
+    """wq#661: effective priority = stored pri minus age boost (never mutates stored pri).
+    Only open/unclaimed tickets are boosted. Blocked and gated tickets are excluded —
+    they are waiting on something identified and should not drift up the queue on their own.
+    Boost: +1 tier per AGING_DAYS days open, capped at 1. effective_pri never goes below 1."""
+    if status != 'open': return pri
+    if gate and gate.strip(): return pri  # gated — has an identified blocking condition
+    try:
+        created = datetime.datetime.strptime(created_at, FMT).replace(tzinfo=datetime.timezone.utc)
+        days = (utcnow() - created).total_seconds() / 86400.0
+    except (TypeError, ValueError):
+        return pri
+    boost = min(1, int(days / AGING_DAYS))
+    return max(1, pri - boost)
 CANON_SUBSYSTEMS = {"vault-ha","litellm","minerva-db","queue-db","messenger",
                     "research-index","fleet-ssh","cloudflared","fleet-state","wq-tooling",
                     # wq#512 (2026-08-13): cross-lane shared assets. The github lane and the
@@ -1065,11 +1083,16 @@ def cmd_list(a):
     if lane: conds.append("lane=?"); params.append(lane)
     if getattr(a, "by", None): conds.append("claimed_by=?"); params.append(a.by)
     if getattr(a, "status", None): conds.append("status=?"); params.append(a.status)
-    q = "SELECT id,lane,pri,status,title,claimed_by,deps,lease_expires,subsystems,gate FROM tasks"
+    # wq#661: include created_at + gate for effective_pri computation.
+    q = "SELECT id,lane,pri,status,title,claimed_by,deps,lease_expires,subsystems,gate,created_at FROM tasks"
     if conds: q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY lane,pri,id"
     rows = c.execute(q, params).fetchall(); c.close()
     if not rows: print("(empty)"); return
+    # wq#661: --sort effective re-sorts by effective_pri then id; default order unchanged.
+    sort = getattr(a, "sort", "default")
+    if sort == "effective":
+        rows = sorted(rows, key=lambda r: (r[1], effective_pri(r[2], r[3], r[9], r[10]), r[0]))
     t_now = now()
     for r in rows:
         cb = f" <{r[5]}>" if r[5] else ""
@@ -1081,12 +1104,18 @@ def cmd_list(a):
             if r[7] is None: lz = " lease=legacy(none)"
             elif r[7] < t_now: lz = f" lease=EXPIRED@{r[7]}Z"
             else: lz = f" lease={r[7]}Z"
-        print(f"[{r[0]:>3}] {r[1]:<4} p{r[2]} {r[3]:<8} {r[4][:66]}{cb}{dep}{sub}{gt}{lz}")
+        ep = effective_pri(r[2], r[3], r[9], r[10])
+        ep_tag = f" ep{ep}" if ep != r[2] else ""
+        print(f"[{r[0]:>3}] {r[1]:<4} p{r[2]}{ep_tag} {r[3]:<8} {r[4][:64]}{cb}{dep}{sub}{gt}{lz}")
 def cmd_show(a):
     ping("show")
     c = conn(); cur = c.execute("SELECT * FROM tasks WHERE id=?", (a.id,)); r = cur.fetchone(); cols=[d[0] for d in cur.description]; c.close()
     if not r: print("no such task"); return
-    for k,v in zip(cols,r): print(f"{k:13}: {v}")
+    row = dict(zip(cols, r))
+    for k, v in row.items(): print(f"{k:13}: {v}")
+    # wq#661: computed field — never stored, always derived from current state + age.
+    ep = effective_pri(row.get("pri", 2), row.get("status", ""), row.get("gate", ""), row.get("created_at", ""))
+    print(f"effective_pri: {ep}")
 def cmd_edit(a):
     c = conn(); fields=[]; vals=[]
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
@@ -1198,7 +1227,7 @@ s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_block)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
-s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.set_defaults(f=cmd_list)
+s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
 s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
