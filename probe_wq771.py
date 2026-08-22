@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """probe_wq771 — lumen-pr refuses to land over uncommitted work in the target tree.
 
+Section D extends this to wq#792: an un-pushed local COMMIT on the target's default
+branch is the same loss class as uncommitted state, and dirty_target_guard now checks
+both.
+
 WHAT THIS ASSERTS, and what it does not, stated first because the sections are not equal:
 
   DISCRIMINATORS (B) drive the REAL `lumen-pr land` end to end against a fake forge and
@@ -281,7 +285,7 @@ sha4 = branch_commit(w4, "config.json", '{"lanes": {}, "cloud_ceiling": 5}\n')
 PR["head"] = {"sha": sha4, "ref": "fix/probe"}
 rc, out = land(w4, LUMEN_PR_ALLOW_DIRTY=1)
 check("B5 LUMEN_PR_ALLOW_DIRTY=1 lands, and says so loudly",
-      rc == 0 and merged_yet() and "LANDING OVER UNCOMMITTED WORK ON PURPOSE" in out,
+      rc == 0 and merged_yet() and "LANDING OVER TARGET-ONLY WORK ON PURPOSE" in out,
       f"rc={rc} out={out[-300:]!r}")
 
 p5, w5 = forge_repo("untracked")
@@ -322,7 +326,7 @@ open(os.path.join(wt2, "config.json"), "w").write('{"lanes": {}, "cloud_ceiling"
 git(wt2, "add -- config.json")
 rc, out = sh(f'{LPR} commit {wt2} "fix(probe): touch a held path"', env=env(WQ_AGENT="probe-wq771"))
 check("B9 commit WARNS about the collision and still commits (nothing is destroyed yet)",
-      rc == 0 and "UNCOMMITTED WORK IN THE TARGET TREE" in out and "config.json" in out,
+      rc == 0 and "TARGET TREE HAS WORK ORIGIN DOES NOT" in out and "config.json" in out,
       f"rc={rc} out={out[-300:]!r}")
 
 r3 = real_repo("startnote")
@@ -330,6 +334,51 @@ open(os.path.join(r3, "config.json"), "w").write('{"lanes": {"build": {}}}\n')
 rc, out = sh(f"{LPR} start {r3} fix/probe-note --worktree", env=env(WQ_AGENT="probe-wq771"))
 check("B10 start names the landmines up front, before any work is done",
       rc == 0 and "wq#771" in out and "config.json" in out, f"rc={rc} out={out[-300:]!r}")
+
+# ---------------------------------------------------------------------------
+print("\nD. wq#792 — un-pushed COMMIT on the target's default branch, not just uncommitted state")
+
+p7, w7 = forge_repo("unpushed")
+open(os.path.join(p7, "config.json"), "w").write('{"lanes": {"build": {"enabled": true}}}\n')
+git(p7, "add -- config.json")
+git(p7, "commit -qm 'feat(probe): local-only commit never pushed'")
+sha7 = branch_commit(w7, "config.json", '{"lanes": {}, "cloud_ceiling": 5}\n')
+PR["head"] = {"sha": sha7, "ref": "fix/probe"}
+FILES[:] = ["config.json"]
+rc, out = land(w7)
+check("D1 land REFUSES over an un-pushed commit on the target's default branch, cites wq#792",
+      rc != 0 and "config.json" in out and "wq#792" in out and "refusing to land" in out,
+      f"rc={rc} out={out[-300:]!r}")
+check("D1b the merge endpoint was NEVER called", not merged_yet(), str(HITS))
+
+p8, w8 = forge_repo("unpushed-unrelated")
+open(os.path.join(p8, "README.md"), "w").write("local-only commit, unrelated path\n")
+git(p8, "add -- README.md")
+git(p8, "commit -qm 'chore(probe): unrelated local-only commit'")
+sha8 = branch_commit(w8, "config.json", '{"lanes": {}, "cloud_ceiling": 5}\n')
+PR["head"] = {"sha": sha8, "ref": "fix/probe"}
+rc, out = land(w8)
+check("D2 intersection, not 'any un-pushed commit': an unrelated local-only commit does not block",
+      rc == 0 and merged_yet(), f"rc={rc} out={out[-300:]!r}")
+
+p9, w9 = forge_repo("unpushed-override")
+open(os.path.join(p9, "config.json"), "w").write('{"lanes": {"build": {}}}\n')
+git(p9, "add -- config.json")
+git(p9, "commit -qm 'feat(probe): another local-only commit'")
+sha9 = branch_commit(w9, "config.json", '{"lanes": {}, "cloud_ceiling": 5}\n')
+PR["head"] = {"sha": sha9, "ref": "fix/probe"}
+rc, out = land(w9, LUMEN_PR_ALLOW_DIRTY=1)
+check("D3 LUMEN_PR_ALLOW_DIRTY=1 lands over an un-pushed commit too, and says so loudly",
+      rc == 0 and merged_yet() and "LANDING OVER TARGET-ONLY WORK ON PURPOSE" in out,
+      f"rc={rc} out={out[-300:]!r}")
+
+r5 = real_repo("dcheck-unpushed")
+open(os.path.join(r5, "config.json"), "w").write("local-only, real repo\n")
+git(r5, "add -- config.json")
+git(r5, "commit -qm 'feat(probe): local-only commit, real repo'")
+rc, out = sh(f"{LPR} dirtycheck {r5} config.json", env=env())
+check("D4 dirtycheck also catches an un-pushed commit, not just uncommitted diffs",
+      rc != 0 and "config.json" in out and "wq#792" in out, f"rc={rc} out={out[-200:]!r}")
 
 # ---------------------------------------------------------------------------
 print("\nC. REGRESSION GUARDS — behaviour the change must not move")
@@ -357,7 +406,7 @@ git(r4, "checkout -q -b fix/probe-primary")
 git(r4, "add -- config.json")
 rc, out = sh(f'{LPR} commit {r4} "fix(probe): commit in the primary tree itself"', env=env())
 check("C6 committing IN the target tree does not warn about the caller's own staged work",
-      rc == 0 and "UNCOMMITTED WORK IN THE TARGET TREE" not in out, f"rc={rc} out={out[-300:]!r}")
+      rc == 0 and "TARGET TREE HAS WORK ORIGIN DOES NOT" not in out, f"rc={rc} out={out[-300:]!r}")
 check("C7 the guard prefers the local merge-base diff — no /files call when the head is local",
       not any(p.endswith("/files") for _, p in HITS_LOCAL_HEAD), str(HITS_LOCAL_HEAD))
 

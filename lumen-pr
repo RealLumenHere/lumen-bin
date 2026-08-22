@@ -13,7 +13,7 @@
 #   lumen-pr land   <repo-path> <pr-number> [--timeout SEC]
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
-#   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>...  # wq#771 target-tree guard
+#   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>...  # wq#771/wq#792 target-tree guard
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
 # trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
@@ -328,7 +328,7 @@ lint_body_sections() { # lint_body_sections <body-text>
   return 0
 }
 
-# --- dirty target-tree guard (wq#771) ---------------------------------------
+# --- dirty target-tree guard (wq#771, wq#792) -------------------------------
 # WHY: on 2026-08-21 the dispatcher sat dead for ~3 hours. A session had edited
 # dispatcher/config.json in the LIVE foreman tree (adding the 'build' lane) and never
 # committed it. A second session cut a worktree from origin/main — which by definition
@@ -348,6 +348,14 @@ lint_body_sections() { # lint_body_sections <body-text>
 # Other linked worktrees are agent scratch and are NOT checked; the primary tree is the
 # one whose uncommitted state is live configuration.
 # LUMEN_PR_ALLOW_DIRTY=1 overrides, loudly, for the deliberate case.
+#
+# wq#792: uncommitted working-tree state was the first shape of this loss, not the whole
+# of it. An un-pushed local COMMIT on the target's default branch is the same class: a
+# squash-merge on the remote lands a version of the touched paths branched from
+# origin/$DEFAULT_BRANCH, which never saw that commit either, and it reads as silently
+# superseded rather than conflicting. Found live: /home/lumen/bin's local main carried a
+# commit no `land` had ever pushed, so every subsequently landed PR merged on the forge
+# but never reached the tree every agent actually invokes. tree_unpushed (below) covers it.
 
 # The main work tree of the repo, whichever tree we were pointed at. git-worktree(1)
 # lists the main work tree first. The --git-common-dir parent is the fallback, and is
@@ -386,61 +394,86 @@ tree_uncommitted() { # tree_uncommitted <tree>
   } | LC_ALL=C sort -u
 }
 
+# Paths touched by commits on <tree>'s $DEFAULT_BRANCH that origin/$DEFAULT_BRANCH does
+# not have (wq#792). Only checked when $DEFAULT_BRANCH is actually checked out there — a
+# tree parked on some other branch has nothing of $DEFAULT_BRANCH's to be ahead of, and a
+# missing origin/$DEFAULT_BRANCH (never fetched) means "unknown", not "clean", so this
+# returns nothing rather than guessing.
+tree_unpushed() { # tree_unpushed <tree>
+  local t="$1"
+  [ "$(git -C "$t" branch --show-current 2>/dev/null)" = "$DEFAULT_BRANCH" ] || return 0
+  git -C "$t" rev-parse --verify -q "refs/remotes/origin/$DEFAULT_BRANCH" >/dev/null 2>&1 || return 0
+  git -C "$t" -c core.quotePath=false diff --name-only \
+    "origin/$DEFAULT_BRANCH...$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u
+}
+
 # dirty_target_guard <refuse|warn> <label> <newline-separated paths>
 # Paths arrive as an ARGUMENT, never on stdin: a function on the right of a pipe runs in
 # a subshell, so `die` inside it would exit that subshell and the land would carry on.
 dirty_target_guard() {
-  local mode="$1" label="$2" paths="$3" primary hits n
+  local mode="$1" label="$2" paths="$3" primary sorted uncommitted unpushed hits n
   [ -n "$paths" ] || return 0
   if ! primary=$(primary_worktree); then
     note "WARNING: cannot resolve the primary work tree of $SLUG — dirty-target guard (wq#771) SKIPPED" >&2
     return 0
   fi
-  hits=$(LC_ALL=C comm -12 \
-    <(printf '%s\n' "$paths" | grep -v '^$' | LC_ALL=C sort -u) \
-    <(tree_uncommitted "$primary"))
+  sorted=$(printf '%s\n' "$paths" | grep -v '^$' | LC_ALL=C sort -u)
+  uncommitted=$(LC_ALL=C comm -12 <(printf '%s\n' "$sorted") <(tree_uncommitted "$primary"))
+  unpushed=$(LC_ALL=C comm -12 <(printf '%s\n' "$sorted") <(tree_unpushed "$primary"))
+  hits=$(printf '%s\n%s\n' "$uncommitted" "$unpushed" | grep -v '^$' | LC_ALL=C sort -u)
   [ -n "$hits" ] || return 0
   n=$(printf '%s\n' "$hits" | grep -c .)
 
   {
-    printf 'lumen-pr: UNCOMMITTED WORK IN THE TARGET TREE (wq#771)\n'
+    printf 'lumen-pr: TARGET TREE HAS WORK ORIGIN DOES NOT (wq#771/wq#792)\n'
     printf '  target tree: %s\n' "$primary"
-    printf '  %s path(s) this %s touches are uncommitted there:\n' "$n" "$label"
-    printf '%s\n' "$hits" | sed 's/^/    /'
+    printf '  %s path(s) this %s touches are affected:\n' "$n" "$label"
+    if [ -n "$uncommitted" ]; then
+      printf '  uncommitted there:\n'
+      printf '%s\n' "$uncommitted" | sed 's/^/    /'
+    fi
+    if [ -n "$unpushed" ]; then
+      printf '  in a local commit on %s never pushed to origin:\n' "$DEFAULT_BRANCH"
+      printf '%s\n' "$unpushed" | sed 's/^/    /'
+    fi
   } >&2
 
   # Non-zero from here down means "collision found". Nothing runs under `set -e`, so this
   # never aborts a caller by itself; it gives dirtycheck (and any future caller) something
   # to branch on without re-deriving the answer.
   if [ "$mode" != refuse ]; then
-    note "WARNING: if this branch lands while those stay uncommitted, land will refuse (wq#771)" >&2
+    note "WARNING: if this branch lands while that stays uncommitted/un-pushed, land will refuse (wq#771/wq#792)" >&2
     return 1
   fi
 
   if [ "${LUMEN_PR_ALLOW_DIRTY:-0}" = 1 ]; then
     {
-      printf 'lumen-pr: !!! LUMEN_PR_ALLOW_DIRTY=1 — LANDING OVER UNCOMMITTED WORK ON PURPOSE !!!\n'
+      printf 'lumen-pr: !!! LUMEN_PR_ALLOW_DIRTY=1 — LANDING OVER TARGET-ONLY WORK ON PURPOSE !!!\n'
       printf 'lumen-pr: !!! holder=%s repo=%s paths=%s\n' "$GITLOCK_HOLDER" "$SLUG" "$(printf '%s' "$hits" | tr '\n' ' ')"
       printf 'lumen-pr: !!! say so in the ticket notes; this is the 2026-08-21 dispatcher stall by hand\n'
     } >&2
     return 1
   fi
 
-  die "refusing to land over uncommitted work in $primary (listed above).
+  die "refusing to land over work the target tree $primary has that origin does not (listed above).
       Merging now lands a version of those paths branched from origin/$DEFAULT_BRANCH, which
-      never saw the local edit. Git will report NO conflict — there is nothing committed to
-      conflict with — so the local edit is superseded silently and then reads as stale debris.
-      That is the 2026-08-21 dispatcher stall, verbatim: build lane deleted, 42 tickets
-      invisible, ~3h dead.
+      never saw the local work. Git will report NO conflict — there is nothing on that side to
+      conflict with — so the local work is superseded silently and then reads as stale debris.
+      That is the 2026-08-21 dispatcher stall (wq#771): build lane deleted, 42 tickets invisible,
+      ~3h dead. An un-pushed commit (wq#792) is the same shape: it merges fine on the forge and
+      silently never reaches the tree every agent actually runs out of.
 
       Decide in the TARGET tree, then re-run this land:
-        git -C $primary status --short
-        git -C $primary diff -- <path>        # is the local work worth keeping?
-      keep it (land that first, then this):
+        git -C $primary status --short                                        # uncommitted?
+        git -C $primary log --oneline origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH  # un-pushed commit(s)?
+      keep uncommitted work (land that first, then this):
         git -C $primary add -- <path> && git -C $primary commit -m '<type>(<scope>): <what>'
+      keep an un-pushed commit (push it, or land it as its own PR, then this):
+        git -C $primary push origin $DEFAULT_BRANCH
       discard it, deliberately:
-        git -C $primary checkout -- <path>    # tracked, modified
-        rm -- $primary/<path>                 # untracked
+        git -C $primary checkout -- <path>                          # tracked, modified
+        rm -- $primary/<path>                                       # untracked
+        git -C $primary reset --hard origin/$DEFAULT_BRANCH          # discard un-pushed commit(s) — destructive
 
       Deliberate exception, logged loudly: LUMEN_PR_ALLOW_DIRTY=1 lumen-pr land ..."
 }
@@ -1012,7 +1045,7 @@ cmd_dirtycheck() {
   [ -n "${paths//[$'\n']/}" ] || die "usage: lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>... | -"
   n=$(printf '%s' "$paths" | grep -c .)
   dirty_target_guard "$mode" "path list" "$paths" || return 1
-  note "clean: none of the $n path(s) given is uncommitted in $(primary_worktree)"
+  note "clean: none of the $n path(s) given is uncommitted or in an un-pushed commit in $(primary_worktree)"
 }
 
 case "${1:-}" in
