@@ -13,6 +13,7 @@
 #   lumen-pr land   <repo-path> <pr-number> [--timeout SEC]
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
+#   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>...  # wq#771 target-tree guard
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
 # trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
@@ -26,6 +27,10 @@
 # then /home/lumen/.secrets/github-frank.token, then the deprecated GITHUB_TOKEN in
 # /home/lumen/agent/.env (wq#524). Gitea repos take the same ladder from
 # /home/lumen/.secrets/gitea-lumen.token. Never printed, never committed.
+#
+# LUMEN_PR_ALLOW_DIRTY=1 overrides the wq#771 target-tree guard for one invocation, and
+# prints a banner saying so. It is not a way to make a noisy check quiet: the check is
+# only ever noisy when someone's uncommitted work is about to be superseded.
 set -uo pipefail
 
 BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
@@ -323,6 +328,176 @@ lint_body_sections() { # lint_body_sections <body-text>
   return 0
 }
 
+# --- dirty target-tree guard (wq#771) ---------------------------------------
+# WHY: on 2026-08-21 the dispatcher sat dead for ~3 hours. A session had edited
+# dispatcher/config.json in the LIVE foreman tree (adding the 'build' lane) and never
+# committed it. A second session cut a worktree from origin/main — which by definition
+# did not contain that edit — and landed a PR touching the same file. Git reported NO
+# conflict, because there was nothing COMMITTED to conflict with: the uncommitted lane
+# was simply superseded, then looked like stale debris and was cleared. Net: the build
+# lane silently deleted, 42 tickets invisible to autonomy, four dispatcher passes with
+# candidates:2 spawned:0. Third instance of this class in that one file in one day.
+#
+# The existing locks are not broken and could not have caught it. gitlock (wq#532a) and
+# slock serialise COMMITS and MERGES; wq leases protect TICKETS. Nothing in that set can
+# see uncommitted working-tree state, and uncommitted working-tree state is exactly what
+# was lost. The collision system was bypassed, not defeated.
+#
+# So: before a merge, look at the TARGET repo — the PRIMARY work tree, the one the fleet
+# actually runs out of — and refuse when any path this PR touches is uncommitted there.
+# Other linked worktrees are agent scratch and are NOT checked; the primary tree is the
+# one whose uncommitted state is live configuration.
+# LUMEN_PR_ALLOW_DIRTY=1 overrides, loudly, for the deliberate case.
+
+# The main work tree of the repo, whichever tree we were pointed at. git-worktree(1)
+# lists the main work tree first. The --git-common-dir parent is the fallback, and is
+# resolved from INSIDE the repo because git returns that path relative to the repo, not
+# to $PWD (the same trap cmd_land documents).
+primary_worktree() {
+  local out
+  out=$(git -C "$REPO_PATH" worktree list --porcelain 2>/dev/null \
+        | awk 'NR==1 && $1=="worktree" { print substr($0, 10); exit }')
+  if [ -z "$out" ]; then
+    out=$(cd "$REPO_PATH" && cd "$(git rev-parse --git-common-dir)/.." 2>/dev/null && pwd -P)
+  fi
+  [ -d "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+same_tree() { # same_tree <a> <b>
+  local a b
+  a=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  b=$(cd "$2" 2>/dev/null && pwd -P) || return 1
+  [ "$a" = "$b" ]
+}
+
+# Every path in <tree> that differs from its HEAD: unstaged, staged, or untracked.
+# The ticket names the first two; untracked is here because a merge that ADDS a path
+# git already sees untracked is refused by git itself ("untracked working tree file
+# would be overwritten"), and because "operator wrote a file and never committed it" is
+# the same loss with the same shape. core.quotePath=false keeps non-ASCII paths literal
+# so they compare against the PR's list instead of against \xNN escapes.
+tree_uncommitted() { # tree_uncommitted <tree>
+  local t="$1"
+  {
+    git -C "$t" -c core.quotePath=false diff --name-only 2>/dev/null
+    git -C "$t" -c core.quotePath=false diff --cached --name-only 2>/dev/null
+    git -C "$t" -c core.quotePath=false ls-files --others --exclude-standard 2>/dev/null
+  } | LC_ALL=C sort -u
+}
+
+# dirty_target_guard <refuse|warn> <label> <newline-separated paths>
+# Paths arrive as an ARGUMENT, never on stdin: a function on the right of a pipe runs in
+# a subshell, so `die` inside it would exit that subshell and the land would carry on.
+dirty_target_guard() {
+  local mode="$1" label="$2" paths="$3" primary hits n
+  [ -n "$paths" ] || return 0
+  if ! primary=$(primary_worktree); then
+    note "WARNING: cannot resolve the primary work tree of $SLUG — dirty-target guard (wq#771) SKIPPED" >&2
+    return 0
+  fi
+  hits=$(LC_ALL=C comm -12 \
+    <(printf '%s\n' "$paths" | grep -v '^$' | LC_ALL=C sort -u) \
+    <(tree_uncommitted "$primary"))
+  [ -n "$hits" ] || return 0
+  n=$(printf '%s\n' "$hits" | grep -c .)
+
+  {
+    printf 'lumen-pr: UNCOMMITTED WORK IN THE TARGET TREE (wq#771)\n'
+    printf '  target tree: %s\n' "$primary"
+    printf '  %s path(s) this %s touches are uncommitted there:\n' "$n" "$label"
+    printf '%s\n' "$hits" | sed 's/^/    /'
+  } >&2
+
+  # Non-zero from here down means "collision found". Nothing runs under `set -e`, so this
+  # never aborts a caller by itself; it gives dirtycheck (and any future caller) something
+  # to branch on without re-deriving the answer.
+  if [ "$mode" != refuse ]; then
+    note "WARNING: if this branch lands while those stay uncommitted, land will refuse (wq#771)" >&2
+    return 1
+  fi
+
+  if [ "${LUMEN_PR_ALLOW_DIRTY:-0}" = 1 ]; then
+    {
+      printf 'lumen-pr: !!! LUMEN_PR_ALLOW_DIRTY=1 — LANDING OVER UNCOMMITTED WORK ON PURPOSE !!!\n'
+      printf 'lumen-pr: !!! holder=%s repo=%s paths=%s\n' "$GITLOCK_HOLDER" "$SLUG" "$(printf '%s' "$hits" | tr '\n' ' ')"
+      printf 'lumen-pr: !!! say so in the ticket notes; this is the 2026-08-21 dispatcher stall by hand\n'
+    } >&2
+    return 1
+  fi
+
+  die "refusing to land over uncommitted work in $primary (listed above).
+      Merging now lands a version of those paths branched from origin/$DEFAULT_BRANCH, which
+      never saw the local edit. Git will report NO conflict — there is nothing committed to
+      conflict with — so the local edit is superseded silently and then reads as stale debris.
+      That is the 2026-08-21 dispatcher stall, verbatim: build lane deleted, 42 tickets
+      invisible, ~3h dead.
+
+      Decide in the TARGET tree, then re-run this land:
+        git -C $primary status --short
+        git -C $primary diff -- <path>        # is the local work worth keeping?
+      keep it (land that first, then this):
+        git -C $primary add -- <path> && git -C $primary commit -m '<type>(<scope>): <what>'
+      discard it, deliberately:
+        git -C $primary checkout -- <path>    # tracked, modified
+        rm -- $primary/<path>                 # untracked
+
+      Deliberate exception, logged loudly: LUMEN_PR_ALLOW_DIRTY=1 lumen-pr land ..."
+}
+
+# The paths a PR touches. Resolved LOCALLY where possible: merge-base(origin/default, head)
+# ..head is exactly the set the squash lands, needs no pagination, and cannot be silently
+# capped the way GitHub's /pulls/N/files is (30 per page, 300 files hard cap). The forge is
+# the fallback for landing a PR whose head this clone has never fetched.
+pr_changed_files() { # pr_changed_files <pr-number> <head-sha>
+  local pr="$1" sha="$2" base page=1 chunk n
+  if ! git -C "$REPO_PATH" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    git -C "$REPO_PATH" fetch -q origin 2>/dev/null || true
+  fi
+  if git -C "$REPO_PATH" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    base=$(git -C "$REPO_PATH" merge-base "origin/$DEFAULT_BRANCH" "$sha" 2>/dev/null)
+    if [ -n "$base" ]; then
+      git -C "$REPO_PATH" -c core.quotePath=false diff --name-only "$base" "$sha"
+      return 0
+    fi
+  fi
+  while [ "$page" -le 5 ]; do
+    if ! api GET "/repos/$SLUG/pulls/$pr/files?per_page=100&page=$page"; then
+      note "WARNING: could not list PR #$pr files (HTTP $API_CODE) — the wq#771 guard is running on an INCOMPLETE file list" >&2
+      return 0
+    fi
+    # previous_filename too: a rename lands a DELETE of the old path, which clobbers an
+    # uncommitted edit there just as thoroughly as a modification would.
+    chunk=$(printf '%s' "$API_BODY" | jq -r '.[]? | (.filename // empty), (.previous_filename // empty)' 2>/dev/null)
+    n=$(printf '%s' "$API_BODY" | jq -r '.[]? | .filename // empty' 2>/dev/null | grep -c .)
+    [ -n "$chunk" ] && printf '%s\n' "$chunk"
+    [ "${n:-0}" -lt 100 ] && return 0
+    page=$((page + 1))
+  done
+  note "WARNING: PR #$pr changes more than 500 files — the wq#771 guard checked the first 500" >&2
+}
+
+# start knows no file set (nothing is written yet), so the useful thing to say is WHICH
+# paths are landmines: touch one and `land` will refuse.
+dirty_target_start_notice() {
+  # Called only from the --worktree branch, where the caller is about to go and work
+  # SOMEWHERE ELSE. In the --primary flow the caller is standing in this tree and the
+  # existing "uncommitted files carried into the branch" line already says it.
+  local primary dirty n
+  primary=$(primary_worktree) || return 0
+  dirty=$(git -C "$primary" -c core.quotePath=false diff --name-only 2>/dev/null
+          git -C "$primary" -c core.quotePath=false diff --cached --name-only 2>/dev/null)
+  dirty=$(printf '%s\n' "$dirty" | grep -v '^$' | LC_ALL=C sort -u)
+  [ -n "$dirty" ] || return 0
+  n=$(printf '%s\n' "$dirty" | grep -c .)
+  note "NOTE (wq#771): $n path(s) are uncommitted in the target tree $primary."
+  note "  Your branch starts from origin/$DEFAULT_BRANCH and does NOT contain those edits."
+  note "  Touch any of them and 'lumen-pr land' will refuse until they are committed or discarded:"
+  printf '%s\n' "$dirty" | head -20 | sed 's/^/    /'
+  [ "$n" -gt 20 ] && printf '    ... and %s more (git -C %s status --short)\n' "$((n - 20))" "$primary"
+  return 0
+}
+
 # --- worktree ownership (wq#598) --------------------------------------------
 # A worktree path is $WORKTREE_ROOT/<repo>-<branch-slug>, and §2 FORBIDS ticket ids and agent
 # names inside a branch name — so the path is derived entirely from a slug that two sessions can
@@ -450,6 +625,7 @@ cmd_start() {
       wt_owner_write "$wt"
       note "created worktree $wt on $branch from origin/$DEFAULT_BRANCH"
     fi
+    dirty_target_start_notice
     note "the shared tree at $REPO_PATH was NOT touched (still on $(git -C "$REPO_PATH" branch --show-current))"
     note "next: work in $wt, then: lumen-pr commit $wt \"<subject>\" --refs wq#N"
     printf '%s\n' "$wt"
@@ -496,6 +672,13 @@ cmd_commit() {
     die "refusing to commit directly to '$DEFAULT_BRANCH' (§2, §10.1). Run: lumen-pr start $REPO_PATH <type>/<slug>"
   git -C "$REPO_PATH" diff --cached --quiet && \
     die "nothing staged. Stage ONLY the paths this ticket touched: git -C $REPO_PATH add <paths>  (git add -A is banned, §10.8)"
+  # wq#771: warn, never refuse. Committing destroys nothing in the target tree — landing
+  # does. Saying it here means the collision is visible while the branch is still cheap to
+  # re-scope, instead of at land time after CI has run. Skipped when this IS the target
+  # tree: then the staged files are the caller's own work, and warning about them is noise.
+  if ! primary_worktree >/dev/null || ! same_tree "$REPO_PATH" "$(primary_worktree)"; then
+    dirty_target_guard warn "commit" "$(git -C "$REPO_PATH" -c core.quotePath=false diff --cached --name-only)"
+  fi
   local msg; msg="$subject"
   if [ -n "$body_file" ]; then
     [ -r "$body_file" ] || die "cannot read body file: $body_file"
@@ -654,6 +837,12 @@ cmd_land() {
   [ "$state" = open ] || die "PR #$pr is '$state', not open"
   [ "$draft" = true ] && die "PR #$pr is a draft — mark it ready before landing (§5)"
 
+  # wq#771: BEFORE the CI wait and before the git lock. Everything above this point is a
+  # read, so refusing here costs nothing and — unlike refusing after a ten-minute check
+  # poll — does not park a shared lock behind a decision a human has to make anyway.
+  local pr_files; pr_files=$(pr_changed_files "$pr" "$head_sha")
+  dirty_target_guard refuse "PR #$pr" "$pr_files"
+
   # Wait for checks. A repo with no CI yet has nothing to wait for; say so loudly
   # rather than silently treating 'no checks' as 'green'.
   local waited=0 conclusion total
@@ -809,6 +998,23 @@ cmd_check() {
   fi
 }
 
+cmd_dirtycheck() {
+  need_repo "${1:-}"; shift 2>/dev/null || true
+  local mode=refuse paths="" n
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) mode="${2:-}"; shift 2 ;;
+      -)      paths="$paths$(cat)"$'\n'; shift ;;
+      *)      paths="$paths$1"$'\n'; shift ;;
+    esac
+  done
+  case "$mode" in refuse|warn) : ;; *) die "unknown --mode '$mode' (refuse|warn)" ;; esac
+  [ -n "${paths//[$'\n']/}" ] || die "usage: lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>... | -"
+  n=$(printf '%s' "$paths" | grep -c .)
+  dirty_target_guard "$mode" "path list" "$paths" || return 1
+  note "clean: none of the $n path(s) given is uncommitted in $(primary_worktree)"
+}
+
 case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   commit) shift; cmd_commit "$@" ;;
@@ -819,7 +1025,11 @@ case "${1:-}" in
   # opposite of a chokepoint. The fence guards mutation; SCOPE_OP=none marks a non-mutation.
   gitlock) shift; SCOPE_OP=none cmd_gitlock "$@" ;;
   check)  shift; SCOPE_OP=none cmd_check "$@" ;;
+  # wq#771: the guard's decision, on an explicit path list, with no forge and no merge.
+  # Read-only like check/gitlock. Exists so the probe can exercise the REAL function
+  # instead of a re-implementation of it, and so an operator can ask "would this land?"
+  dirtycheck) shift; SCOPE_OP=none cmd_dirtycheck "$@" ;;
   ''|-h|--help|help)
     sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock)" ;;
+  *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock|dirtycheck)" ;;
 esac
