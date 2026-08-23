@@ -182,15 +182,19 @@ def main():
     print(f"You're an engineering agent on my Lumen fleet. Your name is {name}.\n")
     print(f"Work the {lane} lane of my work queue to completion, then stop.\n")
     print("Start here:")
-    print(f"- Register: {WQ} whoami --register {name}")
     if cfg["dispatch"]:
-        print(f"- Read {cfg['dispatch']} — that's how we work")
+        print(f"- Read {cfg['dispatch']} and follow its LOOP exactly (registration + rules)")
     else:
+        print(f"- Register yourself: {WQ} whoami --register {name}")
         print("- How we work: branch + PR via /home/lumen/bin/lumen-pr, Conventional Commits,")
         print("  wq#<id> in the Refs footer, a timestamped .bak before editing any file,")
         print("  lumen_episode.py precheck before state-changing work, never reboot anything.")
     print(f"- Read the tail of {BOARD} for where things stand")
-    print(f"- Then: {WQ} claim --lane {lane}\n")
+    print(f"- Then: {WQ} claim --lane {lane}")
+    print()
+    print("IMPORTANT (wq#545): the WORKER registers itself — never run `wq whoami --register`")
+    print("on behalf of a worker, and never copy a WQ_AGENT export line into more than one")
+    print("session. Two sessions sharing a WQ_AGENT silently invert every ownership check.\n")
     if tickets:
         print("Open and claimable right now:")
         for tid, pri, title in tickets:
