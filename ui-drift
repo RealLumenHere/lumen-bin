@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+ui-drift (wq#770) — the dashboards-vs-reality probe.
+
+Fails in BOTH directions:
+  INVISIBLE       a user-facing cloudflared hostname that no dashboard links
+  DEAD_LINK       a dashboard link whose hostname has no cloudflared ingress
+                  (guaranteed catch-all 404 — the sonarr/radarr/prowlarr class)
+  RETIRED_LINK    a dashboard still linking a deliberately retired service
+  ORIGIN_DOWN     an ingress whose local origin does not answer
+  IDENTITY_CHANGED  the origin answers, but as a DIFFERENT service than the one
+                  pinned last time. This is the wq#766 defect class: chat.
+                  lumennode.uk kept answering — it just answered as ttyd. We
+                  compare WHAT ANSWERS, not merely that something did.
+
+READ-ONLY. Never restarts, reconfigures, or repoints anything. It reports,
+notifies, and (only when drift survives a second cycle) opens a wq ticket.
+
+Usage: ui-drift [--json] [--no-notify] [--reseed]
+"""
+import json, os, re, subprocess, sys, datetime, hashlib
+from pathlib import Path
+
+INV      = Path("/home/lumen/sentinel/ui_inventory.json")
+PINS     = Path("/home/lumen/sentinel/ui_identity.json")
+STATE    = Path("/home/lumen/sentinel/ui_drift_state.json")
+LATEST   = Path("/home/lumen/sentinel/ui_drift_latest.json")
+OUTDIR   = Path("/home/lumen/maint/ui-drift")
+NTFY     = os.getenv("UI_DRIFT_NTFY_URL", "http://localhost:8080/lumen-alerts")
+WQ       = "/home/lumen/bin/wq"
+AQ       = "/home/lumen/bin/aq"
+TICKET_AFTER = 2          # consecutive cycles before a ticket is opened
+
+
+def sh(cmd, timeout=40):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except Exception as e:
+        return None, "", f"{type(e).__name__}"
+
+
+def fingerprint(url, timeout=10):
+    """Identity of whatever answers at url: (status, server, content-type, title).
+
+    Deliberately excludes body size and body text — those churn on live pages and
+    would cry wolf. Title + server + content-type is enough to tell Glance from
+    ttyd from a 404 page.
+    """
+    rc, out, err = sh(["curl", "-sS", "-m", str(timeout), "-o", "/tmp/.uidrift_body",
+                       "-D", "/tmp/.uidrift_hdr", "-w", "%{http_code}", url],
+                      timeout=timeout + 8)
+    if rc != 0:
+        return {"reachable": False, "detail": err or f"curl rc={rc}"}
+    code = (out or "").strip()
+    hdr = Path("/tmp/.uidrift_hdr").read_text(errors="replace") if Path("/tmp/.uidrift_hdr").exists() else ""
+    try:
+        body = Path("/tmp/.uidrift_body").read_text(errors="replace")[:20000]
+    except Exception:
+        body = ""
+    def h(name):
+        m = re.search(rf"^{name}:\s*(.+)$", hdr, re.I | re.M)
+        return m.group(1).strip().split(";")[0] if m else ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    title = re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+    return {"reachable": True, "status": code, "server": h("Server"),
+            "content_type": h("Content-Type"), "title": title}
+
+
+def ident_key(fp):
+    if not fp.get("reachable"):
+        return "UNREACHABLE"
+    return "|".join([fp.get("status", ""), fp.get("server", ""),
+                     fp.get("content_type", ""), fp.get("title", "")])
+
+
+def host_of(url):
+    m = re.match(r"https?://([^/]+)", url or "")
+    return m.group(1).lower() if m else ""
+
+
+def load_inventory():
+    """Refuse to probe against a stale inventory.
+
+    A silent fall-back to yesterday's inventory would make a broken discovery
+    step look like a healthy dashboard — the same fail-open pathology that made
+    the wq#575 shadow run read as parity. Fail loud instead.
+    """
+    rc, out, err = sh(["/home/lumen/bin/ui-inventory"], timeout=180)
+    if rc != 0:
+        raise SystemExit(f"ui-inventory failed (rc={rc}): {err or out}")
+    if not INV.exists():
+        raise SystemExit(f"ui-inventory produced no inventory: {err or out}")
+    inv = json.loads(INV.read_text())
+    try:
+        gen = datetime.datetime.fromisoformat(inv["generated_at"])
+        age = (datetime.datetime.now(datetime.timezone.utc) - gen).total_seconds()
+    except Exception as e:
+        raise SystemExit(f"inventory has no usable generated_at: {e}")
+    if age > 600:
+        raise SystemExit(f"inventory is {age:.0f}s old — ui-inventory ran but did not "
+                         "rewrite it; refusing to probe against stale discovery")
+    if inv.get("ingress_error"):
+        raise SystemExit(f"ingress discovery degraded: {inv['ingress_error']}")
+    return inv
+
+
+def check(inv, reseed=False):
+    findings = []
+    ingress = {e["hostname"]: e for e in inv["ingress"]}
+    retired = inv.get("retired_hosts", {})
+
+    # --- dashboard side -------------------------------------------------
+    linked_hosts = set()
+    for l in inv["dashboard_links"]:
+        if l.get("kind") == "feed":
+            continue
+        h = host_of(l["url"])
+        if not h.endswith("lumennode.uk"):
+            continue          # external link (github, etc) — not our routing
+        linked_hosts.add(h)
+        if h in retired:
+            findings.append({"kind": "RETIRED_LINK", "key": f"retired:{h}:{l['source']}",
+                             "host": h, "where": l["source"],
+                             "detail": retired[h]})
+        elif h not in ingress:
+            findings.append({"kind": "DEAD_LINK", "key": f"dead:{h}:{l['source']}",
+                             "host": h, "where": l["source"],
+                             "detail": "no cloudflared ingress — hits the catch-all 404"})
+
+    # --- reality side ---------------------------------------------------
+    for h, e in ingress.items():
+        if e["infra"] or e["retired"]:
+            continue
+        if h not in linked_hosts:
+            findings.append({"kind": "INVISIBLE", "key": f"invisible:{h}", "host": h,
+                             "where": "-", "detail": f"served at {e['origin']}, "
+                             "linked from no dashboard"})
+
+    # --- rendered side: config that never reaches the page is still drift -
+    # Glance serves widget HTML from /api/pages/<slug>/content/, so a link that
+    # exists in glance.yml but not in the rendered content is invisible in
+    # practice — a config-only check would score that as healthy.
+    for slug in ("lumen-fleet", "news"):
+        rc, out, err = sh(["curl", "-sS", "-m", "20", "-o", f"/tmp/.uidrift_{slug}",
+                           "-w", "%{http_code}",
+                           f"http://localhost:5959/api/pages/{slug}/content/"], timeout=30)
+        body = ""
+        try:
+            body = Path(f"/tmp/.uidrift_{slug}").read_text(errors="replace")
+        except Exception:
+            pass
+        if rc != 0 or (out or "").strip() != "200" or len(body) < 500:
+            findings.append({"kind": "PAGE_DOWN", "key": f"page:{slug}", "host": slug,
+                             "where": "glance", "detail": f"page did not render "
+                             f"(http={out or rc}, {len(body)} bytes)"})
+            continue
+        if slug == "lumen-fleet":
+            for l in inv["dashboard_links"]:
+                if l.get("kind") == "feed" or not l["source"].startswith("glance:Lumen"):
+                    continue
+                if l["url"] not in body:
+                    findings.append({"kind": "NOT_RENDERED", "key": f"render:{l['url']}",
+                                     "host": host_of(l["url"]) or l["url"],
+                                     "where": "glance:Lumen Fleet",
+                                     "detail": "configured in glance.yml but absent "
+                                     "from the rendered page"})
+
+    # --- identity: what actually ANSWERS at each origin ------------------
+    try:
+        pins = json.loads(PINS.read_text())
+    except Exception:
+        pins = {}
+    new_pins = dict(pins)
+    for h, e in ingress.items():
+        origin = e["origin"]
+        if not origin.startswith("http"):
+            continue
+        fp = fingerprint(origin)
+        key = ident_key(fp)
+        prev = pins.get(h)
+        new_pins[h] = {"identity": key, "origin": origin, "fp": fp,
+                       "seen": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        if not fp.get("reachable"):
+            findings.append({"kind": "ORIGIN_DOWN", "key": f"down:{h}", "host": h,
+                             "where": origin, "detail": fp.get("detail", "no answer")})
+            continue
+        if prev and not reseed:
+            if prev.get("origin") != origin:
+                findings.append({"kind": "REPOINTED", "key": f"repointed:{h}", "host": h,
+                                 "where": origin,
+                                 "detail": f"origin changed {prev.get('origin')} -> {origin}"})
+            elif prev.get("identity") != key:
+                findings.append({"kind": "IDENTITY_CHANGED", "key": f"identity:{h}",
+                                 "host": h, "where": origin,
+                                 "detail": f"answers as '{key}' (was '{prev.get('identity')}')"})
+    PINS.write_text(json.dumps(new_pins, indent=2, sort_keys=True))
+    return findings
+
+
+def notify(findings, first_run, new_keys, ticketed):
+    body_lines = [f"{f['kind']} {f['host']} ({f['where']}): {f['detail']}" for f in findings]
+    body = "\n".join(body_lines)[:900] or "dashboards match reality"
+    title = (f"ui-drift: {len(findings)} drift item(s)" if findings
+             else "ui-drift: dashboards clean")
+    prio = "high" if new_keys else "default"
+    try:
+        subprocess.run(["curl", "-sS", "-m", "10", "-d", body,
+                        "-H", f"Title: {title}", "-H", f"Priority: {prio}",
+                        "-H", "Tags: mag" if findings else "Tags: white_check_mark",
+                        NTFY], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    if findings:
+        try:
+            subprocess.run([AQ, "add", "ui-drift", "dashboard-drift",
+                            f"{len(findings)} dashboard/reality mismatches", body[:400]],
+                           capture_output=True, timeout=15)
+        except Exception:
+            pass
+
+
+def open_ticket(persisted):
+    """Persisted drift gets a real ticket. wq refuses duplicate titles, so this
+    is self-deduping across cycles."""
+    kinds = sorted({f["kind"] for f in persisted})
+    hosts = sorted({f["host"] for f in persisted})[:6]
+    title = f"[ui-drift] {len(persisted)} persistent dashboard drift item(s): " + ", ".join(hosts)
+    detail = ("Opened automatically by ui-drift after the same drift survived "
+              f"{TICKET_AFTER} consecutive cycles.\n\n"
+              + "\n".join(f"- {f['kind']} {f['host']} ({f['where']}): {f['detail']}"
+                          for f in persisted)
+              + "\n\nProbe: /home/lumen/bin/ui-drift · inventory: /home/lumen/bin/ui-inventory"
+              "\nLatest report: /home/lumen/maint/ui-drift/latest.md"
+              "\nFix by regenerating the dashboard (`ui-inventory --write-glance`) or by "
+              "correcting cloudflared ingress — the probe never changes anything itself.")
+    rc, out, err = sh([WQ, "add", "--lane", "build", "--pri", "2",
+                       "--title", title[:200], "--detail", detail], timeout=40)
+    return rc, (out or err)[:300]
+
+
+def main():
+    args = sys.argv[1:]
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    inv = load_inventory()
+    findings = check(inv, reseed="--reseed" in args)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    try:
+        state = json.loads(STATE.read_text())
+    except Exception:
+        state = {"streak": {}, "runs": 0}
+    prev_keys = set(state.get("streak", {}))
+    streak = {}
+    for f in findings:
+        streak[f["key"]] = state.get("streak", {}).get(f["key"], 0) + 1
+    new_keys = sorted(set(streak) - prev_keys)
+    persisted = [f for f in findings if streak[f["key"]] >= TICKET_AFTER
+                 and not state.get("ticketed", {}).get(f["key"])]
+    first_run = state.get("runs", 0) == 0
+
+    # Only keep ticket-suppression for drift that is STILL present. Without this
+    # a resolved-then-recurring item would never be ticketed again.
+    ticketed = {k: v for k, v in state.get("ticketed", {}).items() if k in streak}
+    ticket_result = None
+    if persisted and "--no-notify" not in args:
+        rc, out = open_ticket(persisted)
+        ticket_result = out
+        if rc == 0:
+            for f in persisted:
+                ticketed[f["key"]] = now.isoformat()
+
+    report = {"generated_at": now.isoformat(), "runs": state.get("runs", 0) + 1,
+              "findings": findings, "counts": {}, "new_keys": new_keys,
+              "ticket": ticket_result}
+    for f in findings:
+        report["counts"][f["kind"]] = report["counts"].get(f["kind"], 0) + 1
+    LATEST.write_text(json.dumps(report, indent=2))
+
+    lines = [f"# ui-drift {now.isoformat()}",
+             f"findings={len(findings)} new={len(new_keys)} run={report['runs']}", ""]
+    for f in findings:
+        lines.append(f"[{f['kind']}] {f['host']} ({f['where']}) — {f['detail']}"
+                     f"  (streak {streak[f['key']]})")
+    if not findings:
+        lines.append("clean: every dashboard link resolves to the service it claims, "
+                     "and every user-facing hostname is linked.")
+    (OUTDIR / f"drift_{now.date().isoformat()}.md").write_text("\n".join(lines))
+    (OUTDIR / "latest.md").write_text("\n".join(lines))
+
+    STATE.write_text(json.dumps({"streak": streak, "runs": report["runs"],
+                                 "ticketed": ticketed, "at": now.isoformat()}, indent=2))
+
+    if "--no-notify" not in args:
+        notify(findings, first_run, new_keys, ticketed)
+    if "--json" in args:
+        print(json.dumps(report, indent=2))
+    else:
+        print("\n".join(lines))
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+ui-inventory (wq#770) — derive the live service inventory from what is ACTUALLY
+running, and render the generated sections of the dashboards from it.
+
+SOURCES OF TRUTH (all read-only):
+  - /etc/cloudflared/config.yml   ingress hostname -> local origin
+  - docker ps                     running containers
+  - systemctl                     lumen-*.service units
+  - ss -ltn                       local listeners
+  - lumen_state.py current        fleet nodes
+
+The ONLY hand-maintained data here is PRESENTATION metadata (title/group) and
+the INFRA set (hostnames that are machine endpoints, not user-facing links).
+A hostname nobody has classified still lands on the dashboard under "Services"
+— new services appear by default, they are never silently dropped.
+
+Writes: /home/lumen/sentinel/ui_inventory.json
+Usage:  ui-inventory [--json] [--emit-glance] [--write-glance]
+"""
+import json, os, re, subprocess, sys, datetime, shutil
+from pathlib import Path
+
+CF_CONFIG   = Path("/etc/cloudflared/config.yml")
+GLANCE_YML  = Path("/home/lumen/glance/glance.yml")
+MC_LINKS_TS = Path("/home/lumen/mission-control/ui/src/lib/api.ts")
+OUT_JSON    = Path("/home/lumen/sentinel/ui_inventory.json")
+STATE_PY    = "/home/lumen/minerva/lumen_state.py"
+
+# Machine endpoints — real services, deliberately NOT dashboard links.
+# Adding a hostname here is a deliberate act; anything not listed is user-facing.
+INFRA_HOSTS = {
+    "mcp-backend.lumennode.uk", "postgres-mcp.lumennode.uk",
+    "postgres-mcp-plausible.lumennode.uk", "memory-mcp.lumennode.uk",
+    "copilot.lumennode.uk", "vip.lumennode.uk",
+    # the dashboard itself — a self-link is noise, not a service link
+    "home.lumennode.uk",
+}
+
+# Services deliberately retired. A dashboard that still links one is drift.
+RETIRED_HOSTS = {
+    "leantime.lumennode.uk": "retired 2026-07-16, replaced by Scribe (wq#267)",
+    "ghost.lumennode.uk": "Ghost retired",
+    "uptime.lumennode.uk": "uptime-kuma never installed",
+}
+
+# Presentation metadata only. group=None -> "Services"; drawer=True -> Other drawer.
+PRESENTATION = {
+    "qbit.lumennode.uk":      ("qBittorrent", "Media",        False),
+    "plex.lumennode.uk":      ("Plex",        "Media",        False),
+    "projects.lumennode.uk":  ("Projects",    "Productivity", False),
+    "actual.lumennode.uk":    ("Actual Budget","Productivity",False),
+    "n8n.lumennode.uk":       ("n8n",         "Productivity", False),
+    "vault.lumennode.uk":     ("Vaultwarden", "Productivity", False),
+    "scribe.lumennode.uk":    ("Scribe",      "Productivity", True),
+    "langfuse.lumennode.uk":  ("Langfuse",    "AI & Chat",    False),
+    "chat.lumennode.uk":      ("Chat",        "AI & Chat",    True),
+    "pokemon.lumennode.uk":   ("Lumen Plays Pokemon", "AI & Chat", False),
+    "mctl.lumennode.uk":      ("Mission Control", "AI & Chat", False),
+    "propose.lumennode.uk":   ("Proposals",   "AI & Chat",    True),
+    "beszel.lumennode.uk":    ("Beszel",      "Monitoring",   False),
+    "analytics.lumennode.uk": ("Analytics",   "Monitoring",   False),
+    "power.lumennode.uk":     ("Power",       "Monitoring",   False),
+    "status.lumennode.uk":    ("Status",      "Monitoring",   True),
+    "ntfy.lumennode.uk":      ("ntfy",        "Monitoring",   True),
+    "bench.lumennode.uk":     ("Bench",       "Monitoring",   True),
+    "law.lumennode.uk":       ("Law",         "Productivity", True),
+    "home.lumennode.uk":      ("Home",        None,           True),
+}
+GROUP_ORDER = ["Media", "Productivity", "AI & Chat", "Monitoring", "Services"]
+
+# Deep links: the hostname root is not the useful landing page.
+URL_OVERRIDE = {
+    "plex.lumennode.uk": "https://plex.lumennode.uk/web",
+    "status.lumennode.uk": "https://status.lumennode.uk/webapp_login",
+}
+
+
+def sh(cmd, timeout=30):
+    try:
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                           text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except Exception as e:
+        return None, "", f"{type(e).__name__}: {e}"
+
+
+def discover_ingress():
+    import yaml
+    rc, out, err = sh(["sudo", "-n", "cat", str(CF_CONFIG)])
+    if rc != 0 or not out:
+        try:
+            out = CF_CONFIG.read_text()
+        except Exception:
+            return [], f"cloudflared config unreadable: {err}"
+    doc = yaml.safe_load(out) or {}
+    rows = []
+    for e in doc.get("ingress", []) or []:
+        h = e.get("hostname")
+        if not h:
+            continue
+        rows.append({
+            "hostname": h,
+            "origin": e.get("service", ""),
+            "public_url": f"https://{h}",
+            "infra": h in INFRA_HOSTS,
+            "retired": h in RETIRED_HOSTS,
+        })
+    return rows, None
+
+
+def discover_containers():
+    rc, out, _ = sh(["docker", "ps", "--format",
+                     "{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}"])
+    rows = []
+    for line in (out or "").splitlines():
+        p = line.split("\t")
+        if len(p) >= 4:
+            rows.append({"name": p[0], "image": p[1], "ports": p[2], "status": p[3]})
+    return rows
+
+
+def discover_units():
+    rc, out, _ = sh("systemctl list-units --type=service --all --no-legend --no-pager "
+                    "'lumen-*.service' | awk '{print $1, $3, $4}'")
+    rows = []
+    for line in (out or "").splitlines():
+        p = line.split()
+        if len(p) >= 3 and p[0].endswith(".service"):
+            rows.append({"unit": p[0], "active": p[1], "sub": p[2]})
+    return rows
+
+
+def discover_listeners():
+    rc, out, _ = sh("ss -ltn | tail -n +2 | awk '{print $4}'")
+    ports = set()
+    for a in (out or "").splitlines():
+        m = re.search(r":(\d+)$", a.strip())
+        if m:
+            ports.add(int(m.group(1)))
+    return sorted(ports)
+
+
+def discover_nodes():
+    rc, out, _ = sh(["python3", STATE_PY, "current"], timeout=90)
+    nodes = {}
+    for line in (out or "").splitlines():
+        m = re.match(r"\s*([a-z0-9_.\-']+)\.([a-z0-9_\-]+)\s*=\s*(.*?)\s*\(since", line, re.I)
+        if not m:
+            continue
+        subj, pred, val = m.group(1), m.group(2), m.group(3)
+        if pred in ("tailscale_ip", "lan_ip", "role", "status", "hardware"):
+            nodes.setdefault(subj, {})[pred] = val
+    # a node is a subject with a tailscale ip; drop plugs/aliases
+    return {k: v for k, v in nodes.items()
+            if v.get("tailscale_ip") and not k.startswith(("tapo", "p1", "p2", "p3",
+                                                           "p4", "p5", "p6", "p7",
+                                                           "p8", "p9"))}
+
+
+HOST_RE = re.compile(r"https?://([a-z0-9.\-]+\.lumennode\.uk)[^\s\"'<>)]*", re.I)
+URL_RE = re.compile(r"https?://[^\s\"'<>)]+", re.I)
+
+
+def discover_dashboard_links():
+    """Every link the dashboards actually present, with where it came from."""
+    links = []
+    try:
+        txt = GLANCE_YML.read_text()
+    except Exception:
+        txt = ""
+    section = "glance"
+    for i, line in enumerate(txt.splitlines(), 1):
+        if re.search(r"^\s*-\s*name:\s*(.+)$", line):
+            section = "glance:" + re.search(r"^\s*-\s*name:\s*(.+)$", line).group(1).strip()
+        for u in URL_RE.findall(line):
+            u = u.rstrip(',"\'')
+            if "localhost:5959/assets" in u:
+                continue
+            links.append({"source": section, "line": i, "url": u,
+                          "kind": "feed" if (".rss" in u or "atom" in u or "feed" in u)
+                          else "link"})
+    try:
+        ts = MC_LINKS_TS.read_text()
+        for m in re.finditer(r"label:\s*'([^']+)',\s*href:\s*'([^']+)'", ts):
+            links.append({"source": "mission-control", "line": 0,
+                          "url": m.group(2), "kind": "link", "label": m.group(1)})
+    except Exception:
+        pass
+    return links
+
+
+def build():
+    ingress, ierr = discover_ingress()
+    inv = {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "ingress": ingress,
+        "ingress_error": ierr,
+        "containers": discover_containers(),
+        "units": discover_units(),
+        "listeners": discover_listeners(),
+        "nodes": discover_nodes(),
+        "dashboard_links": discover_dashboard_links(),
+        "infra_hosts": sorted(INFRA_HOSTS),
+        "retired_hosts": RETIRED_HOSTS,
+    }
+    return inv
+
+
+BEGIN_MARK = "          # BEGIN GENERATED SERVICES (ui-inventory wq#770)"
+END_MARK   = "          # END GENERATED SERVICES (ui-inventory wq#770)"
+
+
+def presentable(inv):
+    """(title, group, drawer) for every user-facing ingress hostname."""
+    rows = []
+    for e in inv["ingress"]:
+        h = e["hostname"]
+        if e["infra"] or e["retired"]:
+            continue
+        title, group, drawer = PRESENTATION.get(h, (None, None, False))
+        if title is None:
+            title = h.split(".")[0].capitalize()
+        if group is None:
+            group = "Services"
+        rows.append({"hostname": h, "title": title, "group": group,
+                     "drawer": drawer,
+                     "url": URL_OVERRIDE.get(h, e["public_url"])})
+    return rows
+
+
+def render_glance_block(inv):
+    rows = presentable(inv)
+    main = [r for r in rows if not r["drawer"]]
+    drawer = sorted([r for r in rows if r["drawer"]], key=lambda r: r["title"].lower())
+    out = [BEGIN_MARK,
+           "          # Generated from cloudflared ingress + docker/systemd discovery.",
+           "          # Do not hand-edit: run `ui-inventory --write-glance`.",
+           "          # Hand-written widgets OUTSIDE these markers survive regeneration.",
+           "          - type: bookmarks",
+           "            title: Lumen Services",
+           "            groups:"]
+    for g in GROUP_ORDER:
+        items = sorted([r for r in main if r["group"] == g], key=lambda r: r["title"].lower())
+        if not items:
+            continue
+        out.append(f"              - title: {g}")
+        out.append("                links:")
+        for r in items:
+            out.append(f"                  - title: {r['title']}")
+            out.append(f"                    url: {r['url']}")
+    out += ["",
+            "          - type: custom-api",
+            "            cache: 24h",
+            "            url: http://localhost:5959/assets/other.json",
+            "            template: |",
+            '              <details class="other-drawer">',
+            '                <summary class="color-subdue">Other</summary>',
+            '                <div class="other-drawer-links">']
+    for r in drawer:
+        out.append(f'                  <a class="color-highlight" href="{r["url"]}" '
+                   f'target="_blank" rel="noreferrer">{r["title"]}</a>')
+    out += ['                </div>', '              </details>', END_MARK]
+    return "\n".join(out)
+
+
+def write_glance(inv, dry=False):
+    import yaml
+    txt = GLANCE_YML.read_text()
+    lines = txt.splitlines()
+    try:
+        b = next(i for i, l in enumerate(lines) if "BEGIN GENERATED SERVICES" in l)
+        e = next(i for i, l in enumerate(lines) if "END GENERATED SERVICES" in l)
+    except StopIteration:
+        print("REFUSED: generation markers not found in glance.yml.\n"
+              "  Add these two lines around the Lumen Services + Other drawer widgets:\n"
+              f"{BEGIN_MARK}\n{END_MARK}", file=sys.stderr)
+        return 2
+    if e < b:
+        print("REFUSED: END marker precedes BEGIN marker.", file=sys.stderr)
+        return 2
+    new = lines[:b] + render_glance_block(inv).splitlines() + lines[e + 1:]
+    cand = "\n".join(new) + "\n"
+    try:
+        yaml.safe_load(cand)
+    except Exception as ex:
+        print(f"REFUSED: generated glance.yml does not parse: {ex}", file=sys.stderr)
+        return 3
+    if cand == txt:
+        print("glance.yml already current — no write.")
+        return 0
+    if dry:
+        print(cand)
+        return 0
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    shutil.copy2(GLANCE_YML, f"{GLANCE_YML}.bak.{stamp}")
+    GLANCE_YML.write_text(cand)
+    print(f"glance.yml regenerated (backup {GLANCE_YML}.bak.{stamp}). "
+          "Restart the glance container to apply.")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    inv = build()
+    OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+    OUT_JSON.write_text(json.dumps(inv, indent=2))
+    if "--emit-glance" in args:
+        print(render_glance_block(inv))
+        return 0
+    if "--write-glance" in args:
+        return write_glance(inv, dry="--dry-run" in args)
+    if "--json" in args:
+        print(json.dumps(inv, indent=2))
+        return 0
+    rows = presentable(inv)
+    print(f"ui-inventory {inv['generated_at']}")
+    print(f"  ingress hostnames : {len(inv['ingress'])} "
+          f"({sum(1 for e in inv['ingress'] if e['infra'])} infra, {len(rows)} user-facing)")
+    print(f"  containers        : {len(inv['containers'])}")
+    print(f"  lumen-* units     : {len(inv['units'])}")
+    print(f"  listeners         : {len(inv['listeners'])}")
+    print(f"  fleet nodes       : {len(inv['nodes'])}")
+    print(f"  dashboard links   : {len(inv['dashboard_links'])}")
+    print(f"  -> {OUT_JSON}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
