@@ -5,6 +5,7 @@
 # and prints the paste-ready dispatch prompt. Idempotent: refuses to clobber.
 set -euo pipefail
 WQDIR=/home/lumen/agents/work-queue
+DISPATCHER_CONFIG="${FOREMAN_DISPATCHER_CONFIG:-/home/lumen/foreman/dispatcher/config.json}"
 LANE="${1:?lane name}"; DIR="${2:?project dir}"; DESC="${3:?project description}"
 LOCK="${4:-$LANE-service}"
 LANE_UC="$(echo "$LANE" | tr a-z- A-Z_)"
@@ -37,9 +38,43 @@ if [ ! -e "$BOARD" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%MZ) wq-lane-init -- NOTE: board created, lane '$LANE' opened"
   } > "$BOARD"
 fi
+# wq#846 / opsaudit_a10_lane_defaults.md §4a: a lane with no dispatcher config.json
+# entry is invisible to foreman_dispatcher.py — its tickets pile up unclaimed (the
+# `build` lane went a whole campaign this way). Register the lane here, DISABLED by
+# default, so the enable/disable choice is explicit instead of a silent absence.
+CONFIG_NOTE="  dispatcher: WARNING — $DISPATCHER_CONFIG not found, lane NOT registered"
+if [ -f "$DISPATCHER_CONFIG" ]; then
+  CONFIG_STATUS="$(python3 - "$DISPATCHER_CONFIG" "$LANE" <<'PYEOF'
+import json, sys
+
+path, lane = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    cfg = json.load(f)
+lanes = cfg.setdefault("lanes", {})
+if lane in lanes:
+    print("EXISTS")
+else:
+    lanes[lane] = {
+        "enabled": False,
+        "max_per_day": 999,
+        "note": "auto-registered by wq-lane-init (wq#846); enable explicitly",
+    }
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("ADDED")
+PYEOF
+)"
+  if [ "$CONFIG_STATUS" = "ADDED" ]; then
+    CONFIG_NOTE="  dispatcher: lane '$LANE' added to $DISPATCHER_CONFIG as DISABLED
+    enable with: jq '.lanes.$LANE.enabled = true' $DISPATCHER_CONFIG | sponge $DISPATCHER_CONFIG"
+  else
+    CONFIG_NOTE="  dispatcher: lane '$LANE' already present in $DISPATCHER_CONFIG"
+  fi
+fi
 echo "LANE READY: $LANE"
 echo "  dispatch: $DISPATCH"
 echo "  board:    $BOARD"
+echo "$CONFIG_NOTE"
 echo "  seed tickets:  wq add --lane $LANE --pri 1 --title '[$LANE] ...' --detail '...'"
 echo "  service lock:  $LOCK   git lock: $LANE-git"
 echo
