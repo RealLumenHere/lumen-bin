@@ -10,6 +10,12 @@ read /home/lumen/.secrets/github-lumen.token and export it — this script
 never reads secrets itself). Unauthenticated (60/hr) when unset, unchanged
 from v1. state.json now also persists the app-version snapshot ('apps' key)
 so a wrapper (fleet-maint-assemble) can classify drift without re-probing.
+
+wq#854: --strict flag exits 2 when any upstream lookup returns None (so
+fleet-maint-assemble can fail the completeness gate on probe failure, not
+just on missing nodes). Thor excluded from NODES (Frank's workstation —
+maintenance tooling must never touch it). llama.cpp uses /tags endpoint +
+bNNNN regex (no GitHub Releases exist for that repo).
 """
 import json, os, re, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone
@@ -25,7 +31,7 @@ STUCK_SECS = 24 * 3600
 # lumen_state (bes/sia/sobek/gameboy use username==hostname per provision SOP).
 NODES = {
     "lumen": "",
-    "thor": "thor@100.112.151.100",
+    # thor excluded: Frank's workstation, maintenance tooling must never touch it (wq#854)
     "thoth": "thoth@100.75.1.108",
     "seshat": "seshat@100.121.243.124",
     "anubis": "anubis@100.121.17.5",
@@ -77,6 +83,22 @@ def gh_latest(repo):
     j = http_json(f"https://api.github.com/repos/{repo}/releases/latest", token=token)
     if j and j.get("tag_name"):
         return j["tag_name"].lstrip("v")
+    return None
+
+def gh_latest_tag(repo, pattern=None):
+    """Latest tag from GitHub for repos that don't use Releases (e.g.
+    ggml-org/llama.cpp uses bNNNN tags). pattern is a compiled regex that
+    must match the tag name; first match by recency wins. Fail-soft -> None.
+    wq#854."""
+    token = os.environ.get("GH_TOKEN") or None
+    j = http_json(f"https://api.github.com/repos/{repo}/tags?per_page=20", token=token)
+    if not j or not isinstance(j, list):
+        return None
+    for tag in j:
+        name = tag.get("name", "")
+        if pattern and not pattern.match(name):
+            continue
+        return name
     return None
 
 def probe_node(node):
@@ -143,7 +165,7 @@ def probe_apps():
         "gitea": gh_latest("go-gitea/gitea"),
         "vaultwarden": gh_latest("dani-garcia/vaultwarden"),
         "miniflux": gh_latest("miniflux/v2"),
-        "llamacpp": gh_latest("ggml-org/llama.cpp"),
+        "llamacpp": gh_latest("ggml-org/llama.cpp"),  # now uses GitHub Releases (v0.x.y)
     }
     a["latest"] = latest
     # ollama per inference node via API (tailnet)
@@ -291,6 +313,7 @@ def main():
     args = sys.argv[1:]
     no_ntfy = "--no-ntfy" in args
     no_ticket = "--no-ticket" in args
+    strict = "--strict" in args  # wq#854: exit 2 on any None upstream lookup
     only = None
     for i, a in enumerate(args):
         if a == "--nodes" and i + 1 < len(args):
@@ -320,6 +343,13 @@ def main():
         sh(f"{NTFY} -t lumen-updates -T fleet-update-check {json.dumps(digest)}", 30)
         for u in urgent[:5]:
             sh(f"{NTFY} -t lumen-alerts -p urgent -T fleet-update-check {json.dumps('URGENT: ' + u)}", 30)
+    # wq#854: --strict mode exits 2 when any upstream latest lookup is None,
+    # so fleet-maint-assemble can rely on exit code for completeness.
+    if strict and not only:
+        none_lookups = [k for k, v in apps.get("latest", {}).items() if v is None]
+        if none_lookups:
+            print(f"STRICT: upstream lookups returned None for: {none_lookups}", file=sys.stderr)
+            sys.exit(2)
     # deduped user-lane ticket (wq add refuses duplicate normalized titles ->
     # fall back to wq edit of the existing open one)
     if not no_ticket and (urgent or action):

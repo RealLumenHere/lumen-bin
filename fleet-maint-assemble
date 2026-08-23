@@ -31,22 +31,26 @@ WINDOWS_DIR = "/home/lumen/maint/windows"
 NTFY = "/home/lumen/bin/ntfy-send"
 WQ = "/home/lumen/bin/wq"
 
-DECLARED_ABSENT = {"hathor", "wadjet"}  # A11 §3a: tailnet-offline / bench
+DECLARED_ABSENT_DEFAULT = {"hathor", "wadjet"}  # A11 §3a: tailnet-offline / bench
+# thor never appears: excluded from fleet-update-check NODES dict (wq#854)
 
-# Ordering law, A11 §5. Tiers run low-to-high; ties keep this list order.
+# Ordering law, A11 §5 (updated wq#852/854). Tiers run low-to-high; ties
+# keep this list order. Thor excluded entirely (Frank's workstation).
 TIER1_LEAF = ["gameboy", "apep", "thoth", "seshat", "sia"]
-TIER2_SERVICE = ["anubis", "bes", "isis"]
-TIER3_STANDBY = ["sobek"]
+TIER1B_INFERENCE = ["nephthys", "hathor", "isis"]  # Mac Pro inference trio
+TIER2_SERVICE = ["anubis", "bes"]
+TIER3_STANDBY = ["sobek", "wadjet"]
 TIER4_PRIMARY = ["maat"]
 TIER5_LAST = ["lumen"]
-NODE_ORDER = TIER1_LEAF + TIER2_SERVICE + TIER3_STANDBY + TIER4_PRIMARY + TIER5_LAST
+NODE_ORDER = TIER1_LEAF + TIER1B_INFERENCE + TIER2_SERVICE + TIER3_STANDBY + TIER4_PRIMARY + TIER5_LAST
 
 def node_tier(node):
-    for tier, roster in ((1, TIER1_LEAF), (2, TIER2_SERVICE), (3, TIER3_STANDBY),
+    for tier, roster in ((1, TIER1_LEAF), (1.5, TIER1B_INFERENCE),
+                         (2, TIER2_SERVICE), (3, TIER3_STANDBY),
                          (4, TIER4_PRIMARY), (5, TIER5_LAST)):
         if node in roster:
             return (tier, roster.index(node))
-    return (1.5, 0)  # unlisted-but-reachable node (thor, nephthys): treat as leaf-adjacent
+    return (6, 0)  # unlisted-but-reachable: sort after lumen, flag for review
 
 LANE_RANK = {"SEC": 0, "APP": 1, "APT": 2, "REBOOT": 3, "FW": 9}
 
@@ -105,7 +109,7 @@ def run_fleet_update_check(gh_token):
     env = os.environ.copy()
     if gh_token:
         env["GH_TOKEN"] = gh_token
-    r = subprocess.run([FLEET_UPDATE_CHECK, "--no-ticket", "--no-ntfy"],
+    r = subprocess.run([FLEET_UPDATE_CHECK, "--no-ticket", "--no-ntfy", "--strict"],
                         env=env, capture_output=True, text=True, timeout=900)
     return r.returncode, r.stdout, r.stderr
 
@@ -115,14 +119,15 @@ def load_state():
         return json.load(f)
 
 
-def completeness_gate(nodes, apps):
+def completeness_gate(nodes, apps, declared_absent=None):
     """A11 §3c: any '?'/None upstream lookup, any current-version probe that
     should have succeeded but didn't, or any node neither reachable nor
     declared-absent -> fail. Returns list of failure strings (empty = pass)."""
+    absent = declared_absent if declared_absent is not None else DECLARED_ABSENT_DEFAULT
     failures = []
     for n, d in nodes.items():
         if "unreachable" in d:
-            if n not in DECLARED_ABSENT:
+            if n not in absent:
                 failures.append(f"{n}: unreachable and not on the declared-absent list")
         elif "apt_security" not in d or "apt_other" not in d:
             failures.append(f"{n}: apt debt probe returned nothing (reachable but incomplete)")
@@ -183,7 +188,15 @@ def make_item(lane, node, component, current, target, detail=""):
 def build_items(nodes, apps):
     items = []
     latest = apps.get("latest", {})
-    all_nodes = list(nodes.keys())
+    # Filter to nodes in the ordering law — thor and any stale state.json
+    # entries for nodes we don't maintain get skipped with a warning.
+    all_nodes = []
+    for n in nodes.keys():
+        if n in NODE_ORDER:
+            all_nodes.append(n)
+        else:
+            print(f"fleet-maint-assemble: WARNING — node '{n}' in state.json "
+                  f"but not in NODE_ORDER, skipping", file=sys.stderr)
 
     # APT tail — one item per reachable node with a non-security apt debt.
     for n in all_nodes:
@@ -262,7 +275,7 @@ def build_items(nodes, apps):
 
     # ABSENT — declared-absent nodes get an explicit line item, never a
     # silent skip (A11 §5).
-    for n in DECLARED_ABSENT:
+    for n in DECLARED_ABSENT_DEFAULT:
         if n in nodes and "unreachable" in nodes[n]:
             items.append({
                 "lane": "ABSENT", "node": n, "component": None, "current": None,
@@ -378,10 +391,13 @@ def main():
     args = sys.argv[1:]
     no_ntfy = "--no-ntfy" in args
     dry_run = "--dry-run" in args
+    declared_absent = None  # None = use default set
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     for i, a in enumerate(args):
         if a == "--date" and i + 1 < len(args):
             day = args[i + 1]
+        if a == "--declared-absent" and i + 1 < len(args):
+            declared_absent = set(args[i + 1].split(","))
 
     gh_token = load_gh_token()
     if not gh_token:
@@ -411,7 +427,7 @@ def main():
     nodes = state.get("nodes", {})
     apps = state.get("apps", {})
 
-    failures = completeness_gate(nodes, apps)
+    failures = completeness_gate(nodes, apps, declared_absent=declared_absent)
     if failures:
         msg = f"fleet-maint-assemble: completeness gate FAILED ({len(failures)} issue(s)) — no batch written"
         print(msg, file=sys.stderr)

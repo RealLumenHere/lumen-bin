@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""fleet-maint-run — ordered rolling maintenance executor (wq#853).
+
+Phase 3 of the A11 maintenance window design (reports/opsaudit_a11_maintenance_window.md
+§4). Phase 1 (fleet-maint-assemble) writes an approved batch-YYYY-MM-DD.json and opens a
+`user`-lane wq ticket; Frank's reply is phase 2. This script is phase 3: it takes that
+approved batch, walks it in the fixed order the design mandates (§5), and runs every item
+through G0-G7 before mutating anything.
+
+Design decisions this file makes concrete:
+
+  - Every gate's real action (apply, rollback, rollback dry-run, backup precondition,
+    health probe, up-check, failed-units listing, version ingest) is a shell command
+    string supplied BY THE APPROVED BATCH. This script only sequences, times, registers
+    paired restores, and enforces stop-on-first-failure — it does not know what
+    "restart tailscaled" means. That is what A11 §8 calls "narrower and honest": A6's
+    shared precondition runner (P1/P3/P4) doesn't exist yet, so this ships its own
+    verification over its own items instead of pretending to share one.
+
+  - G0 (batch sha256 vs the value the approved wq ticket carries) and batch-schema
+    validation both run BEFORE any preflight or item work, and both abort the whole run
+    on failure. Mirrors A11 §3c's non-negotiable: no batch is better than a batch with a
+    hole in it, applied here to the runner's own inputs, not just the assembler's.
+
+  - The ordering law (§5: leaf nodes, then service nodes, then sobek, then maat, then
+    lumen; reboots after every package item on the same node) is fixed in NODE_ORDER
+    below, not left to the batch author's judgement.
+
+  - Stop-on-first-failure is absolute (§4): the first item that doesn't reach OK/ABSENT
+    stops the run; every later item is recorded NOT_ATTEMPTED, never attempted.
+
+  - Phase 3b (RECORD) always runs, in a way that survives every abort path above,
+    including a G0 mismatch before a single item ran.
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+WQ_BIN = os.environ.get("FLEET_MAINT_WQ_BIN", "/home/lumen/bin/wq")
+NTFY_BIN = os.environ.get("FLEET_MAINT_NTFY_BIN", "/home/lumen/bin/ntfy-send")
+STATE_REGEN_BIN = os.environ.get("FLEET_MAINT_STATE_REGEN_BIN", "/home/lumen/bin/state-regen")
+EPISODE_BIN = os.environ.get("FLEET_MAINT_EPISODE_BIN", "/home/lumen/minerva/lumen_episode.py")
+NTFY_TOPIC = os.environ.get("FLEET_MAINT_NTFY_TOPIC", "lumen-alerts")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REPORT_DIR = os.environ.get(
+    "FLEET_MAINT_REPORT_DIR", os.path.normpath(os.path.join(_HERE, "..", "..", "reports")))
+DEFAULT_REGISTRY = os.environ.get(
+    "FLEET_MAINT_REGISTRY", "/home/lumen/maint/state/paired-restores.json")
+
+# G5: health probe passes at T+60s AND T+300s (A11 §4 phase 3 table).
+G5_T1_S = int(os.environ.get("FLEET_MAINT_G5_T1_S", "60"))
+G5_T2_S = int(os.environ.get("FLEET_MAINT_G5_T2_S", "300"))
+
+# A11 §5 — "Fixed, encoded in the runner, not left to the assembler's judgement."
+NODE_ORDER = [
+    "gameboy", "apep", "thoth", "seshat", "sia",   # 1. leaf nodes first
+    "nephthys", "hathor", "isis",                   # 1b. inference leaf (Mac Pro trio)
+    "anubis", "bes",                                # 2. service nodes
+    "sobek", "wadjet",                              # 3. vault standby — the rehearsal
+    "maat",                                         # 4. vault primary — last among remote
+    "lumen",                                        # 5. runs the runner — always last
+    # thor excluded: Frank's workstation, never touched by maintenance
+]
+
+REQUIRED_FOR_APPLY = ("pre_state_cmd", "rollback_cmd", "rollback_dryrun_cmd")
+
+
+def log(msg):
+    print(f"[fleet-maint-run {_now_iso()}] {msg}", flush=True)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run_cmd(cmd, timeout=180):
+    """Runs an item-supplied shell command string. shell=True is deliberate: every
+    command here comes from a batch that already passed G0 (sha256 match against the
+    Frank-approved ticket) — the trust boundary is the approval, not the shell."""
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except OSError as e:
+        return 1, "", str(e)
+
+
+def run_argv(argv, timeout=30):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def ntfy(msg, priority="high", title="fleet-maint-run", run_argv=run_argv):
+    rc, out, err = run_argv([NTFY_BIN, "-p", priority, "-T", title, NTFY_TOPIC, msg], timeout=20)
+    if rc != 0:
+        log(f"ntfy failed (non-fatal): {err or out}")
+    return rc == 0
+
+
+def _run_check(cmd, run_cmd, required=True):
+    if not cmd:
+        return (not required), "no check command supplied"
+    rc, out, err = run_cmd(cmd)
+    return rc == 0, (err or out or "").strip()
+
+
+# ---- P4 paired-restore registry -------------------------------------------------------
+# No shared supervisor exists yet (A6 §4 P4: "the single largest build dependency ...
+# does not exist today"), so this run owns its own registration file: written before
+# every mutation, cleared only on a clean G7. If this process dies mid-item the file
+# survives on disk for a human or a future supervisor to act on.
+
+def _load_registry(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_registry(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def register_paired_restore(registry_path, run_id, item):
+    reg = _load_registry(registry_path)
+    reg[str(item["id"])] = {
+        "run_id": run_id,
+        "node": item.get("node"),
+        "component": item.get("component"),
+        "rollback_cmd": item.get("rollback_cmd"),
+        "registered_at": _now_iso(),
+    }
+    _save_registry(registry_path, reg)
+
+
+def clear_paired_restore(registry_path, item):
+    reg = _load_registry(registry_path)
+    reg.pop(str(item["id"]), None)
+    _save_registry(registry_path, reg)
+
+
+# ---- ordering law (A11 §5) --------------------------------------------------------------
+
+def _sort_key(item):
+    node = item.get("node")
+    tier = NODE_ORDER.index(node) if node in NODE_ORDER else len(NODE_ORDER)
+    is_reboot = 1 if item.get("reboot") else 0
+    return (tier, is_reboot, item.get("id", 0))
+
+
+def order_items(items):
+    return sorted(items, key=_sort_key)
+
+
+# ---- batch validation -------------------------------------------------------------------
+# A11 §3c's non-negotiable ("an approval artifact may not contain a `?`") applied to the
+# runner's own inputs: refuse to run rather than discover a missing gate artifact after
+# a mutation has already happened.
+
+def validate_batch(items):
+    problems = []
+    seen_ids = set()
+    for it in items:
+        iid = it.get("id")
+        if iid is None or iid in seen_ids:
+            problems.append(f"item {iid!r}: missing or duplicate id")
+        seen_ids.add(iid)
+
+        if it.get("absent"):
+            continue
+        if it.get("node") not in NODE_ORDER:
+            problems.append(f"item {iid}: node {it.get('node')!r} has no tier in the "
+                             f"A11 §5 ordering law — refusing to guess its place in the run")
+        if not it.get("apply_cmd"):
+            continue
+        if not it.get("health_probe_cmd"):
+            problems.append(f"item {iid}: apply_cmd set but no health_probe_cmd — G5 needs "
+                             f"'the specific probe that proves it worked', not a default check")
+        if it.get("reboot"):
+            continue  # a reboot's rollback is a human incident, not a rollback_cmd
+        for field in REQUIRED_FOR_APPLY:
+            if not it.get(field):
+                problems.append(f"item {iid}: apply_cmd set but {field} missing")
+        if it.get("requires_backup") and not it.get("backup_precondition_cmd"):
+            problems.append(f"item {iid}: requires_backup=true but no backup_precondition_cmd (P1)")
+    return problems
+
+
+# ---- per-item gate sequence (G0 is run once, at the top of run_batch) ------------------
+
+class ItemResult:
+    def __init__(self, item):
+        self.id = item.get("id")
+        self.node = item.get("node")
+        self.component = item.get("component")
+        self.status = None  # ABSENT | OK | ABORTED | ROLLED_BACK | ROLLBACK_FAILED | NOT_ATTEMPTED
+        self.gate_failed = None
+        self.detail = ""
+
+    def to_dict(self):
+        return {"id": self.id, "node": self.node, "component": self.component,
+                "status": self.status, "gate_failed": self.gate_failed, "detail": self.detail}
+
+
+def run_item(item, *, registry_path, run_id, run_cmd=run_cmd, sleep_fn=time.sleep,
+             g5_t1=G5_T1_S, g5_t2=G5_T2_S):
+    r = ItemResult(item)
+
+    if item.get("absent"):
+        r.status = "ABSENT"
+        r.detail = "declared absent — a line item, not a silent skip (A11 §5)"
+        return r
+
+    is_reboot = bool(item.get("reboot"))
+    if is_reboot and not item.get("consent"):
+        r.status = "ABORTED"
+        r.gate_failed = "CONSENT"
+        r.detail = "reboot item lacks live per-node consent — fail closed (A11 §7 item 10)"
+        return r
+
+    if item.get("requires_replication_lag_zero"):
+        ok, detail = _run_check(item.get("replication_lag_cmd"), run_cmd)
+        if not ok:
+            r.status = "ABORTED"
+            r.gate_failed = "REPL_LAG"
+            r.detail = f"pg_stat_replication lag check failed: {detail}"
+            return r
+
+    apply_cmd = item.get("apply_cmd")
+    if not apply_cmd:
+        r.status = "OK"
+        r.detail = "no apply_cmd — informational line item, no gates run"
+        return r
+
+    # G1 — pre-state capture (version / unit state / NRestarts, plus a failed-units baseline)
+    pre_state_cmd = item.get("pre_state_cmd")
+    if pre_state_cmd:
+        rc, out, err = run_cmd(pre_state_cmd)
+        if rc != 0:
+            r.status = "ABORTED"
+            r.gate_failed = "G1"
+            r.detail = f"pre-state capture failed rc={rc}: {err or out}"
+            return r
+    elif not is_reboot:
+        r.status = "ABORTED"
+        r.gate_failed = "G1"
+        r.detail = "no pre_state_cmd supplied for an item with apply_cmd"
+        return r
+
+    baseline_failed_units = None
+    fu_cmd = item.get("failed_units_cmd")
+    if fu_cmd:
+        rc, out, err = run_cmd(fu_cmd)
+        if rc != 0:
+            r.status = "ABORTED"
+            r.gate_failed = "G1"
+            r.detail = f"failed-units baseline failed rc={rc}: {err or out}"
+            return r
+        baseline_failed_units = set(out.split())
+
+    if not is_reboot:
+        # G2 — P1: restore-proven backup for THIS target, THIS run
+        if item.get("requires_backup"):
+            rc, out, err = run_cmd(item.get("backup_precondition_cmd"),
+                                    timeout=item.get("backup_timeout_s", 300))
+            if rc != 0:
+                r.status = "ABORTED"
+                r.gate_failed = "G2"
+                r.detail = f"backup precondition (P1) failed rc={rc}: {err or out}"
+                return r
+
+        # G3 — P3: rollback command exercised in this run (dry-run counts, untested doesn't)
+        rc, out, err = run_cmd(item.get("rollback_dryrun_cmd"))
+        if rc != 0:
+            r.status = "ABORTED"
+            r.gate_failed = "G3"
+            r.detail = f"rollback dry-run (P3) failed rc={rc}: {err or out}"
+            return r
+
+        # G4 — P4: paired restore registered BEFORE mutation
+        register_paired_restore(registry_path, run_id, item)
+
+    def rollback(reason):
+        rb_cmd = item.get("rollback_cmd")
+        if not rb_cmd:
+            r.status = "ROLLBACK_FAILED"
+            r.detail = f"{reason}; no rollback_cmd for this item — MANUAL INTERVENTION REQUIRED"
+            return
+        rc, out, err = run_cmd(rb_cmd, timeout=item.get("rollback_timeout_s", 180))
+        if rc == 0:
+            r.status = "ROLLED_BACK"
+            r.detail = reason
+            if not is_reboot:
+                # state is back to pre-mutation — the P4 breadcrumb has done its job
+                clear_paired_restore(registry_path, item)
+        else:
+            r.status = "ROLLBACK_FAILED"
+            r.detail = (f"{reason}; rollback_cmd ALSO failed rc={rc}: {err or out} — "
+                        f"MANUAL INTERVENTION REQUIRED")
+
+    # apply
+    rc, out, err = run_cmd(apply_cmd, timeout=item.get("apply_timeout_s", 180))
+    if rc != 0:
+        rollback(f"apply failed rc={rc}: {err or out}")
+        return r
+
+    # G5 — health probe passes at T+60s AND T+300s; auto-rollback on either failure
+    probe_cmd = item.get("health_probe_cmd")
+    sleep_fn(g5_t1)
+    ok, detail = _run_check(probe_cmd, run_cmd)
+    if not ok:
+        rollback(f"G5 health probe failed at T+{g5_t1}s: {detail}")
+        return r
+    sleep_fn(max(g5_t2 - g5_t1, 0))
+    ok, detail = _run_check(probe_cmd, run_cmd)
+    if not ok:
+        rollback(f"G5 health probe failed at T+{g5_t2}s: {detail}")
+        return r
+
+    # G6 — node_exporter up{} recovered; no new failed units since G1
+    up_cmd = item.get("up_check_cmd")
+    if up_cmd:
+        ok, detail = _run_check(up_cmd, run_cmd)
+        if not ok:
+            rollback(f"G6 up-check failed: {detail}")
+            return r
+    if fu_cmd:
+        rc, out, err = run_cmd(fu_cmd)
+        if rc != 0:
+            rollback(f"G6 failed-units re-check errored rc={rc}: {err or out}")
+            return r
+        new_failed = set(out.split()) - (baseline_failed_units or set())
+        if new_failed:
+            rollback(f"G6 new failed units since G1: {sorted(new_failed)}")
+            return r
+
+    # G7 — state ingest (best-effort; the item is already verified healthy), clear P4
+    ingest_cmd = item.get("ingest_cmd")
+    if ingest_cmd:
+        rc, out, err = run_cmd(ingest_cmd)
+        if rc != 0:
+            log(f"item {r.id}: G7 ingest_cmd failed (non-fatal): {err or out}")
+    if not is_reboot:
+        clear_paired_restore(registry_path, item)
+
+    r.status = "OK"
+    r.detail = f"{item.get('current_version', '?')} -> {item.get('target_version', '?')}"
+    return r
+
+
+# ---- report (phase 3b) -------------------------------------------------------------------
+
+def render_report(run_id, run_status, stop_reason, results):
+    lines = [f"# fleet-maint-run — {run_id}", "", f"**Status:** {run_status}"]
+    if stop_reason:
+        lines.append(f"**Stop reason:** {stop_reason}")
+    lines += ["", "| id | node | component | status | gate | detail |", "|---|---|---|---|---|---|"]
+    for r in results:
+        detail = (r.detail or "").replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| {r.id} | {r.node} | {r.component} | {r.status} | {r.gate_failed or '-'} | {detail} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _finish(run_id, results, *, batch, report_dir, wq_ticket, run_status, stop_reason,
+            dispatcher_restore_cmd, run_cmd=run_cmd, run_argv=run_argv):
+    """Phase 3b — RECORD. Always runs, even when G0 failed and no item was ever touched."""
+    if dispatcher_restore_cmd:
+        rc, out, err = run_cmd(dispatcher_restore_cmd)
+        if rc == 0:
+            log("phase 3b: dispatcher timer restored")
+        else:
+            log(f"phase 3b: dispatcher restore FAILED rc={rc}: {err or out} — "
+                f"MANUAL INTERVENTION REQUIRED")
+
+    if results:
+        rc, out, err = run_argv([STATE_REGEN_BIN])
+        if rc != 0:
+            log(f"phase 3b: state-regen failed (non-fatal): {err or out}")
+        changed = ",".join(f"{r.node}/{r.component}" for r in results
+                            if r.status == "OK" and r.detail and "->" in r.detail)
+        rc, out, err = run_argv([
+            sys.executable, EPISODE_BIN, "commit",
+            "--summary", f"maint window {run_id}: {run_status}",
+            "--changed", changed,
+            "--why", "A11 section 4 phase 3 rolling maintenance window",
+            "--ref", f"wq#853 {run_id}",
+        ])
+        if rc != 0:
+            log(f"phase 3b: episode commit failed (non-fatal): {err or out}")
+
+    window_date = (batch or {}).get("window_date", "unknown-date")
+    report_path = os.path.join(report_dir, f"maint_window_{window_date}.md")
+    os.makedirs(report_dir, exist_ok=True)
+    with open(report_path, "w") as f:
+        f.write(render_report(run_id, run_status, stop_reason, results))
+
+    ntfy(f"[fleet-maint-run] window {window_date}: {run_status}" +
+         (f" -- {stop_reason}" if stop_reason else ""), run_argv=run_argv)
+
+    if wq_ticket:
+        note = f"maint window {window_date}: {run_status}; report {report_path}"
+        rc, out, err = run_argv([WQ_BIN, "done", str(wq_ticket), "--notes", note])
+        if rc != 0:
+            log(f"phase 3b: wq done failed (non-fatal): {err or out}")
+
+    return {"run_id": run_id, "status": run_status, "stop_reason": stop_reason,
+            "report_path": report_path, "items": [r.to_dict() for r in results]}
+
+
+# ---- top-level run (G0 -> validate -> preflight -> ordered items -> phase 3b) -----------
+
+def run_batch(batch_path, expected_sha256, *, registry_path=DEFAULT_REGISTRY,
+              report_dir=DEFAULT_REPORT_DIR, wq_ticket=None, run_cmd=run_cmd,
+              run_argv=run_argv, sleep_fn=time.sleep, g5_t1=G5_T1_S, g5_t2=G5_T2_S):
+    run_id = f"maint-{_now_iso()}"
+
+    def abort_preflight(reason, batch=None, dispatcher_restore_cmd=None):
+        log(reason)
+        return _finish(run_id, [], batch=batch, report_dir=report_dir, wq_ticket=wq_ticket,
+                        run_status="ABORTED_PREFLIGHT", stop_reason=reason,
+                        dispatcher_restore_cmd=dispatcher_restore_cmd,
+                        run_cmd=run_cmd, run_argv=run_argv)
+
+    try:
+        with open(batch_path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return abort_preflight(f"cannot read batch file {batch_path}: {e}")
+
+    # G0 — batch file sha256 matches the approved ticket. Abort whole run on mismatch.
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_sha256 != expected_sha256:
+        return abort_preflight(
+            f"G0 FAILED: batch sha256 {actual_sha256} != approved {expected_sha256} — "
+            f"this is not the batch Frank approved")
+
+    batch = json.loads(raw)
+    items = batch.get("items", [])
+
+    problems = validate_batch(items)
+    if problems:
+        return abort_preflight("batch validation failed:\n  " + "\n  ".join(problems), batch=batch)
+
+    ordered = order_items(items)
+
+    pf = batch.get("preflight", {}) or {}
+    for name, key in (("mesh quiet", "mesh_quiet_cmd"), ("vault HA", "vault_ha_cmd")):
+        cmd = pf.get(key)
+        if cmd:
+            rc, out, err = run_cmd(cmd)
+            if rc != 0:
+                return abort_preflight(f"preflight '{name}' failed rc={rc}: {err or out}", batch=batch)
+
+    dispatcher_restore_cmd = pf.get("dispatcher_restore_cmd")
+    stop_cmd = pf.get("dispatcher_stop_cmd")
+    if stop_cmd:
+        rc, out, err = run_cmd(stop_cmd)
+        if rc != 0:
+            return abort_preflight(f"preflight dispatcher-stop failed rc={rc}: {err or out}",
+                                    batch=batch, dispatcher_restore_cmd=dispatcher_restore_cmd)
+        # The dispatcher is now stopped. That is itself a mutation (A11 §5): "that is a
+        # stop, so it carries a paired restore ... restored in phase 3b" — unconditionally,
+        # regardless of how the rest of this run goes.
+
+    results = []
+    stopped = False
+    stop_reason = None
+    for item in ordered:
+        if stopped:
+            r = ItemResult(item)
+            r.status = "NOT_ATTEMPTED"
+            r.detail = "run stopped earlier — stop-on-first-failure is absolute (A11 §4)"
+            results.append(r)
+            continue
+        r = run_item(item, registry_path=registry_path, run_id=run_id, run_cmd=run_cmd,
+                     sleep_fn=sleep_fn, g5_t1=g5_t1, g5_t2=g5_t2)
+        results.append(r)
+        log(f"item {r.id} ({r.node}/{r.component}): {r.status} -- {r.detail}")
+        if r.status not in ("OK", "ABSENT"):
+            stopped = True
+            stop_reason = (f"item {r.id} ({r.node}/{r.component}) failed at "
+                            f"{r.gate_failed or 'apply/health'}: {r.detail}")
+
+    run_status = "STOPPED" if stopped else "COMPLETED"
+    return _finish(run_id, results, batch=batch, report_dir=report_dir, wq_ticket=wq_ticket,
+                   run_status=run_status, stop_reason=stop_reason,
+                   dispatcher_restore_cmd=dispatcher_restore_cmd,
+                   run_cmd=run_cmd, run_argv=run_argv)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="fleet-maint-run -- ordered rolling maintenance executor (A11 phase 3, wq#853)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("run", help="execute an approved maintenance batch")
+    p.add_argument("--batch", required=True, help="path to the approved batch-YYYY-MM-DD.json")
+    p.add_argument("--expected-sha256", required=True,
+                   help="sha256 recorded on the approved wq ticket (G0)")
+    p.add_argument("--wq-ticket", type=int, default=None,
+                   help="the [maint] Window ticket to close in phase 3b")
+    p.add_argument("--registry", default=DEFAULT_REGISTRY, help="P4 paired-restore registry path")
+    p.add_argument("--report-dir", default=DEFAULT_REPORT_DIR)
+
+    args = ap.parse_args()
+    result = run_batch(args.batch, args.expected_sha256, registry_path=args.registry,
+                        report_dir=args.report_dir, wq_ticket=args.wq_ticket)
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] == "COMPLETED" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
