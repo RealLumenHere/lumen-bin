@@ -66,7 +66,7 @@ a target whose own lease has expired is reclaimed-then-claimed in one call, loud
 out-of-order claim prints a NOTICE naming the lane head it stepped past. ONE eligibility ruling
 (_eligible) serves the lane scan, the --id check and the head notice — a second copy of these
 checks is how the watchdog's L831 happened, and that path is closed here by construction."""
-import sqlite3, sys, os, argparse, datetime, socket, re, secrets
+import sqlite3, sys, os, argparse, datetime, socket, re, secrets, json
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 240
 def _envint(name, default):
@@ -118,6 +118,24 @@ CANON_SUBSYSTEMS = {"vault-ha","litellm","minerva-db","queue-db","messenger",
                     "ccc-repo",   # frankstupak/claude-command-center + its primary clone
                     "mc-tree"}    # mission-control PRIMARY tree /home/lumen/mission-control
                                   # (app.py + ui/; linked worktrees are NOT this) — mc-v2 2026-08-21
+# wq#912: 27 open tickets sat in 7 lanes the dispatcher could never see because their lane
+# had no dispatcher/config.json entry — mis-laned at ticket-creation time, never caught until
+# an audit went looking. LANE_EXEMPT names the lanes that deliberately have no entry (not a
+# mis-lane): 'auto' is wq's own CLI default (wq#830: spans arbitrary repos, never one lane's
+# repo); 'user' is Frank-only (wq itself already refuses agent claims from it); 't1' stays
+# lumen_dispatch's (DESIGN.md §13: "No t1 lane takeover"). Anything else needs a real entry.
+LANE_EXEMPT = {"auto", "user", "t1"}
+DISPATCHER_CONFIG = os.environ.get("WQ_DISPATCHER_CONFIG",
+                                   "/home/lumen/foreman/dispatcher/config.json")
+def configured_lanes():
+    """wq#912: lanes with a live dispatcher/config.json entry. None means the config could
+    not be read — callers must fail OPEN (a missing/unreadable file never blocks `wq add`)."""
+    try:
+        with open(DISPATCHER_CONFIG) as f:
+            cfg = json.load(f)
+        return set(cfg.get("lanes", {}).keys())
+    except (OSError, ValueError):
+        return None
 def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
 def now(): return utcnow().strftime(FMT)
 def lease_from(minutes): return (utcnow() + datetime.timedelta(minutes=minutes)).strftime(FMT)
@@ -710,6 +728,16 @@ def cmd_add(a):
     if bad and not a.force:
         print(f"REFUSED: non-canonical subsystem(s): {', '.join(bad)}")
         print(f"Canonical set: {', '.join(sorted(CANON_SUBSYSTEMS))}\nUse --force to override (discouraged).")
+        sys.exit(1)
+    # wq#912: refuse a lane the dispatcher will never see. Skip silently if the config
+    # can't be read (configured_lanes() returns None) — a missing file must never block add.
+    lanes = configured_lanes()
+    if lanes is not None and a.lane not in lanes and a.lane not in LANE_EXEMPT and not a.force:
+        print(f"REFUSED: lane {a.lane!r} has no dispatcher/config.json entry — the dispatcher "
+              f"will never see this ticket (wq#912).")
+        print(f"Configured lanes: {', '.join(sorted(lanes))}\n"
+              f"Exempt (deliberately unlisted): {', '.join(sorted(LANE_EXEMPT))}\n"
+              f"Use an existing lane, add one to dispatcher/config.json first, or --force to override.")
         sys.exit(1)
     c = conn()
     if not a.force:

@@ -20,6 +20,10 @@ def make_env(tmp_path, agent="test-reap-agent"):
     env = dict(os.environ)
     env["WQ_DB"] = str(tmp_path / "scratch_wq.db")
     env["WQ_AGENT"] = agent
+    # wq#912: this file adds tickets under scratch lane names ("lane-a"/"lane-b") that will
+    # never be real dispatcher lanes — point the lane guard at a path that doesn't exist so
+    # it fails open instead of refusing against the live dispatcher config.
+    env["WQ_DISPATCHER_CONFIG"] = str(tmp_path / "no-such-dispatcher-config.json")
     return env
 
 
