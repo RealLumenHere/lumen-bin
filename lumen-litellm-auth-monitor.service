@@ -1,0 +1,19 @@
+[Unit]
+Description=LiteLLM auth failure monitor (wq#721)
+Documentation=file:///home/lumen/docs/litellm/service_keys.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=lumen
+Group=lumen
+ExecStart=/home/lumen/bin/litellm-auth-monitor
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=litellm-auth-monitor
+
+[Install]
+WantedBy=multi-user.target
