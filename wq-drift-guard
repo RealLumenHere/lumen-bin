@@ -33,7 +33,8 @@ alert() {
     ntfy-send -t "$NTFY_TOPIC" -p urgent -T "wq DRIFT DETECTED" "$msg" 2>/dev/null || true
 }
 
-case "${1#--}" in
+ARG="${1-}"
+case "${ARG#--}" in
     status)
         if drift; then
             echo "DRIFTED — disk=$(disk_hash) git=$(git_hash)"
