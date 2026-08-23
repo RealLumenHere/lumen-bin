@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""fleet-update-check v1 (wq#419, per wq#387 spec §4) — READ-ONLY reporter.
+Weekly SSH fan-out: apt debt (security/other), reboot-required age, stuck
+dpkg/apt >24h watchdog, app-version drift, docker digest drift, fwupd,
+failed units. Sinks: maint report + ntfy digest + deduped user-lane wq ticket.
+NEVER applies anything. Flags: --no-ntfy --no-ticket --nodes a,b,c
+
+wq#852: GitHub lookups use the GH_TOKEN env var when set (caller's job to
+read /home/lumen/.secrets/github-lumen.token and export it — this script
+never reads secrets itself). Unauthenticated (60/hr) when unset, unchanged
+from v1. state.json now also persists the app-version snapshot ('apps' key)
+so a wrapper (fleet-maint-assemble) can classify drift without re-probing.
+"""
+import json, os, re, subprocess, sys, time, urllib.request
+from datetime import datetime, timezone
+
+SSH_KEY = "/home/lumen/.ssh/id_ed25519"
+OUT_DIR = "/home/lumen/maint/update-check"
+STATE_F = os.path.join(OUT_DIR, "state.json")
+NTFY = "/home/lumen/bin/ntfy-send"
+WQ = "/home/lumen/bin/wq"
+STUCK_SECS = 24 * 3600
+
+# name -> ssh target ("" = local). Sources: fleet-auth-ssh-probe roster +
+# lumen_state (bes/sia/sobek/gameboy use username==hostname per provision SOP).
+NODES = {
+    "lumen": "",
+    "thor": "thor@100.112.151.100",
+    "thoth": "thoth@100.75.1.108",
+    "seshat": "seshat@100.121.243.124",
+    "anubis": "anubis@100.121.17.5",
+    "apep": "apep@100.82.2.72",
+    "maat": "maam@100.105.219.34",
+    "wadjet": "wadjet@100.116.217.15",
+    "nephthys": "nephthys@100.98.74.87",
+    "isis": "isis@100.100.129.24",
+    "hathor": "hathor@100.80.71.13",
+    "bes": "bes@100.110.156.91",
+    "sia": "sia@100.111.15.120",
+    "sobek": "sobek@100.86.156.91",
+    "gameboy": "gameboy@100.118.56.59",
+}
+
+def sh(cmd, timeout=25):
+    """Run local command -> (rc, stdout+stderr)."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return 255, f"ERR:{e}"
+
+def node_sh(node, cmd, timeout=25):
+    tgt = NODES[node]
+    if not tgt:
+        return sh(cmd, timeout)
+    import shlex  # single-quote wrap: $(...) must expand REMOTELY, not locally
+    ssh = (f"ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "
+           f"-i {SSH_KEY} {tgt} {shlex.quote(cmd)}")
+    return sh(ssh, timeout)
+
+def http_json(url, timeout=10, token=None):
+    try:
+        headers = {"User-Agent": "fleet-update-check"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+def gh_latest(repo):
+    """Latest release tag from GitHub, fail-soft -> None. Auth via GH_TOKEN
+    env (wq#852) if set — raises the rate limit from 60/hr to 5000/hr."""
+    token = os.environ.get("GH_TOKEN") or None
+    j = http_json(f"https://api.github.com/repos/{repo}/releases/latest", token=token)
+    if j and j.get("tag_name"):
+        return j["tag_name"].lstrip("v")
+    return None
+
+def probe_node(node):
+    """All read-only per-node probes. Returns dict; 'unreachable' on SSH fail."""
+    d = {"node": node}
+    rc, out = node_sh(node, "echo up && hostname")
+    if rc != 0:
+        d["unreachable"] = out[:200]
+        return d
+    # 1. apt debt: upgradable split security/other
+    rc, out = node_sh(node, "apt list --upgradable 2>/dev/null | tail -n +2", 40)
+    lines = [l for l in out.splitlines() if "/" in l]
+    sec = [l for l in lines if "-security" in l]
+    d["apt_security"] = len(sec)
+    d["apt_other"] = len(lines) - len(sec)
+    d["apt_sec_pkgs"] = [l.split("/")[0] for l in sec][:10]
+    # reboot-required flag + age (days)
+    rc, out = node_sh(node,
+        "test -f /var/run/reboot-required && stat -c %Y /var/run/reboot-required || echo NO")
+    if out and out != "NO" and out.isdigit():
+        d["reboot_debt_days"] = round((time.time() - int(out)) / 86400, 1)
+    # 2. stuck apt/dpkg/unattended process >24h (no sudo needed).
+    # WHITELIST: unattended-upgrade-shutdown --wait-for-signal is a persistent
+    # monitor daemon by design — not a wedge (verified on lumen 2026-08-09).
+    rc, out = node_sh(node,
+        "ps -eo etimes,args | awk '$0 ~ /(^|\\/| )(apt|apt-get|dpkg|unattended-upgrade)( |$|\\.)/' | grep -v -e wait-for-signal -e awk || true")
+    stuck = []
+    for l in out.splitlines():
+        p = l.split(None, 1)
+        if len(p) == 2 and p[0].isdigit() and int(p[0]) > STUCK_SECS:
+            stuck.append(f"{p[1].split('/')[-1][:40]}({int(p[0])//3600}h)")
+    if stuck:
+        d["stuck_pkg_procs"] = stuck
+    # 3. versions present on this node (fail-soft each)
+    rc, out = node_sh(node, "tailscale version 2>/dev/null | head -1")
+    if rc == 0 and out:
+        d["tailscale"] = out.split()[0]
+    rc, out = node_sh(node, "command -v cloudflared >/dev/null && cloudflared version 2>/dev/null | head -1 || true")
+    m = re.search(r"version (\S+)", out or "")
+    if m:
+        d["cloudflared"] = m.group(1)
+    # 5. fwupd pending count (read-only; degrades if no fwupd/no perms)
+    rc, out = node_sh(node,
+        "command -v fwupdmgr >/dev/null && fwupdmgr get-updates 2>/dev/null | grep -c 'New version' || echo -")
+    if out and out.strip().isdigit() and int(out.strip()) > 0:
+        d["fwupd_pending"] = int(out.strip())
+    # 6. failed units (systemctl prefixes each line with a ● bullet — strip it)
+    rc, out = node_sh(node, "systemctl --failed --no-legend 2>/dev/null")
+    fails = []
+    for l in out.splitlines():
+        toks = [t for t in l.split() if t not in ("●", "×", "*")]
+        if toks:
+            fails.append(toks[0])
+    d["failed_units"] = fails
+    return d
+
+def probe_apps():
+    """Fleet-level app versions vs upstream latest (all fail-soft)."""
+    a = {}
+    latest = {
+        "ollama": gh_latest("ollama/ollama"),
+        "tailscale": gh_latest("tailscale/tailscale"),
+        "cloudflared": gh_latest("cloudflare/cloudflared"),
+        "gitea": gh_latest("go-gitea/gitea"),
+        "vaultwarden": gh_latest("dani-garcia/vaultwarden"),
+        "miniflux": gh_latest("miniflux/v2"),
+        "llamacpp": gh_latest("ggml-org/llama.cpp"),
+    }
+    a["latest"] = latest
+    # ollama per inference node via API (tailnet)
+    a["ollama"] = {}
+    for n, ip in (("lumen", "127.0.0.1"), ("isis", "100.100.129.24"),
+                  ("hathor", "100.80.71.13"), ("nephthys", "100.98.74.87")):
+        j = http_json(f"http://{ip}:11434/api/version", 6)
+        if j and j.get("version"):
+            a["ollama"][n] = j["version"]
+    # gitea on anubis (binary or docker, fail-soft)
+    rc, out = node_sh("anubis",
+        "gitea --version 2>/dev/null || docker exec gitea gitea --version 2>/dev/null || true")
+    m = re.search(r"[Vv]ersion\s+(\S+)", out or "")
+    if m:
+        a["gitea"] = m.group(1)
+    # vaultwarden image on maat (container name may vary — match image string)
+    rc, out = node_sh("maat",
+        "docker ps --format '{{.Image}}' 2>/dev/null | grep -i vaultwarden || "
+        "sudo -n docker ps --format '{{.Image}}' 2>/dev/null | grep -i vaultwarden || true")
+    if out:
+        a["vaultwarden_image"] = out.splitlines()[0]
+    # miniflux on sia — exec real version (":latest" tag says nothing).
+    # Binary is /usr/bin/miniflux inside the image (bare name not on PATH).
+    rc, out = node_sh("sia",
+        "docker exec $(docker ps --format '{{.Names}}' | grep -i miniflux | head -1) "
+        "/usr/bin/miniflux -version 2>/dev/null || true", 30)
+    m = re.search(r"(\d+\.\d+\.\d+)", out or "")
+    if m:
+        a["miniflux"] = m.group(1)
+    # twscrape local vs PyPI
+    rc, out = sh("pip show twscrape 2>/dev/null | awk '/^Version:/{print $2}'")
+    if out:
+        a["twscrape"] = out
+    j = http_json("https://pypi.org/pypi/twscrape/json")
+    if j:
+        a["latest"]["twscrape"] = j.get("info", {}).get("version")
+    # llama-server recorded build (state store, fail-soft)
+    rc, out = sh("python3 /home/lumen/minerva/lumen_state.py current litellm 2>/dev/null | grep -i llama || true")
+    return a
+
+def probe_docker_digest_drift():
+    """Pinned/running images on Lumen vs upstream tag digest. Read-only.
+    manifest inspect needs network but pulls nothing."""
+    drift = []
+    rc, out = sh("docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null")
+    for line in out.splitlines():
+        p = line.split(None, 1)
+        if len(p) != 2:
+            continue
+        name, image = p
+        # upstream digest of the tag the container was started from —
+        # fingerprint stored in state; movement across weekly runs = "review"
+        ref = image.split("@")[0]
+        rc3, mani = sh(f"docker manifest inspect {ref} 2>/dev/null | "
+                       f"python3 -c \"import sys,json,hashlib;d=sys.stdin.read();print(hashlib.sha256(d.encode()).hexdigest()[:12]) if d.strip() else ''\"", 30)
+        if rc3 == 0 and mani:
+            drift.append({"container": name, "image": image,
+                          "upstream_manifest_fp": mani})
+    return drift
+
+def load_state():
+    try:
+        return json.load(open(STATE_F))
+    except Exception:
+        return {}
+
+def save_state(s):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    json.dump(s, open(STATE_F, "w"), indent=1)
+
+def build_report(nodes, apps, drift, prev):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    urgent, action = [], []
+    L = [f"# Fleet update check — {now}", ""]
+    L.append("| node | apt sec | apt other | reboot debt | stuck pkg | fwupd | failed units |")
+    L.append("|---|---|---|---|---|---|---|")
+    for n in sorted(nodes):
+        d = nodes[n]
+        if "unreachable" in d:
+            L.append(f"| {n} | UNREACHABLE | | | | | |")
+            action.append(f"{n}: unreachable")
+            continue
+        stuck = ",".join(d.get("stuck_pkg_procs", [])) or "-"
+        if d.get("stuck_pkg_procs"):
+            urgent.append(f"{n}: pkg process stuck >24h: {stuck}")
+        rb = d.get("reboot_debt_days", "-")
+        fu = ",".join(d.get("failed_units", [])) or "-"
+        prev_fu = set(prev.get("nodes", {}).get(n, {}).get("failed_units", []))
+        new_fu = set(d.get("failed_units", [])) - prev_fu
+        if new_fu:
+            urgent.append(f"{n}: NEW failed units: {','.join(new_fu)}")
+        if d.get("apt_security", 0) > 0:
+            action.append(f"{n}: {d['apt_security']} security pkgs "
+                          f"({','.join(d.get('apt_sec_pkgs', [])[:5])})")
+        if isinstance(rb, float) and rb > 14:
+            action.append(f"{n}: reboot debt {rb}d")
+        L.append(f"| {n} | {d.get('apt_security',0)} | {d.get('apt_other',0)} "
+                 f"| {rb} | {stuck} | {d.get('fwupd_pending','-')} | {fu} |")
+    # app drift table (rank 1-4 gaps escalate)
+    L += ["", "## App versions vs upstream latest", ""]
+    lat = apps.get("latest", {})
+    def row(comp, have, rank=99):
+        want = lat.get(comp)
+        gap = bool(want and have and str(want) not in str(have))
+        mark = " **<- behind**" if gap else ""
+        L.append(f"- {comp}: have `{have}` / latest `{want or '?'}`{mark}")
+        if gap and rank <= 4:
+            urgent.append(f"{comp} behind (rank{rank}): {have} vs {want}")
+        elif gap:
+            action.append(f"{comp}: {have} -> {want}")
+    row("cloudflared", next((d.get("cloudflared") for d in nodes.values()
+                             if d.get("cloudflared")), None), 1)
+    row("gitea", apps.get("gitea"), 2)
+    row("vaultwarden", apps.get("vaultwarden_image"), 3)
+    row("miniflux", apps.get("miniflux"), 4)
+    for n, v in sorted(apps.get("ollama", {}).items()):
+        row(f"ollama[{n}]", v)
+    ts_vers = {d.get("tailscale") for d in nodes.values() if d.get("tailscale")}
+    L.append(f"- tailscale fleet versions: {sorted(ts_vers)} / latest `{lat.get('tailscale') or '?'}`")
+    if len(ts_vers) > 1:
+        action.append(f"tailscale version split: {sorted(ts_vers)}")
+    row("twscrape", apps.get("twscrape"))
+    L.append(f"- llama.cpp latest tag: `{lat.get('llamacpp') or '?'}` (recorded build b9334 — INFO only)")
+    # docker digest movement vs last run (state-compared)
+    L += ["", "## Docker upstream tag movement (Lumen)", ""]
+    prev_fp = {x["container"]: x["upstream_manifest_fp"]
+               for x in prev.get("drift", [])}
+    for x in drift:
+        moved = (x["container"] in prev_fp
+                 and prev_fp[x["container"]] != x["upstream_manifest_fp"])
+        note = " **<- upstream moved, review available**" if moved else ""
+        L.append(f"- {x['container']} ({x['image']}): fp {x['upstream_manifest_fp']}{note}")
+        if moved:
+            action.append(f"docker {x['container']}: upstream tag moved (review, no pull)")
+    L += ["", "## Actionable", ""]
+    for u in urgent:
+        L.append(f"- URGENT: {u}")
+    for a in action:
+        L.append(f"- {a}")
+    if not urgent and not action:
+        L.append("- none — fleet clean")
+    return "\n".join(L) + "\n", urgent, action
+
+def main():
+    args = sys.argv[1:]
+    no_ntfy = "--no-ntfy" in args
+    no_ticket = "--no-ticket" in args
+    only = None
+    for i, a in enumerate(args):
+        if a == "--nodes" and i + 1 < len(args):
+            only = args[i + 1].split(",")
+    prev = load_state()
+    nodes = {}
+    for n in NODES:
+        if only and n not in only:
+            continue
+        nodes[n] = probe_node(n)
+        print(f"[probe] {n}: {'unreachable' if 'unreachable' in nodes[n] else 'ok'}",
+              file=sys.stderr)
+    apps = probe_apps() if not only else {"latest": {}}
+    drift = probe_docker_digest_drift() if not only else []
+    report, urgent, action = build_report(nodes, apps, drift, prev)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    open(os.path.join(OUT_DIR, "latest.md"), "w").write(report)
+    open(os.path.join(OUT_DIR, f"report-{day}.md"), "w").write(report)
+    save_state({"nodes": nodes, "drift": drift, "apps": apps, "ts": day})
+    print(report)
+    # ntfy sinks
+    if not no_ntfy:
+        digest = (f"update-check: {len(urgent)} urgent, {len(action)} actionable, "
+                  f"{sum(1 for d in nodes.values() if 'unreachable' in d)} unreachable "
+                  f"of {len(nodes)} nodes")
+        sh(f"{NTFY} -t lumen-updates -T fleet-update-check {json.dumps(digest)}", 30)
+        for u in urgent[:5]:
+            sh(f"{NTFY} -t lumen-alerts -p urgent -T fleet-update-check {json.dumps('URGENT: ' + u)}", 30)
+    # deduped user-lane ticket (wq add refuses duplicate normalized titles ->
+    # fall back to wq edit of the existing open one)
+    if not no_ticket and (urgent or action):
+        week = datetime.now(timezone.utc).strftime("%G-W%V")
+        title = f"[fleet] Update review {week}"
+        detail = ("Weekly fleet-update-check found actionable items. Full report: "
+                  f"maint/update-check/report-{day}.md\n\nURGENT:\n"
+                  + "\n".join(f"- {u}" for u in urgent)
+                  + "\n\nActionable:\n" + "\n".join(f"- {a}" for a in action))
+        # no-shell exec: real newlines survive into the ticket detail
+        r = subprocess.run([WQ, "add", "--lane", "user", "--pri", "2",
+                            "--title", title, "--detail", detail],
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout + r.stderr)
+        if r.returncode != 0 or "duplicate" in out.lower():
+            lst = subprocess.run([WQ, "list", "user"], capture_output=True,
+                                 text=True, timeout=30).stdout
+            m = re.search(r"\[\s*(\d+)\].*" + re.escape(title[:30]), lst)
+            if m:
+                subprocess.run([WQ, "edit", m.group(1), "--detail", detail],
+                               capture_output=True, text=True, timeout=30)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()

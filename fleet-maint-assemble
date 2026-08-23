@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""fleet-maint-assemble (wq#852, A11 §4 phase 1) — completeness-gated batch
+assembler for the monthly maintenance window. Wraps fleet-update-check; does
+not replace it. Report: reports/opsaudit_a11_maintenance_window.md.
+
+1. Reads /home/lumen/.secrets/github-lumen.token and runs fleet-update-check
+   with it exported as GH_TOKEN (raises the GitHub lookup budget past the
+   60/hr unauthenticated ceiling that produced the all-'?' silent-failure
+   run in A11 §3c).
+2. Completeness gate: any '?'/None upstream lookup, any current-version probe
+   that should have succeeded but didn't, or any node that is neither
+   reachable nor on the declared-absent list -> exit 2, ntfy lumen-alerts,
+   NO batch file written. A batch is an approval artifact and may not
+   contain a hole.
+3. Classifies each drift item into a lane (SEC/APP/APT/FW/REBOOT), orders
+   the batch per §5's fixed ordering law, and writes:
+     - /home/lumen/maint/windows/batch-YYYY-MM-DD.json (machine, for phase 3)
+     - /home/lumen/maint/windows/batch-YYYY-MM-DD.md   (human)
+     - one user-lane wq ticket: "[maint] Window YYYY-MM-DD — N items, approve or amend"
+
+Never mutates anything. Flags: --no-ntfy --date YYYY-MM-DD (override for
+re-runs/testing) --dry-run (skip wq ticket + ntfy, still writes batch files)
+"""
+import json, os, re, subprocess, sys
+from datetime import datetime, timezone
+
+GH_TOKEN_FILE = "/home/lumen/.secrets/github-lumen.token"
+FLEET_UPDATE_CHECK = "/home/lumen/bin/fleet-update-check"
+STATE_F = "/home/lumen/maint/update-check/state.json"
+WINDOWS_DIR = "/home/lumen/maint/windows"
+NTFY = "/home/lumen/bin/ntfy-send"
+WQ = "/home/lumen/bin/wq"
+
+DECLARED_ABSENT = {"hathor", "wadjet"}  # A11 §3a: tailnet-offline / bench
+
+# Ordering law, A11 §5. Tiers run low-to-high; ties keep this list order.
+TIER1_LEAF = ["gameboy", "apep", "thoth", "seshat", "sia"]
+TIER2_SERVICE = ["anubis", "bes", "isis"]
+TIER3_STANDBY = ["sobek"]
+TIER4_PRIMARY = ["maat"]
+TIER5_LAST = ["lumen"]
+NODE_ORDER = TIER1_LEAF + TIER2_SERVICE + TIER3_STANDBY + TIER4_PRIMARY + TIER5_LAST
+
+def node_tier(node):
+    for tier, roster in ((1, TIER1_LEAF), (2, TIER2_SERVICE), (3, TIER3_STANDBY),
+                         (4, TIER4_PRIMARY), (5, TIER5_LAST)):
+        if node in roster:
+            return (tier, roster.index(node))
+    return (1.5, 0)  # unlisted-but-reachable node (thor, nephthys): treat as leaf-adjacent
+
+LANE_RANK = {"SEC": 0, "APP": 1, "APT": 2, "REBOOT": 3, "FW": 9}
+
+# Curated advisory knowledge (A11 §3b) — version-prefix match against the
+# CURRENT running version. This is not a live CVE feed; it is the same
+# manual judgement §3b insists on ("the assembler must say which is which
+# rather than printing a version delta and calling it a CVE"). Extend by
+# hand when a new advisory against a component we run is confirmed.
+SEC_ADVISORIES = {
+    "tailscale": [
+        ("1.98.", "TS-2026-010/TS-2026-011",
+         "Tailscale SSH env-var leak via inherited fds; unmapped-4via6 dest accepted. "
+         "Severity is per-node: reduced where RunSSH=false + real sshd is in use."),
+    ],
+}
+
+# Per-component apply/rollback/health-probe/backup metadata (A11 §7 shape).
+COMPONENTS = {
+    "tailscale": dict(apply="service restart", rollback="apt pin previous version, restart",
+                       health="tailscale status peer count recovers; node reachable from lumen",
+                       backup=None),
+    "cloudflared": dict(apply="DETACHED ONLY (lumen-run/systemd-run — Commander rides this tunnel)",
+                         rollback="restore previous binary", health="every CF hostname 200/302",
+                         backup=None),
+    "gitea": dict(apply="service restart", rollback="nightly dump + previous binary",
+                  health="git ls-remote on fleet repos; GET /api/v1/version",
+                  backup="restic gitea snapshot, restore-proven (A6 P1) before apply"),
+    "vaultwarden": dict(apply="container recreate",
+                         rollback="previous image tag + per-DB copy",
+                         health="vault.lumennode.uk 302; one cipher read via API",
+                         backup="restore-proven Postgres+Vaultwarden snapshot from THIS run (fq#22: a dump that exits 0 is not proof)"),
+    "miniflux": dict(apply="container recreate", rollback="previous image tag",
+                      health="/healthcheck 200; feed count unchanged", backup=None),
+    "ollama": dict(apply="service restart", rollback="pin previous binary/apt version",
+                    health="ollama list responds; loaded model unchanged", backup=None),
+}
+
+
+def sh(cmd, timeout=30):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return 255, f"ERR:{e}"
+
+
+def load_gh_token():
+    try:
+        tok = open(GH_TOKEN_FILE).read().strip()
+        return tok or None
+    except Exception:
+        return None
+
+
+def run_fleet_update_check(gh_token):
+    env = os.environ.copy()
+    if gh_token:
+        env["GH_TOKEN"] = gh_token
+    r = subprocess.run([FLEET_UPDATE_CHECK, "--no-ticket", "--no-ntfy"],
+                        env=env, capture_output=True, text=True, timeout=900)
+    return r.returncode, r.stdout, r.stderr
+
+
+def load_state():
+    with open(STATE_F) as f:
+        return json.load(f)
+
+
+def completeness_gate(nodes, apps):
+    """A11 §3c: any '?'/None upstream lookup, any current-version probe that
+    should have succeeded but didn't, or any node neither reachable nor
+    declared-absent -> fail. Returns list of failure strings (empty = pass)."""
+    failures = []
+    for n, d in nodes.items():
+        if "unreachable" in d:
+            if n not in DECLARED_ABSENT:
+                failures.append(f"{n}: unreachable and not on the declared-absent list")
+        elif "apt_security" not in d or "apt_other" not in d:
+            failures.append(f"{n}: apt debt probe returned nothing (reachable but incomplete)")
+
+    latest = apps.get("latest", {})
+    if not latest:
+        failures.append("upstream latest-version lookups: empty (GitHub probe did not run)")
+    for comp, val in latest.items():
+        if val is None:
+            failures.append(f"upstream latest lookup failed: {comp} (returned '?')")
+
+    def reachable(n):
+        return n in nodes and "unreachable" not in nodes[n]
+
+    if reachable("anubis") and not apps.get("gitea"):
+        failures.append("gitea: current-version probe failed on anubis (reachable node)")
+    if reachable("maat") and not apps.get("vaultwarden_image"):
+        failures.append("vaultwarden: current-version probe failed on maat (reachable node)")
+    if reachable("sia") and not apps.get("miniflux"):
+        failures.append("miniflux: current-version probe failed on sia (reachable node)")
+    for n, d in nodes.items():
+        if "unreachable" in d:
+            continue
+        if not d.get("tailscale"):
+            failures.append(f"{n}: tailscale current-version probe failed")
+
+    return failures
+
+
+def sec_lane_note(component, have):
+    for prefix, advisory_id, desc in SEC_ADVISORIES.get(component, []):
+        if have and str(have).startswith(prefix):
+            return advisory_id, desc
+    return None, None
+
+
+def make_item(lane, node, component, current, target, detail=""):
+    meta = COMPONENTS.get(component, {})
+    advisory_id, advisory_desc = (None, None)
+    if lane == "SEC":
+        advisory_id, advisory_desc = sec_lane_note(component, current)
+    return {
+        "lane": lane,
+        "node": node,
+        "component": component,
+        "current": current,
+        "target": target,
+        "detail": detail,
+        "advisory_id": advisory_id,
+        "advisory_desc": advisory_desc,
+        "apply": meta.get("apply", "n/a"),
+        "rollback": meta.get("rollback", "n/a"),
+        "health_probe": meta.get("health", "systemctl --failed empty; node_exporter up{} recovered"),
+        "backup_precondition": meta.get("backup"),
+    }
+
+
+def build_items(nodes, apps):
+    items = []
+    latest = apps.get("latest", {})
+    all_nodes = list(nodes.keys())
+
+    # APT tail — one item per reachable node with a non-security apt debt.
+    for n in all_nodes:
+        d = nodes.get(n, {})
+        if "unreachable" in d:
+            continue
+        if d.get("apt_other", 0) > 0:
+            items.append(make_item("APT", n, "apt-tail", None, None,
+                                    detail=f"{d['apt_other']} non-security package(s) pending"))
+
+    # tailscale — per-node drift vs latest; SEC if the running version matches
+    # a curated advisory prefix, APP otherwise.
+    ts_latest = latest.get("tailscale")
+    for n in all_nodes:
+        d = nodes.get(n, {})
+        if "unreachable" in d:
+            continue
+        have = d.get("tailscale")
+        if have and ts_latest and have != ts_latest:
+            advisory_id, _ = sec_lane_note("tailscale", have)
+            lane = "SEC" if advisory_id else "APP"
+            items.append(make_item(lane, n, "tailscale", have, ts_latest))
+
+    # cloudflared — reported per-node in fleet-update-check; take whichever
+    # node(s) actually run it.
+    cf_latest = latest.get("cloudflared")
+    for n in all_nodes:
+        d = nodes.get(n, {})
+        have = d.get("cloudflared")
+        if have and cf_latest and have != cf_latest:
+            items.append(make_item("APP", n, "cloudflared", have, cf_latest))
+
+    # gitea (anubis), vaultwarden (maat), miniflux (sia) — single-target apps.
+    gitea_have = apps.get("gitea")
+    if gitea_have and latest.get("gitea") and latest["gitea"] not in str(gitea_have):
+        items.append(make_item("APP", "anubis", "gitea", gitea_have, latest["gitea"]))
+
+    vw_image = apps.get("vaultwarden_image")
+    if vw_image and latest.get("vaultwarden") and latest["vaultwarden"] not in vw_image:
+        items.append(make_item("APP", "maat", "vaultwarden", vw_image, latest["vaultwarden"]))
+
+    mf_have = apps.get("miniflux")
+    if mf_have and latest.get("miniflux") and latest["miniflux"] not in str(mf_have):
+        items.append(make_item("APP", "sia", "miniflux", mf_have, latest["miniflux"]))
+
+    # ollama — per inference node.
+    ol_latest = latest.get("ollama")
+    for n, have in apps.get("ollama", {}).items():
+        if have and ol_latest and have != ol_latest:
+            items.append(make_item("APP", n, "ollama", have, ol_latest))
+
+    # fwupd — excluded from every window by default (A11 §6); still a line
+    # item so the report is complete, marked excluded rather than silently
+    # dropped.
+    for n in all_nodes:
+        d = nodes.get(n, {})
+        pending = d.get("fwupd_pending")
+        if pending:
+            it = make_item("FW", n, "firmware", None, None,
+                            detail=f"{pending} pending firmware update(s)")
+            it["excluded"] = True
+            it["excluded_reason"] = "fwupd excluded by default — bench session with Frank at the machine (A11 §6)"
+            items.append(it)
+
+    # REBOOT — flag set after the package items above land, one per node.
+    # BOOT items always require explicit per-node consent at run time
+    # (A11 §4 step 4 / §7 item 10); assemble only records the debt.
+    for n in all_nodes:
+        d = nodes.get(n, {})
+        rb = d.get("reboot_debt_days")
+        if rb is not None:
+            it = make_item("REBOOT", n, "kernel-activation", None, None,
+                            detail=f"reboot-required flag age {rb}d")
+            it["requires_explicit_consent"] = True
+            items.append(it)
+
+    # ABSENT — declared-absent nodes get an explicit line item, never a
+    # silent skip (A11 §5).
+    for n in DECLARED_ABSENT:
+        if n in nodes and "unreachable" in nodes[n]:
+            items.append({
+                "lane": "ABSENT", "node": n, "component": None, "current": None,
+                "target": None, "detail": f"declared absent: {nodes[n]['unreachable']}",
+                "advisory_id": None, "advisory_desc": None, "apply": "n/a",
+                "rollback": "n/a", "health_probe": "n/a", "backup_precondition": None,
+            })
+
+    def sort_key(it):
+        tier, tier_pos = node_tier(it["node"])
+        return (tier, tier_pos, LANE_RANK.get(it["lane"], 5))
+
+    items.sort(key=sort_key)
+    for i, it in enumerate(items, start=1):
+        it["id"] = i
+    return items
+
+
+DURATION_MIN = {"SEC": 5, "APP": 5, "APT": 3, "REBOOT": 6, "FW": 0, "ABSENT": 0}
+
+
+def estimate_minutes(items):
+    return sum(DURATION_MIN.get(it["lane"], 4) for it in items if not it.get("excluded"))
+
+
+def write_batch(day, items, nodes, gh_authed):
+    os.makedirs(WINDOWS_DIR, exist_ok=True)
+    runnable = [it for it in items if it["lane"] not in ("FW", "ABSENT") and not it.get("excluded")]
+    sec_urgent = [it for it in runnable if it["lane"] == "SEC"]
+    batch = {
+        "window_date": day,
+        "assembled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "gh_authenticated": gh_authed,
+        "item_count": len(runnable),
+        "estimated_minutes": estimate_minutes(items),
+        "preconditions": [
+            "No live agent session on the mesh (wq list shows no claimed ticket on a live lease); "
+            "foreman dispatcher timer stopped for the window duration (a stop, paired-restore per standing rule).",
+            "Vault HA healthy: Ma'at in_recovery=f, at least one standby streaming, replication lag = 0.",
+        ],
+        "ordering_law": "A11 §5: leaf nodes, then service nodes, then sobek (standby), then maat (primary, "
+                         "lag=0 verified same-minute), then lumen always last; reboots run per-node after "
+                         "that node's package items, never two dependent nodes in one window.",
+        "items": items,
+        "counts_by_lane": {lane: sum(1 for it in items if it["lane"] == lane)
+                            for lane in ("SEC", "APP", "APT", "FW", "REBOOT", "ABSENT")},
+        "note": "fwupd items are listed for visibility and are EXCLUDED from execution by default (A11 §6). "
+                "REBOOT items require explicit per-node consent at run time.",
+    }
+    if sec_urgent:
+        batch["sec_urgent_out_of_band"] = (
+            "SEC-lane items present. A11 §6: a KEV-listed or actively-exploited advisory does not wait "
+            "for the window — this build does not yet automate a KEV feed check, so that call is manual: "
+            "review the SEC items below before assuming they can ride the scheduled window."
+        )
+
+    json_path = os.path.join(WINDOWS_DIR, f"batch-{day}.json")
+    with open(json_path, "w") as f:
+        json.dump(batch, f, indent=2)
+
+    md_path = os.path.join(WINDOWS_DIR, f"batch-{day}.md")
+    L = [f"# Maintenance window — {day}", "",
+         f"Assembled {batch['assembled_at']} · GitHub auth: {'yes' if gh_authed else 'NO (unauthenticated, degraded rate limit)'}",
+         f"{len(runnable)} runnable item(s) · est. {batch['estimated_minutes']} min total", "",
+         "| # | lane | node | component | current -> target | apply | rollback | health probe |",
+         "|---|---|---|---|---|---|---|---|"]
+    for it in items:
+        tag = " (EXCLUDED)" if it.get("excluded") else ""
+        cur_tgt = f"{it['current']} -> {it['target']}" if it.get("target") else (it.get("detail") or "-")
+        L.append(f"| {it['id']} | {it['lane']}{tag} | {it['node']} | {it.get('component') or '-'} | "
+                  f"{cur_tgt} | {it['apply']} | {it['rollback']} | {it['health_probe']} |")
+        if it.get("advisory_id"):
+            L.append(f"  - advisory: **{it['advisory_id']}** — {it['advisory_desc']}")
+        if it.get("backup_precondition"):
+            L.append(f"  - backup precondition: {it['backup_precondition']}")
+        if it.get("excluded_reason"):
+            L.append(f"  - {it['excluded_reason']}")
+        if it.get("requires_explicit_consent"):
+            L.append("  - requires explicit per-node consent at run time")
+    L += ["", "## Preconditions (checked at run time, not at assembly)", ""]
+    for p in batch["preconditions"]:
+        L.append(f"- {p}")
+    if "sec_urgent_out_of_band" in batch:
+        L += ["", "## SEC-lane note", "", batch["sec_urgent_out_of_band"]]
+    md_path_content = "\n".join(L) + "\n"
+    with open(md_path, "w") as f:
+        f.write(md_path_content)
+    return json_path, md_path, batch
+
+
+def open_wq_ticket(day, json_path, md_path, batch):
+    title = f"[maint] Window {day} — {batch['item_count']} items, approve or amend"
+    lines = [f"Batch assembled for {day}. {batch['item_count']} runnable item(s), "
+             f"est. {batch['estimated_minutes']} min total.",
+             f"JSON: {json_path}", f"Human: {md_path}", "",
+             "Reply APPROVE, APPROVE MINUS <ids>, or SKIP. Covers only the enumerated items on the "
+             "enumerated nodes for this window; expires when the window closes.", ""]
+    for it in batch["items"]:
+        if it.get("excluded"):
+            continue
+        cur_tgt = f"{it['current']} -> {it['target']}" if it.get("target") else (it.get("detail") or "")
+        lines.append(f"{it['id']}. [{it['lane']}] {it['node']} {it.get('component') or ''} {cur_tgt}".rstrip())
+    if "sec_urgent_out_of_band" in batch:
+        lines += ["", "NOTE: " + batch["sec_urgent_out_of_band"]]
+    detail = "\n".join(lines)
+    r = subprocess.run([WQ, "add", "--lane", "user", "--pri", "2",
+                        "--title", title, "--detail", detail],
+                       capture_output=True, text=True, timeout=30)
+    return r.returncode, (r.stdout + r.stderr)
+
+
+def main():
+    args = sys.argv[1:]
+    no_ntfy = "--no-ntfy" in args
+    dry_run = "--dry-run" in args
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for i, a in enumerate(args):
+        if a == "--date" and i + 1 < len(args):
+            day = args[i + 1]
+
+    gh_token = load_gh_token()
+    if not gh_token:
+        print("fleet-maint-assemble: WARNING — no GitHub token at "
+              f"{GH_TOKEN_FILE}, falling back to unauthenticated (60/hr) GitHub lookups", file=sys.stderr)
+
+    rc, out, err = run_fleet_update_check(gh_token)
+    print(out)
+    if err:
+        print(err, file=sys.stderr)
+    if rc != 0:
+        msg = f"fleet-maint-assemble: fleet-update-check exited {rc} — no batch written"
+        print(msg, file=sys.stderr)
+        if not no_ntfy:
+            sh(f'{NTFY} -t lumen-alerts -p urgent -T fleet-maint-assemble {json.dumps(msg)}', 30)
+        sys.exit(2)
+
+    try:
+        state = load_state()
+    except Exception as e:
+        msg = f"fleet-maint-assemble: could not load state.json ({e}) — no batch written"
+        print(msg, file=sys.stderr)
+        if not no_ntfy:
+            sh(f'{NTFY} -t lumen-alerts -p urgent -T fleet-maint-assemble {json.dumps(msg)}', 30)
+        sys.exit(2)
+
+    nodes = state.get("nodes", {})
+    apps = state.get("apps", {})
+
+    failures = completeness_gate(nodes, apps)
+    if failures:
+        msg = f"fleet-maint-assemble: completeness gate FAILED ({len(failures)} issue(s)) — no batch written"
+        print(msg, file=sys.stderr)
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+        if not no_ntfy:
+            detail = msg + ": " + "; ".join(failures[:5])
+            sh(f'{NTFY} -t lumen-alerts -p urgent -T fleet-maint-assemble {json.dumps(detail)}', 30)
+        sys.exit(2)
+
+    items = build_items(nodes, apps)
+    json_path, md_path, batch = write_batch(day, items, nodes, gh_authed=bool(gh_token))
+    print(f"fleet-maint-assemble: batch written — {json_path}")
+
+    if not dry_run:
+        rc, out = open_wq_ticket(day, json_path, md_path, batch)
+        if rc != 0:
+            print(f"fleet-maint-assemble: wq ticket creation returned {rc}: {out}", file=sys.stderr)
+        else:
+            print(f"fleet-maint-assemble: wq ticket opened: {out.strip()}")
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
