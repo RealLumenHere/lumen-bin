@@ -1,0 +1,24 @@
+[Unit]
+Description=dispatch-lint — alert when a dispatch file still instructs a retired rule, or omits/contradicts a UNIVERSAL_RULES.md rule (wq#533/wq#565/wq#561/wq#758)
+After=network-online.target
+Wants=network-online.target
+OnFailure=ntfy-onfailure@%n.service
+
+[Service]
+Type=oneshot
+User=lumen
+# INVOKED DIRECTLY, NEVER PIPED (wq#565) — see lumen-pat-scan.service for why.
+# --universal ADDED (wq#758). Previously deliberately withheld: three dispatches never
+# stated the `git add -A` ban, three never stated the precheck/progress-board rules, and
+# two disagreed about the lease TTL (90 vs wq's actual DEFAULT_TTL_MIN=240) — wiring the
+# alert while those were live and unfixable-that-morning would have trained everyone to
+# ignore this unit's failures. wq#758 fixed all six dispatch files against
+# UNIVERSAL_RULES.md (see reports/opsaudit_a8_dispatch_lint.md) and wq-lane-init now
+# preflights every new dispatch file the same way, so a clean run is the actual invariant
+# from here — this flag stops it silently regressing.
+ExecStart=/home/lumen/bin/dispatch-lint --universal
+# NO SuccessExitStatus=1: exit 1 is the finding and must fire OnFailure=.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# wq-lane-init — scaffold a parallel-agent lane for any project.
+# Usage: wq-lane-init <lane> <project_dir> "<project description>" [service_lock]
+# Creates <LANE>_DISPATCH.md from the template, the project's progress board,
+# and prints the paste-ready dispatch prompt. Idempotent: refuses to clobber.
+set -euo pipefail
+WQDIR=/home/lumen/agents/work-queue
+LANE="${1:?lane name}"; DIR="${2:?project dir}"; DESC="${3:?project description}"
+LOCK="${4:-$LANE-service}"
+LANE_UC="$(echo "$LANE" | tr a-z- A-Z_)"
+DISPATCH="$WQDIR/${LANE_UC}_DISPATCH.md"
+# wq#491 / github-standards §3, §6.10: coordination boards NEVER live inside a
+# product repo — they are the loudest "AI bot log" tell an outside developer sees.
+BOARD="$WQDIR/boards/${LANE_UC}_QUEUE_PROGRESS.md"
+[ -e "$DISPATCH" ] && { echo "EXISTS: $DISPATCH — not overwriting"; exit 1; }
+[ -d "$DIR" ] || { echo "no such project dir: $DIR"; exit 1; }
+REPO_NOTE=""
+[ -d "$DIR/.git" ] && REPO_NOTE=", git repo: $(git -C "$DIR" remote get-url origin 2>/dev/null || echo local-only)"
+sed -e "s|<LANE>|$LANE|g" \
+    -e "s|<PROJECT_DIR>|$DIR|g" \
+    -e "s|<PROJECT_DESC>|$DESC|g" \
+    -e "s|<SERVICE_LOCK>|$LOCK|g" \
+    -e "s|<REPO_NOTE>|$REPO_NOTE|g" \
+    -e "s|<BOARD_PATH>|$BOARD|g" \
+    "$WQDIR/_TEMPLATE_DISPATCH.md" > "$DISPATCH"
+# wq#758: a lane must not be born already violating UNIVERSAL_RULES.md — check the file we
+# just wrote before handing it out, not after some agent has already booted from it.
+if ! /home/lumen/bin/dispatch-lint --file "$DISPATCH" --universal; then
+  echo "REFUSING: $DISPATCH failed dispatch-lint --universal (wq#758) — see violations above" >&2
+  rm -f "$DISPATCH"
+  exit 1
+fi
+mkdir -p "$WQDIR/boards"
+if [ ! -e "$BOARD" ]; then
+  { echo "# $LANE QUEUE PROGRESS BOARD (append-only; every $LANE-lane agent reads this first)"
+    echo "# Format: <ISO-time> <agent> wq#<id> CLAIMED|NOTE|SHIPPED|BLOCKED: <one line>"
+    echo "$(date -u +%Y-%m-%dT%H:%MZ) wq-lane-init -- NOTE: board created, lane '$LANE' opened"
+  } > "$BOARD"
+fi
+echo "LANE READY: $LANE"
+echo "  dispatch: $DISPATCH"
+echo "  board:    $BOARD"
+echo "  seed tickets:  wq add --lane $LANE --pri 1 --title '[$LANE] ...' --detail '...'"
+echo "  service lock:  $LOCK   git lock: $LANE-git"
+echo
+echo "──────── PASTE-READY DISPATCH PROMPT ────────"
+cat "$DISPATCH"
