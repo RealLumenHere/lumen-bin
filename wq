@@ -1130,6 +1130,109 @@ def find_artifact(notes):
                 return True, "path", cand
     return False, None, None
 
+# ---------------------------------------------------------------- wq#899 merge-state gate
+# PROBLEM (FLEET_OPS_AUDIT_2026-08-23): wq#759 SHAPE-checks the artifact — a PR URL counts as
+# evidence the moment it parses. The 2026-08-23 audit found ~30 tickets closed `done` citing a
+# PR that was still open, and one of them (wq#825) had its only copy of the code in a working
+# tree, where the next clean checkout would have erased it. A PR URL proves a branch exists.
+# It does not prove the work landed.
+#
+# So when the artifact IS a pull-request URL, resolve it. Merged is evidence. Head already
+# reachable from the base branch is evidence too — a squash or cherry-pick leaves the PR open
+# while the code is genuinely on main. An open PR whose head is nowhere near main is not
+# evidence, and `done` refuses it.
+#
+# FAIL OPEN ON INFRASTRUCTURE, FAIL CLOSED ON FACTS. No token, no network, unknown forge, HTTP
+# error, ambiguous answer -> warn and allow. This gate exists to catch a mistake, not to wedge
+# every lane in the fleet the first time the forge restarts.
+PR_URL_RE = re.compile(r"https?://([^/\s]+)/([^/\s]+)/([^/\s]+?)/pulls?/(\d+)")
+MERGE_STATE_TIMEOUT = float(os.environ.get("WQ_MERGE_STATE_TIMEOUT", "8"))
+
+def _forge_token(host):
+    """Same search order lumen-pr uses. Returned to the caller, never printed."""
+    if host in ("github.com", "www.github.com"):
+        return os.environ.get("GITHUB_TOKEN", "").strip() or None
+    for path in (os.environ.get("GITEA_TOKEN_FILE") or "/home/lumen/.secrets/gitea-lumen.token",):
+        try:
+            with open(path) as fh:
+                tok = fh.read().strip()
+                if tok:
+                    return tok
+        except OSError:
+            pass
+    try:
+        with open("/home/lumen/agent/.env") as fh:
+            for line in fh:
+                if line.startswith("GITEA_TOKEN="):
+                    tok = line.split("=", 1)[1].strip().strip("\"'")
+                    if tok:
+                        return tok
+    except OSError:
+        pass
+    return None
+
+def _forge_get(host, path, token):
+    import json as _json, urllib.request, urllib.error
+    if host in ("github.com", "www.github.com"):
+        base, auth = "https://api.github.com", f"Bearer {token}"
+    else:
+        base, auth = f"http://{host}/api/v1", f"token {token}"
+    req = urllib.request.Request(base + path, headers={
+        "Authorization": auth, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=MERGE_STATE_TIMEOUT) as r:
+            return _json.load(r)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"_error": str(e)[:120]}
+
+def _head_on_main(sha, base_ref):
+    """Is `sha` already an ancestor of the base branch in the repo the caller is standing in?
+
+    Agents run `wq done` from inside the worktree they did the work in, so cwd is nearly always
+    the right clone. Cheap, offline, and it catches the squash-merge case the forge reports as
+    'still open'. Any doubt at all -> None, meaning 'no local opinion', not 'no'."""
+    import subprocess
+    def g(*args):
+        return subprocess.run(["git", *args], capture_output=True, text=True,
+                              timeout=MERGE_STATE_TIMEOUT)
+    try:
+        if g("rev-parse", "--git-dir").returncode != 0:
+            return None
+        if g("cat-file", "-e", sha + "^{commit}").returncode != 0:
+            return None
+        for ref in (f"origin/{base_ref}", base_ref, "origin/main", "main"):
+            if g("rev-parse", "--verify", "--quiet", ref).returncode == 0:
+                return g("merge-base", "--is-ancestor", sha, ref).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+def pr_merge_state(url):
+    """Resolve a PR URL to (verdict, detail). verdict is one of:
+        'merged'  — the forge says it merged
+        'landed'  — still open, but its head is already an ancestor of the base branch
+        'open'    — open, and the head is not on the base branch: the wq#899 failure
+        'unknown' — could not tell (no token, network down, HTTP error, not a PR URL)"""
+    m = PR_URL_RE.search(url or "")
+    if not m:
+        return "unknown", "not a pull-request URL"
+    host, owner, repo, num = m.group(1), m.group(2), m.group(3), m.group(4)
+    token = _forge_token(host)
+    if not token:
+        return "unknown", f"no forge token for {host}"
+    pr = _forge_get(host, f"/repos/{owner}/{repo}/pulls/{num}", token)
+    if "_error" in pr or not isinstance(pr, dict) or "state" not in pr:
+        return "unknown", f"{host} unreachable or refused: {pr.get('_error', 'bad response')}"
+    if pr.get("merged"):
+        return "merged", f"{owner}/{repo}#{num} merged"
+    head = (pr.get("head") or {}).get("sha") or ""
+    base_ref = ((pr.get("base") or {}).get("ref")) or "main"
+    if head and _head_on_main(head, base_ref) is True:
+        return "landed", f"{owner}/{repo}#{num} open, but {head[:10]} is already on {base_ref}"
+    if pr.get("state") == "closed":
+        return "open", f"{owner}/{repo}#{num} was CLOSED without merging"
+    return "open", f"{owner}/{repo}#{num} is still OPEN and {head[:10] or 'its head'} is not on {base_ref}"
+
 # wq#841: the single definition of "this ticket came back from the dead". Rework is a move INTO
 # an in-flight state FROM a terminal one. A lease reap or a release of a claim nobody finished is
 # claimed->open — not rework, and it must not inflate the metric.
@@ -1185,6 +1288,26 @@ def cmd_done(a):
                   f"URL, or a commit sha) or an explicit --no-artifact \"<reason>\" recorded "
                   f"on the ticket. Got notes={notes!r}.")
             sys.exit(2)
+        # wq#899: the artifact is a PR URL, so the URL is not the end of the check.
+        if kind == "url" and "/pull" in detail:
+            unmerged = getattr(a, "unmerged", None)
+            verdict, why = pr_merge_state(detail)
+            if verdict == "open" and not unmerged:
+                print(f"REFUSED: wq#899 merge-state gate — task {a.id} not closed. Its evidence "
+                      f"is a pull request that has not landed: {why}. A PR URL proves a branch "
+                      f"exists, not that the work is on main — a clean checkout would lose it. "
+                      f"Land the PR and re-run `wq done`, or, if the PR is a stale reference and "
+                      f"the work really is elsewhere, say so on the record with "
+                      f"--unmerged \"<reason>\".")
+                sys.exit(3)
+            if unmerged:
+                a.notes = (a.notes + (" " if a.notes else "") +
+                           f"[UNMERGED-PR: {unmerged}]").strip()
+            elif verdict == "unknown":
+                print(f"WARNING: wq#899 merge-state gate could not verify {detail} ({why}). "
+                      f"Closing anyway — the gate does not block on forge trouble.")
+            elif verdict == "landed":
+                print(f"note: {why} — accepting as landed.")
     _finish(a, 'done')
     print(f"done {a.id} (subsystem locks released)")
 def _reopen_tag(n): return f" [REOPENED — reopened_count={n}]" if n else ""
@@ -1518,7 +1641,7 @@ s=sub.add_parser("whoami",help="show identity / --register <name> to mint a sess
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_block)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
