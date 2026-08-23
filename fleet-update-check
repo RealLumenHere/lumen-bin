@@ -14,8 +14,11 @@ so a wrapper (fleet-maint-assemble) can classify drift without re-probing.
 wq#854: --strict flag exits 2 when any upstream lookup returns None (so
 fleet-maint-assemble can fail the completeness gate on probe failure, not
 just on missing nodes). Thor excluded from NODES (Frank's workstation —
-maintenance tooling must never touch it). llama.cpp uses /tags endpoint +
-bNNNN regex (no GitHub Releases exist for that repo).
+maintenance tooling must never touch it). llama.cpp tags every build as a
+prerelease GitHub Release (bNNNN) and has no real release since v0.2.0, so
+/releases/latest (which filters out prereleases) fell back to that stale
+v0.2.0 tag; gh_latest_tag() reads /releases (newest-first, prereleases
+included) and matches the bNNNN pattern instead.
 """
 import json, os, re, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone
@@ -86,16 +89,20 @@ def gh_latest(repo):
     return None
 
 def gh_latest_tag(repo, pattern=None):
-    """Latest tag from GitHub for repos that don't use Releases (e.g.
-    ggml-org/llama.cpp uses bNNNN tags). pattern is a compiled regex that
-    must match the tag name; first match by recency wins. Fail-soft -> None.
+    """Latest release tag from GitHub, including prereleases (e.g.
+    ggml-org/llama.cpp tags every build as a prerelease bNNNN GitHub
+    Release and has no non-prerelease release since v0.2.0, so
+    /releases/latest — which filters out prereleases — 404s-to-stale
+    onto that ancient v0.2.0 tag). Uses /releases (list, newest-first)
+    rather than /tags (not recency-ordered). pattern is a compiled regex
+    that must match the tag name; first match wins. Fail-soft -> None.
     wq#854."""
     token = os.environ.get("GH_TOKEN") or None
-    j = http_json(f"https://api.github.com/repos/{repo}/tags?per_page=20", token=token)
+    j = http_json(f"https://api.github.com/repos/{repo}/releases?per_page=20", token=token)
     if not j or not isinstance(j, list):
         return None
-    for tag in j:
-        name = tag.get("name", "")
+    for rel in j:
+        name = rel.get("tag_name", "")
         if pattern and not pattern.match(name):
             continue
         return name
@@ -165,7 +172,7 @@ def probe_apps():
         "gitea": gh_latest("go-gitea/gitea"),
         "vaultwarden": gh_latest("dani-garcia/vaultwarden"),
         "miniflux": gh_latest("miniflux/v2"),
-        "llamacpp": gh_latest("ggml-org/llama.cpp"),  # now uses GitHub Releases (v0.x.y)
+        "llamacpp": gh_latest_tag("ggml-org/llama.cpp", pattern=re.compile(r"^b\d+$")),
     }
     a["latest"] = latest
     # ollama per inference node via API (tailnet)
