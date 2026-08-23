@@ -115,7 +115,9 @@ CANON_SUBSYSTEMS = {"vault-ha","litellm","minerva-db","queue-db","messenger",
                                   # branches, tags, releases, rulesets, published history
                     "lpp-tree",   # the PRIMARY working tree /home/lumen/pokemon
                                   # (linked worktrees under scratch/worktrees are NOT this)
-                    "ccc-repo"}   # frankstupak/claude-command-center + its primary clone
+                    "ccc-repo",   # frankstupak/claude-command-center + its primary clone
+                    "mc-tree"}    # mission-control PRIMARY tree /home/lumen/mission-control
+                                  # (app.py + ui/; linked worktrees are NOT this) — mc-v2 2026-08-21
 def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
 def now(): return utcnow().strftime(FMT)
 def lease_from(minutes): return (utcnow() + datetime.timedelta(minutes=minutes)).strftime(FMT)
