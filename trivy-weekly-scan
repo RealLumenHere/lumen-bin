@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# wq#858 — Weekly Trivy CVE scan: all local Docker images + host rootfs.
+# Runs as lumen via systemd oneshot. Reports land in ./reports/.
+set -euo pipefail
+
+TRIVY=/home/lumen/bin/trivy
+REPORT_DIR=/home/lumen/services/trivy-weekly/reports
+STAMP=$(date -u +%Y%m%d_%H%M%S)
+REPORT="$REPORT_DIR/trivy_${STAMP}.txt"
+JSON_REPORT="$REPORT_DIR/trivy_${STAMP}.json"
+NTFY_TOPIC=lumen-fleet
+
+echo "=== Trivy weekly scan $STAMP ===" | tee "$REPORT"
+echo "" >> "$REPORT"
+
+# --- Update DB first ---
+echo "[*] Updating Trivy DB..." | tee -a "$REPORT"
+$TRIVY image --download-db-only --quiet 2>&1 | tee -a "$REPORT" || true
+
+# --- Scan all local Docker images ---
+echo "" >> "$REPORT"
+echo "=== CONTAINER IMAGE SCAN ===" | tee -a "$REPORT"
+IMAGES=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u)
+TOTAL_HIGH=0
+TOTAL_CRIT=0
+for img in $IMAGES; do
+  echo "[*] Scanning $img ..." | tee -a "$REPORT"
+  $TRIVY image --severity HIGH,CRITICAL --format table --quiet "$img" 2>&1 | tee -a "$REPORT" || true
+done
+
+# --- Scan host rootfs ---
+echo "" >> "$REPORT"
+echo "=== HOST ROOTFS SCAN ===" | tee -a "$REPORT"
+$TRIVY rootfs --severity HIGH,CRITICAL --format table --quiet / 2>&1 | tee -a "$REPORT" || true
+
+# --- JSON summary for machine consumption ---
+echo "" >> "$REPORT"
+echo "=== JSON SUMMARY ===" | tee -a "$REPORT"
+$TRIVY rootfs --severity HIGH,CRITICAL --format json --quiet / > "$JSON_REPORT" 2>&1 || true
+
+# --- Count findings ---
+HIGH_COUNT=$(grep -c "HIGH" "$REPORT" 2>/dev/null || echo 0)
+CRIT_COUNT=$(grep -c "CRITICAL" "$REPORT" 2>/dev/null || echo 0)
+
+echo "" >> "$REPORT"
+echo "=== SUMMARY ===" | tee -a "$REPORT"
+echo "HIGH findings (approx): $HIGH_COUNT" | tee -a "$REPORT"
+echo "CRITICAL findings (approx): $CRIT_COUNT" | tee -a "$REPORT"
+echo "Full report: $REPORT" | tee -a "$REPORT"
+echo "JSON report: $JSON_REPORT" | tee -a "$REPORT"
+
+# --- Prune reports older than 90 days ---
+find "$REPORT_DIR" -name 'trivy_*.txt' -mtime +90 -delete 2>/dev/null || true
+find "$REPORT_DIR" -name 'trivy_*.json' -mtime +90 -delete 2>/dev/null || true
+
+# --- Notify ---
+if [ "$CRIT_COUNT" -gt 0 ]; then
+  curl -s -u "lumen:$(cat /home/lumen/agent/.env | grep NTFY_PASS | cut -d= -f2)" \
+    -H "Title: Trivy: $CRIT_COUNT CRITICAL CVEs found" \
+    -H "Priority: high" \
+    -H "Tags: warning" \
+    -d "Weekly scan found $CRIT_COUNT CRITICAL and $HIGH_COUNT HIGH. Report: $REPORT" \
+    "http://127.0.0.1:8080/$NTFY_TOPIC" 2>/dev/null || true
+else
+  curl -s -u "lumen:$(cat /home/lumen/agent/.env | grep NTFY_PASS | cut -d= -f2)" \
+    -H "Title: Trivy weekly: $HIGH_COUNT HIGH, 0 CRITICAL" \
+    -H "Priority: default" \
+    -H "Tags: white_check_mark" \
+    -d "Clean scan. Report: $REPORT" \
+    "http://127.0.0.1:8080/$NTFY_TOPIC" 2>/dev/null || true
+fi
+
+echo "[*] Done."

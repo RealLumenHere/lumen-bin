@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# wq#857 — Lightweight journald -> VictoriaLogs forwarder.
+# Ships journal entries as JSON lines via /insert/jsonline.
+# Runs as a systemd oneshot on a 60s timer. Cursor-tracked for resume.
+set -euo pipefail
+
+VLOGS_URL="${VLOGS_URL:-http://100.110.156.91:9428}"
+CURSOR_FILE="${CURSOR_FILE:-/var/lib/vlogs-forwarder/cursor}"
+HOSTNAME_TAG=$(hostname)
+MAX_LINES=500
+
+mkdir -p "$(dirname "$CURSOR_FILE")"
+
+JCTL_ARGS=(-o json --no-pager -n "$MAX_LINES")
+if [ -f "$CURSOR_FILE" ] && [ -s "$CURSOR_FILE" ]; then
+  JCTL_ARGS+=(--after-cursor="$(cat "$CURSOR_FILE")")
+else
+  JCTL_ARGS+=(--since="-1h")
+fi
+
+BATCH_FILE=$(mktemp /tmp/vlogs-batch.XXXXXX)
+trap 'rm -f "$BATCH_FILE"' EXIT
+
+# Export journal as JSON, transform to VictoriaLogs format
+journalctl "${JCTL_ARGS[@]}" 2>/dev/null | while IFS= read -r line; do
+  # Map journald JSON to VictoriaLogs fields:
+  # _msg = MESSAGE, _time = __REALTIME_TIMESTAMP (us -> RFC3339)
+  echo "$line" | python3 -c "
+import sys, json
+from datetime import datetime, timezone
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw: continue
+    try:
+        j = json.loads(raw)
+    except: continue
+    ts_us = int(j.get('__REALTIME_TIMESTAMP', '0'))
+    ts = datetime.fromtimestamp(ts_us / 1e6, tz=timezone.utc).isoformat()
+    out = {
+        '_msg': j.get('MESSAGE', ''),
+        '_time': ts,
+        'host': j.get('_HOSTNAME', '$HOSTNAME_TAG'),
+        'unit': j.get('_SYSTEMD_UNIT', ''),
+        'syslog_id': j.get('SYSLOG_IDENTIFIER', ''),
+        'priority': j.get('PRIORITY', ''),
+        'pid': j.get('_PID', ''),
+    }
+    print(json.dumps(out))
+" >> "$BATCH_FILE"
+done
+
+LINES=$(wc -l < "$BATCH_FILE")
+
+if [ "$LINES" -gt 0 ]; then
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$VLOGS_URL/insert/jsonline" \
+    --data-binary @"$BATCH_FILE" \
+    -H "Content-Type: application/json" 2>/dev/null || echo "000")
+
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+    LAST_CURSOR=$(journalctl --no-pager -n 1 -o export 2>/dev/null | grep '^__CURSOR=' | cut -d= -f2- || true)
+    [ -n "$LAST_CURSOR" ] && echo "$LAST_CURSOR" > "$CURSOR_FILE"
+    echo "[vlogs-forwarder] Shipped $LINES lines (HTTP $HTTP_CODE)"
+  else
+    echo "[vlogs-forwarder] POST failed: HTTP $HTTP_CODE" >&2
+    exit 1
+  fi
+else
+  echo "[vlogs-forwarder] No new entries"
+fi
