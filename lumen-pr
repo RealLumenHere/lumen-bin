@@ -10,7 +10,7 @@
 #   lumen-pr start  <repo-path> <type>/<slug> [--worktree|--primary|--adopt]
 #   lumen-pr commit <repo-path> "<conventional subject>" [--refs wq#N] [--body-file F]
 #   lumen-pr open   <repo-path> --title T --body-file F [--draft] [--allow-second-person]
-#   lumen-pr land   <repo-path> <pr-number> [--timeout SEC]
+#   lumen-pr land   <repo-path> <pr-number> [--timeout SEC] [--merge]
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
 #   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>...  # wq#771/wq#792 target-tree guard
@@ -725,7 +725,13 @@ $(cat "$body_file")"
 Refs: $refs"
   msg="$msg
 $FOOTER_ASSIST"
+  # wq#657: record HEAD before the commit so we can detect a silent no-op — git
+  # commit exits 0 in some edge cases without actually creating a commit (e.g.
+  # empty diff after rebase, or an amend that collapses to the same tree).
+  local pre_head; pre_head=$(git -C "$REPO_PATH" rev-parse HEAD)
   printf '%s\n' "$msg" | git -C "$REPO_PATH" commit -q -F - || die "git commit failed"
+  local post_head; post_head=$(git -C "$REPO_PATH" rev-parse HEAD)
+  [ "$pre_head" != "$post_head" ] || die "git commit exited 0 but HEAD did not move ($pre_head). This is a silent no-op — stage the right files and retry."
   note "committed $(git -C "$REPO_PATH" rev-parse --short HEAD) on $cur"
   git -C "$REPO_PATH" log -1 --pretty='  %s' 
   note "staged files in this commit:"
@@ -849,10 +855,11 @@ mergeability_guard() {
 
 cmd_land() {
   need_repo "${1:-}"; local pr="${2:-}"; shift 2 2>/dev/null || true
-  local timeout=600
+  local timeout=600 merge_method=squash
   while [ $# -gt 0 ]; do
     case "$1" in
       --timeout) timeout="${2:-600}"; shift 2 ;;
+      --merge) merge_method=merge; shift ;;
       *) die "unknown flag for land: $1" ;;
     esac
   done
@@ -929,11 +936,19 @@ cmd_land() {
   api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR re-fetch"
   mergeability_guard "$pr"
 
-  # Squash merge: the squashed subject becomes the Conventional Commit that
-  # release tooling reads, so it must be the PR title verbatim (§2, §7).
-  # The squashed BODY must carry the §3 footers forward — GitHub's default
-  # squash body is a bullet list of branch subjects, and an empty body drops
-  # `Refs:`/`Assisted-by:` off main's history entirely.
+  # wq#657: merge_method is 'squash' (default) or 'merge' (--merge flag). Squash
+  # is the §2 default — one Conventional Commit per PR on main. --merge preserves
+  # individual branch commits when a landing ticket explicitly asks for N logical
+  # commits in main's history.
+  #
+  # Squash: the squashed subject becomes the Conventional Commit that release
+  # tooling reads, so it must be the PR title verbatim (§2, §7). The squashed
+  # BODY must carry the §3 footers forward — GitHub's default squash body is a
+  # bullet list of branch subjects, and an empty body drops Refs:/Assisted-by:
+  # off main's history entirely.
+  #
+  # Merge: the merge commit carries the PR title + footers. Individual branch
+  # commits keep their own messages intact — that is the whole point.
   local footers
   if api GET "/repos/$SLUG/pulls/$pr/commits"; then
     footers=$(printf '%s' "$API_BODY" \
@@ -945,23 +960,20 @@ cmd_land() {
   [ -n "${footers:-}" ] || footers="$FOOTER_ASSIST"
   # wq#557: the merge call itself diverges. GitHub: PUT .../merge with
   # {merge_method, commit_title, commit_message, sha}. Gitea 1.26.4: POST .../merge with
-  # {do:"squash", MergeTitleField, MergeMessageField, head_commit_id} — different VERB,
+  # {do:<method>, MergeTitleField, MergeMessageField, head_commit_id} — different VERB,
   # different field names, and `do` is required. Both verified from the live swagger, not
-  # from memory. The §3 footers must survive the squash on either forge, because an empty
-  # squash body drops Refs:/Assisted-by: off main's history entirely.
+  # from memory. The §3 footers must survive on either forge.
   local payload
   if [ "${FORGE:-github}" = gitea ]; then
-    payload=$(jq -n --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
-      '{do:"squash", merge_title_field:$t, merge_message_field:$m, head_commit_id:$s, delete_branch_after_merge:true}')
-    api POST "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "squash merge"
-    # Gitea's merge returns an EMPTY body on success (204-style), so there is no .sha to
-    # report. Saying "merged" without a sha is honest; inventing one would not be.
-    note "merged PR #$pr (squash) on $FORGE_HOST"
+    payload=$(jq -n --arg do "$merge_method" --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
+      '{do:$do, merge_title_field:$t, merge_message_field:$m, head_commit_id:$s, delete_branch_after_merge:true}')
+    api POST "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "$merge_method merge"
+    note "merged PR #$pr ($merge_method) on $FORGE_HOST"
   else
-    payload=$(jq -n --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
-      '{merge_method:"squash", commit_title:$t, commit_message:$m, sha:$s}')
-    api PUT "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "squash merge"
-    note "merged PR #$pr as $(printf '%s' "$API_BODY" | jq -r '.sha' | cut -c1-10) (squash)"
+    payload=$(jq -n --arg mm "$merge_method" --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
+      '{merge_method:$mm, commit_title:$t, commit_message:$m, sha:$s}')
+    api PUT "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "$merge_method merge"
+    note "merged PR #$pr as $(printf '%s' "$API_BODY" | jq -r '.sha' | cut -c1-10) ($merge_method)"
   fi
 
   # wq#557: Gitea exposes NO DELETE on /git/refs — GET only, confirmed in its swagger. The
