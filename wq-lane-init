@@ -15,6 +15,70 @@ DISPATCH="$WQDIR/${LANE_UC}_DISPATCH.md"
 BOARD="$WQDIR/boards/${LANE_UC}_QUEUE_PROGRESS.md"
 [ -e "$DISPATCH" ] && { echo "EXISTS: $DISPATCH — not overwriting"; exit 1; }
 [ -d "$DIR" ] || { echo "no such project dir: $DIR"; exit 1; }
+
+# ── wq#876: register lane in dispatcher config FIRST ──
+# If this fails the lane isn't half-initialized (no dispatch/board yet).
+# flock serializes concurrent wq-lane-init runs against the same config.json.
+CONFIG_NOTE="  dispatcher: WARNING — $DISPATCHER_CONFIG not found, lane NOT registered"
+if [ -f "$DISPATCHER_CONFIG" ]; then
+  CONFIG_STATUS="$(python3 - "$DISPATCHER_CONFIG" "$LANE" <<'PYEOF'
+import fcntl, json, os, sys, tempfile
+
+path, lane = sys.argv[1], sys.argv[2]
+lockpath = path + ".lock"
+try:
+    # wq#876: separate lockfile so rename() can't invalidate the lock
+    lfd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        # read the actual config AFTER acquiring the lock
+        with open(path) as f:
+            cfg = json.load(f)
+        lanes = cfg.setdefault("lanes", {})
+        if lane in lanes:
+            print("EXISTS")
+        else:
+            lanes[lane] = {
+                "enabled": False,
+                "max_per_day": 999,
+                "note": "auto-registered by wq-lane-init (wq#846); enable explicitly",
+            }
+            # atomic write: tmp in same dir, rename over original
+            dirn = os.path.dirname(path) or "."
+            tfd, tmp = tempfile.mkstemp(dir=dirn, suffix=".tmp", prefix=".config-")
+            try:
+                with os.fdopen(tfd, "w") as tf:
+                    json.dump(cfg, tf, indent=2)
+                    tf.write("\n")
+                os.rename(tmp, path)
+            except BaseException:
+                os.unlink(tmp)
+                raise
+            print("ADDED")
+    finally:
+        os.close(lfd)
+except Exception as e:
+    # wq#876: fail soft — warn, don't crash the whole script
+    print(f"WARN:{e}", file=sys.stderr)
+    print("ERROR")
+PYEOF
+)" || CONFIG_STATUS="ERROR"
+  case "$CONFIG_STATUS" in
+    ADDED)
+      CONFIG_NOTE="  dispatcher: lane '$LANE' added to $DISPATCHER_CONFIG as DISABLED"
+      CONFIG_NOTE="$CONFIG_NOTE
+    enable: python3 -c \"import json,sys; c=json.load(open(sys.argv[1])); c['lanes']['$LANE']['enabled']=True; json.dump(c,open(sys.argv[1],'w'),indent=2)\" $DISPATCHER_CONFIG"
+      ;;
+    EXISTS)
+      CONFIG_NOTE="  dispatcher: lane '$LANE' already present in $DISPATCHER_CONFIG"
+      ;;
+    *)
+      CONFIG_NOTE="  dispatcher: WARNING — failed to register lane in $DISPATCHER_CONFIG (see stderr)"
+      ;;
+  esac
+fi
+
+# ── scaffold dispatch + board (only after config registration succeeded or warned) ──
 REPO_NOTE=""
 [ -d "$DIR/.git" ] && REPO_NOTE=", git repo: $(git -C "$DIR" remote get-url origin 2>/dev/null || echo local-only)"
 sed -e "s|<LANE>|$LANE|g" \
@@ -37,39 +101,6 @@ if [ ! -e "$BOARD" ]; then
     echo "# Format: <ISO-time> <agent> wq#<id> CLAIMED|NOTE|SHIPPED|BLOCKED: <one line>"
     echo "$(date -u +%Y-%m-%dT%H:%MZ) wq-lane-init -- NOTE: board created, lane '$LANE' opened"
   } > "$BOARD"
-fi
-# wq#846 / opsaudit_a10_lane_defaults.md §4a: a lane with no dispatcher config.json
-# entry is invisible to foreman_dispatcher.py — its tickets pile up unclaimed (the
-# `build` lane went a whole campaign this way). Register the lane here, DISABLED by
-# default, so the enable/disable choice is explicit instead of a silent absence.
-CONFIG_NOTE="  dispatcher: WARNING — $DISPATCHER_CONFIG not found, lane NOT registered"
-if [ -f "$DISPATCHER_CONFIG" ]; then
-  CONFIG_STATUS="$(python3 - "$DISPATCHER_CONFIG" "$LANE" <<'PYEOF'
-import json, sys
-
-path, lane = sys.argv[1], sys.argv[2]
-with open(path) as f:
-    cfg = json.load(f)
-lanes = cfg.setdefault("lanes", {})
-if lane in lanes:
-    print("EXISTS")
-else:
-    lanes[lane] = {
-        "enabled": False,
-        "max_per_day": 999,
-        "note": "auto-registered by wq-lane-init (wq#846); enable explicitly",
-    }
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2)
-    print("ADDED")
-PYEOF
-)"
-  if [ "$CONFIG_STATUS" = "ADDED" ]; then
-    CONFIG_NOTE="  dispatcher: lane '$LANE' added to $DISPATCHER_CONFIG as DISABLED
-    enable with: jq '.lanes.$LANE.enabled = true' $DISPATCHER_CONFIG | sponge $DISPATCHER_CONFIG"
-  else
-    CONFIG_NOTE="  dispatcher: lane '$LANE' already present in $DISPATCHER_CONFIG"
-  fi
 fi
 echo "LANE READY: $LANE"
 echo "  dispatch: $DISPATCH"
