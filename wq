@@ -1032,6 +1032,45 @@ def cmd_heartbeat(a):
     if subs: acquire_subs(c, subs, r[1], a.ttl, f"wq#{a.id}")  # extends held slocks for same holder
     c.execute("COMMIT"); c.close()
     print(f"heartbeat {a.id}: lease + {len(subs)} slock(s) extended to {lease}Z (holder {r[1]})")
+# ---------------------------------------------------------------- wq#759 evidence gate
+# PROBLEM (FLEET_OPS_AUDIT_2026-08-21 F8): 29 done tickets carry no report notes — nothing
+# gated closure on evidence, so 'done' meant 'an agent said done'. From here, `wq done`
+# refuses unless --notes names something checkable (an existing file path, a PR/commit URL,
+# or a commit sha) or the caller states --no-artifact "<reason>" explicitly, on the record.
+ARTIFACT_URL_RE = re.compile(r"https?://\S*/(?:pulls?|commits?)/\S+")
+# a git sha is hex and 7-40 chars; require >=1 a-f letter so plain decimal tokens (dates,
+# ticket ids) never false-positive as shas.
+ARTIFACT_SHA_RE = re.compile(r"(?=[0-9a-f]{7,40}$)[0-9a-f]*[a-f][0-9a-f]*")
+
+def _artifact_path_candidates(token):
+    """Resolve a bare token to the paths it could mean: as given, relative to the caller's
+    cwd (the common case — agents run `wq done` from inside their own worktree), and
+    relative to /home/lumen (the fleet home, for notes written from elsewhere)."""
+    if os.path.isabs(token):
+        return [token]
+    return [token, os.path.join(os.getcwd(), token), os.path.join("/home/lumen", token)]
+
+def find_artifact(notes):
+    """Does `notes` name a verifiable artifact? Returns (ok, kind, detail)."""
+    notes = notes or ""
+    m = ARTIFACT_URL_RE.search(notes)
+    if m:
+        return True, "url", m.group(0).rstrip(".,)")
+    for raw in notes.split():
+        tok = raw.strip(".,;:()[]\"'")
+        if tok and ARTIFACT_SHA_RE.fullmatch(tok):
+            return True, "sha", tok
+    for raw in notes.split():
+        tok = raw.strip(".,;:()[]\"'")
+        if not tok or tok.startswith("http"):
+            continue
+        if "/" not in tok and not re.search(r"\.[A-Za-z0-9]{1,5}$", tok):
+            continue  # doesn't look path-shaped — skip rather than stat() every word
+        for cand in _artifact_path_candidates(tok):
+            if os.path.exists(cand):
+                return True, "path", cand
+    return False, None, None
+
 def _finish(a, new_status):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
@@ -1046,15 +1085,33 @@ def _finish(a, new_status):
         release_subs(c, parse_subs(r[1]), r[0] or "")
     if new_status == 'done':
         c.execute("UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL, "
-                  "lease_ttl=NULL WHERE id=?",
+                  "lease_ttl=NULL, block_reason=NULL, blocked_at=NULL WHERE id=?",
                   (now(), getattr(a,'notes','') or '', a.id))
     elif new_status == 'open':
         c.execute("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
-                  "lease_expires=NULL, lease_ttl=NULL WHERE id=?", (a.id,))
+                  "lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL "
+                  "WHERE id=?", (a.id,))
     elif new_status == 'blocked':
-        c.execute("UPDATE tasks SET status='blocked', notes=?, lease_expires=NULL WHERE id=?", (a.reason, a.id))
+        # wq#741: block_reason/blocked_at are the structural home for this — notes keeps
+        # getting the same string too, so `wq show`/`wq list` need no changes.
+        c.execute("UPDATE tasks SET status='blocked', notes=?, block_reason=?, blocked_at=?, "
+                  "lease_expires=NULL WHERE id=?", (a.reason, a.reason, now(), a.id))
     c.execute("COMMIT"); c.close()
-def cmd_done(a):    _finish(a, 'done');    print(f"done {a.id} (subsystem locks released)")
+def cmd_done(a):
+    notes = getattr(a, "notes", "") or ""
+    no_artifact = getattr(a, "no_artifact", None)
+    if no_artifact:
+        a.notes = (notes + (" " if notes else "") + f"[NO-ARTIFACT: {no_artifact}]").strip()
+    else:
+        ok, kind, detail = find_artifact(notes)
+        if not ok:
+            print(f"REFUSED: wq#759 evidence gate — task {a.id} not closed. `done` requires "
+                  f"--notes naming a verifiable artifact (an existing file path, a PR/commit "
+                  f"URL, or a commit sha) or an explicit --no-artifact \"<reason>\" recorded "
+                  f"on the ticket. Got notes={notes!r}.")
+            sys.exit(2)
+    _finish(a, 'done')
+    print(f"done {a.id} (subsystem locks released)")
 def cmd_release(a): _finish(a, 'open');    print(f"released {a.id} (subsystem locks released)")
 def cmd_block(a):   _finish(a, 'blocked'); print(f"blocked {a.id}: {a.reason} (subsystem locks released)")
 def cmd_preflight(a):
@@ -1173,6 +1230,47 @@ def cmd_retire(a):
               + f" — reason: {reason}")
     print(f"({len(planted)} identity marker(s) planted; any wq/slock call by them now refuses "
           f"with the STOP banner)")
+def cmd_closure_quality(a):
+    """wq#759: is 'done' backed by evidence, and is that trend improving? Buckets every
+    done ticket by (lane, ISO week of done_at) and classifies its notes with the same
+    find_artifact() the `done` gate itself enforces going forward, so the report and the
+    gate can never silently disagree. Rows closed before the gate existed show up as
+    unverified — that's the audit's own baseline, not a bug."""
+    ping("closure-quality")
+    c = conn()
+    q = "SELECT lane, done_at, notes FROM tasks WHERE status='done' AND done_at IS NOT NULL"
+    params = []
+    if a.lane:
+        q += " AND lane=?"; params.append(a.lane)
+    rows = c.execute(q, params).fetchall(); c.close()
+    cutoff = (utcnow() - datetime.timedelta(weeks=a.weeks)).strftime(FMT)
+    buckets = {}
+    for lane, done_at, notes in rows:
+        if not done_at or done_at < cutoff:
+            continue
+        try:
+            dt = datetime.datetime.strptime(done_at, FMT)
+        except ValueError:
+            continue
+        year, week, _ = dt.isocalendar()
+        key = (lane, f"{year}-W{week:02d}")
+        v, na, u = buckets.get(key, (0, 0, 0))
+        notes = notes or ""
+        if "[NO-ARTIFACT:" in notes:
+            na += 1
+        elif find_artifact(notes)[0]:
+            v += 1
+        else:
+            u += 1
+        buckets[key] = (v, na, u)
+    if not buckets:
+        print(f"(no done tickets with done_at in the last {a.weeks} week(s))"); return
+    print(f"{'lane':<10} {'week':<9} {'done':>5} {'verified':>9} {'no-artifact':>12} {'unverified':>11} {'pct-verified':>13}")
+    for (lane, wk), (v, na, u) in sorted(buckets.items()):
+        total = v + na + u
+        pct = f"{100*v/total:.0f}%" if total else "-"
+        print(f"{lane:<10} {wk:<9} {total:>5} {v:>9} {na:>12} {u:>11} {pct:>13}")
+
 def cmd_reap(a):
     """wq#647 (RELIABILITY_SPEC.md §E, fq#614): an INDEPENDENT sweep for expired
     claimed-ticket leases, decoupled from any `wq claim` call. cmd_claim's own
@@ -1225,7 +1323,7 @@ s=sub.add_parser("whoami",help="show identity / --register <name> to mint a sess
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_block)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
@@ -1234,6 +1332,7 @@ s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_sh
 s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
+s=sub.add_parser("closure-quality",help="wq#759: evidence-quality trend per lane per week"); s.add_argument("--lane",default=None); s.add_argument("--weeks",type=int,default=8); s.set_defaults(f=cmd_closure_quality)
 init()
 a = p.parse_args()
 if not getattr(a,"cmd",None): p.print_help(); sys.exit(0)
