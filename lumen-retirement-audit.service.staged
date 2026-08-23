@@ -1,0 +1,16 @@
+[Unit]
+Description=retirement-audit — weekly sweep for retired services still running, still enabled, or still burning RAM (wq#723)
+After=network-online.target docker.service
+Wants=network-online.target
+OnFailure=ntfy-onfailure@%n.service
+
+[Service]
+Type=oneshot
+User=lumen
+# INVOKED DIRECTLY, NEVER PIPED — a pipe hides the exit code this unit is built on.
+ExecStart=/home/lumen/bin/retirement-audit run
+# NO SuccessExitStatus=1: exit 1 means a retired service is still alive and MUST fire OnFailure=.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""retirement-audit — weekly sweep for services that were retired on paper but
+are still running, still enabled, or still burning RAM somewhere (wq#723).
+
+Root case: the v4 lumen-agent kept running for 6+ days after the v5 stack
+replaced it, and nothing on the fleet was watching for that. Retirement is a
+decision; this is the thing that checks the decision actually took.
+
+Checks
+  A  RETIRED-STILL-ALIVE   every entry in retired_services.yaml is probed on its
+                           declared node (systemd unit state / docker container /
+                           process pattern). A live one is an ALERT.
+  B  ORPHAN LONG-RUNNERS   processes older than --max-age-days (default 7) that no
+                           systemd unit and no container owns. WARN.
+  C  DEAD UNIT FILES       units that are active or enabled while their unit file
+                           or ExecStart target is gone from disk. WARN.
+
+Read-only. Never stops, disables or kills anything — it reports and files alerts.
+Alerts persist to aq (source=retirement-audit) and go out on ntfy.
+
+Exit 0 = no alerts, 1 = alert findings (so OnFailure= fires), 2 = the audit broke.
+
+  retirement-audit run [--local-only] [--json] [--no-alert] [--max-age-days N]
+  retirement-audit list
+  retirement-audit selftest
+"""
+import argparse, json, os, re, subprocess, sys, time
+
+CONF_PATH = os.environ.get("RETIREMENT_AUDIT_CONF",
+                           "/home/lumen/docs/fleet/retired_services.yaml")
+STATE_PY  = "/home/lumen/minerva/lumen_state.py"
+AQ        = "/home/lumen/bin/aq"
+NTFY_SEND = "/home/lumen/bin/ntfy-send"
+NTFY_TOPIC = "lumen-fleet"
+SELF_MARKERS = ("retirement-audit",)
+
+LIVE_ACTIVE = ("active", "activating", "reloading")
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return 255, f"EXEC_FAILED: {e}"
+
+
+def load_conf(path=CONF_PATH):
+    import yaml
+    with open(path) as f:
+        conf = yaml.safe_load(f)
+    conf.setdefault("retired", [])
+    conf.setdefault("nodes", {})
+    conf.setdefault("never_touch", [])
+    conf.setdefault("manifest_extra", [])
+    return conf
+
+
+# ---------------------------------------------------------------- remote access
+
+def node_ip(node):
+    """Tailscale IP from the bi-temporal state store. Never hardcoded."""
+    rc, out = sh(f"python3 {STATE_PY} current {node} tailscale_ip", timeout=30)
+    m = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", out)
+    return m.group(1) if m else None
+
+
+def run_on(node, cmd, conf, timeout=30):
+    """Run a read-only command locally or over SSH. Returns (rc, out, reachable)."""
+    if node in (None, "lumen"):
+        rc, out = sh(cmd, timeout=timeout)
+        return rc, out, True
+    if node in conf.get("never_touch", []):
+        return 255, "NEVER_TOUCH", False
+    ip = node_ip(node)
+    if not ip:
+        return 255, "NO_IP_IN_STATE_STORE", False
+    user = (conf.get("nodes", {}).get(node) or {}).get("ssh_user") or node
+    ssh = (f"ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no "
+           f"{user}@{ip} {json_quote(cmd)}")
+    rc, out = sh(ssh, timeout=timeout + 15)
+    if rc == 255 and ("Connection timed out" in out or "No route" in out
+                      or "Connection refused" in out or "Host key" in out):
+        return rc, out, False
+    return rc, out, True
+
+
+def json_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# ---------------------------------------------------------------- check A
+
+def unit_facts(text):
+    """Parse `systemctl show -p LoadState -p ActiveState -p UnitFileState`."""
+    facts = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            facts[k.strip()] = v.strip()
+    return facts
+
+
+def verdict_systemd(facts, expect):
+    """(alive: bool, detail: str) — pure, selftested."""
+    load = facts.get("LoadState", "unknown")
+    active = facts.get("ActiveState", "unknown")
+    filestate = facts.get("UnitFileState", "")
+    if active in LIVE_ACTIVE:
+        return True, f"ActiveState={active} (LoadState={load}, UnitFileState={filestate or 'n/a'})"
+    if expect in ("absent", "masked", "disabled") and filestate == "enabled":
+        return True, f"still enabled (UnitFileState=enabled, ActiveState={active}) — will fire again"
+    if expect == "absent" and load not in ("not-found", "masked") and filestate not in ("", "masked"):
+        return False, f"present but inert (LoadState={load}, UnitFileState={filestate})"
+    return False, f"clear (LoadState={load}, ActiveState={active}, UnitFileState={filestate or 'n/a'})"
+
+
+def check_a(conf, local_only, findings):
+    for entry in conf["retired"]:
+        node = entry.get("node", "lumen")
+        if node in conf.get("never_touch", []):
+            continue
+        if node != "lumen" and local_only:
+            continue
+        if node != "lumen" and node not in conf.get("nodes", {}):
+            findings.append({"check": "A", "severity": "warn", "entry": name, "node": node,
+                             "target": entry.get("unit") or entry.get("container") or entry.get("pattern"),
+                             "detail": f"node {node!r} is not declared in the config nodes: map — not probed"})
+            continue
+        kind = entry.get("kind")
+        name = entry.get("name", "?")
+        expect = entry.get("expect", "absent")
+        base = {"check": "A", "entry": name, "node": node,
+                "retired_on": entry.get("retired_on"), "ref": entry.get("ref"),
+                "reason": entry.get("reason", "")}
+        if kind == "systemd":
+            unit = entry["unit"]
+            cmd = f"systemctl show {unit} -p LoadState -p ActiveState -p UnitFileState"
+            rc, out, reachable = run_on(node, cmd, conf)
+            if not reachable:
+                findings.append(dict(base, severity="skip", target=unit,
+                                     detail=f"node unreachable ({out.strip()[:80]})"))
+                continue
+            alive, detail = verdict_systemd(unit_facts(out), expect)
+            findings.append(dict(base, severity="alert" if alive else "ok",
+                                 target=unit, detail=detail))
+        elif kind == "docker":
+            pat = entry["container"]
+            rc, out, reachable = run_on(node, "docker ps -a --format '{{.Names}}\t{{.State}}'", conf)
+            if not reachable or rc != 0:
+                findings.append(dict(base, severity="skip", target=pat,
+                                     detail="docker not queryable on this node"))
+                continue
+            hits = [l.split("\t") for l in out.strip().splitlines() if "\t" in l]
+            matched = [(n, s) for n, s in hits if re.search(pat, n)]
+            running = [n for n, s in matched if s == "running"]
+            if running:
+                findings.append(dict(base, severity="alert", target=pat,
+                                     detail=f"container(s) running: {', '.join(running)}"))
+            elif matched:
+                findings.append(dict(base, severity="warn", target=pat,
+                                     detail=f"stopped container(s) still on disk: "
+                                            f"{', '.join(n for n, _ in matched)}"))
+            else:
+                findings.append(dict(base, severity="ok", target=pat, detail="absent"))
+        elif kind == "process":
+            pat = entry["pattern"]
+            rc, out, reachable = run_on(node, f"pgrep -af {json_quote(pat)} || true", conf)
+            if not reachable:
+                findings.append(dict(base, severity="skip", target=pat,
+                                     detail="node unreachable"))
+                continue
+            hits = [l for l in out.strip().splitlines()
+                    if l and not any(m in l for m in SELF_MARKERS)]
+            findings.append(dict(base, severity="alert" if hits else "ok", target=pat,
+                                 detail=("; ".join(hits[:3]) if hits else "no matching process")))
+        else:
+            findings.append(dict(base, severity="warn", target=str(kind),
+                                 detail=f"unknown kind {kind!r} in config"))
+
+
+# ---------------------------------------------------------------- check B
+
+def cgroup_owner(cgline):
+    """Map a /proc/<pid>/cgroup line to (kind, name). Pure, selftested."""
+    path = cgline.strip().split("::")[-1]
+    parts = [p for p in path.rstrip("/").split("/") if p]
+    leaf = parts[-1] if parts else ""
+    # Walk from the leaf up: a unit's own sub-cgroups (systemd-udevd.service/udev,
+    # a container's inner scope) still belong to that unit.
+    for comp in reversed(parts):
+        m = re.match(r"docker-([0-9a-f]{12,64})\.scope$", comp)
+        if m:
+            return "docker", m.group(1)[:12]
+        if comp.endswith(".service"):
+            return "unit", comp
+    if leaf in ("", "init.scope"):
+        return "init", leaf or "/"
+    if leaf.endswith(".scope"):
+        return "scope", leaf
+    return "other", leaf
+
+
+def local_manifest():
+    _, units = sh("systemctl list-unit-files --no-legend --no-pager | awk '{print $1}'")
+    unit_set = {u.strip() for u in units.splitlines() if u.strip()}
+    _, loaded = sh("systemctl list-units --type=service --all --no-legend --no-pager | awk '{print $1}'")
+    unit_set |= {u.strip() for u in loaded.splitlines() if u.strip()}
+    _, cids = sh("docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null || true")
+    containers = {}
+    for line in cids.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            containers[parts[0][:12]] = parts[1]
+    return unit_set, containers
+
+
+def check_b(conf, max_age_days, findings):
+    unit_set, containers = local_manifest()
+    extra = tuple(conf.get("manifest_extra", []))
+    cutoff = max_age_days * 86400
+    _, ps = sh("ps -eo pid,ppid,etimes,user,rss,args --no-headers")
+    orphans = []
+    for line in ps.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        pid, ppid, etimes, user, rss, args = parts
+        try:
+            pid_i, ppid_i, age, rss_kb = int(pid), int(ppid), int(etimes), int(rss)
+        except ValueError:
+            continue
+        if age < cutoff or ppid_i == 2 or pid_i == 2:
+            continue
+        if any(m in args for m in SELF_MARKERS) or any(e in args for e in extra):
+            continue
+        try:
+            cg = open(f"/proc/{pid_i}/cgroup").read()
+        except OSError:
+            continue
+        kind, name = cgroup_owner(cg)
+        if kind == "unit" and name in unit_set:
+            continue
+        if kind == "docker" and name in containers:
+            continue
+        if kind == "init":
+            continue
+        orphans.append({"pid": pid_i, "age_days": age // 86400, "user": user,
+                        "rss_mb": rss_kb // 1024, "owner": f"{kind}:{name}",
+                        "cmd": args[:120]})
+    if orphans:
+        top = sorted(orphans, key=lambda o: -o["rss_mb"])[:8]
+        detail = "; ".join(f"pid {o['pid']} {o['age_days']}d {o['rss_mb']}MB "
+                           f"[{o['owner']}] {o['cmd'][:60]}" for o in top)
+        findings.append({"check": "B", "severity": "warn", "entry": "orphan-long-runners",
+                         "node": "lumen", "target": f">{max_age_days}d, unowned",
+                         "detail": f"{len(orphans)} process(es): {detail}",
+                         "rows": orphans})
+    else:
+        findings.append({"check": "B", "severity": "ok", "entry": "orphan-long-runners",
+                         "node": "lumen", "target": f">{max_age_days}d, unowned",
+                         "detail": "every long-running process is owned by a live unit or container"})
+
+
+# ---------------------------------------------------------------- check C
+
+def exec_target_exists(target):
+    """systemd resolves an unqualified ExecStart name against its own search path
+    (journalctl, udevadm, ...), so a bare name is not a dead reference."""
+    if target.startswith("/"):
+        return os.path.exists(target)
+    import shutil
+    return shutil.which(target) is not None
+
+
+def check_c(conf, findings):
+    _, out = sh("systemctl list-units --type=service --all --no-legend --no-pager "
+                "| awk '{print $1, $2, $3}'")
+    broken = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        unit, load, active = parts[0], parts[1], parts[2]
+        if load == "not-found" and active in LIVE_ACTIVE:
+            broken.append(f"{unit}: unit file gone from disk but still {active}")
+            continue
+        if load != "loaded" or active not in LIVE_ACTIVE:
+            continue
+        _, show = sh(f"systemctl show {unit} -p FragmentPath -p ExecStart")
+        facts = unit_facts(show)
+        frag = facts.get("FragmentPath", "")
+        if frag and not os.path.exists(frag):
+            broken.append(f"{unit}: FragmentPath {frag} missing")
+            continue
+        m = re.search(r"path=([^\s;]+)", facts.get("ExecStart", ""))
+        if m and not exec_target_exists(m.group(1)):
+            broken.append(f"{unit}: ExecStart target {m.group(1)} missing")
+    if broken:
+        findings.append({"check": "C", "severity": "warn", "entry": "dead-unit-files",
+                         "node": "lumen", "target": "active units",
+                         "detail": f"{len(broken)}: " + "; ".join(broken[:6])})
+    else:
+        findings.append({"check": "C", "severity": "ok", "entry": "dead-unit-files",
+                         "node": "lumen", "target": "active units",
+                         "detail": "no active unit points at a missing file"})
+
+
+# ---------------------------------------------------------------- output
+
+def emit_alerts(findings, enabled=True):
+    if not enabled:
+        return
+    alerts = [f for f in findings if f["severity"] == "alert"]
+    warns = [f for f in findings if f["severity"] == "warn"]
+    for f in alerts:
+        key = f"{f['node']}:{f['entry']}"
+        title = f"retired service still alive: {f['entry']} on {f['node']}"
+        msg = (f"{f.get('target')} — {f['detail']}. Retired {f.get('retired_on')} "
+               f"({f.get('ref')}): {f.get('reason','')}")
+        sh(f"{AQ} add retirement-audit {json_quote(key)} {json_quote(title)} "
+           f"{json_quote(msg)} --owner claude", timeout=20)
+        sh(f"{NTFY_SEND} -t {NTFY_TOPIC} -p high -T {json_quote('retirement-audit')} "
+           f"{json_quote(title + ' — ' + f['detail'][:200])}", timeout=20)
+    for f in warns:
+        key = f"{f['node']}:{f['entry']}"
+        sh(f"{AQ} add retirement-audit {json_quote(key)} "
+           f"{json_quote('retirement-audit warn: ' + f['entry'])} "
+           f"{json_quote(f['detail'][:1500])} --owner claude", timeout=20)
+
+
+def render(findings, max_age_days):
+    sev = lambda s: [f for f in findings if f["severity"] == s]
+    out = [f"retirement-audit {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+           f"config: {CONF_PATH}", ""]
+    out.append(f"ALERT {len(sev('alert'))}  WARN {len(sev('warn'))}  "
+               f"OK {len(sev('ok'))}  SKIPPED {len(sev('skip'))}")
+    out.append("")
+    for label, s in (("ALERT", "alert"), ("WARN", "warn"), ("SKIPPED", "skip")):
+        rows = sev(s)
+        if not rows:
+            continue
+        out.append(f"== {label} ==")
+        for f in rows:
+            out.append(f"  [{f['check']}] {f['entry']} @{f['node']} ({f.get('target')})")
+            out.append(f"      {f['detail']}")
+            if f.get("reason"):
+                out.append(f"      retired {f.get('retired_on')} {f.get('ref')}: {f['reason']}")
+        out.append("")
+    out.append(f"(check B threshold: {max_age_days}d)")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- selftest
+
+def selftest():
+    fails = 0
+    def chk(label, got, want):
+        nonlocal fails
+        ok = got == want
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'} {label:54s} want={want!r} got={got!r}")
+
+    chk("active unit is alive",
+        verdict_systemd({"LoadState": "loaded", "ActiveState": "active",
+                         "UnitFileState": "enabled"}, "absent")[0], True)
+    chk("enabled-but-inactive timer is alive (fires later)",
+        verdict_systemd({"LoadState": "loaded", "ActiveState": "inactive",
+                         "UnitFileState": "enabled"}, "disabled")[0], True)
+    chk("masked+inactive is clear",
+        verdict_systemd({"LoadState": "masked", "ActiveState": "inactive",
+                         "UnitFileState": "masked"}, "masked")[0], False)
+    chk("not-found is clear",
+        verdict_systemd({"LoadState": "not-found", "ActiveState": "inactive",
+                         "UnitFileState": ""}, "absent")[0], False)
+    chk("disabled-but-present is clear",
+        verdict_systemd({"LoadState": "loaded", "ActiveState": "inactive",
+                         "UnitFileState": "disabled"}, "disabled")[0], False)
+    chk("activating counts as alive",
+        verdict_systemd({"LoadState": "loaded", "ActiveState": "activating",
+                         "UnitFileState": "static"}, "absent")[0], True)
+
+    chk("cgroup: service unit", cgroup_owner("0::/system.slice/lumen-rerank.service"),
+        ("unit", "lumen-rerank.service"))
+    chk("cgroup: docker scope",
+        cgroup_owner("0::/system.slice/docker-9f1c2d3e4b5a6789.scope"),
+        ("docker", "9f1c2d3e4b5a"))
+    chk("cgroup: login session",
+        cgroup_owner("0::/user.slice/user-1000.slice/session-9.scope"),
+        ("scope", "session-9.scope"))
+    chk("cgroup: init", cgroup_owner("0::/init.scope"), ("init", "init.scope"))
+    chk("cgroup: unit sub-cgroup rolls up to the unit",
+        cgroup_owner("0::/system.slice/systemd-udevd.service/udev"),
+        ("unit", "systemd-udevd.service"))
+    chk("exec target: absolute missing path is dead",
+        exec_target_exists("/no/such/binary"), False)
+    chk("exec target: bare name on PATH is fine", exec_target_exists("sh"), True)
+
+    conf = load_conf()
+    chk("config parses with entries", len(conf["retired"]) > 0, True)
+    required = {"name", "kind", "expect"}
+    missing = [e.get("name", "?") for e in conf["retired"]
+               if not required.issubset(e) or
+               (e["kind"] == "systemd" and "unit" not in e) or
+               (e["kind"] == "docker" and "container" not in e) or
+               (e["kind"] == "process" and "pattern" not in e)]
+    chk("every entry has its required fields", missing, [])
+    chk("thor is never probed", "thor" in conf["never_touch"], True)
+    chk("no retired entry targets thor",
+        [e["name"] for e in conf["retired"] if e.get("node") == "thor"], [])
+
+    # never_touch is enforced at the call site, not just declared
+    rc, out, reachable = run_on("thor", "echo SHOULD_NEVER_RUN", conf)
+    chk("run_on refuses thor", out, "NEVER_TOUCH")
+
+    print("\n" + ("ALL PASS" if fails == 0 else f"{fails} FAILURE(S)"))
+    return 1 if fails else 0
+
+
+# ---------------------------------------------------------------- main
+
+def cmd_run(args):
+    conf = load_conf()
+    findings = []
+    check_a(conf, args.local_only, findings)
+    check_b(conf, args.max_age_days, findings)
+    check_c(conf, findings)
+    emit_alerts(findings, enabled=not args.no_alert)
+    if args.json:
+        print(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                          "findings": findings}, indent=2))
+    else:
+        print(render(findings, args.max_age_days))
+    return 1 if any(f["severity"] == "alert" for f in findings) else 0
+
+
+def cmd_list(args):
+    conf = load_conf()
+    for e in conf["retired"]:
+        print(f"{e['name']:28s} {e['kind']:8s} @{e.get('node','lumen'):10s} "
+              f"expect={e.get('expect'):9s} retired={e.get('retired_on')} {e.get('ref')}")
+    print(f"({len(conf['retired'])} entries; never_touch={conf['never_touch']})")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="retirement-audit (wq#723)")
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("run")
+    r.add_argument("--local-only", action="store_true", help="skip remote nodes")
+    r.add_argument("--json", action="store_true")
+    r.add_argument("--no-alert", action="store_true", help="report only, no aq/ntfy")
+    r.add_argument("--max-age-days", type=int, default=7)
+    r.set_defaults(func=cmd_run)
+    sub.add_parser("list").set_defaults(func=cmd_list)
+    sub.add_parser("selftest").set_defaults(func=lambda a: selftest())
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 0
+    try:
+        return args.func(args)
+    except Exception as e:
+        print(f"retirement-audit FAILED: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly retirement audit (wq#723) — Mondays 09:17 UTC
+
+[Timer]
+OnCalendar=Mon *-*-* 09:17:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+Unit=lumen-retirement-audit.service
+
+[Install]
+WantedBy=timers.target
