@@ -1,0 +1,10 @@
+[Unit]
+Description=wq drift guard — 5-minute check for wq file clobbering (wq#886)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

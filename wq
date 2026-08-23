@@ -181,6 +181,16 @@ def init():
     if "model"        not in cols: c.execute("ALTER TABLE tasks ADD COLUMN model TEXT")
     if "effort"       not in cols: c.execute("ALTER TABLE tasks ADD COLUMN effort TEXT")
     if "archetype"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN archetype TEXT")
+    # wq#741 via wq#841(a2): _finish writes these on every done/block. Lost in the 2026-08-23
+    # 12:17Z revert of /home/lumen/bin/wq; restored here because a fresh DB is unusable without
+    # them. block_reason/blocked_at are cleared on release/done so a re-block starts fresh.
+    if "block_reason" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN block_reason TEXT")
+    if "blocked_at"   not in cols: c.execute("ALTER TABLE tasks ADD COLUMN blocked_at TEXT")
+    # wq#841 (escalated from wq#787's verify-pass of wq#763): rework needs a DURABLE signal.
+    # reopened_count is monotonic and lives in its own column, so nothing any later `wq done`/
+    # `wq edit` writes can erase it.
+    if "reopened_count" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN reopened_count INTEGER DEFAULT 0")
+    if "reopened_at"    not in cols: c.execute("ALTER TABLE tasks ADD COLUMN reopened_at TEXT")
     # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
     # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
     # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
@@ -1071,10 +1081,24 @@ def find_artifact(notes):
                 return True, "path", cand
     return False, None, None
 
+# wq#841: the single definition of "this ticket came back from the dead". Rework is a move INTO
+# an in-flight state FROM a terminal one. A lease reap or a release of a claim nobody finished is
+# claimed->open — not rework, and it must not inflate the metric.
+TERMINAL_STATUSES = ("done", "rejected")
+INFLIGHT_STATUSES = ("open", "claimed", "blocked")
+def is_reopen(old_status, new_status):
+    return (old_status or "") in TERMINAL_STATUSES and (new_status or "") in INFLIGHT_STATUSES
+def bump_reopened(c, tid):
+    """Monotonic +1 in its own column. COALESCE covers rows that predate the migration."""
+    c.execute("UPDATE tasks SET reopened_count=COALESCE(reopened_count,0)+1, reopened_at=? WHERE id=?",
+              (now(), tid))
+    return c.execute("SELECT reopened_count FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+
 def _finish(a, new_status):
+    """Returns the new reopened_count if this call was a reopen, else 0."""
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
-    r = c.execute("SELECT claimed_by, subsystems FROM tasks WHERE id=?", (a.id,)).fetchone()
+    r = c.execute("SELECT claimed_by, subsystems, status FROM tasks WHERE id=?", (a.id,)).fetchone()
     if r is None:
         c.execute("COMMIT"); c.close(); print(f"REFUSED: no such task {a.id}"); sys.exit(1)
     caller, _ = resolve_identity(a)
@@ -1096,7 +1120,9 @@ def _finish(a, new_status):
         # getting the same string too, so `wq show`/`wq list` need no changes.
         c.execute("UPDATE tasks SET status='blocked', notes=?, block_reason=?, blocked_at=?, "
                   "lease_expires=NULL WHERE id=?", (a.reason, a.reason, now(), a.id))
+    reopened = bump_reopened(c, a.id) if is_reopen(r[2], new_status) else 0
     c.execute("COMMIT"); c.close()
+    return reopened
 def cmd_done(a):
     notes = getattr(a, "notes", "") or ""
     no_artifact = getattr(a, "no_artifact", None)
@@ -1112,8 +1138,9 @@ def cmd_done(a):
             sys.exit(2)
     _finish(a, 'done')
     print(f"done {a.id} (subsystem locks released)")
-def cmd_release(a): _finish(a, 'open');    print(f"released {a.id} (subsystem locks released)")
-def cmd_block(a):   _finish(a, 'blocked'); print(f"blocked {a.id}: {a.reason} (subsystem locks released)")
+def _reopen_tag(n): return f" [REOPENED — reopened_count={n}]" if n else ""
+def cmd_release(a): print(f"released {a.id} (subsystem locks released){_reopen_tag(_finish(a, 'open'))}")
+def cmd_block(a):   print(f"blocked {a.id}: {a.reason} (subsystem locks released){_reopen_tag(_finish(a, 'blocked'))}")
 def cmd_preflight(a):
     """Ad-hoc guard: warn if about to touch subsystems with no held lock for this holder."""
     holder = a.holder or os.environ.get("WQ_AGENT", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
@@ -1177,6 +1204,12 @@ def cmd_show(a):
     print(f"effective_pri: {ep}")
 def cmd_edit(a):
     c = conn(); fields=[]; vals=[]
+    # wq#841: `wq edit --status open` on a done/rejected ticket IS the reopen path the fleet
+    # actually uses (there is no `wq reopen`). Read the old status before the UPDATE overwrites it.
+    prev_status = None
+    if a.status is not None:
+        row = c.execute("SELECT status FROM tasks WHERE id=?", (a.id,)).fetchone()
+        prev_status = row[0] if row else None
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype)):
@@ -1191,8 +1224,10 @@ def cmd_edit(a):
         m, e = norm_tuple(m, e)
         fields += ["model=?", "effort=?"]; vals += [m, e]
     if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype"); c.close(); return
-    vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals); c.commit()
-    print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}"); c.close()
+    vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
+    reopened = bump_reopened(c, a.id) if is_reopen(prev_status, a.status) else 0
+    c.commit()
+    print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}{_reopen_tag(reopened)}"); c.close()
 def cmd_retire(a):
     """wq#568 (1)(2): retire a session id or every session under a base name. Atomic per
     target: claims revert to open, slocks drop, registry row goes, retired marker persists.

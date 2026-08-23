@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# wq-drift-guard — detect when /home/lumen/bin/wq diverges from git HEAD.
+# wq#886: untracked, shared, mutable binary means any worker can silently
+# clobber the tool every other worker depends on. This guard fires every
+# few minutes and ntfy-alerts on drift so a clobber is caught in minutes
+# instead of hours. Manual: wq-drift-guard [--fix|--status]
+set -uo pipefail
+
+REPO=/home/lumen/bin
+FILE=wq
+NTFY_TOPIC=lumen-alerts
+NTFY_TAG=wq-drift
+LOCKFILE=/tmp/.wq-drift-guard.lock
+STATE=/tmp/.wq-drift-guard.state
+
+# ── one-at-a-time ──
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0
+
+cd "$REPO" || { echo "wq-drift-guard: repo $REPO missing" >&2; exit 2; }
+
+drift() {
+    # exit 0 = drifted, exit 1 = clean
+    git diff --quiet HEAD -- "$FILE" 2>/dev/null && return 1 || return 0
+}
+
+disk_hash() { sha256sum "$REPO/$FILE" 2>/dev/null | cut -d' ' -f1; }
+git_hash()  { git show "HEAD:$FILE" 2>/dev/null | sha256sum | cut -d' ' -f1; }
+
+alert() {
+    local msg="$1"
+    echo "$msg" >&2
+    ntfy-send -t "$NTFY_TOPIC" -p urgent -T "wq DRIFT DETECTED" "$msg" 2>/dev/null || true
+}
+
+case "${1#--}" in
+    status)
+        if drift; then
+            echo "DRIFTED — disk=$(disk_hash) git=$(git_hash)"
+            echo "  git diff HEAD -- $FILE:"
+            git diff --stat HEAD -- "$FILE"
+            exit 1
+        else
+            echo "CLEAN — $(disk_hash)"
+            exit 0
+        fi
+        ;;
+    fix)
+        if ! drift; then echo "already clean"; exit 0; fi
+        echo "restoring $FILE from git HEAD..."
+        git checkout HEAD -- "$FILE"
+        chmod +x "$FILE"
+        echo "restored — $(disk_hash)"
+        echo "clean" > "$STATE"
+        ;;
+    check|"")
+        if ! drift; then
+            # clean — clear any prior alert state
+            [ -f "$STATE" ] && rm -f "$STATE"
+            exit 0
+        fi
+        # drifted — alert once per drift episode
+        cur_hash=$(disk_hash)
+        prev_hash=""
+        [ -f "$STATE" ] && prev_hash=$(cat "$STATE" 2>/dev/null)
+        if [ "$cur_hash" = "$prev_hash" ]; then
+            # already alerted for this exact drift — don't spam
+            exit 1
+        fi
+        echo "$cur_hash" > "$STATE"
+        alert "wq on disk (${cur_hash:0:12}…) != git HEAD ($(git_hash | cut -c1-12)…). A lane likely clobbered it. Run: wq-drift-guard --fix OR git -C $REPO checkout HEAD -- $FILE"
+        exit 1
+        ;;
+    *)
+        echo "usage: wq-drift-guard [--status|--fix|--check]" >&2
+        exit 2
+        ;;
+esac

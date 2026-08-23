@@ -1,0 +1,9 @@
+[Unit]
+Description=wq drift detection — alert if /home/lumen/bin/wq diverges from git HEAD (wq#886)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/lumen/bin/wq-drift-guard
+User=lumen
+Group=lumen

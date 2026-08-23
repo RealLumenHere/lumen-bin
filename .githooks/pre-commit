@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# wq#886: pre-commit gate for `wq`. Twice on 2026-08-23 a lane restored an older copy of
+# /home/lumen/bin/wq over its own edits, silently dropping a shipped migration/writer (the
+# wq#841 reopened_count bump, the wq#741 block_reason/blocked_at columns). Both landed on
+# origin/main anyway because nothing checked the file before it was committed.
+#
+# This hook: if `wq` is part of the commit, run its regression suite (tests/test_wq_reap.py,
+# tests/test_wq_reopened.py) against the STAGED content — not the live deployed binary — and
+# refuse the commit if it fails. It also holds an slock for the duration, so two concurrent
+# commits touching `wq` from different lanes serialize instead of racing.
+#
+# Install (one-time per checkout): git config core.hooksPath .githooks
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+if ! git diff --cached --name-only | grep -qx 'wq'; then
+  exit 0
+fi
+
+SLOCK=/home/lumen/bin/slock
+HOLDER="wq886-precommit-$$"
+LOCKED=0
+if [ -x "$SLOCK" ]; then
+  if "$SLOCK" acquire lumen-bin-wq --ttl 120 --holder "$HOLDER" \
+       --note "pre-commit test gate (wq#886)" >/dev/null 2>&1; then
+    LOCKED=1
+  else
+    echo "pre-commit(wq#886): another commit is testing wq right now — retry in a moment" >&2
+    exit 1
+  fi
+fi
+STAGED_WQ=$(mktemp /tmp/wq886-staged-wq.XXXXXX)
+cleanup() {
+  [ "$LOCKED" = 1 ] && "$SLOCK" release lumen-bin-wq --holder "$HOLDER" >/dev/null 2>&1 || true
+  rm -f "$STAGED_WQ"
+}
+trap cleanup EXIT
+
+git show :wq > "$STAGED_WQ"
+chmod +x "$STAGED_WQ"
+
+if ! python3 -m py_compile "$STAGED_WQ"; then
+  echo "pre-commit(wq#886): staged wq does not even compile — refusing commit" >&2
+  exit 1
+fi
+
+if ! WQ_BIN="$STAGED_WQ" python3 -m pytest "$REPO_ROOT/tests/test_wq_reap.py" \
+      "$REPO_ROOT/tests/test_wq_reopened.py" -q; then
+  echo "pre-commit(wq#886): staged wq fails its regression suite — this is exactly how the" >&2
+  echo "  2026-08-23 reopened_count/block_reason incident happened. Refusing commit." >&2
+  echo "  See tests/test_wq_reopened.py and tests/test_wq_reap.py." >&2
+  exit 1
+fi
+
+exit 0
