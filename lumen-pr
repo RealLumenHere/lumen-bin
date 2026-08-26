@@ -893,18 +893,32 @@ cmd_land() {
     # pending|success|error|failure|warning. Normalise both into total/pending/failed so
     # the policy below (never merge red, say so loudly when there is no CI at all) is
     # written once and means the same thing on both forges.
-    local pending failed
+    local pending failed cancelled
     if [ "${FORGE:-github}" = gitea ]; then
       api GET "/repos/$SLUG/commits/$head_sha/statuses" || api_fail "commit statuses fetch"
       total=$(printf '%s' "$API_BODY" | jq -r 'length')
       pending=$(printf '%s' "$API_BODY" | jq -r '[.[] | select(.status == "pending")] | length')
-      failed=$(printf '%s' "$API_BODY" | jq -r '[.[] | select(.status == "error" or .status == "failure")] | length')
+      # wq#986: Gitea's commit-status API has no "cancelled" state (verified against its
+      # swagger — status is only pending|success|error|failure|warning), so a workflow run
+      # that never got a runner and was cancelled by Gitea's own queue timeout reports as
+      # status=failure with description "Has been cancelled". That is an INFRA gap (zero
+      # runners registered), not evidence the code is broken, but the old check treated it
+      # identically to a real test failure and refused every PR on the repo (wq#984 worked
+      # around it with a direct-API merge). Split failure/error entries on the description
+      # instead of conflating them: a genuine failure still blocks; a cancelled-unrun one is
+      # reported and does not.
+      failed=$(printf '%s' "$API_BODY" | jq -r '[.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i") | not))] | length')
+      cancelled=$(printf '%s' "$API_BODY" | jq -r '[.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i")))] | length')
       if [ "$total" = 0 ]; then
         note "NO CI CHECKS configured on this repo (§8 not yet satisfied) — landing on review alone"
         break
       fi
+      if [ "$cancelled" -gt 0 ]; then
+        printf '%s' "$API_BODY" | jq -r '.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i"))) | "  CANCELLED (not a failure, wq#986): \(.context) -> \(.description)  \(.target_url)"' >&2
+        note "WARNING: $cancelled check(s) never ran (cancelled — most likely no runner registered for this repo). Not treated as a failing check. If this hides a real problem, check the run at $FORGE_BASE_URL/$SLUG/actions."
+      fi
       if [ "$failed" -gt 0 ]; then
-        printf '%s' "$API_BODY" | jq -r '.[] | select(.status == "error" or .status == "failure") | "  FAILED: \(.context) -> \(.status)  \(.target_url)"' >&2
+        printf '%s' "$API_BODY" | jq -r '.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i") | not)) | "  FAILED: \(.context) -> \(.status)  \(.target_url)"' >&2
         die "PR #$pr has failing checks — fix them, do not merge red (§5)"
       fi
     else
@@ -921,7 +935,14 @@ cmd_land() {
       die "PR #$pr has failing checks — fix them, do not merge red (§5)"
     fi
     fi
-    if [ "$pending" = 0 ]; then note "all $total check(s) green"; break; fi
+    if [ "$pending" = 0 ]; then
+      if [ "${cancelled:-0}" -gt 0 ]; then
+        note "all $total check(s) settled: $cancelled cancelled-unrun (wq#986, not blocking), rest green"
+      else
+        note "all $total check(s) green"
+      fi
+      break
+    fi
     [ "$waited" -ge "$timeout" ] && die "timed out after ${timeout}s with $pending check(s) still running"
     note "waiting on $pending/$total check(s)... (${waited}s)"
     sleep 15; waited=$((waited + 15))
