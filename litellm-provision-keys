@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""wq#719 — provision per-caller virtual keys with budget caps on LiteLLM gateway.
+
+wq#920 — --rotate <alias> mode: printed/leaked keys are burned, not just re-masked.
+Generates a replacement key under a new gateway alias (mirroring the existing
+alias's budget/duration), writes it under the ORIGINAL alias's file paths (so
+EnvironmentFile= consumers don't need path changes), then deletes the old key.
+"""
+import json, os, sys, urllib.request, urllib.error, pathlib, datetime, argparse
+
+LITELLM = "http://localhost:4000"
+MASTER_KEY = pathlib.Path("/home/lumen/.secrets/litellm-master.env").read_text().split("=",1)[1].strip()
+SECRETS_DIR = pathlib.Path("/home/lumen/.secrets/litellm-service-keys")
+SECRETS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Service definitions: alias -> (max_budget_usd, budget_duration, description)
+SERVICES = {
+    "lumen-agent":       (15.0, "30d", "lumen-agent-v4 + fleet-researcher"),
+    "lumen-messenger":   (5.0,  "30d", "messenger agent_bridge LiteLLM path"),
+    "lpp":               (5.0,  "30d", "lumen-plays-pokemon brain"),
+    "minerva-pipeline":  (8.0,  "30d", "classifier + proposal + verify + factory"),
+    "lumen-reflector":   (3.0,  "30d", "weekly reflector (DeepSeek pro)"),
+    "brain-healthcheck": (1.0,  "30d", "periodic gateway smoke test"),
+    "minerva-bench":     (5.0,  "30d", "costbench + judgearena + pelican + recall"),
+    "ops-emergency":     (25.0, "30d", "manual ops — replacement for master key"),
+    "sentinel":          (2.0,  "30d", "fleet sentinel probes (probe-synthetic-llm, wq#896)"),
+    "sia-news":          (2.0,  "30d", "sia-news news-intake container, remote host sia (wq#903)"),
+    "lumen-research":    (5.0,  "30d", "research/ pipeline: article_ingest, research_agent, kb_research_agent, deep_research_agent, eval_agent, deploy_agent, run_missing_deep (wq#903)"),
+    "lumen-dispatch":    (2.0,  "30d", "lumen-dispatch PoC dispatcher, disarmed pending Frank Tier-3 gate (wq#903)"),
+    "langfuse-evaluator": (3.0, "30d", "langfuse-ops evaluator.py LLM-as-judge sampling (wq#903)"),
+    "duet":              (2.0,  "30d", "duet.py interactive CLI tool (wq#903)"),
+    "librechat":         (3.0,  "30d", "LibreChat custom endpoint via litellm, docker on Lumen (wq#949 follow-on)"),
+    "sim-studio":        (2.0,  "30d", "sim-studio compose stack, dormant (wq#949 follow-on)"),
+}
+
+ENV_DIR = SECRETS_DIR / "env"
+
+def gen_key(alias: str, max_budget: float, budget_duration: str, description: str):
+    """Create a virtual key via /key/generate."""
+    payload = json.dumps({
+        "key_alias": alias,
+        "max_budget": max_budget,
+        "budget_duration": budget_duration,
+        "metadata": {"description": description, "created_by": "wq719"},
+    }).encode()
+    req = urllib.request.Request(
+        f"{LITELLM}/key/generate",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {MASTER_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return data.get("key") or data.get("generated_key")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        # If key alias already exists, fetch it
+        if "already exists" in body.lower() or e.code == 400:
+            print(f"  WARN: {alias} may already exist: {body[:200]}", file=sys.stderr)
+            return None
+        raise
+
+def delete_key(key: str):
+    """Delete a virtual key via /key/delete. Returns True on success."""
+    payload = json.dumps({"keys": [key]}).encode()
+    req = urllib.request.Request(
+        f"{LITELLM}/key/delete",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {MASTER_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+            return True
+    except urllib.error.HTTPError as e:
+        print(f"  WARN: delete failed: {e.read().decode()[:200]}", file=sys.stderr)
+        return False
+
+def save_key(alias: str, key: str):
+    p = SECRETS_DIR / f"{alias}.key"
+    p.write_text(key + "\n")
+    os.chmod(p, 0o600)
+    # wq#721: units source their key via EnvironmentFile=, not Environment= —
+    # write the same value in that form so a fresh alias is drop-in ready.
+    ENV_DIR.mkdir(parents=True, exist_ok=True)
+    envp = ENV_DIR / f"{alias}.env"
+    envp.write_text(f"LITELLM_MASTER_KEY={key}\n")
+    os.chmod(envp, 0o600)
+
+def _load_manifest():
+    summary_path = SECRETS_DIR / "manifest.json"
+    try:
+        return summary_path, json.loads(summary_path.read_text())
+    except Exception:
+        return summary_path, {}
+
+def _next_gateway_alias(alias, old_gateway_alias):
+    """alias -> alias-2; alias-2 -> alias-3; ..."""
+    import re
+    m = re.match(rf'^{re.escape(alias)}-(\d+)$', old_gateway_alias)
+    n = int(m.group(1)) + 1 if m else 2
+    return f"{alias}-{n}"
+
+def rotate(alias: str, new_alias: str = None):
+    """Burn-and-replace a leaked/rotating key. Generates a fresh key under a
+    new gateway alias (mirroring the original alias's budget/duration), saves
+    it under the ORIGINAL alias's file paths (so EnvironmentFile= consumers
+    need no path change, just a restart), then deletes the old gateway key.
+    """
+    if alias not in SERVICES:
+        print(f"ERROR: unknown alias {alias!r} (not in SERVICES)", file=sys.stderr)
+        return 1
+    budget, duration, desc = SERVICES[alias]
+    summary_path, results = _load_manifest()
+    prev = results.get(alias, {})
+    old_gateway_alias = prev.get("gateway_alias", alias)
+    old_key = prev.get("key")
+    keyfile = SECRETS_DIR / f"{alias}.key"
+    if not old_key and keyfile.exists():
+        old_key = keyfile.read_text().strip()
+    if new_alias is None:
+        new_alias = _next_gateway_alias(alias, old_gateway_alias)
+
+    print(f"Rotating {alias}: gateway alias {old_gateway_alias} -> {new_alias}")
+    # wq#949: the manifest can lag reality (wq#920 rotated ops-emergency without
+    # updating it). If the target gateway alias already exists, walk forward to
+    # the next free generation instead of failing.
+    new_key = None
+    for _ in range(6):
+        new_key = gen_key(new_alias, budget, duration, f"{desc} [rotated from {old_gateway_alias}]")
+        if new_key:
+            break
+        bumped = _next_gateway_alias(alias, new_alias)
+        print(f"  -> {new_alias} unavailable; trying {bumped}", file=sys.stderr)
+        new_alias = bumped
+    if not new_key:
+        print(f"ERROR: /key/generate failed up to {new_alias}", file=sys.stderr)
+        return 1
+    save_key(alias, new_key)
+    results[alias] = {
+        "key": new_key, "max_budget": budget, "budget_duration": duration,
+        "gateway_alias": new_alias, "rotated_from": old_gateway_alias,
+    }
+    summary_path.write_text(json.dumps(results, indent=2) + "\n")
+    os.chmod(summary_path, 0o600)
+    print(f"  -> new key saved to {keyfile} (gateway alias {new_alias})")
+
+    if old_key:
+        deleted = delete_key(old_key)
+        print(f"  -> old key ({old_gateway_alias}) {'deleted' if deleted else 'DELETE FAILED — remove it manually'}")
+    else:
+        print("  -> WARN: no prior key on file; nothing to delete", file=sys.stderr)
+
+    print(f"NOTE: restart consumers of {keyfile} / {ENV_DIR / (alias + '.env')} to pick up the new key.")
+    return 0
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--rotate", metavar="ALIAS",
+                    help="rotate ALIAS's key: generate a replacement under a new gateway "
+                         "alias, save it under ALIAS's existing file paths, delete the old key")
+    p.add_argument("--new-alias", metavar="ALIAS",
+                    help="gateway alias for the replacement key (default: <ALIAS>-N)")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    if args.rotate:
+        return rotate(args.rotate, args.new_alias)
+
+    print(f"Provisioning {len(SERVICES)} service keys on {LITELLM}")
+    summary_path, results = _load_manifest()
+    generated = 0
+    for alias, (budget, duration, desc) in SERVICES.items():
+        print(f"  {alias}: max_budget=${budget}, duration={duration}")
+        key = gen_key(alias, budget, duration, desc)
+        if key:
+            save_key(alias, key)
+            results[alias] = {"key": key, "max_budget": budget, "budget_duration": duration}
+            generated += 1
+            print(f"    -> key saved to {SECRETS_DIR}/{alias}.key")
+        else:
+            existing = SECRETS_DIR / f"{alias}.key"
+            if existing.exists() and alias not in results:
+                # backfill manifest entry for a pre-existing key this run skipped
+                results[alias] = {"key": existing.read_text().strip(),
+                                   "max_budget": budget, "budget_duration": duration}
+            print(f"    -> SKIPPED (already exists or error)")
+
+    # Write summary (merged with any pre-existing manifest, not clobbered)
+    summary_path.write_text(json.dumps(results, indent=2) + "\n")
+    os.chmod(summary_path, 0o600)
+    print(f"\nManifest written to {summary_path}")
+    print(f"Keys generated this run: {generated}/{len(SERVICES)}; manifest has {len(results)} aliases total")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
