@@ -177,6 +177,8 @@ def test_live_file_delivers_every_rule_including_the_ones_the_cut_dropped():
     done = render(LIVE_FILE)
     assert done.returncode == 0, done.stderr
     kept = rules_of(done.stdout)
-    assert kept == yaml.safe_load(open(LIVE_FILE, encoding="utf-8"))["rules"]
+    live_rules = yaml.safe_load(open(LIVE_FILE, encoding="utf-8"))["rules"]
+    expected = [r["text"] if isinstance(r, dict) else r for r in live_rules]
+    assert kept == expected
     assert any("THOR IS THE ONLY HARD RULE" in rule for rule in kept)
     assert any("FULL AUTONOMY" in rule for rule in kept)
