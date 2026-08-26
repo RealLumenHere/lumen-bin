@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""instincts-render — render /home/lumen/instincts.yaml for session injection.
+
+WHY (wq#958): claude_context.sh --core injected `head -c 4096` of a 23,064-byte file. That is
+the first 22 of 57 rules. The other 35 — every rule added 2026-08-20 onward, including the FULL
+AUTONOMY grant and THOR IS THE ONLY HARD RULE — reached no session, while the SUPERSEDED
+reboot-gate rule sat inside the cut and was served as live law. The cut also landed mid-rule, so
+what did arrive ended in corrupt YAML.
+
+Raising the cap would not fix that. A byte cap cannot see where a rule ends and it drops in
+silence, so the reader cannot tell a short file from a truncated one. This renders whole rules,
+ordered by tier, and states every omission in the output itself. R1
+(foreman/reports/R1_instincts_efficacy.md §1) priced the whole file at under 1% of a median
+session's weighted spend, so the default is to deliver all of it; the budget flags exist for
+callers that have a reason.
+
+Tiers (R1 §6; wq#959 assigns them, this reads them):
+  - a rule may be a mapping carrying `tier:` — highest precedence
+  - a `# tier: N` comment applies to each rule after it, until the next such comment
+  - anything unclassified is tier 0, because unclassified means "not known to be droppable"
+
+Exit codes: 0 rendered, 3 nothing to render (missing, empty, or `rules: []`), 4 unusable file.
+Nothing is written to stdout on 3 or 4 — a caller that cannot get valid YAML gets none.
+"""
+import argparse
+import re
+import sys
+
+import yaml
+
+DEFAULT_PATH = "/home/lumen/instincts.yaml"
+UNCLASSIFIED_TIER = 0
+TIER_LABELS = {0: "hard constraints", 1: "operating doctrine", 2: "domain"}
+
+# The corpus measures 4.34 bytes/token under cl100k. Dividing by 4 over-counts tokens, which
+# spends a --budget-tokens ceiling early rather than overrunning it.
+CHARS_PER_TOKEN = 4
+
+TIER_MARKER = re.compile(r"^\s*#\s*tier\s*:\s*(\d+)\s*$")
+RULES_KEY = re.compile(r"^rules\s*:")
+
+EXIT_EMPTY = 3
+EXIT_UNUSABLE = 4
+
+
+def die(message, code):
+    print(f"instincts-render: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def marker_tiers(text, expected):
+    """Tier per rule, read from `# tier: N` comments, in file order.
+
+    Returns None unless the scan finds exactly `expected` list items — a mismatch means the
+    line scan and the parser disagree about the file's shape, and guessing which rule a marker
+    covers is how rules get misfiled. Falling back to unclassified delivers them all instead.
+    """
+    tiers, tier, in_rules, indent = [], None, False, None
+    for line in text.splitlines():
+        marker = TIER_MARKER.match(line)
+        if marker:
+            tier = int(marker.group(1))
+            continue
+        if not in_rules:
+            in_rules = bool(RULES_KEY.match(line))
+            continue
+        item = re.match(r"^(\s*)-\s", line)
+        if not item:
+            continue
+        if indent is None:
+            indent = item.group(1)
+        if item.group(1) == indent:
+            tiers.append(tier)
+    return tiers if len(tiers) == expected else None
+
+
+def load_rules(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        die(f"{path}: not found", EXIT_EMPTY)
+    except OSError as exc:
+        die(f"{path}: {exc}", EXIT_UNUSABLE)
+
+    if not text.strip():
+        die(f"{path}: empty", EXIT_EMPTY)
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        die(f"{path}: not valid YAML, refusing to inject a partial file: {exc}", EXIT_UNUSABLE)
+    if not isinstance(doc, dict) or "rules" not in doc:
+        die(f"{path}: no `rules:` key", EXIT_UNUSABLE)
+    if doc["rules"] is None or doc["rules"] == []:
+        die(f"{path}: `rules:` is empty", EXIT_EMPTY)
+    if not isinstance(doc["rules"], list):
+        die(f"{path}: `rules:` is not a list", EXIT_UNUSABLE)
+
+    inherited = marker_tiers(text, len(doc["rules"]))
+    rules = []
+    for index, raw in enumerate(doc["rules"]):
+        default = inherited[index] if inherited else None
+        if isinstance(raw, str):
+            body, tier = raw, default
+        elif isinstance(raw, dict) and isinstance(raw.get("text"), str):
+            body, tier = raw["text"], raw.get("tier", default)
+        else:
+            die(f"{path}: rule {index + 1} is neither a string nor a mapping with `text`",
+                EXIT_UNUSABLE)
+        if not isinstance(tier, int):
+            tier = UNCLASSIFIED_TIER
+        rules.append((tier, index, body))
+    return rules
+
+
+def select(rules, max_tier, budget_tokens):
+    """Whole rules only, tier first then file order. Returns (kept, reasons-for-dropped)."""
+    kept, dropped_tier, dropped_budget, spent = [], 0, 0, 0
+    for tier, index, body in sorted(rules, key=lambda r: (r[0], r[1])):
+        if max_tier is not None and tier > max_tier:
+            dropped_tier += 1
+            continue
+        cost = -(-len(body) // CHARS_PER_TOKEN)
+        if budget_tokens is not None and spent + cost > budget_tokens:
+            dropped_budget += 1
+            continue
+        spent += cost
+        kept.append((tier, index, body))
+    return kept, dropped_tier, dropped_budget
+
+
+def render(kept, total, dropped_tier, dropped_budget, path):
+    chunks, previous = [], None
+    tiered = len({tier for tier, _, _ in kept}) > 1
+    for tier, _, body in kept:
+        if tiered and tier != previous:
+            label = TIER_LABELS.get(tier, "")
+            chunks.append(f"  # --- tier {tier}{' — ' + label if label else ''} ---")
+            previous = tier
+        item = yaml.safe_dump([body], default_flow_style=False, allow_unicode=True,
+                              width=10 ** 6, sort_keys=False)
+        chunks.append("\n".join("  " + line for line in item.rstrip("\n").splitlines()))
+
+    head = [f"# instincts: {len(kept)} of {total} rule(s) from {path}"]
+    if dropped_tier or dropped_budget:
+        why = []
+        if dropped_tier:
+            why.append(f"{dropped_tier} above the requested tier")
+        if dropped_budget:
+            why.append(f"{dropped_budget} past the token budget")
+        head.append(f"# OMITTED: {', '.join(why)}. Read them in full at {path}.")
+    doc = "\n".join(head + ["rules:"] + chunks) + "\n"
+
+    # The bug this replaces shipped corrupt YAML. Never emit anything that does not parse back
+    # to exactly the rules selected.
+    try:
+        back = yaml.safe_load(doc)
+    except yaml.YAMLError as exc:
+        die(f"refusing to emit unparseable output: {exc}", EXIT_UNUSABLE)
+    if not isinstance(back, dict) or back.get("rules") != [body for _, _, body in kept]:
+        die("refusing to emit output that does not round-trip to the selected rules",
+            EXIT_UNUSABLE)
+    return doc
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--file", default=DEFAULT_PATH, help=f"default {DEFAULT_PATH}")
+    ap.add_argument("--max-tier", type=int, metavar="N",
+                    help="drop rules above tier N (default: keep every tier)")
+    ap.add_argument("--budget-tokens", type=int, metavar="N",
+                    help="stop at N estimated tokens, on a rule boundary (default: no ceiling)")
+    args = ap.parse_args()
+
+    rules = load_rules(args.file)
+    kept, dropped_tier, dropped_budget = select(rules, args.max_tier, args.budget_tokens)
+    if not kept:
+        die("every rule was filtered out; nothing to inject", EXIT_EMPTY)
+    sys.stdout.write(render(kept, len(rules), dropped_tier, dropped_budget, args.file))
+
+
+if __name__ == "__main__":
+    main()

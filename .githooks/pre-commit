@@ -15,7 +15,26 @@ set -euo pipefail
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
-if ! git diff --cached --name-only | grep -qx 'wq'; then
+STAGED=$(git diff --cached --name-only)
+
+# wq#958: instincts-render is on every session's context path. If it ships broken, rules stop
+# reaching sessions in silence — the exact failure it was written to end. No slock: unlike `wq`
+# it touches no shared database.
+if printf '%s\n' "$STAGED" | grep -qx 'instincts-render'; then
+  STAGED_RENDER=$(mktemp /tmp/wq958-staged-instincts-render.XXXXXX)
+  trap 'rm -f "$STAGED_RENDER"' EXIT
+  git show :instincts-render > "$STAGED_RENDER"
+  chmod +x "$STAGED_RENDER"
+  if ! INSTINCTS_RENDER_BIN="$STAGED_RENDER" python3 -m pytest \
+        "$REPO_ROOT/tests/test_instincts_render.py" -q; then
+    echo "pre-commit(wq#958): staged instincts-render fails its regression suite. Refusing." >&2
+    exit 1
+  fi
+  rm -f "$STAGED_RENDER"
+  trap - EXIT
+fi
+
+if ! printf '%s\n' "$STAGED" | grep -qx 'wq'; then
   exit 0
 fi
 
