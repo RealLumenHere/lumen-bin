@@ -190,29 +190,104 @@ def cmd_web(args):
 
 
 def cmd_reddit(args):
-    kind = "reddit"
+    deep = getattr(args, "deep", False)
+    kind = "reddit-deep" if deep else "reddit"       # deep results cache separately (they carry comments)
     q = f"site:reddit.com {args.query}"
     if not args.no_cache:
         hit = cache_lookup(args.project, kind, args.query, args.n, args.ttl)
         if hit:
-            emit(envelope("searxng-reddit", True, {"results": hit["results"]},
+            emit(envelope("searxng-reddit", True, {"results": hit["results"], "deep": deep},
                           query=args.query, cached=True, cached_at=hit.get("iso")))
     results, err = searxng_search(q, args.n)
     if err:
         emit(envelope("searxng-reddit", False, error=err, query=args.query, cached=False))
+    if deep:
+        # Ticket item 1: "parse comments, not just titles." Auto-read the top N reddit
+        # threads and attach their comment tree inline (one crawl path: _fetch_and_extract).
+        threads = [r for r in results if "reddit.com" in (r.get("url") or "")][:args.threads]
+        for r in threads:
+            payload, rerr = _fetch_and_extract(r["url"])
+            if payload:
+                cmts = payload["comments"]
+                if args.depth is not None:
+                    cmts = [c for c in cmts if c.get("depth", 0) <= args.depth]
+                r["comments"] = cmts
+                r["comment_count"] = len(cmts)
+                if payload.get("content"):
+                    r["content"] = payload["content"]
+            else:
+                r["comments"], r["comment_count"] = [], 0
+                r["read_error"] = (rerr or {}).get("error", "unknown")
+        cache_store(args.project, kind, args.query, args.n, results)
+        emit(envelope("searxng-reddit", True,
+                      {"results": results, "deep": True, "threads_read": len(threads)},
+                      query=args.query, cached=False))
     cache_store(args.project, kind, args.query, args.n, results)
     emit(envelope("searxng-reddit", True, {"results": results,
-                  "hint": "use `fleet-search read <thread-url>` to pull full comments (old.reddit)"},
+                  "hint": "add --deep to auto-extract comments, or `fleet-search read <thread-url>`"},
                   query=args.query, cached=False))
 
 
 # ---------- GitHub (authenticated API) ----------
+def _github_graphql(token, query, variables=None):
+    """POST a GraphQL query to GitHub. Returns (status, data_or_None, err_str). Fail-soft."""
+    payload = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(
+        "https://api.github.com/graphql", data=payload,
+        headers={"User-Agent": UA, "Authorization": "Bearer " + token,
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace")), None
+    except urllib.error.HTTPError as e:
+        return e.code, None, (e.read()[:300].decode("utf-8", "replace") if hasattr(e, "read") else "")
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        return 0, None, str(e)
+
+
 def cmd_github(args):
     token = _env_token("GITHUB_TOKEN")
+
+    # ----- discussions: GraphQL only (REST has no discussions search) -----
+    if getattr(args, "discussions", False):
+        if not token:
+            emit(envelope("github-discussions", False,
+                          error="github discussions need GITHUB_TOKEN (GraphQL requires auth)",
+                          query=args.query))
+        gql = ("query($q:String!,$n:Int!){search(query:$q,type:DISCUSSION,first:$n){"
+               "discussionCount nodes{... on Discussion{title url createdAt "
+               "repository{nameWithOwner} comments{totalCount} answer{author{login}}}}}}")
+        status, data, err = _github_graphql(token, gql, {"q": args.query, "n": args.n})
+        if status != 200 or data is None:
+            emit(envelope("github-discussions", False,
+                          error=f"github graphql http {status}: {err}", query=args.query))
+        if data.get("errors"):
+            emit(envelope("github-discussions", False,
+                          error="graphql: " + json.dumps(data["errors"])[:300], query=args.query))
+        s = data.get("data", {}).get("search", {}) or {}
+        out = []
+        for nn in s.get("nodes", [])[:args.n]:
+            if not nn:
+                continue
+            out.append({"title": nn.get("title", ""), "url": nn.get("url", ""),
+                        "repo": (nn.get("repository") or {}).get("nameWithOwner", ""),
+                        "comments": (nn.get("comments") or {}).get("totalCount", 0),
+                        "answered": bool(nn.get("answer")), "created": nn.get("createdAt", "")})
+        cache_store(args.project, "github-discussions", args.query, args.n, out)
+        emit(envelope("github-discussions", True,
+                      {"results": out, "total": s.get("discussionCount", 0), "authenticated": True},
+                      query=args.query, cached=False))
+
+    # ----- code / issues / repos: REST search -----
     headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = "Bearer " + token
-    if args.issues:
+    if getattr(args, "code", False):
+        headers["Accept"] = "application/vnd.github.text-match+json"   # returns matching fragments
+        endpoint = "https://api.github.com/search/code?" + urllib.parse.urlencode(
+            {"q": args.query, "per_page": args.n})
+        kind = "github-code"
+    elif args.issues:
         endpoint = "https://api.github.com/search/issues?" + urllib.parse.urlencode(
             {"q": args.query, "per_page": args.n})
         kind = "github-issues"
@@ -226,12 +301,24 @@ def cmd_github(args):
     if status == 401:
         emit(envelope(kind, False, error="github 401 — GITHUB_TOKEN missing/invalid in agent/.env", query=args.query))
     if status == 403:
-        emit(envelope(kind, False, error="github 403 — rate limited (unauth=10/min) or token lacks scope", query=args.query))
+        emit(envelope(kind, False, error="github 403 — rate limited (code search=10/min auth) or token lacks scope", query=args.query))
+    if status == 422:
+        emit(envelope(kind, False, error=f"github 422 — unprocessable query (code search needs auth + real terms): {err}", query=args.query))
     if status != 200 or data is None:
         emit(envelope(kind, False, error=f"github http {status}: {err}", query=args.query))
     out = []
     for r in data.get("items", [])[:args.n]:
-        if args.issues:
+        if kind == "github-code":
+            frags = []
+            for m in (r.get("text_matches") or [])[:2]:
+                frag = (m.get("fragment") or "").strip()
+                if frag:
+                    frags.append(frag[:300])
+            out.append({"title": r.get("name", ""), "path": r.get("path", ""),
+                        "url": r.get("html_url", ""),
+                        "repo": (r.get("repository") or {}).get("full_name", ""),
+                        "snippet": (" … ".join(frags))[:400]})
+        elif kind == "github-issues":
             out.append({"title": r.get("title", ""), "url": r.get("html_url", ""),
                         "state": r.get("state", ""), "comments": r.get("comments", 0),
                         "snippet": (r.get("body", "") or "")[:400],
@@ -314,8 +401,12 @@ def _reddit_comment_tree(html, max_comments=40):
     return out
 
 
-def cmd_read(args):
-    url = args.url
+def _fetch_and_extract(url):
+    """Fetch a URL (old.reddit-aware) and extract content + comments. Fail-soft.
+    Returns (payload_dict, err_dict) — exactly one is non-None.
+      payload = {"content","comments","comment_count","url","http","bytes"}
+      err     = {"error","url",...}  (splat into envelope(..., False, **err))
+    Reused by both `cmd_read` and reddit `--deep` so there is ONE crawl/extract path."""
     is_reddit = "reddit.com" in url
     fetch_url = url
     # Reddit: rewrite www/new/.json -> old.reddit HTML (the only path that returns 200 since May 2026)
@@ -326,12 +417,12 @@ def cmd_read(args):
             fetch_url = fetch_url[:-5]
     status, body, final = _get(fetch_url)
     if status == 0:
-        emit(envelope("read", False, error=f"fetch failed: {body[:200].decode('utf-8','replace')}", url=fetch_url))
+        return None, {"error": f"fetch failed: {body[:200].decode('utf-8','replace')}", "url": fetch_url}
     if status == 403:
         hint = " (reddit blocks datacenter IPs / .json since 2026-05-30; old.reddit HTML needed)" if is_reddit else ""
-        emit(envelope("read", False, error=f"http 403 blocked{hint}", url=fetch_url))
+        return None, {"error": f"http 403 blocked{hint}", "url": fetch_url}
     if status != 200:
-        emit(envelope("read", False, error=f"http {status}", url=fetch_url))
+        return None, {"error": f"http {status}", "url": fetch_url}
     html = body.decode("utf-8", "replace")
 
     content, comments = None, []
@@ -349,12 +440,20 @@ def cmd_read(args):
         comments = _reddit_comment_tree(html) or comments
 
     if not content and not comments:
-        emit(envelope("read", False, error="fetched OK but extracted no content/comments",
-                      url=fetch_url, http=status, bytes=len(body)))
+        return None, {"error": "fetched OK but extracted no content/comments",
+                      "url": fetch_url, "http": status, "bytes": len(body)}
+    return ({"content": content or "", "comments": comments, "comment_count": len(comments),
+             "url": fetch_url, "http": status, "bytes": len(body)}, None)
+
+
+def cmd_read(args):
+    payload, err = _fetch_and_extract(args.url)
+    if err:
+        emit(envelope("read", False, **err))
     emit(envelope("read", True,
-                  {"content": content or "", "comments": comments,
-                   "comment_count": len(comments)},
-                  url=fetch_url, http=status, bytes=len(body), cached=False))
+                  {"content": payload["content"], "comments": payload["comments"],
+                   "comment_count": payload["comment_count"]},
+                  url=payload["url"], http=payload["http"], bytes=payload["bytes"], cached=False))
 
 
 # ---------- main ----------
@@ -378,7 +477,14 @@ def build_parser():
         sp.add_argument("query")
         sp.add_argument("--n", type=int, default=10, help="max results (default 10)")
         if name == "github":
-            sp.add_argument("--issues", action="store_true", help="search issues/PRs instead of repos")
+            g = sp.add_mutually_exclusive_group()
+            g.add_argument("--issues", action="store_true", help="search issues/PRs")
+            g.add_argument("--code", action="store_true", help="search code content (finds scripts repo-search buries)")
+            g.add_argument("--discussions", action="store_true", help="search GitHub Discussions (GraphQL)")
+        if name == "reddit":
+            sp.add_argument("--deep", action="store_true", help="auto-extract comments from the top threads")
+            sp.add_argument("--threads", type=int, default=3, help="with --deep: how many top threads to read (default 3)")
+            sp.add_argument("--depth", type=int, default=None, help="with --deep: max comment nesting depth to keep")
         sp.set_defaults(func=fn)
 
     rp = sub.add_parser("read", help="fetch + extract a URL (old.reddit-aware)")
