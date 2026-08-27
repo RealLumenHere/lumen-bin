@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""fleet-search — unified web/community search router for Lumen fleet agents.
+
+wq#999. Design: /home/lumen/foreman/research/SEARXNG_FLEET_INTEGRATION.md §5,§6.
+
+The fleet's agents have only Bash(curl *) / Bash(python3 *) egress — no WebSearch/
+WebFetch tool. This CLI is the single curl-reachable search surface. It routes each
+source to its best reachable path:
+
+  web     general web / discovery  -> SearXNG json (google+bing+ddg)
+  reddit  find reddit threads      -> SearXNG site:reddit.com
+  read    fetch + extract a URL    -> old.reddit-aware trafilatura (+bs4 comment tree)
+  github  repos/issues/code        -> authenticated GitHub REST API (GITHUB_TOKEN)
+  hn      hacker news              -> HN Algolia API (stories + comments)
+  so      stackoverflow            -> StackExchange API
+
+Contract (every sub-command, always):
+  Prints ONE json object: {"source","ok","query"|"url","results"|"content","error","cached"}
+  ok:false + error string on any failure. NEVER a silent empty that reads as
+  "no findings" (same anti-pattern as the memoryd silent-fallback lesson).
+  Exit code: 0 on ok:true, 2 on ok:false. Fail-soft: a dead engine or a Reddit 403
+  is a normal ok:false result, not a crash.
+
+Per-project cache (--project <name>): writes/reads
+  /home/lumen/projects/<name>/research/search_cache.jsonl  (query->results, ts)
+  and appends discovery to PRIOR_ART.md. Checked first (TTL default 14d).
+"""
+import sys, os, json, time, argparse, hashlib, urllib.parse, urllib.request, urllib.error
+
+SEARXNG = os.environ.get("FLEET_SEARXNG_BASE", "http://127.0.0.1:8888")
+AGENT_ENV = "/home/lumen/agent/.env"
+PROJECTS = "/home/lumen/projects"
+CACHE_TTL_DEFAULT = 14 * 86400          # 14 days for volatile web
+UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+HTTP_TIMEOUT = 20
+
+
+def _env_token(key):
+    """Read a single key from the agent .env without importing anything. Returns '' if absent."""
+    try:
+        with open(AGENT_ENV) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    # ignore a defused/commented placeholder
+                    return "" if v.startswith("#") else v
+    except OSError:
+        pass
+    return ""
+
+
+def envelope(source, ok, payload=None, error=None, **extra):
+    out = {"source": source, "ok": ok}
+    out.update(extra)
+    if ok:
+        out.update(payload or {})
+    else:
+        out["error"] = error or "unknown error"
+    return out
+
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+    sys.exit(0 if obj.get("ok") else 2)
+
+
+# ---------- HTTP helpers ----------
+def _get(url, headers=None, timeout=HTTP_TIMEOUT):
+    """GET -> (status, body_bytes, final_url). Never raises on HTTP error; returns the code."""
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(), r.geturl()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read() if hasattr(e, "read") else b"", url
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, str(e).encode(), url
+
+
+def _get_json(url, headers=None, timeout=HTTP_TIMEOUT):
+    status, body, _ = _get(url, headers=headers, timeout=timeout)
+    if status != 200:
+        return status, None, body[:300].decode("utf-8", "replace")
+    try:
+        return status, json.loads(body.decode("utf-8", "replace")), None
+    except json.JSONDecodeError as e:
+        return status, None, f"json decode: {e}"
+
+
+# ---------- per-project cache ----------
+def _cache_paths(project):
+    if not project:
+        base = "/home/lumen/agent/research_cache"      # global fallback
+    else:
+        base = os.path.join(PROJECTS, project, "research")
+    return os.path.join(base, "search_cache.jsonl"), os.path.join(base, "PRIOR_ART.md"), base
+
+
+def _cache_key(kind, query, n):
+    return hashlib.sha256(f"{kind}|{query}|{n}".encode()).hexdigest()[:16]
+
+
+def cache_lookup(project, kind, query, n, ttl):
+    path, _, _ = _cache_paths(project)
+    if not os.path.exists(path):
+        return None
+    key = _cache_key(kind, query, n)
+    hit = None
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("key") == key and (time.time() - rec.get("ts", 0)) < ttl:
+                    hit = rec          # last (freshest) wins
+    except OSError:
+        return None
+    return hit
+
+
+def cache_store(project, kind, query, n, results):
+    path, prior, base = _cache_paths(project)
+    try:
+        os.makedirs(base, exist_ok=True)
+        rec = {"key": _cache_key(kind, query, n), "kind": kind, "query": query,
+               "n": n, "ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "results": results}
+        with open(path, "a") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # append a compact discovery line to PRIOR_ART.md so future agents don't re-search
+        if project and results:
+            _append_prior_art(prior, kind, query, results)
+    except OSError:
+        pass                          # cache is best-effort; never fail the search on it
+
+
+def _append_prior_art(prior, kind, query, results):
+    new = not os.path.exists(prior)
+    with open(prior, "a") as fh:
+        if new:
+            fh.write("# PRIOR ART — auto-collected by fleet-search\n\n"
+                     "_Discovery log. Each entry: a search that returned hits. "
+                     "Read before re-searching the same ground._\n\n")
+        fh.write(f"## [{kind}] {query}  \n")
+        fh.write(f"_{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}_\n\n")
+        for r in results[:8]:
+            u = r.get("url", "")
+            t = (r.get("title", "") or "")[:120]
+            fh.write(f"- {t}  \n  {u}\n")
+        fh.write("\n")
+
+
+# ---------- SearXNG (web / reddit-discovery) ----------
+def searxng_search(query, n=10, engines=None):
+    """Returns (results_list, error_or_None). Fail-soft."""
+    params = {"q": query, "format": "json"}
+    if engines:
+        params["engines"] = ",".join(engines)
+    url = SEARXNG + "/search?" + urllib.parse.urlencode(params)
+    status, data, err = _get_json(url)
+    if status == 0:
+        return None, f"searxng unreachable at {SEARXNG}: {err}"
+    if status == 403:
+        return None, "searxng 403 — JSON format not enabled in settings.yml (search.formats must include 'json')"
+    if status != 200 or data is None:
+        return None, f"searxng http {status}: {err}"
+    out = []
+    for r in data.get("results", [])[:n]:
+        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
+                    "snippet": (r.get("content", "") or "")[:400],
+                    "engine": r.get("engine", "")})
+    return out, None
+
+
+def cmd_web(args):
+    kind = "web"
+    if not args.no_cache:
+        hit = cache_lookup(args.project, kind, args.query, args.n, args.ttl)
+        if hit:
+            emit(envelope("searxng", True, {"results": hit["results"]},
+                          query=args.query, cached=True, cached_at=hit.get("iso")))
+    results, err = searxng_search(args.query, args.n)
+    if err:
+        emit(envelope("searxng", False, error=err, query=args.query, cached=False))
+    cache_store(args.project, kind, args.query, args.n, results)
+    emit(envelope("searxng", True, {"results": results}, query=args.query, cached=False))
+
+
+def cmd_reddit(args):
+    kind = "reddit"
+    q = f"site:reddit.com {args.query}"
+    if not args.no_cache:
+        hit = cache_lookup(args.project, kind, args.query, args.n, args.ttl)
+        if hit:
+            emit(envelope("searxng-reddit", True, {"results": hit["results"]},
+                          query=args.query, cached=True, cached_at=hit.get("iso")))
+    results, err = searxng_search(q, args.n)
+    if err:
+        emit(envelope("searxng-reddit", False, error=err, query=args.query, cached=False))
+    cache_store(args.project, kind, args.query, args.n, results)
+    emit(envelope("searxng-reddit", True, {"results": results,
+                  "hint": "use `fleet-search read <thread-url>` to pull full comments (old.reddit)"},
+                  query=args.query, cached=False))
+
+
+# ---------- GitHub (authenticated API) ----------
+def cmd_github(args):
+    token = _env_token("GITHUB_TOKEN")
+    headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if args.issues:
+        endpoint = "https://api.github.com/search/issues?" + urllib.parse.urlencode(
+            {"q": args.query, "per_page": args.n})
+        kind = "github-issues"
+    else:
+        endpoint = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(
+            {"q": args.query, "per_page": args.n})
+        kind = "github-repos"
+    status, data, err = _get_json(endpoint, headers=headers)
+    if status == 0:
+        emit(envelope(kind, False, error=f"github unreachable: {err}", query=args.query))
+    if status == 401:
+        emit(envelope(kind, False, error="github 401 — GITHUB_TOKEN missing/invalid in agent/.env", query=args.query))
+    if status == 403:
+        emit(envelope(kind, False, error="github 403 — rate limited (unauth=10/min) or token lacks scope", query=args.query))
+    if status != 200 or data is None:
+        emit(envelope(kind, False, error=f"github http {status}: {err}", query=args.query))
+    out = []
+    for r in data.get("items", [])[:args.n]:
+        if args.issues:
+            out.append({"title": r.get("title", ""), "url": r.get("html_url", ""),
+                        "state": r.get("state", ""), "comments": r.get("comments", 0),
+                        "snippet": (r.get("body", "") or "")[:400],
+                        "repo": r.get("repository_url", "").replace("https://api.github.com/repos/", "")})
+        else:
+            out.append({"title": r.get("full_name", ""), "url": r.get("html_url", ""),
+                        "stars": r.get("stargazers_count", 0),
+                        "snippet": (r.get("description", "") or "")[:400],
+                        "updated": r.get("updated_at", "")})
+    cache_store(args.project, kind, args.query, args.n, out)
+    emit(envelope(kind, True, {"results": out, "total": data.get("total_count", 0),
+                  "authenticated": bool(token)}, query=args.query, cached=False))
+
+
+# ---------- Hacker News (Algolia) ----------
+def cmd_hn(args):
+    url = "https://hn.algolia.com/api/v1/search?" + urllib.parse.urlencode(
+        {"query": args.query, "hitsPerPage": args.n})
+    status, data, err = _get_json(url)
+    if status != 200 or data is None:
+        emit(envelope("hn", False, error=f"hn algolia http {status}: {err}", query=args.query))
+    out = []
+    for h in data.get("hits", [])[:args.n]:
+        out.append({"title": h.get("title") or h.get("story_title") or "",
+                    "url": h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}",
+                    "points": h.get("points", 0), "num_comments": h.get("num_comments", 0),
+                    "snippet": (h.get("comment_text") or h.get("story_text") or "")[:400],
+                    "hn_url": f"https://news.ycombinator.com/item?id={h.get('objectID')}"})
+    cache_store(args.project, "hn", args.query, args.n, out)
+    emit(envelope("hn", True, {"results": out, "total": data.get("nbHits", 0)},
+                  query=args.query, cached=False))
+
+
+# ---------- StackOverflow (StackExchange API) ----------
+def cmd_so(args):
+    key = _env_token("STACKEXCHANGE_KEY")
+    params = {"order": "desc", "sort": "relevance", "q": args.query,
+              "site": "stackoverflow", "pagesize": args.n, "filter": "withbody"}
+    if key:
+        params["key"] = key
+    url = "https://api.stackexchange.com/2.3/search/advanced?" + urllib.parse.urlencode(params)
+    status, data, err = _get_json(url)
+    if status != 200 or data is None:
+        emit(envelope("so", False, error=f"stackexchange http {status}: {err}", query=args.query))
+    out = []
+    for q in data.get("items", [])[:args.n]:
+        import re as _re
+        body = _re.sub(r"<[^>]+>", "", q.get("body", "") or "")[:400]
+        out.append({"title": q.get("title", ""), "url": q.get("link", ""),
+                    "score": q.get("score", 0), "answered": q.get("is_answered", False),
+                    "answer_count": q.get("answer_count", 0), "snippet": body})
+    cache_store(args.project, "so", args.query, args.n, out)
+    emit(envelope("so", True, {"results": out,
+                  "quota_remaining": data.get("quota_remaining")}, query=args.query, cached=False))
+
+
+# ---------- read (fetch + extract) ----------
+def _reddit_comment_tree(html, max_comments=40):
+    """Parse old.reddit HTML comment bodies via bs4. Returns list of dicts, or []."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for div in soup.select("div.comment"):
+        body = div.find("div", class_="usertext-body")
+        if not body:
+            continue
+        text = body.get_text(" ", strip=True)
+        if not text:
+            continue
+        author_el = div.find("a", class_="author")
+        author = author_el.get_text(strip=True) if author_el else "?"
+        # nesting depth from margin-left ancestors
+        depth = len(div.find_parents("div", class_="child"))
+        out.append({"author": author, "depth": depth, "text": text[:2000]})
+        if len(out) >= max_comments:
+            break
+    return out
+
+
+def cmd_read(args):
+    url = args.url
+    is_reddit = "reddit.com" in url
+    fetch_url = url
+    # Reddit: rewrite www/new/.json -> old.reddit HTML (the only path that returns 200 since May 2026)
+    if is_reddit:
+        fetch_url = url.replace("www.reddit.com", "old.reddit.com").replace(
+            "://reddit.com", "://old.reddit.com")
+        if fetch_url.endswith(".json"):
+            fetch_url = fetch_url[:-5]
+    status, body, final = _get(fetch_url)
+    if status == 0:
+        emit(envelope("read", False, error=f"fetch failed: {body[:200].decode('utf-8','replace')}", url=fetch_url))
+    if status == 403:
+        hint = " (reddit blocks datacenter IPs / .json since 2026-05-30; old.reddit HTML needed)" if is_reddit else ""
+        emit(envelope("read", False, error=f"http 403 blocked{hint}", url=fetch_url))
+    if status != 200:
+        emit(envelope("read", False, error=f"http {status}", url=fetch_url))
+    html = body.decode("utf-8", "replace")
+
+    content, comments = None, []
+    try:
+        import trafilatura
+        content = trafilatura.extract(html, include_comments=True, favor_recall=True,
+                                      url=final)
+    except ImportError:
+        content = None
+    except Exception as e:                      # extraction must never crash the command
+        content = None
+        comments.append({"author": "_extract_error", "depth": 0, "text": str(e)[:200]})
+
+    if is_reddit:
+        comments = _reddit_comment_tree(html) or comments
+
+    if not content and not comments:
+        emit(envelope("read", False, error="fetched OK but extracted no content/comments",
+                      url=fetch_url, http=status, bytes=len(body)))
+    emit(envelope("read", True,
+                  {"content": content or "", "comments": comments,
+                   "comment_count": len(comments)},
+                  url=fetch_url, http=status, bytes=len(body), cached=False))
+
+
+# ---------- main ----------
+def build_parser():
+    p = argparse.ArgumentParser(prog="fleet-search",
+        description="Unified web/community search router for Lumen fleet agents (wq#999).")
+    p.add_argument("--project", default=None,
+                   help="project name -> cache under projects/<name>/research/")
+    p.add_argument("--ttl", type=int, default=CACHE_TTL_DEFAULT, help="cache TTL seconds (default 14d)")
+    p.add_argument("--no-cache", action="store_true", help="skip cache read (still writes)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    for name, fn, extra in [
+        ("web", cmd_web, "general web / discovery via SearXNG"),
+        ("reddit", cmd_reddit, "find reddit threads via SearXNG"),
+        ("github", cmd_github, "authenticated GitHub API"),
+        ("hn", cmd_hn, "Hacker News (Algolia)"),
+        ("so", cmd_so, "StackOverflow (StackExchange API)"),
+    ]:
+        sp = sub.add_parser(name, help=extra)
+        sp.add_argument("query")
+        sp.add_argument("--n", type=int, default=10, help="max results (default 10)")
+        if name == "github":
+            sp.add_argument("--issues", action="store_true", help="search issues/PRs instead of repos")
+        sp.set_defaults(func=fn)
+
+    rp = sub.add_parser("read", help="fetch + extract a URL (old.reddit-aware)")
+    rp.add_argument("url")
+    rp.set_defaults(func=cmd_read)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except SystemExit:
+        raise
+    except Exception as e:                       # last-resort: still emit a valid envelope
+        emit(envelope(getattr(args, "cmd", "?"), False, error=f"unhandled: {type(e).__name__}: {e}"))
+
+
+if __name__ == "__main__":
+    main()
