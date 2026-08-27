@@ -48,7 +48,40 @@ case "${ARG#--}" in
         ;;
     fix)
         if ! drift; then echo "already clean"; exit 0; fi
-        echo "restoring $FILE from git HEAD..."
+        FORCE="${2-}"
+
+        # wq#1030: NEVER discard the on-disk copy without preserving it first.
+        # A prior version ran `git checkout HEAD -- $FILE` unconditionally,
+        # which silently destroys real uncommitted work whenever disk is
+        # AHEAD of HEAD (a shipped-but-uncommitted fix), not just when disk
+        # is a stale/reverted copy (the wq#886 case this guard exists for).
+        BACKUP_DIR="/home/lumen/backups/wq-drift-guard"
+        mkdir -p "$BACKUP_DIR"
+        cur_hash=$(disk_hash)
+        ts=$(date +%Y%m%d_%H%M%S)
+        backup_file="$BACKUP_DIR/${FILE}.disk.${ts}.${cur_hash:0:12}.bak"
+        cp -p "$REPO/$FILE" "$backup_file"
+        echo "preserved current disk copy -> $backup_file"
+
+        # Classify the drift: if disk's diff against HEAD is pure addition
+        # (0 deletions), disk looks like ahead-with-uncommitted-work, not a
+        # stale/reverted copy — refuse to auto-revert and surface it for a
+        # human instead. `--fix --force` overrides (still backed up above).
+        del_count=$(git diff --numstat HEAD -- "$FILE" 2>/dev/null | awk '{print $2+0}')
+        if [ "${del_count:-0}" -eq 0 ] && [ "$FORCE" != "--force" ]; then
+            echo "REFUSING auto-revert: disk is a pure superset of git HEAD (0 deletions vs HEAD)."
+            echo "This looks like uncommitted legitimate work (wq#1030 class), not a stale/reverted copy."
+            echo "Your disk copy is safe — nothing was touched. Backup also saved at: $backup_file"
+            echo "  Review the diff below, then either commit it:"
+            echo "    cd $REPO && git add $FILE && git commit -m 'fix($FILE): <describe>'"
+            echo "  or, if you're SURE disk should be discarded:"
+            echo "    wq-drift-guard --fix --force"
+            git diff HEAD -- "$FILE"
+            alert "wq-drift-guard: drift on $FILE looks like UNCOMMITTED WORK — NOT auto-reverted. Backup: $backup_file. Review: git -C $REPO diff HEAD -- $FILE"
+            exit 3
+        fi
+
+        echo "restoring $FILE from git HEAD (disk copy preserved at $backup_file)..."
         git checkout HEAD -- "$FILE"
         chmod +x "$FILE"
         echo "restored — $(disk_hash)"
