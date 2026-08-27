@@ -1,0 +1,11 @@
+[Unit]
+Description=aq escalation responder — unacked CRITICAL probe repeats -> fleet-fires ticket + one page (wq#965)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lumen
+ExecStart=/usr/bin/python3 /home/lumen/bin/aq_escalate.py
+# read-only on everything except the alert queue + work queue it must write
+Nice=5
