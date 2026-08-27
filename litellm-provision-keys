@@ -31,6 +31,7 @@ SERVICES = {
     "duet":              (2.0,  "30d", "duet.py interactive CLI tool (wq#903)"),
     "librechat":         (3.0,  "30d", "LibreChat custom endpoint via litellm, docker on Lumen (wq#949 follow-on)"),
     "sim-studio":        (2.0,  "30d", "sim-studio compose stack, dormant (wq#949 follow-on)"),
+    "prompt-forge":      (5.0,  "30d", "prompt-forge clarify + project-framing calls (wq#957)"),
 }
 
 ENV_DIR = SECRETS_DIR / "env"
