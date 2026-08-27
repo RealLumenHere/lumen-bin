@@ -1606,8 +1606,12 @@ def cmd_reap(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
     t_now = now()
+    # wq#1011: also clear a stale GHOST claim on an OPEN ticket (claimed_by set but the
+    # lease already expired). reap previously only swept status='claimed', so an
+    # open+orphaned claim (e.g. #709) could never be reaped and dangled forever.
     q = ("SELECT id, lane, claimed_by, claimed_at, lease_expires, lease_ttl, title FROM tasks "
-         "WHERE status='claimed' AND lease_expires IS NOT NULL AND lease_expires < ?")
+         "WHERE (status='claimed' OR (status='open' AND claimed_by IS NOT NULL)) "
+         "AND lease_expires IS NOT NULL AND lease_expires < ?")
     params = [t_now]
     if a.lane:
         q += " AND lane=?"
@@ -1615,7 +1619,8 @@ def cmd_reap(a):
     expired = c.execute(q, params).fetchall()
     if expired and not a.dry_run:
         uq = ("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
-              "lease_expires=NULL, lease_ttl=NULL WHERE status='claimed' AND "
+              "lease_expires=NULL, lease_ttl=NULL WHERE "
+              "(status='claimed' OR (status='open' AND claimed_by IS NOT NULL)) AND "
               "lease_expires IS NOT NULL AND lease_expires < ?")
         uparams = [t_now]
         if a.lane:
