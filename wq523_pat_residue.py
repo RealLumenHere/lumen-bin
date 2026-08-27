@@ -21,12 +21,38 @@ Claude-transcript paths by construction rather than by an allowlist someone has 
 remember to extend: it walks /home/lumen, /etc, /opt, /srv and reports anything holding a
 token literal that is not one of the four canonical homes or a verified false positive.
 """
-import os, re, sys, json, shutil, hashlib, subprocess, datetime
+import os, re, sys, json, stat, shutil, hashlib, subprocess, datetime
 
 PAT = re.compile(rb'ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,}')
 APPLY = "--apply" in sys.argv
 TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-BACKUP = f"/home/lumen/backups/wq523_pre_redaction_{TS}"
+# wq#1029: pre-redaction backups used to live at /home/lumen/backups/wq523_pre_redaction_*
+# — UNDER a scanned root (/home/lumen, see ROOTS below). That copy still holds the live
+# token by design (it's the pre-redaction original), so the very next --scan/--alert run
+# flagged its own backup CRITICAL. Root-owned /var/backups/lumen is off every scanned root
+# by construction (not just excluded by a prefix someone has to remember to keep in sync),
+# mode 700, chowned to lumen so this script (runs unprivileged, wq#1009) can write it
+# directly with no sudo in the hot path. One-time setup: `sudo chown lumen:lumen
+# /var/backups/lumen` (already done 2026-08-27; directory pre-existed root-owned from a
+# manual wq#1009 relocation).
+BACKUP = f"/var/backups/lumen/wq523_pre_redaction_{TS}"
+
+# wq#1009: BOUND THE SCAN. The old code fed `grep -rlI` over four roots and then did
+# open(f,"rb").read() on every matched file — both unbounded. Roots hold multi-GB files
+# (17.8G eMMC image, trivy DBs, .so, 463M SQL dumps), so a single large NUL-free file spiked
+# the unit to 12.5G peak RSS. The fix is to STREAM: read_tokens() below reads any file in 1MB
+# chunks at ~1MB peak regardless of file size, so memory no longer scales with the largest
+# file — which means we do NOT have to drop coverage to bound memory. Logs and DB dumps (the
+# 4 files a 64MB cap would have skipped) are exactly where a leaked token lands, so they stay
+# in scope and are streamed in full. MAX_FILE_BYTES is now only a RUNTIME backstop against a
+# pathological multi-GB single-line text file (2 GiB — larger than any real text file here;
+# the GB-scale binaries are NUL-bearing and bail after the first chunk). Anything above it is
+# reported, never silently dropped. Belt-and-braces: MemoryMax on the unit.
+ROOTS = ("/home/lumen", "/etc", "/opt", "/srv")
+PRUNE_DIRS = {"node_modules", ".git", "__pycache__"}   # exactly the old grep --exclude-dir set
+MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB runtime backstop (memory is bounded by CHUNK)
+CHUNK = 1 << 20        # 1 MiB streaming read — sets the real per-file memory ceiling
+OVERLAP = 4096         # > any real token, so a token straddling a chunk edge is still caught
 
 CANONICAL = {
     "/home/lumen/agent/.env",
@@ -76,12 +102,90 @@ TIGHTEN = {"/home/lumen/agent/MEMORY.bak.20260328_0821": 0o600,
 EXCLUDE_PREFIX = ("/home/lumen/backups/pat_scrub_20260810_170237/",)
 
 
+def read_tokens(path):
+    """Stream a file in CHUNK blocks; return the set of token literals it holds. Peak ~1MB
+    regardless of file size. A NUL in any block => binary => non-matching (grep -I semantics),
+    returns empty. OVERLAP carry catches a token straddling a block boundary. The set is used
+    only for fingerprinting — a token value is never returned to a caller that prints it."""
+    toks = set()
+    tail = b""
+    read = 0
+    try:
+        with open(path, "rb") as fh:
+            try:
+                while read < MAX_FILE_BYTES:
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        break
+                    read += len(chunk)
+                    if b"\x00" in chunk:
+                        return set()        # binary: grep -I treats as non-matching
+                    window = tail + chunk
+                    for m in PAT.finditer(window):
+                        toks.add(m.group(0))
+                    tail = window[-OVERLAP:]
+                    try:                    # drop already-scanned pages each chunk so the
+                        os.posix_fadvise(   # cgroup's file-cache charge stays ~one chunk,
+                            fh.fileno(), 0, read, os.POSIX_FADV_DONTNEED)  # not whole-file
+                    except OSError:
+                        pass
+            finally:
+                # Drop these one-shot reads from the page cache. Streaming already bounds
+                # anonymous RSS to ~1MB, but read() still populates the kernel page cache,
+                # which cgroup v2 charges to this unit's memory.current/MemoryPeak. Scanning
+                # the SQL dumps and logs would otherwise pin ~MemoryHigh in reclaimable cache
+                # and evict useful cache host-wide. fadvise(DONTNEED) releases it now so the
+                # unit's memory footprint reflects the real working set. (wq#1009)
+                try:
+                    os.posix_fadvise(fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+    except OSError:
+        return set()
+    return toks
+
+
+def build_index(roots=ROOTS):
+    """Bounded walk of roots. Returns (index, oversize):
+      index    = {path: set(token_bytes)} for every regular file <= cap holding >=1 token
+      oversize = sorted paths OVER the cap whose head is NUL-free (text-ish) — files the old
+                 grep would have scanned; surfaced so a size skip is never silent. Over-cap
+                 binaries are omitted (old grep -I skipped them too — not a coverage gap).
+    Correctness rests on the per-file size+binary+content filters; the dir prune equals the
+    old grep --exclude-dir set exactly, so the candidate set is otherwise unchanged. grep -r
+    did not follow symlinks, so neither do we."""
+    index, oversize = {}, []
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+            dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+            for name in filenames:
+                p = os.path.join(dirpath, name)
+                if os.path.islink(p):
+                    continue
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if st.st_size > MAX_FILE_BYTES:
+                    try:
+                        with open(p, "rb") as fh:
+                            if b"\x00" not in fh.read(CHUNK):
+                                oversize.append(p)   # text-ish + over cap = real coverage gap
+                    except OSError:
+                        pass
+                    continue
+                toks = read_tokens(p)
+                if toks:
+                    index[p] = toks
+    return index, sorted(oversize)
+
+
 def scan():
-    out = subprocess.run(["bash", "-c",
-        "grep -rlIE 'ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,}' "
-        "/home/lumen /etc /opt /srv --exclude-dir=node_modules --exclude-dir=.git "
-        "--exclude-dir=__pycache__ 2>/dev/null"], capture_output=True, text=True)
-    return sorted(f for f in out.stdout.split() if f)
+    """Sorted list of files under ROOTS holding >=1 token literal (bounded, streaming)."""
+    index, _ = build_index()
+    return sorted(index)
 
 
 def cmd_scan():
@@ -105,12 +209,8 @@ def live_fingerprints():
     would still authenticate today. Never returns a token, only its fingerprint."""
     live = set()
     for f in sorted(canonical_set()):
-        try:
-            blob = open(f, "rb").read()
-        except OSError:
-            continue
-        for m in PAT.finditer(blob):
-            live.add(hashlib.sha256(m.group(0)).hexdigest()[:12])
+        for t in read_tokens(f):            # bounded/streaming, same as everywhere else
+            live.add(hashlib.sha256(t).hexdigest()[:12])
     return live
 
 
@@ -129,7 +229,8 @@ def cmd_alert():
 
     Exit 1 only on CRITICAL. Never prints a token value.
     """
-    files = scan()
+    index, oversize = build_index()
+    files = sorted(index)
     canonical = canonical_set()
     live = live_fingerprints()
     stray = [f for f in files if f not in canonical and f not in FALSE_POSITIVE]
@@ -138,11 +239,10 @@ def cmd_alert():
     for f in stray:
         try:
             st = os.stat(f)
-            blob = open(f, "rb").read()
         except OSError:
             continue
         world = bool(st.st_mode & 0o007)
-        fps = {hashlib.sha256(m.group(0)).hexdigest()[:12] for m in PAT.finditer(blob)}
+        fps = {hashlib.sha256(t).hexdigest()[:12] for t in index[f]}
         hot = fps & live
         why = []
         if world:
@@ -157,6 +257,11 @@ def cmd_alert():
         print(f"  CRITICAL {mode} {f}  [{why}]")
     if not critical:
         print("  no stray file is world-readable or holds a live token")
+    if oversize:
+        print(f"  note: {len(oversize)} text file(s) over the {MAX_FILE_BYTES>>20}MB cap NOT "
+              f"scanned (bounded for memory; listed so the skip is visible):")
+        for f in oversize:
+            print(f"    OVERSIZE {f}")
     return 1 if critical else 0
 
 
@@ -165,13 +270,17 @@ def main():
         sys.exit(cmd_scan())
     if "--alert" in sys.argv:
         sys.exit(cmd_alert())
-    files = scan()
+    index, oversize = build_index()
+    files = sorted(index)
     canonical = canonical_set()
     todo = [f for f in files
             if f not in canonical and f not in FALSE_POSITIVE and f not in DELETE
             and not f.startswith(EXCLUDE_PREFIX)]
     excluded = [f for f in files if f.startswith(EXCLUDE_PREFIX)]
     print(f"{'APPLY' if APPLY else 'DRY RUN'} — {len(files)} file(s) carry a token literal\n")
+    if oversize:
+        print(f"  {len(oversize)} text file(s) over the {MAX_FILE_BYTES>>20}MB cap NOT scanned "
+              f"(bounded for memory): " + ", ".join(oversize))
     print(f"  {len(canonical & set(files))} canonical (untouched)")
     print(f"  {len(FALSE_POSITIVE & set(files))} verified false positives (untouched)")
     print(f"  {len([f for f in DELETE if os.path.exists(f)])} duplicate credential files -> DELETE")
@@ -179,12 +288,22 @@ def main():
     print(f"  {len(todo)} residue files -> REDACT in place\n")
 
     if APPLY:
+        # wq#1029: defensive — refuse to ever write the pre-redaction backup (which holds
+        # the live token by design) under a path this same tool scans, no matter how BACKUP
+        # gets defined in the future. Cheaper to assert than to re-discover the trap.
+        assert not any(BACKUP == r or BACKUP.startswith(r.rstrip("/") + "/") for r in ROOTS), \
+            f"BACKUP {BACKUP!r} is under a scanned root {ROOTS} — would re-flag itself CRITICAL"
         os.makedirs(BACKUP, mode=0o700, exist_ok=True)
 
     manifest = []
     for f in todo + [f for f in DELETE if os.path.exists(f)]:
         try:
-            data = open(f, "rb").read()
+            with open(f, "rb") as _fh:
+                data = _fh.read()
+                try:
+                    os.posix_fadvise(_fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
         except OSError as e:
             print(f"  !! unreadable, skipped: {f} ({e})")
             continue
