@@ -95,13 +95,15 @@ def run(tool, *args):
 
 print(f"probe_wq561 — tool under test: {SRC}\n")
 
-print("A. the existing default mode is untouched (wq#533 must not regress)")
+print("A. default mode enforces universal rules too (default-on since wq#960)")
 t = make_env("a", {"X_DISPATCH.md": BAD_MISSING})
 rc, out = run(t)
-check("A1", rc == 0, "default run still exits 0 on a file the retired table does not flag")
-check("A2", "UNIVERSAL" not in out,
-      "and says NOTHING about universal rules unless asked — the mode is opt-in (wq#565's "
-      "timer must not go red on arrival)")
+check("A1", rc == 1, "default run now fails on a missing universal rule, no --universal needed "
+      "(flipped wq#960 once wq#758 normalised the six real dispatches)")
+check("A2", "UNIVERSAL RULES NEVER STATED" in out, "and says so without being asked")
+rc, out = run(t, "--no-universal")
+check("A3", rc == 0, "--no-universal still opts all the way out, for parity with the old default")
+check("A4", "UNIVERSAL" not in out, "and says nothing about universal rules when opted out")
 
 print("\nB. --universal catches a rule that is never stated")
 t = make_env("b", {"C_DISPATCH.md": BAD_MISSING})
@@ -139,13 +141,11 @@ check("E2", rc == 0, f"two compliant dispatches pass cleanly (rc={rc})")
 
 print("\nF. the LIVE fleet state this ticket was filed about")
 rc, out = run(SRC, "--universal") if os.path.exists(SRC) else (9, "")
-check("F1", rc == 1,
-      "the six real dispatches do NOT currently satisfy the universal rules — the "
-      "violations ARE the finding, which is why the mode ships opt-in")
-check("F2", "UNIFIED_DISPATCH.md" in out and "no-add-all" in out,
-      "*** the MASTER dispatch never states the `git add -A` ban ***")
-check("F3", "FABLE_QUEUE_DISPATCH.md" in out and "ARTICLE_RESEARCH_DISPATCH.md" in out,
-      "and two lanes are never told about the change-safety precheck gate")
+check("F1", rc == 0,
+      "the six real dispatches DO satisfy the universal rules now (wq#758 fixed them) — "
+      "that fix is what let wq#960 flip this mode default-on")
+check("F2", "no-add-all" not in out, "*** the MASTER dispatch states the `git add -A` ban ***")
+check("F3", "NEVER STATED" not in out, "no dispatch is missing a universal rule anymore")
 rc0, out0 = run(SRC)
 check("F4", rc0 == 0,
       "while the DEFAULT lint stays green on the same files — this change adds a check, "

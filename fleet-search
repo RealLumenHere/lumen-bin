@@ -376,28 +376,72 @@ def cmd_so(args):
 
 
 # ---------- read (fetch + extract) ----------
+_MAX_TREE_DEPTH = 60   # defensive cap; old.reddit's own UI rarely nests past ~10
+
+
 def _reddit_comment_tree(html, max_comments=40):
-    """Parse old.reddit HTML comment bodies via bs4. Returns list of dicts, or []."""
+    """Parse old.reddit HTML comment bodies via bs4. Returns list of dicts, or [].
+
+    Fail-soft (wq#1007): any parse error returns whatever was collected so far,
+    never raises. Handles:
+      - deleted/removed comments (no <a class="author"> -> tagged [deleted]/[removed])
+      - "load more comments" stubs (div.morechildren/morerecursion): counted and
+        surfaced as one trailing _more_stub entry, not expanded (that's a separate
+        old.reddit morechildren AJAX call this parser doesn't make; accept the cap)
+      - pathologically deep or malformed/truncated HTML (RecursionError + broad
+        per-node guards so one bad node can't drop the whole thread)
+    """
     try:
         from bs4 import BeautifulSoup
     except ImportError:
         return []
-    soup = BeautifulSoup(html, "html.parser")
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:          # covers RecursionError (subclass) too
+        return []
+
+    more_stubs = 0
+    try:
+        more_stubs = len(soup.select("div.morechildren, div.morerecursion"))
+    except Exception:
+        pass
+
     out = []
-    for div in soup.select("div.comment"):
-        body = div.find("div", class_="usertext-body")
-        if not body:
-            continue
-        text = body.get_text(" ", strip=True)
-        if not text:
-            continue
-        author_el = div.find("a", class_="author")
-        author = author_el.get_text(strip=True) if author_el else "?"
-        # nesting depth from margin-left ancestors
-        depth = len(div.find_parents("div", class_="child"))
-        out.append({"author": author, "depth": depth, "text": text[:2000]})
+    try:
+        comment_divs = soup.select("div.comment")
+    except Exception:
+        comment_divs = []
+    for div in comment_divs:
         if len(out) >= max_comments:
             break
+        try:
+            body = div.find("div", class_="usertext-body")
+            if not body:
+                continue
+            text = body.get_text(" ", strip=True)
+            if not text:
+                continue
+            author_el = div.find("a", class_="author")
+            if author_el:
+                author = author_el.get_text(strip=True)
+            else:
+                # old.reddit drops <a class="author"> for deleted-author / removed comments
+                low = text.lower()
+                author = ("[deleted]" if "[deleted]" in low else
+                          "[removed]" if "[removed]" in low else "?")
+            # nesting depth from ancestor .child wrappers, capped so a malformed/
+            # runaway tree can't produce an unbounded value
+            depth = min(len(div.find_parents("div", class_="child")), _MAX_TREE_DEPTH)
+            out.append({"author": author, "depth": depth, "text": text[:2000]})
+        except RecursionError:
+            break
+        except Exception:
+            continue
+
+    if more_stubs and len(out) < max_comments:
+        out.append({"author": "_more_stub", "depth": None,
+                     "text": f"{more_stubs} load-more-comments stub(s) not expanded "
+                             "(old.reddit morechildren is a separate AJAX call)"})
     return out
 
 

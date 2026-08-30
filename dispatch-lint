@@ -190,14 +190,15 @@ def main():
     ap.add_argument("--file")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--quiet", action="store_true")
-    # OPT-IN on purpose (wq#561). Every dispatch violates this on the day it ships, because
-    # the violations ARE the finding — three files never mention the `git add -A` ban and
-    # four disagree about the lease TTL. Making it default would turn wq#565's timer red on
-    # arrival and the red would be read as a broken check rather than a real defect. It goes
-    # default-on in the same change that normalises the six files, which needs a quiet
-    # pokemon lane (wq#561's own constraint).
-    ap.add_argument("--universal", action="store_true",
-                    help="also assert universal rules are PRESENT and CONSISTENT (wq#561)")
+    # DEFAULT-ON as of wq#960 (2026-08-26). Was OPT-IN (wq#561) until the six dispatch files
+    # were normalised against UNIVERSAL_RULES.md (wq#758, opsaudit_a8) — confirmed clean
+    # against --universal on the day of this flip. wq-lane-init and the dispatch-lint timer
+    # already pass --universal explicitly; this flip is for the bare/manual invocation, so
+    # drift can't silently regress there either.
+    ap.add_argument("--universal", action="store_true", default=True,
+                    help="assert universal rules are PRESENT and CONSISTENT (wq#561; default on)")
+    ap.add_argument("--no-universal", action="store_false", dest="universal",
+                    help="skip the universal-rules check")
     args = ap.parse_args()
 
     rules, err = load_rules()

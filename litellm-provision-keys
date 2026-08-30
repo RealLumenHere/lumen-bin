@@ -32,6 +32,22 @@ SERVICES = {
     "librechat":         (3.0,  "30d", "LibreChat custom endpoint via litellm, docker on Lumen (wq#949 follow-on)"),
     "sim-studio":        (2.0,  "30d", "sim-studio compose stack, dormant (wq#949 follow-on)"),
     "prompt-forge":      (5.0,  "30d", "prompt-forge clarify + project-framing calls (wq#957)"),
+    # wq#1003: dedicated key for lumen-model-watchdog generate-probes (10min timer,
+    # 7 rungs, max_tokens=5). Measured real cost ~$0.019/24h (~$0.57/30d) — budget
+    # set at ~17x that for runaway headroom, NOT because usage is expected to grow.
+    # KNOWN BUG (docs/litellm/service_keys.md): reset_budget_job.py fails every run,
+    # so a hit cap never recovers — do not shrink this budget without checking that
+    # bug is fixed, or a stuck cap silently blinds the fleet's liveness watchdog.
+    "model-watchdog":    (10.0, "30d", "lumen-model-watchdog liveness generate-probes, all rungs (wq#1003)"),
+    # wq#1022: agent5 DGM v2 benchmark judge/proposer calls (benchmark_v2.py
+    # grade_answer + dgm_v2.py propose_prompt_mutation) were riding the
+    # ops-emergency fallback key via the manual `export LITELLM_MASTER_KEY=$(grep
+    # ... agent/.env)` idiom -- ~$0.48/24h measured (17 judge calls @ max_tokens=1500
+    # saturating on deepseek-v4-pro reasoning + a few large one-offs), ~25x
+    # model-watchdog's footprint on a key meant for ad-hoc ops, not a recurring
+    # benchmark harness. Budget sized at ~20x the single observed run as headroom,
+    # not because daily recurrence is confirmed -- resize if this becomes a cron job.
+    "agent5-dgm":        (10.0, "30d", "agent5 DGM v2 benchmark_v2.py + dgm_v2.py judge/proposer calls (wq#1022)"),
 }
 
 ENV_DIR = SECRETS_DIR / "env"

@@ -12,6 +12,10 @@ Fails in BOTH directions:
                   pinned last time. This is the wq#766 defect class: chat.
                   lumennode.uk kept answering — it just answered as ttyd. We
                   compare WHAT ANSWERS, not merely that something did.
+                  A host with a designed multi-service alternation (e.g. a
+                  live/idle preemption pair, wq#1021) is exempted per an
+                  explicit allowlist in ui_identity_variants.json — never
+                  auto-learned, so a genuinely new impostor is still caught.
 
 READ-ONLY. Never restarts, reconfigures, or repoints anything. It reports,
 notifies, and (only when drift survives a second cycle) opens a wq ticket.
@@ -23,6 +27,7 @@ from pathlib import Path
 
 INV      = Path("/home/lumen/sentinel/ui_inventory.json")
 PINS     = Path("/home/lumen/sentinel/ui_identity.json")
+VARIANTS = Path("/home/lumen/sentinel/ui_identity_variants.json")
 STATE    = Path("/home/lumen/sentinel/ui_drift_state.json")
 LATEST   = Path("/home/lumen/sentinel/ui_drift_latest.json")
 OUTDIR   = Path("/home/lumen/maint/ui-drift")
@@ -77,6 +82,20 @@ def ident_key(fp):
 def host_of(url):
     m = re.match(r"https?://([^/]+)", url or "")
     return m.group(1).lower() if m else ""
+
+
+def load_variants():
+    """Explicit per-host allowlist of legitimate alternate identities.
+
+    Never auto-populated — a host lands here only by a human/design decision
+    (e.g. wq#1021's live/idle preemption pair on pokemon.lumennode.uk), so an
+    identity switching to something NOT on the list is still flagged. Missing
+    or unparsable file = empty allowlist, i.e. old single-identity behavior.
+    """
+    try:
+        return json.loads(VARIANTS.read_text())
+    except Exception:
+        return {}
 
 
 def load_inventory():
@@ -171,6 +190,7 @@ def check(inv, reseed=False):
         pins = json.loads(PINS.read_text())
     except Exception:
         pins = {}
+    variants = load_variants()
     new_pins = dict(pins)
     for h, e in ingress.items():
         origin = e["origin"]
@@ -191,9 +211,11 @@ def check(inv, reseed=False):
                                  "where": origin,
                                  "detail": f"origin changed {prev.get('origin')} -> {origin}"})
             elif prev.get("identity") != key:
-                findings.append({"kind": "IDENTITY_CHANGED", "key": f"identity:{h}",
-                                 "host": h, "where": origin,
-                                 "detail": f"answers as '{key}' (was '{prev.get('identity')}')"})
+                allowed = set(variants.get(h, {}).get("identities", []))
+                if key not in allowed:
+                    findings.append({"kind": "IDENTITY_CHANGED", "key": f"identity:{h}",
+                                     "host": h, "where": origin,
+                                     "detail": f"answers as '{key}' (was '{prev.get('identity')}')"})
     PINS.write_text(json.dumps(new_pins, indent=2, sort_keys=True))
     return findings
 
