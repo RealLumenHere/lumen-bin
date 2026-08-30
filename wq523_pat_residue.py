@@ -21,7 +21,7 @@ Claude-transcript paths by construction rather than by an allowlist someone has 
 remember to extend: it walks /home/lumen, /etc, /opt, /srv and reports anything holding a
 token literal that is not one of the four canonical homes or a verified false positive.
 """
-import os, re, sys, json, stat, shutil, hashlib, subprocess, datetime
+import os, re, sys, json, stat, shutil, hashlib, subprocess, datetime, fnmatch
 
 PAT = re.compile(rb'ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,}')
 APPLY = "--apply" in sys.argv
@@ -82,6 +82,20 @@ FALSE_POSITIVE = {
     "/home/lumen/sandbox/wq298-neutts/venv/lib/python3.14/site-packages/"
     "vector_quantize_pytorch-1.17.8.dist-info/RECORD",                    # pip hash, not a credential
 }
+# wq#1096: gosec's own G101 hardcoded-credential linter ships FAKE sample tokens as test
+# fixtures (e.g. testutils/g101_samples.go) inside the vendored, read-only go module cache —
+# third-party linter source, never fleet credentials. A single exact path breaks the moment
+# `go get -u` bumps the version in its dirname (.../gosec/v2@v2.26.1/...), so this is a glob
+# on the vendored-fixture shape (any go module's testutils/ dir) rather than one gosec
+# version pinned by hand — same allowlist-someone-must-remember-to-extend failure the
+# CANONICAL_GLOBS comment above already called out, avoided the same way.
+FALSE_POSITIVE_GLOBS = ("*/go/pkg/mod/*/testutils/*",)
+
+
+def is_false_positive(path):
+    return path in FALSE_POSITIVE or any(fnmatch.fnmatch(path, g) for g in FALSE_POSITIVE_GLOBS)
+
+
 # Pure duplicates of the live credential file from the completed 2026-08-13 Gitea rotation.
 # Deleting a duplicate of a value that still exists in its canonical home loses nothing;
 # the only non-duplicate content is Gitea creds that the rotation itself superseded.
@@ -91,6 +105,29 @@ DELETE = [
     "/home/lumen/.git-credentials.bak.20260813_062929",
     "/home/lumen/.git-credentials.bak.20260813_063222_pre_secrets_fold",
     "/home/lumen/.git-credentials.broken.20260813_062430",
+    # wq#1096: rotation-backup duplicate sitting next to its canonical home. --alert's own
+    # live_fingerprints() check confirms its token's sha256 matches the CURRENT
+    # /home/lumen/.secrets/github-lumen-classic.token — same "duplicate of a value that
+    # still exists in its canonical home" case as the git-credentials backups above, so the
+    # same remediation applies. --apply backs it up to /var/backups/lumen before removing it.
+    "/home/lumen/.secrets/github-lumen-classic.token.bak.1787963768",
+    # wq#1096: sweep of the 11 dead-token mode-600 backups that --alert has reported
+    # "noted" (never CRITICAL) since the 2026-08-10 scrub. The EXCLUDE_PREFIX comment below
+    # deferred deleting this backup-of-record to "Frank's call, not mine" — wq#1096 is that
+    # call: tokens were already verified dead (HTTP 401), so the safety net has no remaining
+    # value and is pure future-noise. Listed explicitly (not by prefix) so the deletion is
+    # auditable file-by-file, same as every other DELETE entry.
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_frozen-ref_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_work_iprep-pr-api-scenarios_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_work_iprep-pr-autocomplete_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_work_iprep-pr-concurrency-parallel_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_work_iprep-pr-dependency-injection_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_work_iprep-pr-pagination_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_bets_interview-prep-uplift_work_iprep-pr-security_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_build_agent-orchestrator_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_simpill-scratch-preserved_simpill-pr-middleware_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/_home_lumen_simpill-scratch-preserved_simpill-pr-zustand_.git_config",
+    "/home/lumen/backups/pat_scrub_20260810_170237/chat_history.json",
 ]
 TIGHTEN = {"/home/lumen/agent/MEMORY.bak.20260328_0821": 0o600,
            "/home/lumen/backups/pat_scrub_20260810_170237": 0o700}
@@ -191,10 +228,11 @@ def scan():
 def cmd_scan():
     files = scan()
     canonical = canonical_set()
-    stray = [f for f in files if f not in canonical and f not in FALSE_POSITIVE]
+    stray = [f for f in files if f not in canonical and not is_false_positive(f)]
     exposed = [f for f in stray if os.stat(f).st_mode & 0o007]
+    fp_count = len([f for f in files if is_false_positive(f)])
     print(f"pat-scan: {len(files)} file(s) hold a token literal; "
-          f"{len(canonical & set(files))} canonical, {len(FALSE_POSITIVE & set(files))} "
+          f"{len(canonical & set(files))} canonical, {fp_count} "
           f"known false positive(s), {len(stray)} STRAY")
     for f in stray:
         mode = oct(os.stat(f).st_mode)[-3:]
@@ -233,7 +271,7 @@ def cmd_alert():
     files = sorted(index)
     canonical = canonical_set()
     live = live_fingerprints()
-    stray = [f for f in files if f not in canonical and f not in FALSE_POSITIVE]
+    stray = [f for f in files if f not in canonical and not is_false_positive(f)]
 
     critical, noted = [], []
     for f in stray:
@@ -274,7 +312,7 @@ def main():
     files = sorted(index)
     canonical = canonical_set()
     todo = [f for f in files
-            if f not in canonical and f not in FALSE_POSITIVE and f not in DELETE
+            if f not in canonical and not is_false_positive(f) and f not in DELETE
             and not f.startswith(EXCLUDE_PREFIX)]
     excluded = [f for f in files if f.startswith(EXCLUDE_PREFIX)]
     print(f"{'APPLY' if APPLY else 'DRY RUN'} — {len(files)} file(s) carry a token literal\n")
@@ -282,7 +320,7 @@ def main():
         print(f"  {len(oversize)} text file(s) over the {MAX_FILE_BYTES>>20}MB cap NOT scanned "
               f"(bounded for memory): " + ", ".join(oversize))
     print(f"  {len(canonical & set(files))} canonical (untouched)")
-    print(f"  {len(FALSE_POSITIVE & set(files))} verified false positives (untouched)")
+    print(f"  {len([f for f in files if is_false_positive(f)])} verified false positives (untouched)")
     print(f"  {len([f for f in DELETE if os.path.exists(f)])} duplicate credential files -> DELETE")
     print(f"  {len(excluded)} in the 08-10 scrub backup-of-record (untouched; dead tokens, mode 700 — retention is Frank's call)")
     print(f"  {len(todo)} residue files -> REDACT in place\n")
