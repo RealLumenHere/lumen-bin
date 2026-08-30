@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""git-hygiene-sweep — fleet commit-hygiene guard.
+Scans fleet git trees for uncommitted (dirty) changes, unpushed commits,
+behind-upstream drift, and missing upstream. Writes a report and raises ONE
+persistent aq summary row (no ntfy push) when serious issues exist. Auto-
+resolves the row when everything is clean. Mirrors repo-visibility-sentinel.
+Allowlist (one repo-dir basename per line) suppresses known-WIP trees."""
+import os, subprocess, time
+from pathlib import Path
+ROOT="/home/lumen"; AQ="/home/lumen/bin/aq"
+BASE=Path("/home/lumen/agents/commit-hygiene")
+ALLOW=BASE/"allowlist.txt"; REPORT=BASE/"last_report.txt"
+STALE_DAYS=3; BEHIND_ALERT=20
+EXCL=("node_modules","/worktrees/","/scratch/","/_runs/","/_scan","/uplift/",".npm-global","/.cache/",".bak")
+def sh(d,*a): return subprocess.run(["git","-C",d,*a],capture_output=True,text=True).stdout.strip()
+def trees():
+    out=subprocess.run(["find",ROOT,"-maxdepth","3","-type","d","-name",".git"],capture_output=True,text=True).stdout.splitlines()
+    return sorted({g[:-5] for g in out if not any(x in g for x in EXCL)})
+def dirty_age_days(d):
+    oldest=None
+    for ln in sh(d,"status","--porcelain").splitlines():
+        p=os.path.join(d,ln[3:].strip().strip('"'))
+        try: m=os.path.getmtime(p)
+        except OSError: continue
+        oldest=m if oldest is None else min(oldest,m)
+    return 0.0 if oldest is None else (time.time()-oldest)/86400.0
+def readlist(p): return {l.strip() for l in p.read_text().splitlines() if l.strip() and not l.startswith("#")} if p.exists() else set()
+def main():
+    allow=readlist(ALLOW); rows=[]; serious=0
+    tl=trees()
+    for d in tl:
+        name=os.path.basename(d)
+        dirty=len(sh(d,"status","--porcelain").splitlines())
+        up=sh(d,"rev-parse","--abbrev-ref","--symbolic-full-name","@{u}"); noup=(up=="")
+        ahead=int(sh(d,"rev-list","--count",f"{up}..HEAD") or 0) if up else 0
+        behind=int(sh(d,"rev-list","--count",f"HEAD..{up}") or 0) if up else 0
+        age=dirty_age_days(d) if dirty else 0.0
+        iss=[]
+        if dirty: iss.append(f"dirty×{dirty}"+(f"/{age:.0f}d" if age>=STALE_DAYS else ""))
+        if ahead>0: iss.append(f"unpushed×{ahead}")
+        if behind>=BEHIND_ALERT: iss.append(f"behind×{behind}")
+        if noup: iss.append("no-upstream")
+        sev=(dirty and age>=STALE_DAYS) or ahead>0 or behind>=BEHIND_ALERT
+        if iss:
+            rows.append((name,dirty,ahead,behind,age,", ".join(iss),sev and name not in allow))
+            if sev and name not in allow: serious+=1
+    REPORT.parent.mkdir(parents=True,exist_ok=True)
+    with open(REPORT,"w") as f:
+        f.write(f"# git-hygiene-sweep {time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}  ({len(tl)} trees scanned)\n")
+        f.write(f"{'REPO':34}{'DIRTY':>6}{'AHEAD':>6}{'BEHIND':>7}{'AGEd':>6}  ISSUES  (*=alerted)\n")
+        for n,di,ah,be,ag,ii,al in sorted(rows,key=lambda r:(-r[6],-r[1])):
+            f.write(f"{n:34}{di:6}{ah:6}{be:7}{ag:6.0f}  {'*' if al else ' '} {ii}\n")
+    key="fleet-summary"
+    if serious:
+        msg=f"{serious} tree(s) need commit hygiene (unpushed / stale-dirty>{STALE_DAYS}d / behind>{BEHIND_ALERT}). See {REPORT}"
+        subprocess.run([AQ,"add","commit-hygiene",key,"git hygiene: trees need attention",msg],capture_output=True)
+    else:
+        subprocess.run([AQ,"resolve-key","commit-hygiene",key],capture_output=True)
+    print(f"scanned {len(tl)} trees | {len(rows)} with issues | {serious} serious (alerted)")
+
+if __name__ == "__main__":
+    main()

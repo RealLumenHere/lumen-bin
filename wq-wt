@@ -1,0 +1,32 @@
+#!/bin/bash
+# wq-wt — worktree-per-ticket helper (wq#372, 2026-07-19)
+# Standalone; deliberately does NOT touch /home/lumen/bin/wq (coordination-critical).
+# Usage:
+#   wq-wt add <wqid> <slug> [repo-dir]   # create work/wt/<wqid>-<slug> on branch lumen-uplift/<slug>
+#   wq-wt rm  <name>       [repo-dir]    # remove worktree work/wt/<name> (branch kept for the PR)
+#   wq-wt ls               [repo-dir]    # list worktrees
+# Default repo-dir: /home/lumen/bets/simpill-uplift/work/simpill-utils
+set -euo pipefail
+CMD="${1:?usage: wq-wt add|rm|ls ...}"; shift || true
+case "$CMD" in
+  add)
+    ID="${1:?wqid}"; SLUG="${2:?slug}"; REPO="${3:-/home/lumen/bets/simpill-uplift/work/simpill-utils}"
+    cd "$REPO"
+    git fetch upstream 2>/dev/null || git fetch origin
+    BASE=$(git rev-parse --verify upstream/main 2>/dev/null || git rev-parse --verify origin/main)
+    WT="$(dirname "$REPO")/wt/${ID}-${SLUG}"
+    mkdir -p "$(dirname "$WT")"
+    git worktree add -b "lumen-uplift/${SLUG}" "$WT" "$BASE"
+    echo "worktree: $WT  branch: lumen-uplift/${SLUG}  base: $BASE"
+    ;;
+  rm)
+    NAME="${1:?name}"; REPO="${2:-/home/lumen/bets/simpill-uplift/work/simpill-utils}"
+    cd "$REPO"
+    git worktree remove "$(dirname "$REPO")/wt/${NAME}" && echo "removed wt/${NAME} (branch kept)"
+    ;;
+  ls)
+    REPO="${1:-/home/lumen/bets/simpill-uplift/work/simpill-utils}"
+    cd "$REPO" && git worktree list
+    ;;
+  *) echo "unknown: $CMD" >&2; exit 1 ;;
+esac

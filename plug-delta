@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""plug-delta - what does moving a workload from node A to node B actually cost in watts?
+
+MANDATORY before any placement, migration or consolidation recommendation. On 2026-08-13 an
+agent proposed moving the embedding workload to nephthys without querying the plugs. nephthys
+measured 85W wall while completely idle; the move was net +30W. Frank caught it with a
+screenshot. This command is that check, made cheap.
+
+  plug-delta --from lumen --to nephthys
+  plug-delta --from lumen --to seshat --marginal 30 --power-off-source
+  plug-delta --from lumen --to nephthys --window 7d --json
+
+Every figure is measured, with n and window printed. If either node has no history the
+command REFUSES and exits 4 - "no measurement" is an answer, a guess is not.
+"""
+import argparse, json, sys
+sys.path.insert(0, "/home/lumen/bin")
+import plug_hist as ph
+import plug_baseline as pb
+
+RATE = 0.40  # $/kWh, PG&E blended; TOU detail lives in power-dash
+
+
+def get(b, node):
+    d = b["nodes"].get(node)
+    if not d or d.get("insufficient_data"):
+        return None
+    return d
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--from", dest="src", required=True)
+    ap.add_argument("--to", dest="dst", required=True)
+    ap.add_argument("--window", default="14d")
+    ap.add_argument("--workload", default="workload")
+    ap.add_argument("--marginal", type=float,
+                    help="measured W the workload adds on the SOURCE (default: source mean - source idle)")
+    ap.add_argument("--target-marginal", type=float,
+                    help="W it will add on the TARGET if you have measured it (default: same as source)")
+    ap.add_argument("--power-off-source", action="store_true",
+                    help="source node gets powered down after the move (frees its idle floor too)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    try:
+        b = pb.compute(a.window)
+    except ph.CorpusError as e:
+        print("REFUSED: plug corpus unreachable (%s). Do not recommend a placement change "
+              "without measurement." % e, file=sys.stderr)
+        return 3
+
+    s, d = get(b, a.src), get(b, a.dst)
+    missing = [n for n, v in ((a.src, s), (a.dst, d)) if v is None]
+    if missing:
+        print("REFUSED: no measured history for %s in the last %s.\n"
+              "Known nodes: %s\n"
+              "A placement recommendation without measurement on BOTH ends is exactly the "
+              "failure this command exists to stop." % (", ".join(missing), a.window,
+                                                        ", ".join(sorted(b["nodes"]))),
+              file=sys.stderr)
+        return 4
+
+    marg = a.marginal if a.marginal is not None else max(s["mean_w"] - s["idle_w"], 0.0)
+    tmarg = a.target_marginal if a.target_marginal is not None else marg
+    save = s["mean_w"] if a.power_off_source else marg
+    dst_off = d["mean_w"] < 1.0
+    pay_idle = d["idle_w"] if dst_off else 0.0
+    cost = tmarg + pay_idle
+    net = cost - save
+
+    out = {"workload": a.workload, "window": a.window, "source": a.src, "target": a.dst,
+           "source_measured": s, "target_measured": d, "marginal_on_source_w": round(marg, 1),
+           "assumed_marginal_on_target_w": round(tmarg, 1), "target_idle_paid_w": round(pay_idle, 1),
+           "saves_w": round(save, 1), "costs_w": round(cost, 1), "net_w": round(net, 1),
+           "net_kwh_day": round(net * 24 / 1000.0, 2), "net_usd_month": round(net * 24 / 1000.0 * 30 * RATE, 2),
+           "verdict": "WORSE" if net > 1 else ("BETTER" if net < -1 else "WASH")}
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return 0
+
+    def line(n, x):
+        return ("  %-10s idle %6.1fW  mean %6.1fW  load %6.1fW  duty %3.0f%%  n=%d raw samples"
+                % (n, x["idle_w"], x["mean_w"], x["load_w"], x["duty_frac"] * 100, x["n_raw_samples"]))
+
+    print("placement delta: move %s from %s -> %s   (measured window %s, source %s)"
+          % (a.workload, a.src, a.dst, a.window, ph.VM))
+    print(line(a.src, s))
+    print(line(a.dst, d))
+    print("")
+    print("  marginal draw of %s on %s      %+6.1f W   %s"
+          % (a.workload, a.src, marg, "(given)" if a.marginal is not None else "(mean - idle, measured)"))
+    if a.target_marginal is None:
+        print("  assumed same marginal on %-12s %+6.1f W   (UNMEASURED assumption - "
+              "re-run with --target-marginal after a trial)" % (a.dst, tmarg))
+    if dst_off:
+        print("  %s is currently OFF (mean %.1fW): the move also pays its idle floor  %+6.1f W"
+              % (a.dst, d["mean_w"], pay_idle))
+    else:
+        print("  %s is already ON: its %.1fW idle floor is sunk, not charged to this move"
+              % (a.dst, d["idle_w"]))
+    if a.power_off_source:
+        print("  %s powered down afterwards, frees its whole mean draw  %+6.1f W" % (a.src, save))
+    else:
+        print("  %s stays on, so only the marginal draw is freed        %+6.1f W" % (a.src, save))
+    print("")
+    print("  NET %+.1f W   (%+.2f kWh/day, %+.2f $/mo at $%.2f/kWh)   -> %s"
+          % (net, out["net_kwh_day"], out["net_usd_month"], RATE, out["verdict"]))
+    if d["idle_w"] >= 25 and d["duty_frac"] <= 0.10 and not dst_off:
+        alt = tmarg + d["idle_w"] - save
+        print("")
+        print("  SECOND ACCOUNTING - %s idles at %.0fW at %.0f%% duty, i.e. it is on for no measured"
+              % (a.dst, d["idle_w"], d["duty_frac"] * 100))
+        print("  reason. If it would otherwise be POWERED DOWN, its idle floor is NOT sunk and this")
+        print("  move really costs   NET %+.1f W  (%+.2f $/mo).  This is the nephthys trap: the 85W"
+              % (alt, alt * 24 / 1000.0 * 30 * RATE))
+        print("  floor was invisible because nobody queried the plug the fleet was already reading.")
+        print("  Cheaper option first: power %s down (-%.0fW) and leave %s where it is."
+              % (a.dst, d["mean_w"], a.workload))
+        out["net_w_if_target_would_be_off"] = round(alt, 1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

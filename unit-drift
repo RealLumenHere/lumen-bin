@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""unit-drift (wq#1041) — git-tracked desired-state for /etc/systemd/system.
+
+Baseline = fleet unit files + drop-ins + enable-state under a git repo.
+The reconciler is READ-ONLY: it reports drift (added/removed/modified units,
+enable-state changes) and exits 1 on drift. It never applies or restarts.
+
+  unit-drift snapshot          rebuild baseline from /etc, git commit
+  unit-drift check [--digest]  read-only diff; exit 1 on drift;
+                               --digest emits an info-class ntfy on drift
+  unit-drift apply --dry-run   show disk<-baseline plan (manual, no write)
+  unit-drift show-baseline     list tracked files in the baseline
+
+Secret-bearing Environment= values are REDACTED in the stored copies; the
+MANIFEST hashes the REAL on-disk content, so drift is still detected without
+plaintext secrets ever entering the repo.
+"""
+import os, sys, json, hashlib, subprocess, re, datetime
+
+SYS  = "/etc/systemd/system"
+REPO = "/home/lumen/fleet-units"
+UNITS_DIR  = os.path.join(REPO, "units")
+DROPIN_DIR = os.path.join(REPO, "dropins")
+MANIFEST   = os.path.join(REPO, "MANIFEST.json")
+ENABLE_TSV = os.path.join(REPO, "enable-state.tsv")
+KNOWN_RM   = os.path.join(REPO, "known-removed.txt")
+NTFY  = "/home/lumen/bin/ntfy-send"
+TOPIC = "lumen-alerts"
+SEARCH_PATHS = ("/etc/systemd/system","/run/systemd/system",
+                "/usr/lib/systemd/system","/lib/systemd/system")
+SUFFIXES = ("service","socket","timer","target","path","mount",
+            "automount","swap","slice","scope","device")
+SUF_RE = re.compile(r"\.(" + "|".join(SUFFIXES) + r")$")
+SECRET_KEY = re.compile(r"(?i)^(token|key|secret|password|passwd|auth)$")
+SECRET_VAL = re.compile(r"(cfut_|sk-[A-Za-z0-9]|ghp_|xoxb-|glpat-)")
+
+def redact(text):
+    out = []
+    for ln in text.splitlines(keepends=True):
+        m = re.match(r"(\s*Environment=)\"?([^=\"]+)=(.*)$", ln)
+        if m:
+            key, val = m.group(2), m.group(3).rstrip("\"\n")
+            comps = re.split(r"[^A-Za-z0-9]+", key)
+            if any(SECRET_KEY.match(c) for c in comps) or SECRET_VAL.search(val):
+                out.append(m.group(1) + key + "=***REDACTED-wq1041***\n")
+                continue
+        out.append(ln)
+    return "".join(out)
+
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+def read_bytes(p):
+    try:
+        with open(p, "rb") as f: return f.read()
+    except PermissionError:
+        return subprocess.run(["sudo","cat",p], capture_output=True).stdout
+
+def base_unit_exists(base):
+    return any(os.path.exists(os.path.join(d, base)) for d in SEARCH_PATHS)
+
+def scan():
+    units, dropins, enable = {}, {}, {}
+    for name in sorted(os.listdir(SYS)):
+        full = os.path.join(SYS, name)
+        if name.endswith((".wants", ".requires")) and os.path.isdir(full):
+            for lnk in sorted(os.listdir(full)):
+                lp = os.path.join(full, lnk)
+                if os.path.islink(lp):
+                    enable[name + "/" + lnk] = os.readlink(lp)
+            continue
+        if name.endswith(".d") and os.path.isdir(full):
+            for conf in sorted(os.listdir(full)):
+                cp = os.path.join(full, conf)
+                if conf.endswith(".conf") and os.path.isfile(cp):
+                    dropins[name + "/" + conf] = sha(read_bytes(cp))
+            continue
+        if not SUF_RE.search(name):
+            continue
+        if os.path.islink(full):
+            units[name] = {"kind": "symlink", "target": os.readlink(full)}
+        elif os.path.isfile(full):
+            units[name] = {"kind": "file", "sha256": sha(read_bytes(full))}
+    return {"units": units, "dropins": dropins, "enable": enable}
+
+def git(*args):
+    return subprocess.run(["git","-C",REPO,*args], capture_output=True, text=True)
+
+def load_manifest():
+    r = git("show", "HEAD:MANIFEST.json")
+    if r.returncode == 0:
+        return json.loads(r.stdout)
+    return json.load(open(MANIFEST))
+
+def load_known_removed():
+    if os.path.exists(KNOWN_RM):
+        return set(l.strip() for l in open(KNOWN_RM)
+                   if l.strip() and not l.startswith("#"))
+    return set()
+
+def cmd_snapshot():
+    os.makedirs(UNITS_DIR, exist_ok=True); os.makedirs(DROPIN_DIR, exist_ok=True)
+    st = scan()
+    for d in (UNITS_DIR, DROPIN_DIR):
+        for root, _, files in os.walk(d):
+            for f in files: os.remove(os.path.join(root, f))
+    for name, meta in st["units"].items():
+        if meta["kind"] == "symlink":
+            open(os.path.join(UNITS_DIR, name + ".symlink"), "w").write(meta["target"] + "\n")
+        else:
+            txt = read_bytes(os.path.join(SYS, name)).decode("utf-8","replace")
+            open(os.path.join(UNITS_DIR, name), "w").write(redact(txt))
+    for rel in st["dropins"]:
+        dst = os.path.join(DROPIN_DIR, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        txt = read_bytes(os.path.join(SYS, rel)).decode("utf-8","replace")
+        open(dst, "w").write(redact(txt))
+    with open(ENABLE_TSV, "w") as f:
+        for k in sorted(st["enable"]): f.write(k + "\t" + st["enable"][k] + "\n")
+    json.dump(st, open(MANIFEST, "w"), indent=2, sort_keys=True)
+    if not os.path.exists(KNOWN_RM):
+        open(KNOWN_RM, "w").write("# units deliberately removed; reappearance = respawn (wq#1041)\n")
+    git("add", "-A")
+    msg = ("snapshot %s: %d units, %d drop-ins, %d enable-links" %
+           (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            len(st["units"]), len(st["dropins"]), len(st["enable"])))
+    r = git("commit", "-m", msg)
+    print(msg); print((r.stdout or r.stderr).strip())
+    return 0
+
+def _diff(kind, base, cur, known_rm=None):
+    d = []
+    for n in sorted(set(cur) - set(base)):
+        tag = "  RESPAWN(known-removed)" if known_rm and n in known_rm else ""
+        d.append(("ADDED " + kind, n + tag))
+    for n in sorted(set(base) - set(cur)):
+        d.append(("REMOVED " + kind, n))
+    for n in sorted(set(base) & set(cur)):
+        if base[n] != cur[n]: d.append(("MODIFIED " + kind, n))
+    return d
+
+def cmd_check(digest=False):
+    base = load_manifest(); cur = scan(); known = load_known_removed()
+    drift  = _diff("unit",   base["units"],   cur["units"], known)
+    drift += _diff("dropin", base["dropins"], cur["dropins"])
+    drift += _diff("enable", base["enable"],  cur["enable"])
+    orphans = sorted({rel.split("/")[0] for rel in cur["dropins"]
+                      if not base_unit_exists(rel.split("/")[0][:-2])})
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    counts = "%d units, %d drop-ins, %d enable-links" % (
+        len(cur["units"]), len(cur["dropins"]), len(cur["enable"]))
+    if not drift:
+        print("[%s] unit-drift: CLEAN (%s)" % (ts, counts))
+        if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
+        return 0
+    print("[%s] unit-drift: DRIFT — %d change(s) vs git baseline" % (ts, len(drift)))
+    for kind, name in drift: print("  %-16s %s" % (kind, name))
+    if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
+    if digest:
+        summ = "; ".join(k + " " + n for k, n in drift[:12])
+        if len(drift) > 12: summ += "; +%d more" % (len(drift) - 12)
+        subprocess.run([NTFY, "-t", TOPIC, "-p", "low", "-T",
+                        "unit-drift: %d change(s) on lumen" % len(drift), summ])
+    return 1
+
+def cmd_apply():
+    base = load_manifest(); cur = scan()
+    plan  = ["restore " + n for n in sorted(set(base["units"]) - set(cur["units"]))]
+    plan += ["REMOVE "  + n for n in sorted(set(cur["units"]) - set(base["units"]))]
+    plan += ["rewrite " + n for n in sorted(set(base["units"]) & set(cur["units"]))
+             if base["units"][n] != cur["units"][n]]
+    if not plan:
+        print("apply: nothing to do — disk matches baseline"); return 0
+    print("apply PLAN (dry-run — nothing written):")
+    for p in plan: print("  " + p)
+    print("(wq#1041 ships READ-ONLY; no --force-write path is wired. Restore manually.)")
+    return 0
+
+def cmd_show():
+    base = load_manifest()
+    for n in sorted(base["units"]):   print("unit   " + n)
+    for n in sorted(base["dropins"]): print("dropin " + n)
+    for n in sorted(base["enable"]):  print("enable " + n)
+    return 0
+
+def main():
+    a = sys.argv[1:]
+    if not a: print(__doc__); return 2
+    if a[0] == "snapshot":      return cmd_snapshot()
+    if a[0] == "check":         return cmd_check(digest="--digest" in a)
+    if a[0] == "apply":         return cmd_apply()
+    if a[0] == "show-baseline": return cmd_show()
+    print(__doc__); return 2
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

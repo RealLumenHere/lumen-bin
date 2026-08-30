@@ -10,3 +10,15 @@
 __pycache__/
 *.pyc
 .fleet_pw
+
+# large downloaded binaries — not source
+/trivy
+
+# stale/superseded drafts, retired scripts, backups-by-suffix not caught above
+*.orig
+*.new
+*.retired.*
+*.tier1-staged
+*.staged-wq*
+/pt-scribe
+/rotate-fleet-pw.run.sh

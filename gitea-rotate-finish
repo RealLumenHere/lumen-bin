@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# gitea-rotate-finish — finish the wq#529 Gitea credential rotation.
+#
+# Frank re-mints the token in Gitea, writes it to ONE file, and runs this. It:
+#   1. validates the new token against the Gitea API BEFORE changing anything
+#   2. backs up every file it touches
+#   3. rewrites .git-credentials (single entry for the Gitea host)
+#   4. STRIPS the embedded token out of the 4 repo remote URLs, so the credential
+#      lives in one place with one rotation point instead of five
+#   5. verifies each repo can still reach origin, and says so per repo
+# Idempotent. Safe to re-run. Never prints a token.
+set -uo pipefail
+TOKFILE=${1:-/home/lumen/.secrets/gitea-lumen.token}
+HOST=100.121.17.5:3000
+USER=lumen
+REPOS="/home/lumen/projects/lumen-messenger-cc /home/lumen/messenger /home/lumen/minerva /home/lumen/bin"
+TS=$(date +%Y%m%d_%H%M%S)
+die(){ echo "gitea-rotate-finish: $*" >&2; exit 1; }
+
+[ -r "$TOKFILE" ] || die "no token file at $TOKFILE — paste the new Gitea token there first (chmod 600)"
+TOK=$(tr -d '\n\r ' < "$TOKFILE")
+[ -n "$TOK" ] || die "$TOKFILE is empty"
+chmod 600 "$TOKFILE"
+
+echo "1) validating new token against http://$HOST ..."
+code=$(curl -sS --max-time 15 -o /tmp/grf.$$ -w '%{http_code}' -H "Authorization: token $TOK" "http://$HOST/api/v1/user")
+who=$(jq -r '.login // "?"' /tmp/grf.$$ 2>/dev/null); rm -f /tmp/grf.$$
+[ "$code" = 200 ] || die "token rejected (HTTP $code) — nothing changed"
+[ "$who" = "$USER" ] || die "token authenticates as '$who', expected '$USER' — nothing changed"
+echo "   OK: authenticates as $who"
+
+echo "2) rewriting /home/lumen/.git-credentials ..."
+cp -a /home/lumen/.git-credentials "/home/lumen/.git-credentials.bak.${TS}_pre_rotate_finish"
+ENC=${HOST/:/%3a}
+grep -v "$ENC" /home/lumen/.git-credentials > /tmp/gc.$$ 2>/dev/null || true
+printf 'http://%s:%s@%s\n' "$USER" "$TOK" "$ENC" >> /tmp/gc.$$
+install -m600 /tmp/gc.$$ /home/lumen/.git-credentials; rm -f /tmp/gc.$$
+echo "   OK: single Gitea entry, mode 600, backup .bak.${TS}_pre_rotate_finish"
+
+echo "3) stripping embedded tokens from remote URLs ..."
+for r in $REPOS; do
+  [ -d "$r/.git" ] || { echo "   SKIP $r (not a repo)"; continue; }
+  u=$(git -C "$r" remote get-url origin 2>/dev/null) || continue
+  clean=$(printf '%s' "$u" | sed -E "s#^(https?://)[^@]*@#\1#")
+  if [ "$u" != "$clean" ]; then
+    git -C "$r" remote set-url origin "$clean" && echo "   cleaned $(basename "$r") -> credential now comes from the store"
+  else
+    echo "   already clean: $(basename "$r")"
+  fi
+done
+
+echo "4) verifying reachability ..."
+fail=0
+for r in $REPOS; do
+  [ -d "$r/.git" ] || continue
+  if git -C "$r" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+    echo "   OK   $(basename "$r")"
+  else
+    echo "   FAIL $(basename "$r") — origin unreachable with the new credential"; fail=1
+  fi
+done
+[ "$fail" = 0 ] || die "one or more repos could not reach origin — investigate before trusting this rotation"
+echo "done. Old token is dead; new one lives ONLY in $TOKFILE and .git-credentials."

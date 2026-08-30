@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Poll GL-iNet BE9300 interface byte counters into SQLite. Reset-safe hourly accumulator.
+Read-only on the router: cats /proc/net/dev, /proc/uptime and the default route."""
+import os, sqlite3, subprocess, sys, time
+
+ENV = "/home/lumen/.config/wan-usage.env"
+if os.path.exists(ENV):
+    for line in open(ENV):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k, v)
+
+HOST = os.environ.get("WAN_ROUTER_HOST", "192.168.8.1")
+USER = os.environ.get("WAN_ROUTER_USER", "root")
+PW   = os.environ.get("WAN_ROUTER_PASS", "")
+DB   = os.environ.get("WAN_USAGE_DB", "/home/lumen/data/wan_usage.db")
+IFACES = ("sta2", "eth0", "br-lan")
+
+REMOTE = "cat /proc/net/dev; echo '#UP'; cat /proc/uptime; echo '#DR'; ip route show default"
+
+def fetch():
+    cmd = ["sshpass", "-p", PW, "ssh",
+           "-o", "StrictHostKeyChecking=no",
+           "-o", "UserKnownHostsFile=/home/lumen/.ssh/known_hosts_router",
+           "-o", "ConnectTimeout=8", "-o", "BatchMode=no",
+           f"{USER}@{HOST}", REMOTE]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"ssh rc={r.returncode}: {r.stderr.strip()[:200]}")
+    return r.stdout
+
+def parse(out):
+    counters, uptime, wandev, sect = {}, None, None, "dev"
+    for line in out.splitlines():
+        s = line.strip()
+        if s == "#UP":
+            sect = "up"; continue
+        if s == "#DR":
+            sect = "dr"; continue
+        if sect == "dev" and ":" in s:
+            name, rest = s.split(":", 1)
+            f = rest.split()
+            if len(f) >= 9:
+                counters[name.strip()] = (int(f[0]), int(f[8]))
+        elif sect == "up" and s:
+            uptime = int(float(s.split()[0]))
+        elif sect == "dr" and s.startswith("default"):
+            f = s.split()
+            if "dev" in f:
+                wandev = f[f.index("dev") + 1]
+    return counters, uptime, wandev
+
+def init(db):
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS usage(hour_ts INTEGER, iface TEXT, rx INTEGER, tx INTEGER,
+                                     PRIMARY KEY(hour_ts, iface));
+    CREATE TABLE IF NOT EXISTS state(iface TEXT PRIMARY KEY, ts INTEGER, uptime INTEGER,
+                                     rx INTEGER, tx INTEGER);
+    CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+    """)
+
+def main():
+    now = int(time.time())
+    hour = now - (now % 3600)
+    db = sqlite3.connect(DB, timeout=20)
+    init(db)
+    try:
+        counters, uptime, wandev = parse(fetch())
+    except Exception as e:
+        db.execute("INSERT OR REPLACE INTO meta VALUES('last_error',?)", (f"{now}: {e}",))
+        db.commit(); db.close()
+        print(f"poll failed: {e}", file=sys.stderr)
+        return 1
+    for iface in IFACES:
+        if iface not in counters:
+            continue
+        rx, tx = counters[iface]
+        row = db.execute("SELECT ts, uptime, rx, tx FROM state WHERE iface=?", (iface,)).fetchone()
+        if row is None:
+            drx = dtx = 0
+            db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",
+                       (f"baseline_{iface}", f"{now}:{rx}:{tx}:{uptime}"))
+        else:
+            _, p_up, p_rx, p_tx = row
+            if uptime < p_up or rx < p_rx or tx < p_tx:
+                drx, dtx = rx, tx           # counter reset (router reboot) -> keep since-boot bytes
+            else:
+                drx, dtx = rx - p_rx, tx - p_tx
+        if drx or dtx:
+            db.execute("""INSERT INTO usage VALUES(?,?,?,?)
+                          ON CONFLICT(hour_ts, iface) DO UPDATE SET rx=rx+?, tx=tx+?""",
+                       (hour, iface, drx, dtx, drx, dtx))
+        db.execute("INSERT OR REPLACE INTO state VALUES(?,?,?,?,?)", (iface, now, uptime, rx, tx))
+    if wandev:
+        db.execute("INSERT OR REPLACE INTO meta VALUES('wan_dev',?)", (wandev,))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)", (str(now),))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('router_uptime',?)", (str(uptime),))
+    db.commit(); db.close()
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

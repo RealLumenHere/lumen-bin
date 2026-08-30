@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# litellm-auth-alert — EDGE-TRIGGERED burst alerter on the LiteLLM auth-failure log.
+#
+# WHY THIS EXISTS (wq#911, 2026-08-23): lumen-litellm-auth-monitor (wq#721) writes
+# every 401 to /home/lumen/logs/litellm/auth-failures.jsonl, but nothing consumed
+# the file — a fleet-wide auth outage (key rotation gone wrong, VerificationToken
+# table wipe, master-key regression) would be silently logged, not alerted.
+#
+# DESIGN (same contract as lumen-failed-units):
+#  - THRESHOLD: >= N auth_401 events in the last M minutes (defaults 5/10).
+#    Single stray 401s (wq#903-class hardcoded-key stragglers) stay below the
+#    threshold and are triaged via wq, not paged.
+#  - EDGE-TRIGGERED: alerts once on clear->breach (ntfy urgent + aq add); while
+#    the breach persists it only bumps the open aq row (dedup on source+key,
+#    count/last_ts updated) — no ntfy re-fire. On breach->clear it posts a
+#    low-priority recovery notice. Constant re-alerting trains you to ignore
+#    alerts; that is the failure mode this design exists to avoid.
+#  - Reporting only. It never touches keys, containers, or units.
+#  - Fail-open: any internal error exits 0 and leaves state untouched.
+#  - Rotation: the monitor rotates the JSONL at 10 MiB. This reads only the
+#    current file; a rotation mid-window could hide events for one cycle.
+#    Accepted: rotation is rare (months of data < 10 MiB) and the next burst
+#    re-breaches.
+#
+# State: /home/lumen/agents/litellm-auth-alert/state.json
+set -uo pipefail
+
+LOGFILE="${LITELLM_AUTH_LOGFILE:-/home/lumen/logs/litellm/auth-failures.jsonl}"
+THRESHOLD="${LITELLM_AUTH_ALERT_THRESHOLD:-5}"
+WINDOW_MIN="${LITELLM_AUTH_ALERT_WINDOW_MIN:-10}"
+STATE_DIR="${LITELLM_AUTH_ALERT_STATE_DIR:-/home/lumen/agents/litellm-auth-alert}"
+NTFY_TOPIC="${LITELLM_AUTH_ALERT_TOPIC:-lumen-alerts}"
+STATE="$STATE_DIR/state.json"
+NTFY=/home/lumen/bin/ntfy-send
+AQ=/home/lumen/bin/aq
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+
+# Count auth_401 events inside the window and summarize offending IPs/endpoints.
+# (The monitor writes an auth_failure + an auth_401 line per rejection; count
+# only auth_401 to avoid double counting.)
+SUMMARY=$(python3 - "$LOGFILE" "$WINDOW_MIN" <<'PY' 2>/dev/null
+import json, re, sys, datetime
+path, window_min = sys.argv[1], int(sys.argv[2])
+cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=window_min)
+count, ips, endpoints = 0, {}, {}
+try:
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("event") != "auth_401":
+                continue
+            try:
+                ts = datetime.datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=datetime.timezone.utc)
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            count += 1
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+):\d+", d.get("raw", ""))
+            if m:
+                ips[m.group(1)] = ips.get(m.group(1), 0) + 1
+            ep = d.get("endpoint", "?")
+            endpoints[ep] = endpoints.get(ep, 0) + 1
+except FileNotFoundError:
+    pass
+top = lambda d: ",".join(f"{k}x{v}" for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:3])
+print(f"{count}\t{top(ips) or 'none'}\t{top(endpoints) or 'none'}")
+PY
+)
+[[ -z "$SUMMARY" ]] && exit 0
+COUNT=$(cut -f1 <<<"$SUMMARY")
+IPS=$(cut -f2 <<<"$SUMMARY")
+EPS=$(cut -f3 <<<"$SUMMARY")
+[[ "$COUNT" =~ ^[0-9]+$ ]] || exit 0
+
+PREV_BREACHED=$(python3 -c "
+import json
+try:
+    print(1 if json.load(open('$STATE')).get('breached') else 0)
+except Exception:
+    print(0)
+" 2>/dev/null)
+
+notify() { # $1=priority $2=title $3=message
+  [[ -x $NTFY ]] && "$NTFY" -t "$NTFY_TOPIC" -p "$1" -T "$2" --quiet "$3" >/dev/null 2>&1
+  return 0
+}
+
+MSG="$COUNT LiteLLM 401s in last ${WINDOW_MIN}min (threshold $THRESHOLD). ips=$IPS endpoints=$EPS. Log: $LOGFILE — key rotation broken or caller with stale key. Runbook: docs/litellm/service_keys.md"
+
+if [[ "$COUNT" -ge "$THRESHOLD" ]]; then
+  if [[ "$PREV_BREACHED" != "1" ]]; then
+    notify urgent "LiteLLM auth-failure burst" "$MSG"
+  fi
+  # aq dedups on (source,key): first call opens the row, later calls bump count.
+  [[ -x $AQ ]] && "$AQ" add litellm-auth burst-401 "LiteLLM auth-failure burst" "$MSG" >/dev/null 2>&1
+  BREACHED=true
+else
+  if [[ "$PREV_BREACHED" == "1" ]]; then
+    notify low "LiteLLM auth recovered" "$COUNT 401s in last ${WINDOW_MIN}min, below threshold $THRESHOLD"
+  fi
+  BREACHED=false
+fi
+
+python3 - <<PY 2>/dev/null || true
+import json, time
+json.dump({"breached": "$BREACHED" == "true", "count": int("$COUNT"),
+           "checked_at": int(time.time())}, open("$STATE", "w"), indent=1)
+PY
+
+if [[ -t 1 || "${1:-}" == "--print" ]]; then
+  echo "count=$COUNT threshold=$THRESHOLD window=${WINDOW_MIN}min breached=$BREACHED ips=$IPS"
+fi
+exit 0

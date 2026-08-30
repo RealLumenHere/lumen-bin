@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""system-map-gen — regenerates /home/lumen/SYSTEM_MAP.md, the central record
+of everything running on Lumen: services, schedules, pipelines, how each part
+was modified, and what the update agent needs to keep current.
+
+Audience contract (Frank, 2026-07-28):
+  - research team (Minerva agents): what exists, what runs together, where the
+    seams are — so proposals stop guessing about their own infrastructure.
+  - update agent: what versions are pinned and WHY, what has drop-ins, what
+    was recently modified — so "make services current" never bulldozes an
+    intentional pin.
+  - Frank: notified via ntfy lumen-alerts whenever a regen changes the map.
+
+Everything probed live is authoritative; the PIPELINES block is curated here
+in code (versioned in the minerva Gitea repo) and every unit it references is
+validated against the live system on each run — a missing unit renders ⚠.
+Hand-edits to SYSTEM_MAP.md are lost on regen BY DESIGN: fix the generator.
+"""
+import json, re, sqlite3, subprocess, sys, time
+from pathlib import Path
+
+OUT = Path('/home/lumen/SYSTEM_MAP.md')
+DB = '/home/lumen/minerva/minerva.db'
+
+
+def sh(cmd, t=25):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t)
+        return r.stdout
+    except Exception:
+        return ''
+
+
+# ── curated: what runs together (validated against live units each regen) ──
+PIPELINES = {
+  'intel → proposals (Minerva core)': [
+    ('lumen-scout (cron hourly) + lumen-intel.timer', 'RSS/X/HF/OpenAlex/GitHub → /home/lumen/agent/intel.db seen_items + prompt files'),
+    ('minerva-classifier.timer', 'intel.db → classify via LiteLLM cerebras-oss-120b (max_tokens 1200, JSON mode, failures NOT persisted) → minerva.db classified_intel'),
+    ('minerva-proposal.timer', 'classified_intel(self>=0.6) → generator (LUMEN_STATE digest) → hallucination guard: minerva_verify + minerva_factpack hybrid ctx (JUDGE_CTX_CHARS=16000) → latent rescue (ENABLE_LATENT_GUARD=1) → proposals table'),
+    ('lumen-proposals-ui (:8110)', 'proposals table → propose.lumennode.uk'),
+    ('lumen-bc250-watch.timer (15min)', 'TRIPWIRE — BC-250/cyan-skillfish/gfx1013 keyword match in classified_intel → ntfy lumen-alerts IMMEDIATELY, ignoring self_relevance. Exists because the 0.6 proposal gate + 48h classifier horizon + digest reading a different corpus (scratch/research/*.md) meant every BC-250 item since 2026-07-18 died at processed=0 unseen. Read-only on minerva.db, own dedup state. Retire after Hapi blades are purchased and commissioned.'),
+  ],
+  'memory (Memory V2)': [
+    ('lumen_episode.py / lumen_state.py', 'episodic commits + bi-temporal facts → minerva.db; state-regen → context/LIVE_FLEET_STATE.md'),
+    ('lumen-dream.timer + lumen-reflector.timer + lumen-convo-learn.timer', 'consolidation passes over episodes/conversations (no pruning, no auto-edit of claude_memory.md — see factpack_cards.json)'),
+  ],
+  'retrieval (AB-RAG)': [
+    ('lumen-research-index.timer', 'research corpus → pgvector embeddings (lumen-pgvector service itself inactive; index talks to Postgres directly)'),
+    ('lumen-rerank (:8140)', 'cross-encoder ms-marco-MiniLM-L-6-v2; thread-capped 4, MemoryMax 1500M after 2026-07-27 hang incident; also scores minerva_factpack retrieval'),
+  ],
+  'verification ground truth': [
+    ('minerva_factpack.py', 'live probes: services/models/state-facts/artifacts (+[capability] cards when FACTPACK_CARDS=1) → per-claim judge context; digest fallback'),
+    ('factpack_cards_gen.py (manual/on-change)', 'module source → factpack_cards.json capability cards, hash-keyed'),
+    ('minerva_verify_eval_v2.py', 'goldv2 hand-audited labels → per-layer precision/recall; --drift weekly trend'),
+  ],
+  'agent5': [
+    ('lumen-planner + lumen-generator + lumen-evaluator', '/home/lumen/autonomy/agent5/ split pipeline'),
+  ],
+}
+
+PINS = [
+  ('twscrape', '0.19.1 PINNED', 'vendored twscrape_xclid_auth.py bootstraps XClIdGen via authed cookies (upstream #320); upgrade ONLY after checking that module still matches — see minerva/research_prompts/twscrape_xclid_break_20260726.md'),
+  ('cerebras-oss-120b classifier', 'max_tokens=1200 required', 'reasoning model; 400 returned content=None and silently killed 36% of intel (2026-07-27)'),
+  ('lumen-rerank', 'thread caps + MemoryMax drop-in', 'removal reintroduces the 5-day hang that caused 231 MCP gateway restarts/week'),
+  ('restic cache', 'RESTIC_CACHE_DIR=/scratch/restic-cache on all 5 backup units', 'root fs was at 94% with cache on /'),
+]
+
+
+def live_units():
+    units = {}
+    timed = {}
+    for l in sh("systemctl list-timers --all --no-legend --no-pager").splitlines():
+        c = l.split()
+        if len(c) >= 2 and c[-1].endswith('.service'):
+            timed[c[-1]] = c[-2] if not c[0].startswith('-') else ''
+    for l in sh("systemctl list-units 'lumen-*' 'minerva-*' 'llama-*' 'cloudflared*' --all --no-legend --plain").splitlines():
+        c = l.split()
+        if len(c) >= 4 and c[0].endswith('.service'):
+            units[c[0]] = {'active': c[2], 'sub': c[3], 'timer': c[0] in timed}
+    return units, timed
+
+
+def main():
+    units, timed = live_units()
+    L = []
+    A = L.append
+    A('# LUMEN SYSTEM MAP')
+    A(f'*Auto-generated {time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())} by /home/lumen/bin/system-map-gen — DO NOT HAND-EDIT (edit the generator; curated blocks live there, probes do the rest). Fleet-level roster: /home/lumen/FLEET_MAP.md. Canonical facts: lumen_state.py.*\n')
+
+    A('## 1. What is running (live probe)\n')
+    A('| unit | state | drop-ins | script |')
+    A('|---|---|---|---|')
+    for u in sorted(units):
+        st = units[u]
+        mode = 'timer' if st['timer'] else st['active']
+        drop = sh(f"systemctl cat {u} 2>/dev/null | grep -c '^# /etc/systemd/system/{u}.d/'").strip()
+        drop = drop if drop not in ('', '0') else ''
+        exe = sh(f"systemctl cat {u} 2>/dev/null | grep -m1 '^ExecStart=' ").replace('ExecStart=', '').strip()
+        exe = re.sub(r'^/usr/bin/python3 ', '', exe)[:70]
+        A(f"| {u.replace('.service','')} | {mode} | {drop} | {exe} |")
+    A('')
+    A('### cron (user lumen)')
+    for l in sh('crontab -l 2>/dev/null').splitlines():
+        if l.strip() and not l.startswith('#'):
+            A(f'- `{l.strip()[:110]}`')
+    A('')
+    dock = sh("docker ps --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null").strip()
+    if dock:
+        A('### containers')
+        for l in dock.splitlines():
+            n, i, s = (l.split('|') + ['', ''])[:3]
+            A(f'- **{n}** — {i} — {s}')
+        A('')
+
+    A('## 2. What runs together (curated, unit-validated)\n')
+    for name, steps in PIPELINES.items():
+        A(f'### {name}')
+        for unit_ref, desc in steps:
+            refs = re.findall(r'(lumen-[a-z0-9-]+|minerva-[a-z0-9-]+|llama-[a-z0-9-]+)', unit_ref)
+            missing = [r for r in refs
+                       if f'{r}.service' not in units and f'{r}.timer' not in ' '.join(timed.values()) + ' '.join(timed)]
+            warn = ' ⚠ UNIT NOT FOUND: ' + ','.join(missing) if missing else ''
+            A(f'- **{unit_ref}**{warn}\n  {desc}')
+        A('')
+
+    A('## 3. Recent modifications (episode commits, newest first)\n')
+    try:
+        db = sqlite3.connect(DB)
+        for kind, title, ts in db.execute(
+                "SELECT kind, title, created_at FROM archival_notes ORDER BY created_at DESC LIMIT 20"):
+            A(f'- `{str(ts)[:10]}` [{kind}] {str(title)[:120]}')
+        db.close()
+    except Exception as e:
+        A(f'- probe failed: {e}')
+    A('\nFull detail: `python3 /home/lumen/minerva/lumen_episode.py recall "<topic>"`. File-level evidence: `.bak.YYYYMMDD_*` siblings next to every modified file.\n')
+
+    A('## 4. Update-agent contract — pins and DO-NOT-BULLDOZE\n')
+    for what, state, why in PINS:
+        A(f'- **{what}** — {state}\n  WHY: {why}')
+    A('')
+    A('Drop-in inventory (each one is intentional; read it before touching the unit):')
+    for d in sorted(Path('/etc/systemd/system').glob('*.service.d/*.conf')):
+        A(f'- `{d}`')
+    A('')
+
+    A('## 5. Key files\n')
+    for p, d in [
+        ('/home/lumen/minerva/minerva_factpack.py', 'judge ground-truth retrieval (hybrid + closed-world)'),
+        ('/home/lumen/minerva/factpack_cards.json', 'per-module capability cards (hash-keyed)'),
+        ('/home/lumen/minerva/eval_sets/verify_gold_v2.jsonl', 'hand-audited production labels'),
+        ('/home/lumen/minerva/lumen_state.txt', 'generator digest (lumen_proposal_digest.py, CAP 13000)'),
+        ('/home/lumen/FLEET_MAP.md', 'fleet roster'),
+        ('/home/lumen/minerva/context/LIVE_FLEET_STATE.md', 'bi-temporal fact render (state-regen)'),
+    ]:
+        A(f'- `{p}` — {d}')
+    OUT.write_text('\n'.join(L) + '\n')
+    print(f'wrote {OUT} ({OUT.stat().st_size} bytes)')
+
+
+if __name__ == '__main__':
+    main()

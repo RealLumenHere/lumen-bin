@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""eBay Browse API item_summary search wrapper. Uses ebay-token (never prints credentials).
+Usage: ebay-search "query" [--limit N] [--marketplace EBAY_US] [--filter STR] [--sort STR] [--raw] [--json]"""
+import argparse, importlib.util, json, sys, urllib.parse, urllib.request
+from importlib.machinery import SourceFileLoader
+
+_loader = SourceFileLoader("ebay_token", "/home/lumen/bin/ebay-token")
+spec = importlib.util.spec_from_loader("ebay_token", _loader)
+tok = importlib.util.module_from_spec(spec)
+_loader.exec_module(tok)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("query")
+    ap.add_argument("--limit", type=int, default=10)
+    ap.add_argument("--marketplace", default="EBAY_US")
+    ap.add_argument("--filter", default=None, help="Browse API filter string, e.g. price:[10..80],conditions:{USED}")
+    ap.add_argument("--sort", default=None, help="e.g. price, -price, newlyListed")
+    ap.add_argument("--raw", action="store_true", help="dump full API JSON")
+    ap.add_argument("--json", action="store_true", help="one compact JSON object per item")
+    a = ap.parse_args()
+
+    q = {"q": a.query, "limit": str(a.limit)}
+    if a.filter: q["filter"] = a.filter
+    if a.sort: q["sort"] = a.sort
+    url = tok.BASE + "/buy/browse/v1/item_summary/search?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + tok.get()["access_token"],
+        "X-EBAY-C-MARKETPLACE-ID": a.marketplace,
+        "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.stderr.write("HTTP %d: %s\n" % (e.code, e.read().decode()[:500]))
+        sys.exit(1)
+
+    if a.raw:
+        json.dump(data, sys.stdout, indent=2); print(); return
+    items = data.get("itemSummaries", [])
+    if not items:
+        print("0 results (total=%s)" % data.get("total", 0)); return
+    for it in items:
+        p = it.get("price", {})
+        row = {"itemId": it.get("itemId"), "price": "%s %s" % (p.get("value"), p.get("currency")),
+               "condition": it.get("condition"), "title": it.get("title"),
+               "url": it.get("itemWebUrl"), "shipping": (it.get("shippingOptions") or [{}])[0].get("shippingCost", {}).get("value")}
+        if a.json:
+            print(json.dumps(row))
+        else:
+            print("%-14s | %-12s | %-10s | %s" % (row["itemId"].split("|")[1] if row["itemId"] and "|" in row["itemId"] else row["itemId"], row["price"], (row["condition"] or "")[:10], row["title"][:80]))
+    print("-- total matches: %s" % data.get("total"))
+
+if __name__ == "__main__":
+    main()

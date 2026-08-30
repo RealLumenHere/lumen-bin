@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""holddown — the stop/restore contract CLI (wq#967).
+
+Any agent stopping a product unit MUST drop a hold-down first. Easiest form:
+  holddown stop <unit> --ticket wq#N --reason "why" [--restore-by +240m]
+which records enabled-state, writes the flag, then stops the unit.
+
+  holddown set <unit> --reason ... [--ticket wq#N] [--restore-by +240m|'YYYY-MM-DD HH:MM:SS'] [--restore-cmd ...]
+  holddown drop <unit>          # restoring the unit yourself? drop the flag after.
+  holddown list                 # all flags with computed state
+  holddown check <unit>         # exit 0=active 1=no flag 2=expired 3=malformed
+
+Self-healer behavior: ACTIVE flag -> it will never restart the unit.
+EXPIRED (restore_by passed, or owner wq lease gone) -> it restores the unit."""
+import argparse, json, re, subprocess, sys
+from datetime import timedelta
+sys.path.insert(0, "/home/lumen/agent")
+import holddown_lib as H
+
+def resolve_restore_by(s):
+    m = re.fullmatch(r"\+(\d+)([mh]?)", s or "")
+    if m:
+        n = int(m.group(1)); mins = n * 60 if m.group(2) == "h" else n
+        return (H.now_utc() + timedelta(minutes=mins)).strftime("%Y-%m-%d %H:%M:%S")
+    return H.parse_ts(s).strftime("%Y-%m-%d %H:%M:%S")
+
+def do_set(a, then_stop=False):
+    unit = H.norm_unit(a.unit)
+    flag, err = H.load_flag(unit)
+    if err:
+        sys.exit(f"holddown: existing flag for {unit} is MALFORMED ({err}); "
+                 "inspect/remove it by hand before setting a new one.")
+    me = H.os.getenv("WQ_AGENT")
+    if flag and H.state(flag) == "active" and flag.get("owner_agent") != me:
+        sys.exit(f"holddown: {unit} already held by {flag.get('owner_agent')} "
+                 f"(wq#{flag.get('owner_ticket')}, until {flag['restore_by']}). "
+                 "Refusing to overwrite another session's active hold.")
+    ticket = (a.ticket or "").lstrip("wq#") or None
+    d = H.write_flag(unit, a.reason, resolve_restore_by(a.restore_by),
+                     owner_ticket=ticket, restore_cmd=a.restore_cmd)
+    print(f"holddown: flag set for {unit} until {d['restore_by']} "
+          f"(owner wq#{d['owner_ticket']}, restore_cmd={d['restore_cmd'] or 'systemctl start'})")
+    if then_stop:
+        r = subprocess.run(f"sudo -n systemctl stop {unit}", shell=True,
+                           capture_output=True, text=True, timeout=90)
+        if r.returncode != 0:
+            H.archive_flag(unit, "stopfailed")
+            sys.exit(f"holddown: systemctl stop {unit} FAILED "
+                     f"(rc={r.returncode}) — flag archived, unit untouched-or-check: "
+                     f"{(r.stderr or r.stdout)[-300:]}")
+        st = subprocess.run(["systemctl", "is-active", unit],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+        print(f"holddown: {unit} stopped (now {st}). Self-healer will restore it "
+              f"at {d['restore_by']} or when the owner lease lapses — "
+              "run `holddown drop` after you restore it yourself.")
+
+def main():
+    ap = argparse.ArgumentParser(prog="holddown",
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("set", "stop"):
+        p = sub.add_parser(name)
+        p.add_argument("unit")
+        p.add_argument("--reason", required=True)
+        p.add_argument("--ticket", default=None, help="wq#N owning this hold")
+        p.add_argument("--restore-by", default="+240m",
+                       help="+N[m|h] or 'YYYY-MM-DD HH:MM:SS' UTC (default +240m)")
+        p.add_argument("--restore-cmd", default=None)
+    sub.add_parser("drop").add_argument("unit")
+    sub.add_parser("list")
+    sub.add_parser("check").add_argument("unit")
+    a = ap.parse_args()
+    if a.cmd in ("set", "stop"):
+        do_set(a, then_stop=(a.cmd == "stop"))
+    elif a.cmd == "drop":
+        dest = H.archive_flag(a.unit, "dropped")
+        print(f"holddown: {'dropped -> ' + str(dest) if dest else 'no flag for ' + a.unit}")
+    elif a.cmd == "list":
+        rows = list(H.list_flags())
+        if not rows:
+            print("holddown: no flags")
+        for unit, flag, err in rows:
+            if err:
+                print(f"{unit:30} MALFORMED  {err}")
+            else:
+                print(f"{unit:30} {H.state(flag).upper():8} until {flag['restore_by']} "
+                      f"wq#{flag.get('owner_ticket')} by {flag.get('owner_agent')} — {flag.get('reason','')[:60]}")
+    elif a.cmd == "check":
+        flag, err = H.load_flag(a.unit)
+        if err: print(f"MALFORMED: {err}"); sys.exit(3)
+        if not flag: print("no flag"); sys.exit(1)
+        s = H.state(flag); print(s); sys.exit(0 if s == "active" else 2)
+
+if __name__ == "__main__":
+    main()

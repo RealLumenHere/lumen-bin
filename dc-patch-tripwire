@@ -1,0 +1,28 @@
+#!/bin/bash
+# dc-patch-tripwire (wq#416, 2026-08-08): detect silent desktop-commander
+# upgrades that wipe the Lumen dist patches (root cause of the 08-02 loss).
+# Daily timer. URGENT ntfy + aq row on any missing patch or version change.
+set -u
+D=/home/lumen/.npm-global/lib/node_modules/@wonderwhy-er/desktop-commander
+STATE=/home/lumen/.dc-patch-tripwire.state
+NTFY=http://localhost:8080/lumen-alerts
+PROB=()
+VER=$(python3 -c "import json;print(json.load(open('$D/package.json'))['version'])" 2>/dev/null || echo unknown)
+[ -f "$D/dist/handle-store.js" ] || PROB+=("handle-store.js MISSING from dist")
+HM=$(grep -c "Lumen patch wq#416" "$D/dist/terminal-manager.js" 2>/dev/null); HM=${HM:-0}
+[ "${HM//[^0-9]/}" -ge 6 ] 2>/dev/null || PROB+=("terminal-manager.js patch markers=$HM (expect >=6)")
+# sudo-strip marker is lowercase '[lumen tier-1' in command-manager.js
+SM=$(grep -c "lumen tier-1 re-port" "$D/dist/command-manager.js" 2>/dev/null); SM=${SM:-0}
+[ "${SM//[^0-9]/}" -ge 1 ] 2>/dev/null || PROB+=("command-manager.js sudo-strip marker ABSENT")
+LASTVER=$(cat "$STATE" 2>/dev/null || echo "")
+if [ -n "$LASTVER" ] && [ "$LASTVER" != "$VER" ]; then
+  PROB+=("DC version changed $LASTVER -> $VER (npm bump — patches likely wiped)")
+fi
+echo "$VER" > "$STATE"
+if [ ${#PROB[@]} -gt 0 ]; then
+  MSG="DC patch tripwire (v$VER): $(IFS='; '; echo "${PROB[*]}"). Re-port per /home/lumen/uplift/dc-handle-store/ + reports/416_dc_handle_store_report.md"
+  curl -s -m 8 -d "$MSG" -H "Title: DC patches WIPED" -H "Priority: urgent" "$NTFY" >/dev/null
+  /home/lumen/bin/aq add tripwire dc-patch-wipe "DC patches wiped/changed" "$MSG" 2>/dev/null
+  echo "FAIL: $MSG"; exit 1
+fi
+echo "OK v$VER: tm_markers=$HM sudo_strip=$SM hs=present"

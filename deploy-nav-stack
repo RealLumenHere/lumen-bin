@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Deploy the wq#542/552/553 nav stack. Orchestrator-run: no agent alive to do it,
+# freeze lifted, tree clean at cf946a0 == origin/main, CI green, rabbit18 reported
+# NOT VERIFIED LIVE. Records frontier before and after.
+set -uo pipefail
+[ "$(hostname)" = lumen ] || exit 9
+cd /home/lumen/pokemon
+
+echo "=== 1. release rabbit17b dead hold on wq#551 (idle 79m, no WIP) ==="
+/home/lumen/bin/wq release 551 2>&1 | head -1
+
+echo "=== 2. PRE-DEPLOY snapshot ==="
+BEFORE_HASH=$(systemctl show lumen-pokemon-live -p ExecMainStartTimestamp --value)
+echo "  live process started : $BEFORE_HASH"
+echo "  tree HEAD            : $(git rev-parse --short HEAD)"
+echo "  origin/main          : $(git rev-parse --short origin/main)"
+python3 -c "
+import json;d=json.load(open('runtime/frontier.json'))
+print('  FRONTIER BEFORE      : map%s badges=%s flags=%s lastAdvance=%s'%(d['furthestMap'],d['maxBadges'],d['maxEventFlags'],d['lastAdvanceAt']))"
+L=$(ls -t events/live-agent-*.jsonl | head -1)
+echo "  run before           : $(basename $L)  turns=$(grep -c turn_summary "$L")"
+
+echo "=== 3. acquire service lock ==="
+/home/lumen/bin/slock acquire lumen-pokemon-live --holder claude-web-0813-orch --ttl 20 \
+  --note "deploy wq#542/552/553 nav stack + measure" 2>&1 | head -1
+
+echo "=== 4. restart ==="
+sudo -n systemctl restart lumen-pokemon-live 2>&1 | head -3
+sleep 12
+systemctl is-active lumen-pokemon-live | sed 's/^/  active: /'
+systemctl show lumen-pokemon-live -p ExecMainStartTimestamp --value | sed 's/^/  started: /'
+
+echo "=== 5. what did it resume onto? ==="
+sleep 18
+NEW=$(ls -t events/live-agent-*.jsonl | head -1)
+echo "  new run: $(basename "$NEW")"
+grep -m1 '"kind":"boot"' "$NEW" | python3 -c "
+import sys,json
+try:
+    d=json.loads(sys.stdin.read()); print('  resumedFrom:',d.get('resumedFrom'))
+except Exception as e: print('  (no boot line yet)')"
+grep -m1 state_read "$NEW" | python3 -c "
+import sys,json
+try:
+    d=json.loads(sys.stdin.read())
+    print('  first state: map=%s pos=(%s,%s) badges=%s money=%s party=%s'%(d.get('map'),d.get('x'),d.get('y'),d.get('badgeCount'),d.get('money'),d.get('partyCount')))
+except Exception as e: print('  (no state_read yet)')"
+
+echo "=== 6. release lock ==="
+/home/lumen/bin/slock release lumen-pokemon-live --holder claude-web-0813-orch 2>&1 | head -1

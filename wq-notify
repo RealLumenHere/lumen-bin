@@ -1,0 +1,27 @@
+#!/bin/bash
+# wq-notify — durable read of worker outcomes AFTER transient units auto-close.
+# Solves: fworker units exit on sentinel; journalctl for a gone transient unit is
+# ephemeral. This shows the CURRENT unit per ticket + its final sentinel + wq status.
+STORE=/home/lumen/foreman/_runs/notifications.log
+snapshot(){
+  local out=""
+  for T in $(systemctl list-units --all --no-legend 'lumen-job-fworker-wq*' 2>/dev/null | grep -oE 'wq[0-9]+' | sort -u); do
+    U=$(systemctl list-units --all --no-legend "lumen-job-fworker-$T-*" 2>/dev/null | awk '{print $1}' | tail -1)
+    st=$(systemctl show -p ActiveState --value "$U" 2>/dev/null)
+    # LAST terminal sentinel only (TICKET_CLOSED|BLOCKED|CLAIM_ERROR|CRASH), from the newest unit
+    sent=$(journalctl -u "$U" --no-pager 2>/dev/null | grep -oE 'TICKET_CLOSED|BLOCKED|CLAIM_ERROR|CRASH' | tail -1)
+    [ -z "$sent" ] && sent="(running)"
+    wqst=$(/home/lumen/bin/wq show "${T#wq}" 2>/dev/null | awk -F: '/^status/{gsub(/ /,"",$2);print $2}')
+    out+="$T unit=$st sentinel=$sent wq=$wqst\n"
+  done
+  printf "%b" "$out"
+}
+case "${1:-tail}" in
+  now)   echo "=== worker status snapshot $(date -u +%H:%M:%SZ) ==="; snapshot ;;
+  log)   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf "%b" "$(snapshot)" | sed "s/^/$ts /" >> "$STORE"; tail -${2:-40} "$STORE" ;;
+  tail)  echo "=== durable notification log (survives teardown) ==="; tail -${2:-40} "$STORE" 2>/dev/null; echo "=== live snapshot ==="; snapshot ;;
+  watch) while true; do ts=$(date -u +%Y-%m-%dT%H:%M:%SZ); printf "%b" "$(snapshot)" | sed "s/^/$ts /" >> "$STORE"; sleep 60; done ;;
+  full)  U=$(systemctl list-units --all --no-legend "lumen-job-fworker-wq$2-*" 2>/dev/null | awk '{print $1}' | tail -1)
+         echo "=== full journal: $U ==="; journalctl -u "$U" --no-pager 2>/dev/null | sed 's/^.*lumen bash[^:]*: //' | tail -${3:-200} ;;
+  *) echo "usage: wq-notify [now|tail N|log N|watch|full TICKET [lines]]" ;;
+esac

@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""plug-findings - turns the plug corpus into findings Frank never had to ask for.
+
+Why this exists: the fleet measured wall wattage every 60s for weeks and an agent still
+recommended moving a workload onto a node drawing 85W completely idle. The data was
+never the problem. Nobody looked. This looks, on a timer, and pushes what it finds.
+
+  plug-findings                 # detect + push to ntfy (deduped 24h), daily timer
+  plug-findings --dry-run       # print, push nothing
+  plug-findings --digest        # weekly roll-up, always pushed
+  plug-findings --self-test     # planted known-positive; must go RED or the tool is lying
+
+Positive control runs on EVERY invocation. A clean sweep is reported with corpus size
+and control result attached, never bare (FAILURE_ARCHAEOLOGY fq F1 audit discipline).
+"""
+import argparse, json, os, re, socket, subprocess, sys, time
+from datetime import datetime, timezone
+
+
+def _dt(y, m, d):
+    """Fixed clock for the self-test, so the control never depends on today's date."""
+    return datetime(y, m, d, tzinfo=timezone.utc)
+
+sys.path.insert(0, "/home/lumen/bin")
+import plug_hist as ph
+
+BASE   = "/home/lumen/fleet/power-ab/baselines.json"
+STATE  = "/home/lumen/fleet/power-ab/findings_state.json"
+LOG    = "/home/lumen/fleet/power-ab/findings.jsonl"
+TOPIC  = os.environ.get("PLUG_NTFY_TOPIC", "lumen-fleet")
+
+IDLE_ALERT_W  = float(os.environ.get("PLUG_IDLE_ALERT_W", "25"))   # idle burn worth naming
+IDLE_DUTY_MAX = 0.10                                               # "doing nothing"
+DRIFT_MIN_W   = 5.0
+DRIFT_MIN_FRAC = 0.10
+MOVER_MIN_W   = 5.0
+DEDUPE_H      = 24
+STALE_ATTRIB_W = float(os.environ.get("PLUG_STALE_ATTRIB_W", "20"))  # draw that demands an owner
+SERIES_FRESH_S = 600.0   # a present-tense claim needs a sample this recent. 10m matches
+                         # plug_hist.corpus_health(stale_min=10), which is already the
+                         # fleet's definition of "this series has gone quiet" — one
+                         # staleness convention, not two that can disagree.
+
+
+# ---------- node liveness (wq#599) ----------
+# WHY (Frank -> mv4 orch, wq#599): a plug label is an OBSERVATION WITH A DATE, not an
+# assignment. Parked boxes get unplugged by policy (circuit budget + wake-on-AC-recovery),
+# so a machine sits on whatever plug was free and the label rots silently. On 2026-08-14
+# khepri moved P1 -> P3; P3 kept the label node="hathor", and hathor has been tailnet-
+# offline 28.9d. Without this guard the daily run attributes ~137W of khepri's draw to a
+# machine that is switched off, and reports it unprompted as fact. A false unprompted
+# finding is worse than silence: it teaches Frank to distrust the whole channel.
+# The rule: never attribute watts to a node we cannot reach. Report the LABEL as the
+# problem instead, and let an unreachable node drawing nothing be what it plainly is.
+ALIAS = {"gameboy-pc": "gameboy"}   # plug label -> tailscale hostname
+EXPLAINED = "/home/lumen/fleet/power-ab/explained_changes.json"
+
+
+def explained_changes():
+    """{node: change} for drift that has already been diagnosed and accepted.
+
+    Frank, 2026-08-15: the isis +50W drift was investigated on 08-14 — the LPP qwen36
+    rung was deliberately moved onto isis — yet the tool kept surfacing it as an open
+    anomaly and I kept repeating that in reports. Re-reporting a known, accepted cause
+    is the same disease as false attribution: it spends attention on a question that is
+    already answered, which is how a channel stops being read."""
+    try:
+        with open(EXPLAINED) as f:
+            return {c["node"]: c for c in json.load(f).get("changes", [])}
+    except Exception:
+        return {}
+
+
+def _explains(chg, delta):
+    """True only while the observed delta matches what the recorded cause predicts.
+    Drift beyond tolerance is a NEW change and must alarm normally — an explanation
+    covers what it explains, not everything that happens to that node afterwards."""
+    if not chg:
+        return False
+    exp, tol = chg.get("expected_delta_w"), chg.get("tolerance_w", 20.0)
+    if exp is None:
+        return True
+    return abs(delta - exp) <= tol
+
+
+def lan_ips():
+    """{node: lan_ip} from lumen_state. NOT a new dependency: every fleet node is
+    required to have a static LAN IP in netplan (fleet standard), and lumen_state is
+    already the single source of truth for fleet facts. This gives liveness a second
+    path that shares nothing with tailscale — no tailscaled, no control plane, no
+    tailnet routing — so one of them dying no longer blinds the guard."""
+    out = {}
+    try:
+        r = subprocess.run(["python3", "/home/lumen/minerva/lumen_state.py", "current", "", "lan_ip"],
+                           capture_output=True, text=True, timeout=60)
+        for line in r.stdout.splitlines():
+            if ".lan_ip" not in line or "=" not in line:
+                continue
+            node = line.split(".lan_ip")[0].strip()
+            val = line.split("=", 1)[1].strip().split()[0]
+            m = re.match(r"^(\d+\.\d+\.\d+\.\d+)", val)
+            if m and node:
+                out[node] = m.group(1)
+    except Exception:
+        pass
+    return out
+
+
+def _ping(ip):
+    try:
+        return subprocess.run(["ping", "-c", "2", "-W", "2", ip],
+                              capture_output=True, timeout=12).returncode == 0
+    except Exception:
+        return False
+
+
+def liveness():
+    """{hostname: True/False} from tailscale, backed by an independent LAN-ping path.
+
+    Returns ({}, err) only when BOTH paths fail, which the caller treats as fail-closed:
+    attribution is suspended rather than falling back to trusting the label, because
+    label-trust is precisely the behaviour this guard exists to remove."""
+    live, ips, err = {}, {}, None
+    try:
+        r = subprocess.run(["tailscale", "status", "--json"],
+                           capture_output=True, text=True, timeout=25)
+        if r.returncode != 0:
+            err = "tailscale exit %d" % r.returncode
+        else:
+            d = json.loads(r.stdout)
+            me = d.get("Self") or {}
+            if me.get("HostName"):
+                live[me["HostName"].lower()] = True          # we are executing on it
+            for p in (d.get("Peer") or {}).values():
+                hn = (p.get("HostName") or "").lower()
+                if not hn:
+                    continue
+                live[hn] = bool(p.get("Online"))
+                addrs = p.get("TailscaleIPs") or []
+                if addrs:
+                    ips[hn] = addrs[0]
+    except Exception as e:
+        err = "%s: %s" % (type(e).__name__, e)
+
+    # Second opinion before calling anything dead: tailscaled can be down on a host that
+    # is otherwise up and drawing power. Try its tailnet IP, then its LAN IP, which does
+    # not involve tailscale at all. This can only ever REMOVE false LABEL_STALE claims.
+    lan = lan_ips()
+    for hn, ok in list(live.items()):
+        if ok:
+            continue
+        if (hn in ips and _ping(ips[hn])) or (hn in lan and _ping(lan[hn])):
+            live[hn] = True
+
+    # If tailscale gave us nothing at all, fall back entirely to LAN ping so the guard
+    # keeps working rather than degrading into label-trust.
+    if not live and lan:
+        # POSITIVE CONTROL ON THE PROBE ITSELF. A broken/missing ping binary makes every
+        # host look dead, which would turn this fallback into a machine for declaring the
+        # whole fleet powered down — far worse than the bug it protects against. Loopback
+        # must answer before any ping result is believed as evidence of absence.
+        if not _ping("127.0.0.1"):
+            return {}, (err or "") + " | ping probe itself failed (loopback unreachable) — " \
+                                     "no liveness evidence, refusing to call anything offline"
+        me = socket.gethostname().split(".")[0].lower()
+        for hn, ip in lan.items():
+            live[hn] = True if hn == me else _ping(ip)
+        live[me] = True                      # we are demonstrably executing on this host
+        if live:
+            err = (err or "tailscale unavailable") + " — liveness from LAN ping only"
+    return live, err
+
+
+def verdicts(nodes, live):
+    """Map plug-label node names -> True/False/None. Absent from the tailnet entirely
+    means unknown (None), NOT dead: a personal PC on a metered plug was never expected
+    to be a peer, and inventing staleness for it would be the same sin in reverse."""
+    out = {}
+    for n in nodes:
+        out[n] = live.get(ALIAS.get(n, n)) if ALIAS.get(n, n) in live else None
+    return out
+
+
+# ---------- pure detection (self-test feeds this the same way real data does) ----------
+def detect(cur, base, live=None, now=None, expl=None):
+    """cur/base: {node: {...}} -> list of findings. No I/O, so it can be unit-tested.
+
+    live: {node: True/False/None} liveness verdict per node. None/missing = unknown,
+    which changes nothing. False gates ALL attribution for that node (wq#599).
+    expl: {node: change} already-diagnosed causes; suppresses drift within tolerance."""
+    f = []
+    live = live or {}
+    expl = explained_changes() if expl is None else expl
+    now = time.time() if now is None else now
+    for n, c in sorted(cur.items()):
+        b = base.get(n) or {}
+
+        # LIVENESS GATE — runs before every other rule, including PARKED, because every
+        # other rule states a fact about node n. If n is unreachable, the only honest
+        # subject of a sentence about this plug is the LABEL, not the machine.
+        if live.get(n) is False:
+            w = c.get("last_w")
+            if w is None:
+                w = c.get("mean_w") or 0.0
+            # node_power_meta truncates long label values ("P3 (re.."), so take the plug
+            # id only — a half-word in an alert reads like the tool is broken.
+            plug = (c.get("plug") or b.get("plug") or "?").split(" (")[0].strip()
+            # "draws NNW" is present tense and needs a present-tense sample. A window can
+            # still hold hours of samples for a label that has since been retired or a
+            # plug that has since stopped reporting; claiming a dead label is "drawing"
+            # would be the same false-confidence bug wearing the opposite mask.
+            age = None
+            if c.get("last_ts"):
+                try:
+                    age = now - datetime.fromisoformat(
+                        c["last_ts"].replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    age = None
+            stale_series = age is not None and age > SERIES_FRESH_S
+            if stale_series:
+                f.append({"kind": "SERIES_ENDED", "node": n, "watts": w,
+                          "key": "SERIES_ENDED:%s:%s" % (n, c.get("last_ts")),
+                          "msg": "%s (%s) stopped reporting at %s and the node is unreachable — "
+                                 "powered down, or the label was retired and its plug now reports "
+                                 "under a different name. Nothing attributed."
+                                 % (n, plug, c.get("last_ts"))})
+            elif w >= STALE_ATTRIB_W:
+                f.append({"kind": "LABEL_STALE", "node": n, "watts": w,
+                          "key": "LABEL_STALE:%s:%s" % (n, round(w / 10) * 10),
+                          "msg": "plug %s draws %.0fW but its labelled node '%s' is unreachable "
+                                 "(tailnet-offline, ping failed). LABEL IS STALE — a different "
+                                 "machine is on that plug. Watts deliberately NOT attributed to "
+                                 "%s. Fix the label; every power figure for %s is untrustworthy "
+                                 "until you do." % (plug, w, n, n, n)})
+            else:
+                f.append({"kind": "POWERED_DOWN", "node": n, "watts": w,
+                          "key": "POWERED_DOWN:%s" % n,
+                          "msg": "%s is unreachable and its plug (%s) draws %.1fW — powered down, "
+                                 "not an anomaly. Baseline comparison suspended until it returns."
+                                 % (n, plug, w)})
+            continue
+
+        if b.get("insufficient_data") or c.get("insufficient_data"):
+            continue
+        # PARKED NODES (Frank 2026-08-14): unused boxes are deliberately UNPLUGGED —
+        # the circuit will not carry every PC plugged in with wake-on-AC-recovery armed.
+        # Their idle/mean are powered-only statistics over a partial window, so drift
+        # against a differently-powered baseline is an artifact of when it was plugged
+        # in, not a change in the machine. Report the parking, do not alarm on it.
+        if c.get("parked") or b.get("parked"):
+            f.append({"kind": "PARKED", "node": n, "watts": c.get("idle_w", 0.0),
+                      "key": "PARKED:%s:%s" % (n, round(c.get("unpowered_frac", 0) * 10)),
+                      "msg": "%s was unplugged %.0f%% of the window (%d powered buckets); "
+                             "idle/load are powered-only and drift is not comparable" %
+                             (n, c.get("unpowered_frac", 0) * 100, c.get("n_powered_buckets", 0))})
+            continue
+        idle, duty = c["idle_w"], c["duty_frac"]
+        if idle >= IDLE_ALERT_W and duty <= IDLE_DUTY_MAX:
+            f.append({"kind": "IDLE_BURN", "node": n, "watts": idle,
+                      "key": "IDLE_BURN:%s" % n,
+                      "msg": "%s burns %.0fW idle at %.0f%% duty (%.2f kWh/day, ~$%.0f/mo at $0.40/kWh). "
+                             "Nothing may move ONTO this node without plug-delta." %
+                             (n, idle, duty * 100, c["kwh_day"], c["kwh_day"] * 30 * 0.40)})
+        bi = b.get("idle_w")
+        # A frozen/contaminated baseline (wq#599 label cutover) is not a yardstick: it
+        # holds another machine's watts under this name. Comparing against it manufactures
+        # drift out of a relabel. Better to have no drift signal than a fabricated one.
+        if bi is not None and not b.get("baseline_frozen"):
+            d = idle - bi
+            if abs(d) >= max(DRIFT_MIN_W, DRIFT_MIN_FRAC * max(bi, 1)):
+                if _explains(expl.get(n), d):
+                    continue      # diagnosed and accepted; not an open question
+                f.append({"kind": "IDLE_DRIFT", "node": n, "watts": d,
+                          "key": "IDLE_DRIFT:%s:%s" % (n, round(d / 5) * 5),
+                          "msg": "%s idle floor moved %+.1fW (%.1f -> %.1f W vs %s baseline)" %
+                                 (n, d, bi, idle, b.get("_window", "baseline"))})
+    movers = []
+    for n, c in cur.items():
+        b = base.get(n) or {}
+        if live.get(n) is False:
+            continue      # wq#599: cannot call it a mover if we cannot say who "it" is
+        if c.get("parked") or b.get("parked"):
+            continue      # partial-window mean vs full-window mean is not a mover
+        if b.get("baseline_frozen"):
+            continue      # wq#599: contaminated baseline, a "move" against it is fiction
+        if b.get("mean_w") is None or c.get("mean_w") is None:
+            continue
+        d = c["mean_w"] - b["mean_w"]
+        if _explains(expl.get(n), d):
+            continue      # diagnosed and accepted placement change, not a mover
+        if abs(d) >= MOVER_MIN_W:
+            movers.append((abs(d), n, d))
+    for _, n, d in sorted(movers, reverse=True)[:3]:
+        f.append({"kind": "TOP_MOVER", "node": n, "watts": d,
+                  "key": "TOP_MOVER:%s:%s" % (n, round(d / 10) * 10),
+                  "msg": "%s mean draw %+.1fW vs baseline (%.1f -> %.1f W)" %
+                         (n, d, base[n]["mean_w"], cur[n]["mean_w"])})
+    return f
+
+
+def self_test():
+    """Planted known-positive. If this does not go RED the detector is broken and the
+    sweep result must not be trusted."""
+    base = {"ghostnode": {"idle_w": 5.0, "mean_w": 6.0, "duty_frac": 0.02, "_window": "test"},
+            "parkednode": {"idle_w": 5.0, "mean_w": 6.0, "duty_frac": 0.02, "_window": "test"},
+            "stalelabel": {"idle_w": 5.0, "mean_w": 6.0, "duty_frac": 0.02, "_window": "test"},
+            "downnode":   {"idle_w": 84.5, "mean_w": 85.0, "duty_frac": 0.02, "_window": "test"},
+            # wq#599: retired label whose baseline holds ANOTHER machine's watts. Drift
+            # and mover comparisons against it must be suppressed, not merely annotated.
+            "frozennode": {"idle_w": 5.0, "mean_w": 6.0, "duty_frac": 0.02, "_window": "test",
+                           "baseline_frozen": True},
+            "explainednode": {"idle_w": 5.0, "mean_w": 6.0, "duty_frac": 0.02, "_window": "test"},
+            "runawaynode":   {"idle_w": 5.0, "mean_w": 6.0, "duty_frac": 0.02, "_window": "test"}}
+    cur = {"ghostnode": {"idle_w": 85.0, "mean_w": 86.0, "duty_frac": 0.02, "kwh_day": 2.06},
+           # planted parked node: must be reported as PARKED and must NOT raise
+           # IDLE_BURN/IDLE_DRIFT off a partial-window powered-only floor
+           "parkednode": {"idle_w": 85.0, "mean_w": 86.0, "duty_frac": 0.02, "kwh_day": 0.30,
+                          "parked": True, "unpowered_frac": 0.72, "n_powered_buckets": 210},
+           # wq#599 planted STALE LABEL: unreachable node, plug pulling real watts.
+           # This is the khepri-on-P3-labelled-hathor shape. It must go RED as a LABEL
+           # problem and must NOT emit a single finding that attributes watts to the node.
+           "stalelabel": {"idle_w": 136.9, "mean_w": 137.5, "last_w": 140.8, "duty_frac": 0.02,
+                          "kwh_day": 3.30, "plug": "P3", "parked": True, "unpowered_frac": 0.92,
+                          "n_powered_buckets": 24},
+           # wq#599 planted POWERED-DOWN node: unreachable, plug near zero. The nephthys
+           # shape. Must be reported as powered down, never as an idle-burn alarm.
+           "downnode": {"idle_w": 84.9, "mean_w": 79.7, "last_w": 10.7, "duty_frac": 0.02,
+                        "kwh_day": 1.91, "plug": "P2"},
+           # live and drawing hard, but its baseline is contaminated: IDLE_BURN is still
+           # legitimate (it stands on current data alone), while any COMPARISON is not.
+           "frozennode": {"idle_w": 85.0, "mean_w": 86.0, "duty_frac": 0.02, "kwh_day": 2.06},
+           # wq#599 planted RETIRED LABEL: unreachable, and its last sample is hours old
+           # because the plug now reports under a different name. Must NOT be described
+           # in the present tense as "drawing" anything.
+           "endednode": {"idle_w": 136.9, "mean_w": 137.5, "last_w": 159.0, "duty_frac": 0.02,
+                         "kwh_day": 3.30, "plug": "P3",
+                         "last_ts": "2026-01-01T00:00:00+00:00"},
+           # wq#599/Frank-2026-08-15: a node whose drift is ALREADY DIAGNOSED. Must be
+           # silent while it matches the recorded cause (+50W), and must alarm again if
+           # it wanders outside tolerance — an explanation is not a permanent mute.
+           "explainednode": {"idle_w": 55.0, "mean_w": 56.0, "duty_frac": 0.02, "kwh_day": 1.3},
+           "runawaynode":   {"idle_w": 205.0, "mean_w": 206.0, "duty_frac": 0.02, "kwh_day": 4.9}}
+    live = {"ghostnode": True, "parkednode": True, "stalelabel": False, "downnode": False,
+            "frozennode": True, "endednode": False, "explainednode": True, "runawaynode": True}
+    expl = {"explainednode": {"expected_delta_w": 50.0, "tolerance_w": 25.0},
+            "runawaynode":   {"expected_delta_w": 50.0, "tolerance_w": 25.0}}
+    res = detect(cur, base, live, now=_dt(2026, 1, 2).timestamp(), expl=expl)
+    got = {x["kind"] for x in res}
+    kinds_parked = {x["kind"] for x in res if x["node"] == "parkednode"}
+    kinds_stale  = {x["kind"] for x in res if x["node"] == "stalelabel"}
+    kinds_down   = {x["kind"] for x in res if x["node"] == "downnode"}
+    kinds_frozen = {x["kind"] for x in res if x["node"] == "frozennode"}
+    kinds_ended  = {x["kind"] for x in res if x["node"] == "endednode"}
+    kinds_expl   = {x["kind"] for x in res if x["node"] == "explainednode"}
+    kinds_run    = {x["kind"] for x in res if x["node"] == "runawaynode"}
+    need = {"IDLE_BURN", "IDLE_DRIFT", "TOP_MOVER", "PARKED", "LABEL_STALE", "POWERED_DOWN",
+            "SERIES_ENDED"}
+    ok = ((need <= got)
+          and kinds_parked == {"PARKED"}
+          # exclusivity is the whole point: an unreachable node must produce EXACTLY the
+          # label finding and nothing that speaks about the machine itself.
+          and kinds_stale == {"LABEL_STALE"}
+          and kinds_down == {"POWERED_DOWN"}
+          # frozen baseline: current-data findings survive, comparisons are suppressed
+          and kinds_frozen == {"IDLE_BURN"}
+          # a dead series is never described as presently drawing power
+          and kinds_ended == {"SERIES_ENDED"}
+          # diagnosed drift is silent...
+          and "IDLE_DRIFT" not in kinds_expl and "TOP_MOVER" not in kinds_expl
+          # ...but the explanation does not mute a genuinely new excursion
+          and "IDLE_DRIFT" in kinds_run)
+    return ok, sorted(got)
+
+
+# ---------- live data ----------
+def load_base():
+    with open(BASE) as f:
+        b = json.load(f)
+    for n, d in b["nodes"].items():
+        d["_window"] = b["window"]
+    return b
+
+
+def current(window="24h"):
+    import plug_baseline as pb
+    return pb.compute(window)
+
+
+def push(title, body, prio="default", dry=False):
+    if dry:
+        print("[dry-run] ntfy %s/%s: %s" % (TOPIC, prio, title))
+        return True
+    r = subprocess.run(["/home/lumen/bin/ntfy-send", "-t", TOPIC, "-T", title, "-p", prio, body],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("NTFY DELIVERY FAILED: %s" % r.stderr.strip(), file=sys.stderr)
+    return r.returncode == 0
+
+
+def state_load():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def state_save(s):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2)
+    os.replace(tmp, STATE)
+
+
+def log_findings(rows):
+    with open(LOG, "a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def digest(base, cur, health, live=None):
+    lines = ["fleet power digest - %s" % datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ"),
+             "corpus: %d live series, %s samples in %s (VictoriaMetrics on Bes, 3y retention)"
+             % (health["series_live"], f"{health.get('samples_%s' % health['window'], 0):,}",
+                health["window"])]
+    rows = sorted(((d.get("mean_w", 0), n, d) for n, d in cur["nodes"].items()
+                   if not d.get("insufficient_data")), reverse=True)
+    tot = sum(r[0] for r in rows)
+    lines.append("fleet mean %.0fW = %.1f kWh/day = ~$%.0f/mo at $0.40/kWh"
+                 % (tot, tot * 24 / 1000.0, tot * 24 / 1000.0 * 30 * 0.40))
+    lines.append("top draw (%s mean, idle floor, duty):" % cur.get("window", health["window"]))
+    live = live or {}
+    for mw, n, d in rows[:6]:
+        # wq#599: never print a node name as the owner of watts we could not verify.
+        # Deliberately neutral — an unreachable node may be powered down OR its label may
+        # be stale, and the digest has no business guessing which.
+        tag = "  [node unreachable - watts not attributed]" if live.get(n) is False else ""
+        lines.append("  %-11s %6.1fW  idle %5.1fW  duty %3.0f%%%s"
+                     % (n, mw, d["idle_w"], d["duty_frac"] * 100, tag))
+    idle_waste = sum(d["idle_w"] for _, n, d in rows
+                     if d["duty_frac"] <= IDLE_DUTY_MAX and live.get(n) is not False)
+    lines.append("idle-only nodes account for %.0fW continuous (%.1f kWh/day)"
+                 % (idle_waste, idle_waste * 24 / 1000.0))
+    lines.append("check before any placement change: plug-delta --from A --to B")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--window", default="24h", help="current-state window (default 24h)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--digest", action="store_true", help="weekly roll-up, always pushed")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+
+    ctrl_ok, ctrl_got = self_test()
+    if a.self_test:
+        print("POSITIVE CONTROL: %s (fired: %s)" % ("RED - detector works" if ctrl_ok else "GREEN - BROKEN", ctrl_got))
+        return 0 if ctrl_ok else 1
+    if not ctrl_ok:
+        push("plug-findings BROKEN", "positive control did not fire (%s). Findings this run are "
+             "not trustworthy." % ctrl_got, "high", a.dry_run)
+        print("positive control failed: %s" % ctrl_got, file=sys.stderr)
+        return 1
+
+    try:
+        cur = current(a.window)
+        base = load_base()
+    except ph.CorpusError as e:
+        push("fleet power: CORPUS BLIND", "plug corpus unreachable (%s). No wattage awareness "
+             "until this is fixed; check lumen-powerdash-vmtunnel and VM on Bes." % e, "high", a.dry_run)
+        print("CORPUS UNREACHABLE: %s" % e, file=sys.stderr)
+        return 3
+    except FileNotFoundError:
+        print("no baselines yet - run: plug-baseline --write", file=sys.stderr)
+        return 2
+
+    health = cur["corpus"]
+
+    # wq#599 liveness cross-check. A failure to reach tailscale is NOT taken as evidence
+    # that anything is offline — lv stays empty and the run degrades to pre-599 behaviour
+    # with the gap stated in the footer, rather than silently inventing stale labels.
+    lv_raw, lv_err = liveness()
+    lv = verdicts(list(cur["nodes"].keys()) + list(health.get("dropped") or []), lv_raw)
+    n_off = sum(1 for v in lv.values() if v is False)
+    n_unk = sum(1 for v in lv.values() if v is None)
+
+    # FAIL CLOSED (wq#599, Frank 2026-08-15). If BOTH liveness paths are gone we cannot
+    # verify a single label. The old behaviour was to carry on attributing watts by
+    # label, which is exactly the failure this guard was built to remove — degrading
+    # into label-trust would make the guard useless precisely when it matters. So
+    # attribution is SUSPENDED and that fact is itself the finding.
+    if not lv_raw:
+        push("fleet power: ATTRIBUTION SUSPENDED",
+             "no liveness source reachable (%s). Both tailscale and LAN ping failed, so no "
+             "plug label can be verified and no wattage can be honestly attributed to a node. "
+             "Findings are suspended for this run rather than reported against unverified "
+             "labels. Fix liveness (tailscale on Lumen, or LAN reachability) to restore "
+             "power awareness." % (lv_err or "unknown"), "high", a.dry_run)
+        print("LIVENESS UNAVAILABLE (%s) — attribution suspended, fail-closed" % lv_err,
+              file=sys.stderr)
+        return 4
+
+    # A series that stops is only an EMERGENCY if the node it names is still reachable —
+    # that is the "box is up, metering died" case, and awareness really is broken.
+    # An unreachable node with no samples is a machine that was switched off, and a
+    # RETIRED LABEL (wq#599: P3 relabelled hathor->khepri) also lands here by definition:
+    # the old label goes quiet forever by design. Paging Frank at high priority for
+    # either one is the same false-confidence failure this ticket exists to remove.
+    if health["dropped"]:
+        quiet_live = [n for n in health["dropped"] if lv.get(n) is not False]
+        quiet_off  = [n for n in health["dropped"] if lv.get(n) is False]
+        if quiet_live:
+            push("fleet power: plug went quiet", "no samples in 10m from: %s — node still "
+                 "reachable, so the METERING stopped, not the machine. Wattage awareness is "
+                 "partial until this returns." % ", ".join(quiet_live), "high", a.dry_run)
+        if quiet_off:
+            print("series ended for unreachable node(s): %s — powered down or label retired, "
+                  "not alarmed" % ", ".join(quiet_off))
+
+    if a.digest:
+        body = digest(base, cur, health, lv) + "\n\npositive control: RED (detector verified this run)"
+        push("fleet power weekly digest", body, "default", a.dry_run)
+        print(body)
+        return 0
+
+    # insufficient_data is filtered AFTER the liveness gate gets to see the node: a plug
+    # whose labelled node just vanished often has too little powered history to baseline,
+    # and dropping it here is exactly how the stale label stays invisible.
+    found = detect({n: d for n, d in cur["nodes"].items()
+                    if not d.get("insufficient_data") or lv.get(n) is False},
+                   base["nodes"], lv)
+    st = state_load()
+    now = time.time()
+    fresh = [f for f in found if now - st.get(f["key"], 0) > DEDUPE_H * 3600]
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for f in found:
+        f["ts"] = stamp
+        f["window"] = a.window
+    log_findings(found)
+
+    footer = ("\ncorpus: %d live series, %s samples/%s | baseline %s | positive control RED"
+              % (health["series_live"],
+                 f"{health.get('samples_%s' % health['window'], 0):,}", health["window"],
+                 base["window"]))
+    footer += ("\nliveness: %d labels checked, %d unreachable, %d unverifiable%s"
+               % (len(lv), n_off, n_unk,
+                  " | DEGRADED: %s (cross-check still performed)" % lv_err if lv_err else ""))
+    # A stale label is a correctness failure in the awareness channel itself, so it
+    # outranks any wattage finding: send it at high priority, not buried in a daily list.
+    prio = "high" if any(f["kind"] == "LABEL_STALE" for f in fresh) else "default"
+    if fresh:
+        body = "\n".join("- " + f["msg"] for f in fresh) + "\n" + footer
+        if push("fleet power: %d finding(s)" % len(fresh), body, prio, a.dry_run) and not a.dry_run:
+            for f in fresh:
+                st[f["key"]] = now
+            state_save(st)
+        print(body)
+    else:
+        print("no new findings (%d suppressed as already sent within %dh)%s"
+              % (len(found), DEDUPE_H, footer))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

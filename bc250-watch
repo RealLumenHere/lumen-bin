@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""bc250-watch: deterministic BC-250 tripwire -> ntfy.
+
+WHY THIS EXISTS (2026-07-29, Frank directive):
+BC-250 intel was reaching the minerva.db and then dying silently. Three gates ate it:
+  1. minerva_proposal only considers self_relevance >= 0.6. BC-250 items routinely
+     score 0.21-0.41 (source-level heuristic scoring). Those are invisible forever.
+  2. minerva_classifier has a 48h lookback with no catch-up pass. Past that, gone.
+  3. lumen_news_digest reads /home/lumen/scratch/research/*.md - a DIFFERENT stream.
+     Scout intel has no path into the daily digest at all.
+Net effect: every BC-250 row in classified_intel from 2026-07-18 onward sat at
+processed=0 and Frank never saw any of it. Hapi is a ~$1000 buy; awareness cannot
+depend on an LLM picking it for one of three TOP SIGNAL slots.
+
+This watcher bypasses ALL scoring. Keyword match -> immediate push. Read-only on
+minerva.db (no writes, no processed flag changes) so it cannot perturb the
+classifier/proposal pipeline. Own state file for dedup.
+"""
+import json
+import os
+import pathlib
+import sqlite3
+import sys
+import urllib.request
+
+DB = "/home/lumen/minerva/minerva.db"
+NTFY = "http://localhost:8080/lumen-alerts"
+STATE = pathlib.Path("/home/lumen/.bc250-watch-seen.json")
+MAX_PUSH = 12  # per run, so a backfill burst cannot spam the phone
+
+# Substring match, lowercased title+source. Deliberately broad: a false positive
+# costs one notification, a miss costs a bad $1000 decision.
+KEYWORDS = [
+    "bc250", "bc-250", "bc 250",
+    "cyan skillfish", "cyan-skillfish",
+    "gfx1013",
+    "oberon",
+]
+
+
+def seen_load():
+    try:
+        return set(json.loads(STATE.read_text())["ids"])
+    except Exception:
+        return set()
+
+
+def seen_save(ids):
+    STATE.write_text(json.dumps({"ids": sorted(ids)[-4000:]}))
+    os.chmod(STATE, 0o600)
+
+
+def ntfy(title, body, click=None, prio="default"):
+    headers = {
+        "Title": title[:200].encode("ascii", "replace").decode(),
+        "Tags": "rotating_light,cpu",
+        "Priority": prio,
+    }
+    if click:
+        headers["Click"] = click
+    req = urllib.request.Request(
+        NTFY, data=body.encode("utf-8"), headers=headers, method="POST"
+    )
+    urllib.request.urlopen(req, timeout=8).read()
+
+
+def main():
+    armed = "--arm" in sys.argv
+    dry = "--dry-run" in sys.argv
+
+    # read-only URI so a bug here can never write to the minerva db
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    like = " OR ".join(
+        ["LOWER(title) LIKE ?" for _ in KEYWORDS]
+        + ["LOWER(source) LIKE ?" for _ in KEYWORDS]
+    )
+    params = [f"%{k}%" for k in KEYWORDS] * 2
+    rows = conn.execute(
+        f"SELECT id, source, title, url, self_relevance, ts "
+        f"FROM classified_intel WHERE {like} ORDER BY ts DESC LIMIT 400",
+        params,
+    ).fetchall()
+    conn.close()
+
+    seen = seen_load()
+
+    if armed:
+        # first run: mark everything current as seen, push a single armed summary
+        ids = {r[0] for r in rows}
+        if not dry:
+            seen_save(ids)
+            ntfy(
+                "BC-250 watch armed",
+                f"Tripwire live. Baselined {len(ids)} existing BC-250 items as seen.\n"
+                f"Any NEW BC-250 intel now pages immediately, regardless of score.",
+            )
+        print(f"armed: baselined {len(ids)} items")
+        return
+
+    new = [r for r in rows if r[0] not in seen]
+    if not new:
+        print("no new BC-250 intel")
+        return
+
+    for _id, source, title, url, score, ts in new[:MAX_PUSH]:
+        body = f"{title}\n\nsource: {source}\nscore: {score:.2f} (gate bypassed)\n{url or ''}"
+        # score is informational only - it does NOT gate the push
+        prio = "high" if (score or 0) >= 0.6 else "default"
+        print(f"push: [{score:.2f}] {source} :: {title[:70]}")
+        if not dry:
+            ntfy(f"BC-250: {title[:90]}", body, click=url or None, prio=prio)
+
+    if len(new) > MAX_PUSH:
+        extra = len(new) - MAX_PUSH
+        print(f"suppressed {extra} additional (MAX_PUSH cap)")
+        if not dry:
+            ntfy(
+                f"BC-250: +{extra} more items",
+                f"{extra} further BC-250 items this run, capped to avoid spam.\n"
+                f"Full list: sqlite3 {DB} \"SELECT ts,source,title FROM classified_intel "
+                f"WHERE LOWER(title) LIKE '%bc250%' ORDER BY ts DESC LIMIT 40;\"",
+            )
+
+    if not dry:
+        seen.update(r[0] for r in new)
+        seen_save(seen)
+    print(f"pushed {min(len(new), MAX_PUSH)} of {len(new)} new")
+
+
+if __name__ == "__main__":
+    main()

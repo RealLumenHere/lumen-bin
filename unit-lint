@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""unit-lint — READ-ONLY systemd unit hygiene report for the Lumen fleet.
+(Minerva proposal fd50d5642dc3, wq#440, Scribe #301 — scope cut: the proposed
+mass-refactor of ALL live units was rejected (blast radius on crown services
+for cosmetic gain); this linter is the salvageable delta. NEVER edits.)
+
+Checks per unit in /etc/systemd/system: missing Description; service without
+[Install] and not activated by a timer/socket; timer without matching service;
+oneshot without TimeoutStartSec; no Memory limit (advisory); ExecStart path
+missing on disk. Plus fleet-level: .bak/.disabled clutter count, enabled-vs-
+file drift. Output: report to stdout; --json for machine use. Exit 0 always
+(warning-only).
+"""
+import glob, json, os, re, subprocess, sys
+
+UNIT_DIR = "/etc/systemd/system"
+
+def parse(path):
+    d = {}
+    sec = None
+    try:
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                sec = line[1:-1]
+            elif "=" in line and sec:
+                k, v = line.split("=", 1)
+                d.setdefault(sec, {}).setdefault(k.strip(), []).append(v.strip())
+    except Exception as e:
+        d["_error"] = str(e)
+    return d
+
+def main():
+    as_json = "--json" in sys.argv
+    units = sorted(glob.glob(f"{UNIT_DIR}/*.service") +
+                   glob.glob(f"{UNIT_DIR}/*.timer"))
+    units = [u for u in units if os.path.isfile(u)]
+    timers = {os.path.basename(u)[:-6] for u in units if u.endswith(".timer")}
+    findings = []
+    for u in units:
+        name = os.path.basename(u)
+        d = parse(u)
+        f = []
+        if not d.get("Unit", {}).get("Description"):
+            f.append("no Description")
+        if name.endswith(".service"):
+            base = name[:-8]
+            svc = d.get("Service", {})
+            if "Install" not in d and base not in timers:
+                f.append("no [Install] and no matching timer")
+            if svc.get("Type", ["simple"])[0] == "oneshot" \
+                    and not svc.get("TimeoutStartSec"):
+                f.append("oneshot without TimeoutStartSec")
+            if not svc.get("MemoryMax") and not svc.get("MemoryHigh"):
+                f.append("no memory limit (advisory)")
+            for ex in svc.get("ExecStart", []):
+                m = re.match(r"-?(/\S+)", ex.replace('"', ""))
+                if m and not os.path.exists(m.group(1)):
+                    f.append(f"ExecStart binary missing: {m.group(1)}")
+        if name.endswith(".timer"):
+            base = name[:-6]
+            if not os.path.exists(f"{UNIT_DIR}/{base}.service"):
+                f.append("timer without matching .service")
+        if f:
+            findings.append({"unit": name, "issues": f})
+    clutter = len(glob.glob(f"{UNIT_DIR}/*.bak*") +
+                  glob.glob(f"{UNIT_DIR}/*.disabled*"))
+    out = {"units_scanned": len(units), "units_flagged": len(findings),
+           "bak_disabled_clutter": clutter, "findings": findings}
+    if as_json:
+        print(json.dumps(out, indent=1))
+    else:
+        for f in findings:
+            print(f"{f['unit']}: " + "; ".join(f["issues"]))
+        print(f"\n{len(findings)}/{len(units)} units flagged; "
+              f"{clutter} .bak/.disabled files in {UNIT_DIR}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

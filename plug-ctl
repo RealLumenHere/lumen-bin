@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# plug-ctl — Tapo P115 fleet control via python-kasa (KLAP unicast)
+# Usage: plug-ctl <p1..p11|p13|p14|all> <on|off|state|watts|energy|json>
+set -euo pipefail
+source /home/lumen/.config/tapo.env
+KASA=/home/lumen/.local/bin/kasa
+declare -A IP=(
+  [p1]=192.168.8.118 [p2]=192.168.8.220 [p3]=192.168.8.221
+  [p4]=192.168.8.226 [p5]=192.168.8.170 [p6]=192.168.8.212
+  [p7]=192.168.8.230 [p8]=192.168.8.152 [p9]=192.168.8.196
+  [p10]=192.168.8.154 [p11]=192.168.8.115
+  [p13]=192.168.8.181 [p14]=192.168.8.124
+)
+ORDER="p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p13 p14"
+# Display labels only — canonical source is lumen_state.py (node.power_plug facts)
+declare -A LABEL=(
+  # LABELS ARE OBSERVATIONS WITH A DATE, NOT ASSIGNMENTS. Parked boxes get UNPLUGGED
+  # (fleet.power_policy: circuit budget + wake-on-AC-recovery), so a machine sits on
+  # whatever plug happened to be free. Verify occupancy from a wattage transition +
+  # live ssh before trusting any name here. 2026-08-22 (Frank): P3 IS HATHOR'S PLUG.
+  # Khepri was plugged into P3 exactly ONCE (2026-08-14 22:52, 0W->128W) purely so its
+  # hardware could be verified, then removed. That one-off observation was wrongly left
+  # as the standing label for 8 days. A single verification event is NOT an assignment.
+  [p1]=p1-unoccupied [p2]=nephthys [p3]=hathor [p4]=maat [p5]=isis
+  [p6]=seshat [p7]=bes [p8]=sia [p9]=anubis [p10]=thoth [p11]=lumen
+  # 2026-08-10 (Frank): HOUSEHOLD plugs, NOT Lumen fleet nodes. Power-monitored
+  # only; excluded from fleet ops (no updates/reboots/probes/envelopes).
+  [p13]="riley-pc" [p14]="parker-pc"
+)
+k() { "$KASA" --host "$1" --username "$TAPO_USER" --password "$TAPO_PASS" "${@:2}" 2>/dev/null; }
+watts_one() { # name ip -> "name state watts"
+  local out st w
+  out=$(k "$2" state) || { echo "$1 unreachable -"; return; }
+  st=$(grep -m1 '^Device state:' <<<"$out" | awk '{print $3}')
+  w=$(grep -m1 'Current consumption' <<<"$out" | grep -oE '[0-9]+\.?[0-9]*' | head -1)
+  echo "$1 ${st:-?} ${w:-0}"
+}
+cmd="${2:-state}"; tgt="${1:-all}"
+if [[ "$tgt" == "all" ]]; then
+  case "$cmd" in
+    watts|state)
+      tmp=$(mktemp -d)
+      for n in $ORDER; do ( watts_one "$n" "${IP[$n]}" > "$tmp/$n" ) & done
+      wait
+      total=0
+      printf '%-5s %-6s %s\n' PLUG STATE WATTS
+      for n in $ORDER; do
+        read -r nm st w < "$tmp/$n"
+        printf '%-5s %-6s %s\n' "$nm" "$st" "$w"
+        total=$(awk -v a="$total" -v b="$w" 'BEGIN{print a+b}')
+      done
+      printf '%-5s %-6s %s\n' TOTAL - "$total"
+      rm -rf "$tmp" ;;
+    json)
+      tmp=$(mktemp -d)
+      for n in $ORDER; do ( watts_one "$n" "${IP[$n]}" > "$tmp/$n" ) & done
+      wait
+      total=0; first=1
+      printf '{"updated":"%s","plugs":[' "$(date -Iseconds)"
+      for n in $ORDER; do
+        read -r nm st w < "$tmp/$n"
+        [[ $first -eq 0 ]] && printf ','
+        wj="${w:-0}"; [[ "$wj" =~ ^[0-9]+\.?[0-9]*$ ]] || wj=null
+        printf '{"name":"%s","device":"%s","ip":"%s","state":"%s","watts":%s}' "$nm" "${LABEL[$n]:-?}" "${IP[$n]}" "$st" "$wj"
+        total=$(awk -v a="$total" -v b="${w:-0}" 'BEGIN{print a+b}'); first=0
+      done
+      printf '],"total_watts":%s}\n' "$total"
+      rm -rf "$tmp" ;;
+    *) echo "all supports: watts|state|json" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+[[ -n "${IP[$tgt]:-}" ]] || { echo "unknown plug: $tgt (p1..p11|p13|p14|all)" >&2; exit 1; }
+case "$cmd" in
+  on|off) k "${IP[$tgt]}" "$cmd" ;;
+  state) k "${IP[$tgt]}" state ;;
+  watts) watts_one "$tgt" "${IP[$tgt]}" ;;
+  energy) k "${IP[$tgt]}" energy ;;
+  *) echo "cmds: on|off|state|watts|energy" >&2; exit 1 ;;
+esac

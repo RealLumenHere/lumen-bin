@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# wq#591 followup: TRANSIENT load-bench-unload of Qwen3.6-35B-A3B on Lumen.
+# llama-bench loads the model, benches, and exits -> no warm model left behind.
+set -u
+D=/home/lumen/tools/llama.cpp/llama-b9334
+M=/home/lumen/models/qwen36-35b/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+OUT=/home/lumen/scratch/qwen36_bench_lumen.txt
+export LD_LIBRARY_PATH=$D
+echo "START $(date -u +%FT%TZ)" > $OUT
+free -g | head -2 >> $OUT
+"$D/llama-bench" -m "$M" -p 2048 -n 128 -t 12,22,44 -r 2 2>&1 | tee -a $OUT
+echo "END $(date -u +%FT%TZ)" >> $OUT
+free -g | head -2 >> $OUT

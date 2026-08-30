@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# wq#529 full Gitea credential restore. The token NEVER appears in argv, in any
+# log, in a clipboard, or in an LLM context: it is minted on Anubis, piped over
+# ssh into a shell variable here, written to 600-mode files, then unset.
+set -uo pipefail
+[ "$(hostname)" = lumen ] || { echo "lumen only"; exit 9; }
+
+ENVF=/home/lumen/agent/.env
+CRED=/home/lumen/.git-credentials
+STAMP=$(date +%Y%m%d_%H%M%S)
+P=$(grep -oP '^GITEA_PASSWORD=\K.*' "$ENVF" | tr -d '"')
+
+echo "=== 1. delete the ORPHANED token id=3 (value was never captured) ==="
+curl -s -o /dev/null -w "  DELETE token id=3 -> HTTP %{http_code} (204=deleted)\n" \
+  --max-time 10 -X DELETE -u "lumen:$P" http://100.121.17.5:3000/api/v1/users/lumen/tokens/3
+
+echo "=== 2. mint a fresh token on Anubis, piped straight here ==="
+NAME="lumen-fleet-$STAMP"
+NEW=$(ssh -o BatchMode=yes -o ConnectTimeout=10 anubis \
+  "sudo -u gitea gitea admin user generate-access-token -c /etc/gitea/app.ini -w /var/lib/gitea --username lumen --token-name $NAME --scopes write:repository,write:user --raw" 2>/dev/null | tr -d '[:space:]')
+echo "  name=$NAME  len=${#NEW}  sha256=$(printf %s "$NEW" | sha256sum | cut -c1-16)"
+[ ${#NEW} -ge 30 ] || { echo "  MINT FAILED - nothing changed"; exit 1; }
+
+echo "=== 3. verify the new token BEFORE writing it anywhere ==="
+C=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 -H "Authorization: token $NEW" http://100.121.17.5:3000/api/v1/user)
+echo "  new token -> HTTP $C"
+[ "$C" = "200" ] || { echo "  new token does not authenticate - nothing changed"; exit 1; }
+
+echo "=== 4. .git-credentials ==="
+cp -a "$CRED" "$CRED.bak.$STAMP"; chmod 600 "$CRED.bak.$STAMP"
+NEWTOK="$NEW" python3 - "$CRED" <<'PY'
+import re,os,sys
+tok=os.environ["NEWTOK"]; p=sys.argv[1]
+out=[];n=0
+for l in open(p).read().splitlines():
+    m=re.match(r'^(https?://)([^:]+):([^@]*)(@100\.121\.17\.5%3a3000)$', l)
+    if m: out.append(m.group(1)+m.group(2)+":"+tok+m.group(4)); n+=1
+    else: out.append(l)
+fd=os.open(p+".tmp",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+os.write(fd,("\n".join(out)+"\n").encode()); os.close(fd); os.replace(p+".tmp",p)
+print("  rewrote %d line(s)"%n)
+PY
+
+echo "=== 5. agent/.env GITEA_TOKEN ==="
+cp -a "$ENVF" "$ENVF.bak.$STAMP"; chmod 600 "$ENVF.bak.$STAMP"
+NEWTOK="$NEW" python3 - "$ENVF" <<'PY'
+import re,os,sys
+tok=os.environ["NEWTOK"]; p=sys.argv[1]
+out=[];n=0
+for l in open(p).read().splitlines():
+    if re.match(r'^GITEA_TOKEN=', l): out.append("GITEA_TOKEN="+tok); n+=1
+    else: out.append(l)
+fd=os.open(p+".tmp",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+os.write(fd,("\n".join(out)+"\n").encode()); os.close(fd); os.replace(p+".tmp",p)
+print("  rewrote %d line(s)"%n)
+PY
+unset NEW
+
+echo "=== 6. repo remotes: STRIP the embedded token, let .git-credentials answer ==="
+echo "    (one rotation point instead of four - this is the wq#529 fix, not a workaround)"
+for d in /home/lumen/bin /home/lumen/messenger /home/lumen/minerva; do
+  [ -d "$d/.git" ] || continue
+  U=$(git -C "$d" remote get-url origin)
+  CLEAN=$(printf %s "$U" | sed -E 's#://[^@]+@#://lumen@#')
+  git -C "$d" remote set-url origin "$CLEAN"
+  git -C "$d" ls-remote origin -h refs/heads/main >/dev/null 2>&1 \
+    && echo "  $(basename $d): OK   $CLEAN" \
+    || { echo "  $(basename $d): FAILED after strip - reverting to embedded"; git -C "$d" remote set-url origin "$U"; }
+done

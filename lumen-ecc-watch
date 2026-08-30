@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# lumen-ecc-watch — EDAC ECC correctable/uncorrectable delta watcher.
+# Fires URGENT ntfy -> lumen-alerts on ANY new CE/UE; a UE is flagged ESCALATE.
+# SOURCE OF TRUTH = EDAC sysfs mc-level ce_count/ue_count. These INCLUDE the
+# ce_noinfo/rank-unknown errors (like the 2026-08-11 rank:255 CEs) that per-DIMM
+# counters and `ras-mc-ctl --error-count` can miss. NOTE: mc ce_count already
+# includes ce_noinfo_count -> do NOT add them (would double-count).
+# rasdaemon holds the decoded + reboot-persistent history. Timer: every 5 min.
+set -uo pipefail
+[ "$(hostname -s)" = "lumen" ] || exit 0
+STATE_DIR=${LUMEN_ECC_STATE:-/var/lib/lumen-ecc}
+BASE="$STATE_DIR/baseline"
+NTFY=/home/lumen/bin/ntfy-send
+DRYRUN=${DRYRUN:-0}
+mkdir -p "$STATE_DIR"
+
+send(){ if [ "$DRYRUN" = 1 ]; then echo "[DRYRUN ntfy] $*"; else "$NTFY" "$@" || true; fi; }
+
+cur_ce=0; cur_ue=0
+for mc in /sys/devices/system/edac/mc/mc*; do
+  [ -d "$mc" ] || continue
+  cur_ce=$(( cur_ce + $(cat "$mc/ce_count" 2>/dev/null || echo 0) ))
+  cur_ue=$(( cur_ue + $(cat "$mc/ue_count" 2>/dev/null || echo 0) ))
+done
+
+if [ ! -f "$BASE" ]; then printf 'ce=%s\nue=%s\n' "$cur_ce" "$cur_ue" > "$BASE"; exit 0; fi
+base_ce=$(sed -n 's/^ce=//p' "$BASE"); base_ue=$(sed -n 's/^ue=//p' "$BASE")
+base_ce=${base_ce:-0}; base_ue=${base_ue:-0}
+
+# reboot / counter reset -> re-arm, informational (EDAC sysfs zeroes on boot; rasdaemon persists)
+if [ "$cur_ce" -lt "$base_ce" ] || [ "$cur_ue" -lt "$base_ue" ]; then
+  printf 'ce=%s\nue=%s\n' "$cur_ce" "$cur_ue" > "$BASE"
+  send -t lumen-fleet -p low --quiet -T "Lumen ECC baseline re-armed" \
+    "EDAC counters dropped (ce $base_ce->$cur_ce ue $base_ue->$cur_ue) — likely reboot. Baseline re-armed; rasdaemon DB retains full history."
+  exit 0
+fi
+
+d_ce=$(( cur_ce - base_ce )); d_ue=$(( cur_ue - base_ue ))
+[ "$d_ce" -eq 0 ] && [ "$d_ue" -eq 0 ] && exit 0
+
+bd=""
+for mc in /sys/devices/system/edac/mc/mc*; do
+  [ -d "$mc" ] || continue; n=$(basename "$mc")
+  ni=$(cat "$mc/ce_noinfo_count" 2>/dev/null || echo 0)
+  for d in "$mc"/dimm*; do
+    [ -d "$d" ] || continue
+    lbl=$(cat "$d/dimm_label" 2>/dev/null); dce=$(cat "$d/dimm_ce_count" 2>/dev/null||echo 0); due=$(cat "$d/dimm_ue_count" 2>/dev/null||echo 0)
+    { [ "$dce" != 0 ] || [ "$due" != 0 ]; } && bd+="$lbl CE=$dce UE=$due; "
+  done
+  [ "$ni" != 0 ] && bd+="$n rank-unknown CE_noinfo=$ni; "
+done
+last=$(journalctl -k -b 0 2>/dev/null | grep -E 'EDAC MC[0-9]:.*(CE|UE) memory' | tail -1 | sed 's/.*EDAC/EDAC/' | cut -c1-160)
+LEGEND="Dell T5810 slot map: ch0=DIMM1 ch1=DIMM2 ch2=DIMM3 ch3=DIMM4 (global ch = Ha*2+Chan)"
+
+if [ "$d_ue" -gt 0 ]; then
+  send -t lumen-alerts -p urgent -T "Lumen ECC: $d_ue NEW UNCORRECTED (UE) — ESCALATE" \
+    "UNCORRECTED ECC error on Lumen T5810. UE $base_ue->$cur_ue, CE $base_ce->$cur_ce. $bd Last: $last. $LEGEND ** ECC no longer covering: data-integrity risk. Reseat/replace the flagged DIMM and consider pulling Lumen from critical duty. **"
+else
+  # wq#972 (R2 alert hygiene): below-UE correctable CEs are info-class — the daily
+  # lumen-ecc-rollup (-> lumen-fleet) is the standing ECC voice on lumen-alerts's
+  # page path. Route per-CE deltas to the digest topic instead of paging Frank.
+  send -t lumen-updates -p default -T "Lumen ECC: $d_ce new correctable CE" \
+    "New corrected ECC error(s) on Lumen T5810. CE $base_ce->$cur_ce (UE=0). $bd Last: $last. $LEGEND Decoded detail: ras-mc-ctl --summary."
+fi
+printf 'ce=%s\nue=%s\n' "$cur_ce" "$cur_ue" > "$BASE"
+exit 0

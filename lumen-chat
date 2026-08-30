@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# lumen-chat — persistent interactive Claude sessions in named tmux sessions.
+# Frank-facing CLI: new/list/attach/kill/menu
+# Web terminal entry point (menu) is served via ttyd at chat.lumennode.uk.
+set -euo pipefail
+
+SESSION_PREFIX="lumen-chat"
+CLAUDE_BIN="${CLAUDE_BIN:-/home/lumen/.npm-global/bin/claude}"
+[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(which claude 2>/dev/null || true)"
+[ -x "$CLAUDE_BIN" ] || { echo "lumen-chat: claude not found in PATH or ~/.nvm" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<USAGE
+lumen-chat — persistent interactive Claude sessions
+
+  new  [name] [--model MODEL] [--effort EFFORT]
+         Create a new tmux session running claude interactive.
+         name defaults to a timestamp slug.
+
+  list
+         List active lumen-chat sessions.
+
+  attach <name>
+         Attach to an existing session.
+
+  kill   <name>
+         Kill a session.
+
+  menu
+         Interactive session picker (used by the ttyd web terminal).
+USAGE
+  exit 64
+}
+
+session_name() { echo "${SESSION_PREFIX}-${1}"; }
+
+cmd_new() {
+  local name model="" effort=""
+  name="${1:-$(date +%Y%m%d-%H%M%S)}"
+  shift 2>/dev/null || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model)  model="$2"; shift 2 ;;
+      --effort) effort="$2"; shift 2 ;;
+      *) echo "lumen-chat new: unknown option $1" >&2; usage ;;
+    esac
+  done
+
+  local sn
+  sn=$(session_name "$name")
+  if tmux has-session -t "$sn" 2>/dev/null; then
+    echo "lumen-chat: session already exists: $sn (use 'attach $name')" >&2
+    exit 1
+  fi
+
+  local claude_cmd="$CLAUDE_BIN"
+  [[ -n "$model" ]]  && claude_cmd="$claude_cmd --model $model"
+  [[ -n "$effort" ]] && claude_cmd="$claude_cmd --effort $effort"
+
+  tmux new-session -d -s "$sn" "$claude_cmd"
+  echo "created: $sn"
+}
+
+cmd_list() {
+  local sessions
+  sessions=$(tmux list-sessions -F $'#{session_name}\t#{t:session_created}\t#{session_windows}' 2>/dev/null \
+    | grep "^${SESSION_PREFIX}-" || true)
+  if [[ -z "$sessions" ]]; then
+    echo "(no active lumen-chat sessions)"
+    return
+  fi
+  printf "%-35s  %-30s  %s\n" "NAME" "CREATED" "WINDOWS"
+  printf "%-35s  %-30s  %s\n" "----" "-------" "-------"
+  while IFS=$'\t' read -r sn created wins; do
+    local short="${sn#${SESSION_PREFIX}-}"
+    printf "%-35s  %-30s  %s\n" "$short" "$created" "$wins"
+  done <<< "$sessions"
+}
+
+cmd_attach() {
+  local name="${1:?usage: lumen-chat attach <name>}"
+  local sn
+  sn=$(session_name "$name")
+  if ! tmux has-session -t "$sn" 2>/dev/null; then
+    echo "lumen-chat: no session: $sn" >&2
+    exit 1
+  fi
+  exec tmux attach-session -t "$sn"
+}
+
+cmd_kill() {
+  local name="${1:?usage: lumen-chat kill <name>}"
+  local sn
+  sn=$(session_name "$name")
+  tmux kill-session -t "$sn" 2>/dev/null || { echo "lumen-chat: no session: $sn" >&2; exit 1; }
+  echo "killed: $sn"
+}
+
+cmd_menu() {
+  # Interactive picker for the ttyd web terminal.
+  # Runs in a loop until the user exits.
+  local TERM="${TERM:-xterm-256color}"
+  while true; do
+    clear
+    printf '\033[1;36m=== Lumen Chat Sessions ===\033[0m\n\n'
+
+    local sessions=()
+    while IFS= read -r s; do
+      [[ -n "$s" ]] && sessions+=("$s")
+    done < <(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ ${#sessions[@]} -eq 0 ]]; then
+      printf '  \033[2m(no active sessions)\033[0m\n'
+    else
+      local i=1
+      for s in "${sessions[@]}"; do
+        local short="${s#${SESSION_PREFIX}-}"
+        printf '  \033[33m[%d]\033[0m %s\n' "$i" "$short"
+        ((i++))
+      done
+    fi
+    printf '\n  \033[33m[n]\033[0m New session\n'
+    printf '  \033[33m[q]\033[0m Quit\n\n'
+    printf 'Choose: '
+
+    local choice
+    IFS= read -r choice || { echo; exit 0; }
+
+    case "$choice" in
+      q|Q) exit 0 ;;
+      n|N)
+        printf 'Session name [%s]: ' "$(date +%H%M%S)"
+        local new_name
+        IFS= read -r new_name
+        new_name="${new_name:-$(date +%H%M%S)}"
+        printf 'Model (blank=default): '
+        local new_model; IFS= read -r new_model
+        printf 'Effort (blank=default): '
+        local new_effort; IFS= read -r new_effort
+        local sn
+        sn=$(session_name "$new_name")
+        local cmd_arr=("$CLAUDE_BIN")
+        [[ -n "$new_model" ]]  && cmd_arr+=(--model "$new_model")
+        [[ -n "$new_effort" ]] && cmd_arr+=(--effort "$new_effort")
+        tmux new-session -d -s "$sn" "${cmd_arr[@]}" 2>/dev/null || true
+        exec tmux attach-session -t "$sn"
+        ;;
+      [0-9]*)
+        if [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#sessions[@]} ]]; then
+          local target="${sessions[$((choice-1))]}"
+          exec tmux attach-session -t "$target"
+        else
+          printf '\033[31mInvalid choice.\033[0m\n'
+          sleep 1
+        fi
+        ;;
+      *)
+        printf '\033[31mInvalid choice.\033[0m\n'
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ -z "$cmd" ]] && usage
+  shift
+  case "$cmd" in
+    new)    cmd_new "$@" ;;
+    list)   cmd_list ;;
+    attach) cmd_attach "$@" ;;
+    kill)   cmd_kill "$@" ;;
+    menu)   cmd_menu ;;
+    *)      usage ;;
+  esac
+}
+
+main "$@"

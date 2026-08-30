@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Thin wrapper. The generator itself lives in claude-foreman (wq#839):
+#   ops/wq751-worker-success/fworker_stats.py
+#
+# It used to live here as an untracked copy, which is how its §3/§6 prose came to
+# be hardcoded against the 2026-08-22 dataset and never recomputed — there was no
+# tracked artifact and no test holding it honest. Keep this file a delegator so
+# there is exactly one source of truth.
+set -euo pipefail
+
+TARGET="${FWORKER_STATS_SRC:-/home/lumen/foreman/ops/wq751-worker-success/fworker_stats.py}"
+
+if [[ ! -f "$TARGET" ]]; then
+    echo "fworker-stats: generator not found at $TARGET" >&2
+    echo "  It landed on claude-foreman main as ops/wq751-worker-success/fworker_stats.py." >&2
+    echo "  Pull main in /home/lumen/foreman, or set FWORKER_STATS_SRC to a checkout." >&2
+    exit 1
+fi
+
+exec python3 "$TARGET" "$@"

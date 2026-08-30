@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# vault-put-note — store multi-line text as a Vaultwarden secure note.
+# Usage: vault-put-note "Item name"     (secret is read from stdin/tty, never from argv)
+set -euo pipefail
+export PATH=/home/lumen/.npm-global/bin:$PATH
+
+NAME="${1:-}"
+if [ -z "$NAME" ]; then echo "usage: vault-put-note \"Item name\"" >&2; exit 1; fi
+
+STATUS=$(bw status | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
+case "$STATUS" in
+  unauthenticated) echo "-- Vaultwarden login (email + master password) --" >&2; BW_SESSION=$(bw login --raw) ;;
+  locked)          echo "-- Vaultwarden unlock (master password) --" >&2;        BW_SESSION=$(bw unlock --raw) ;;
+  unlocked)        echo "-- session already unlocked --" >&2 ;;
+  *)               echo "unexpected bw status: $STATUS" >&2; exit 1 ;;
+esac
+export BW_SESSION
+bw sync >/dev/null
+
+echo "" >&2
+echo "Paste the secret text now (multi-line OK). Finish with Ctrl-D on a blank line:" >&2
+NOTES=$(cat)
+if [ -z "$NOTES" ]; then echo "empty input — nothing stored" >&2; bw lock >/dev/null; exit 1; fi
+
+printf '%s' "$NOTES" | python3 -c '
+import sys, json
+notes = sys.stdin.read()
+print(json.dumps({
+  "organizationId": None, "collectionIds": None, "folderId": None,
+  "type": 2, "name": sys.argv[1], "notes": notes,
+  "favorite": False, "reprompt": 0, "secureNote": {"type": 0}
+}))' "$NAME" | bw encode | bw create item >/dev/null
+
+bw sync >/dev/null
+echo "" >&2
+echo "stored:" >&2
+bw list items --search "$NAME" | python3 -c 'import sys,json;[print("  ",i["id"],i["name"]) for i in json.load(sys.stdin)]'
+bw lock >/dev/null
+unset BW_SESSION
+echo "vault locked." >&2

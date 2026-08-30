@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ds-cache-rate — DeepSeek prefix-cache hit rate + spend, per caller, per day (PT).
+# Usage: ds-cache-rate [days_back]   (default 3)
+D="${1:-3}"
+Q='("startTime" AT TIME ZONE '"'"'UTC'"'"' AT TIME ZONE '"'"'America/Los_Angeles'"'"')'
+docker exec lumen-pgvector psql -U lumen -d litellm -c "
+SELECT date_trunc('day',$Q)::date AS day,
+       COALESCE(request_tags->>0,'-')          AS caller,
+       count(*)                                AS calls,
+       round(avg(prompt_tokens))               AS avg_in,
+       round(avg(completion_tokens))           AS avg_out,
+       round(100.0*sum(COALESCE((metadata->'usage_object'->>'prompt_cache_hit_tokens')::bigint,0))
+             /nullif(sum(prompt_tokens),0),1)  AS cache_pct,
+       round(sum(spend)::numeric,4)            AS usd
+FROM \"LiteLLM_SpendLogs\"
+WHERE custom_llm_provider='deepseek' AND $Q >= current_date - $D
+GROUP BY 1,2 ORDER BY 1 DESC, 7 DESC;"

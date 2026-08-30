@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""queue-status — one-view unified board across wq lanes + minerva proposals. wq#260.
+READ-ONLY. Usage: queue-status [-n NEXT] [--lane L]"""
+import argparse, sqlite3, sys
+from datetime import datetime, timezone
+
+WQ = "/home/lumen/agents/work-queue/queue.db"
+MV = "/home/lumen/minerva/minerva.db"
+
+def now(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+def conn(p):
+    c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+    c.execute("PRAGMA busy_timeout=5000"); c.row_factory = sqlite3.Row
+    return c
+
+def deps_met(done_ids, deps):
+    return all(d.strip() and int(d) in done_ids for d in deps.split(",") if d.strip()) if deps else True
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-n", type=int, default=8, help="next-claimable rows to show (default 8)")
+    ap.add_argument("--lane", help="restrict to one lane")
+    a = ap.parse_args()
+    t = now()
+    wq = conn(WQ)
+    rows = wq.execute("SELECT id,lane,pri,status,title,deps,claimed_by,lease_expires FROM tasks").fetchall()
+    done_ids = {r["id"] for r in rows if r["status"] == "done"}
+    lanes = sorted({r["lane"] for r in rows}) if not a.lane else [a.lane]
+    print(f"QUEUE STATUS {t}  ({WQ})")
+    print(f"{'lane':<10}{'open':>6}{'ready':>7}{'blockd':>7}{'claimd':>7}{'stale':>6}{'done':>6}")
+    tot = dict(open=0, ready=0, blocked=0, claimed=0, stale=0, done=0)
+    for L in lanes:
+        lr = [r for r in rows if r["lane"] == L]
+        op = [r for r in lr if r["status"] == "open"]
+        ready = [r for r in op if deps_met(done_ids, r["deps"] or "")]
+        cl = [r for r in lr if r["status"] == "claimed"]
+        stale = [r for r in cl if r["lease_expires"] and r["lease_expires"] < t]
+        dn = sum(1 for r in lr if r["status"] == "done")
+        print(f"{L:<10}{len(op):>6}{len(ready):>7}{len(op)-len(ready):>7}{len(cl):>7}{len(stale):>6}{dn:>6}")
+        tot["open"] += len(op); tot["ready"] += len(ready); tot["blocked"] += len(op)-len(ready)
+        tot["claimed"] += len(cl); tot["stale"] += len(stale); tot["done"] += dn
+    print(f"{'TOTAL':<10}{tot['open']:>6}{tot['ready']:>7}{tot['blocked']:>7}{tot['claimed']:>7}{tot['stale']:>6}{tot['done']:>6}")
+    if tot["stale"]:
+        print("  (stale = claimed with expired lease; next claim in that lane reclaims them)")
+    # next claimable across lanes (or one lane), pri ASC then id ASC
+    nxt = sorted((r for r in rows if r["status"] == "open" and r["lane"] in lanes
+                  and r["lane"] != "user" and deps_met(done_ids, r["deps"] or "")),
+                 key=lambda r: (r["pri"], r["id"]))[:a.n]
+    print(f"\nNEXT CLAIMABLE (agent lanes, pri,id order):")
+    for r in nxt:
+        print(f"  #{r['id']:<5} p{r['pri']} [{r['lane']:<8}] {r['title'][:76]}")
+    if not nxt: print("  (none)")
+    # claimed detail
+    live = [r for r in rows if r["status"] == "claimed" and r["lane"] in lanes]
+    if live:
+        print("\nCLAIMED:")
+        for r in sorted(live, key=lambda r: r["id"]):
+            exp = "EXPIRED" if (r["lease_expires"] or "") < t else f"until {r['lease_expires']}"
+            print(f"  #{r['id']:<5} [{r['lane']:<8}] {r['claimed_by'] or '?':<22} {exp}  {r['title'][:48]}")
+    wq.close()
+    # minerva proposals
+    try:
+        mv = conn(MV)
+        ps = mv.execute("SELECT status, COUNT(*) n FROM proposals GROUP BY status ORDER BY n DESC").fetchall()
+        gp = mv.execute("SELECT COUNT(*) FROM proposals WHERE eval_passed=1 AND status IN ('accepted','deploy_ready')").fetchone()[0]
+        mv.close()
+        print("\nMINERVA PROPOSALS: " + "  ".join(f"{r['status']}={r['n']}" for r in ps))
+        print(f"  gate-passed awaiting build (accepted|deploy_ready, eval_passed=1): {gp}"
+              + ("  <- proposal_wq_bridge (wq#258, staged) would materialize these" if gp else ""))
+    except Exception as e:
+        print(f"\nMINERVA PROPOSALS: unavailable ({e})")
+
+if __name__ == "__main__":
+    sys.exit(main())

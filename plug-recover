@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# plug-recover — Tier-2 P115 AC recovery actuator (wq#390 mechanism)
+# Usage:
+#   plug-recover cycle   <plug> [off_secs]   raw AC off/on cycle (bench-safe)
+#   plug-recover recover <node>              full escalation (graceful reboot -> AC cut)
+#   plug-recover status  [plug]              cooldown / arm state
+# Flags: --dry-run
+set -uo pipefail
+CONF=${PLUG_RECOVER_CONF:-/home/lumen/etc/plug-recover.conf}
+STATE=/home/lumen/var/plug-recover
+LOG=$STATE/plug-recover.log
+PLUGCTL=/home/lumen/bin/plug-ctl
+[[ -r $CONF ]] || { echo "missing $CONF" >&2; exit 2; }
+source "$CONF"; mkdir -p "$STATE"
+
+DRY=0; ARGS=()
+for a in "$@"; do [[ "$a" == "--dry-run" ]] && DRY=1 || ARGS+=("$a"); done
+set -- "${ARGS[@]:-}"
+
+log(){ printf '%s %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"; }
+ntfy(){ [[ $DRY -eq 1 ]] && { log "NTFY(dry): $*"; return; }
+        local code
+        code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Priority: high" -d "$*" "$NTFY_URL" 2>/dev/null)
+        [[ "$code" == "200" ]] || log "NTFY DELIVERY FAILED (HTTP $code) url=$NTFY_URL msg=$*"; }
+pstate(){ $PLUGCTL "$1" watts 2>/dev/null | awk '{print $2}'; }
+
+cuts_recent(){ # plug -> count within window
+  local f=$STATE/$1.cuts now cnt=0 t
+  now=$(date +%s); [[ -f $f ]] || { echo 0; return; }
+  while read -r t; do [[ -n "$t" ]] && (( now - t < COOLDOWN_WINDOW )) && ((cnt++)); done < "$f"
+  echo "$cnt"
+}
+cut_record(){ date +%s >> "$STATE/$1.cuts"; }
+
+do_cycle(){ # plug [off_secs] -- returns 0 only if plug verified ON at end
+  local p=$1 secs=${2:-$OFF_SECONDS} t0 s
+  t0=$(date +%s)
+  s=$(pstate "$p"); log "cycle $p: pre-state=$s dwell=${secs}s dry=$DRY"
+  [[ "$s" == "True" || "$s" == "False" ]] || { log "cycle $p: ABORT unreachable/bad state ($s)"; return 3; }
+  if [[ $DRY -eq 1 ]]; then log "cycle $p: DRY-RUN, no relay action"; return 0; fi
+  $PLUGCTL "$p" off >/dev/null 2>&1 || { log "cycle $p: OFF command failed"; return 4; }
+  sleep 2; s=$(pstate "$p")
+  [[ "$s" == "False" ]] || { log "cycle $p: OFF NOT VERIFIED (state=$s) - forcing ON"; $PLUGCTL "$p" on >/dev/null 2>&1; return 5; }
+  log "cycle $p: AC off verified"
+  sleep "$secs"
+  $PLUGCTL "$p" on >/dev/null 2>&1 || { log "cycle $p: ON command FAILED - PLUG LEFT OFF"; ntfy "CRITICAL plug-recover: $p left OFF, restore failed"; return 6; }
+  sleep 3; s=$(pstate "$p")
+  [[ "$s" == "True" ]] || { log "cycle $p: ON NOT VERIFIED (state=$s)"; ntfy "CRITICAL plug-recover: $p not ON after restore"; return 7; }
+  log "cycle $p: AC restored, verified ON (total $(( $(date +%s) - t0 ))s)"
+  return 0
+}
+
+plug_for_node(){ local n=$1 pair; for pair in $OPTIN; do [[ "${pair%%:*}" == "$n" ]] && { echo "${pair##*:}"; return 0; }; done; return 1; }
+node_alive(){ timeout 12 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$1" 'echo ok' 2>/dev/null | grep -q ok; }
+
+do_recover(){ # node -- full Tier-2 escalation
+  local n=$1 p c
+  if [[ "${ARMED:-0}" != "1" ]]; then
+    log "recover $n: REFUSED - mechanism DISARMED (ARMED=0 in $CONF, wq#390 undecided)"; return 10
+  fi
+  p=$(plug_for_node "$n") || { log "recover $n: REFUSED - node not in OPTIN"; return 11; }
+  if [[ " $NEVER_CUT " == *" $n "* ]]; then
+    log "recover $n: in NEVER_CUT - graceful reboot only, no AC cut"
+    [[ $DRY -eq 1 ]] || timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 "$n" 'sudo systemctl reboot' 2>/dev/null
+    ntfy "plug-recover: $n unresponsive - graceful reboot issued (AC cut blocked by NEVER_CUT)"; return 0
+  fi
+  if node_alive "$n"; then log "recover $n: node is ALIVE, nothing to do"; return 0; fi
+  log "recover $n: DEAD - stage 1 graceful reboot via ssh"
+  [[ $DRY -eq 1 ]] || timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 "$n" 'sudo systemctl reboot' 2>/dev/null
+  log "recover $n: grace ${GRACE_SECONDS}s"; [[ $DRY -eq 1 ]] || sleep "$GRACE_SECONDS"
+  if node_alive "$n"; then log "recover $n: RECOVERED by graceful reboot, no AC cut"; ntfy "plug-recover: $n recovered via graceful reboot"; return 0; fi
+  c=$(cuts_recent "$p")
+  if (( c >= COOLDOWN_MAX )); then
+    log "recover $n: COOLDOWN TRIPPED ($c cuts/${COOLDOWN_WINDOW}s >= $COOLDOWN_MAX) - alert and stop"
+    ntfy "CRITICAL plug-recover: $n still dead, AC-cut cooldown tripped ($c cuts) - MANUAL ATTENTION"; return 12
+  fi
+  log "recover $n: stage 2 AC cut on $p (cut $((c+1))/$COOLDOWN_MAX in window)"
+  cut_record "$p"; do_cycle "$p"; local rc=$?
+  ntfy "plug-recover: $n unresponsive - AC cycled via $p (rc=$rc)"
+  return $rc
+}
+
+case "${1:-}" in
+  cycle)   [[ -n "${2:-}" ]] || { echo "usage: plug-recover cycle <plug> [off_secs]" >&2; exit 2; }; do_cycle "$2" "${3:-}" ;;
+  recover) [[ -n "${2:-}" ]] || { echo "usage: plug-recover recover <node>" >&2; exit 2; }; do_recover "$2" ;;
+  status)
+    echo "ARMED=$ARMED  OPTIN='${OPTIN:-<none>}'  NEVER_CUT='$NEVER_CUT'"
+    echo "cooldown: max $COOLDOWN_MAX cuts / ${COOLDOWN_WINDOW}s"
+    for f in "$STATE"/*.cuts; do [[ -e $f ]] || continue
+      pn=$(basename "$f" .cuts); echo "  $pn: $(cuts_recent "$pn") cut(s) in window"; done ;;
+  *) echo "usage: plug-recover {cycle <plug> [secs]|recover <node>|status} [--dry-run]" >&2; exit 2 ;;
+esac

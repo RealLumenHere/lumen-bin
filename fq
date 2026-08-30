@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""fq — Lumen failure queue (Failure Archaeology, Memory V4 subsystem, 2026-08-14).
+The fleet's assertion-discipline ledger: every catalogued failure becomes a
+queryable record carrying THE QUERY THAT WOULD HAVE PREVENTED IT.
+Blameless by construction: `session` is a session handle, never a culprit.
+Wired: lumen_episode.py commit with non-empty --failed auto-creates a row here
+(class F0/uncurated) — the data was always written; now something reads it.
+
+CLI: fq add <class> <session> <summary> [--evidence P] [--cost C] [--caught-by W]
+        [--prevented-by Q] [--occurred DATE] [--provenance frank|agent|summary]
+     fq list [open|all] [--class FN] [--since DATE] [--curated] [--limit N]
+     fq show <id> | fq stats | fq pattern [--days 30] [--min 3]
+     fq promote <id> [--rule "when X, do Y"]   # PROPOSAL-ONLY -> candidates file
+     fq ingest-episode --episode-id I --summary S --failed F [--why W] [--ref R]
+
+Classes: F1 UNVERIFIED_ASSERTION F2 STALE_RECALL F3 TELEMETRY_BLINDNESS
+ F4 RULE_VIOLATION F5 LETTER_VS_INTENT F6 WRONG_TOOL F7 REDUNDANT_WORK
+ F8 CONTEXT_BLOAT F9 SILENT_GAP F10 CONFLICT_UNDETECTED
+ F11 GENERIC_ADVICE_UNVERIFIED F12 LOST_HANDOFF F0 UNCLASSIFIED
+PROPOSAL-ONLY GUARANTEE: fq never edits instincts.yaml, claude_memory.md, or
+the state store. `promote` appends to the Frank-gated candidates file only.
+"""
+import sqlite3, sys, os, re, argparse, datetime, pathlib
+
+DB = pathlib.Path(os.environ.get("FQ_DB", "/home/lumen/agents/failure-queue/failures.db"))
+CANDIDATES = pathlib.Path(os.environ.get(
+    "FQ_CANDIDATES", "/home/lumen/minerva/dream/instincts_candidates_failarch.yaml"))
+
+CLASSES = {
+    "F0": "UNCLASSIFIED", "F1": "UNVERIFIED_ASSERTION", "F2": "STALE_RECALL",
+    "F3": "TELEMETRY_BLINDNESS", "F4": "RULE_VIOLATION", "F5": "LETTER_VS_INTENT",
+    "F6": "WRONG_TOOL", "F7": "REDUNDANT_WORK", "F8": "CONTEXT_BLOAT",
+    "F9": "SILENT_GAP", "F10": "CONFLICT_UNDETECTED",
+    "F11": "GENERIC_ADVICE_UNVERIFIED", "F12": "LOST_HANDOFF",
+}
+CAUGHT = {"frank", "agent", "monitor", "never", "unknown"}
+NOISE_RE = re.compile(r"(?i)^[\s\-]*\(?\s*(none|nothing|n/?a)\s*\)?\s*\.?$")
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS failures(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  occurred TEXT,
+  class TEXT NOT NULL,
+  session TEXT,
+  summary TEXT NOT NULL,
+  evidence TEXT,
+  provenance TEXT DEFAULT 'agent',
+  caught_by TEXT DEFAULT 'unknown',
+  cost TEXT,
+  prevented_by TEXT,
+  source TEXT DEFAULT 'manual',
+  status TEXT DEFAULT 'open',
+  curated INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_fq_class ON failures(class, occurred);
+CREATE INDEX IF NOT EXISTS idx_fq_caught ON failures(caught_by);
+CREATE INDEX IF NOT EXISTS idx_fq_source ON failures(source);
+"""
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def db():
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB, timeout=15)
+    c.executescript(SCHEMA)
+    return c
+
+def is_noise(text):
+    return bool(NOISE_RE.match((text or "").strip()))
+
+def add(cls, session, summary, evidence="", cost="", caught_by="unknown",
+        prevented_by="", occurred="", provenance="agent", source="manual",
+        curated=1):
+    cls = cls.upper()
+    if cls not in CLASSES:
+        raise SystemExit(f"unknown class {cls}; valid: {' '.join(sorted(CLASSES))}")
+    if caught_by not in CAUGHT:
+        raise SystemExit(f"caught-by must be one of {sorted(CAUGHT)}")
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    cur = c.execute(
+        "INSERT INTO failures(ts,occurred,class,session,summary,evidence,provenance,"
+        "caught_by,cost,prevented_by,source,curated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (now(), occurred or now()[:10], cls, (session or "")[:80], summary[:1500],
+         (evidence or "")[:500], provenance, caught_by, (cost or "")[:300],
+         (prevented_by or "")[:600], source, int(curated)))
+    rid = cur.lastrowid
+    c.commit(); c.close()
+    return rid
+
+def ingest_episode(episode_id, summary, failed, why="", ref=""):
+    """Hook target for lumen_episode.py commit. Fail-open at the caller.
+    Skips noise-only failed fields ('none'/'nothing'). Dedup on episode id."""
+    items = [i for i in (failed or []) if i and not is_noise(i)]
+    if not items:
+        return None
+    c = db()
+    dup = c.execute("SELECT id FROM failures WHERE evidence LIKE ? AND source='episode-hook'",
+                    (f"%episode:{episode_id}%",)).fetchone()
+    c.close()
+    if dup:
+        return dup[0]
+    return add("F0", ref or "episode", (summary or "")[:200] + " :: FAILED: " + "; ".join(items),
+               evidence=f"episode:{episode_id}", prevented_by=(why or "")[:600],
+               occurred=now()[:10], provenance="agent", source="episode-hook", curated=0)
+
+def _rows(where="1=1", params=(), limit=200):
+    c = db(); c.row_factory = sqlite3.Row
+    rs = c.execute(f"SELECT * FROM failures WHERE {where} "
+                   f"ORDER BY occurred DESC, id DESC LIMIT ?", (*params, limit)).fetchall()
+    c.close(); return rs
+
+def cmd_list(scope="open", cls=None, since=None, curated_only=False, limit=200):
+    where, params = [], []
+    if scope != "all":
+        where.append("status=?"); params.append(scope)
+    if cls:
+        where.append("class=?"); params.append(cls.upper())
+    if since:
+        where.append("occurred>=?"); params.append(since)
+    if curated_only:
+        where.append("curated=1")
+    rs = _rows(" AND ".join(where) or "1=1", tuple(params), limit)
+    for r in rs:
+        cur = "*" if r["curated"] else " "
+        print(f"[{r['id']:>4}]{cur}{r['class']:<4} {r['occurred'] or '':<10} "
+              f"caught={r['caught_by']:<8} {(r['session'] or '')[:22]:<22} "
+              f"{(r['summary'] or '')[:95]}")
+    print(f"({len(rs)} rows; * = curated)")
+
+def cmd_show(rid):
+    rs = _rows("id=?", (rid,), 1)
+    if not rs:
+        print("not found"); return
+    r = rs[0]
+    for k in ("id", "class", "occurred", "session", "caught_by", "provenance",
+              "cost", "source", "status", "curated"):
+        print(f"{k:>12}: {r[k]}")
+    print(f"{'summary':>12}: {r['summary']}")
+    print(f"{'evidence':>12}: {r['evidence']}")
+    print(f"{'prevented_by':>12}: {r['prevented_by']}")
+
+def cmd_stats():
+    c = db()
+    total = c.execute("SELECT COUNT(*) FROM failures").fetchone()[0]
+    cur = c.execute("SELECT COUNT(*) FROM failures WHERE curated=1").fetchone()[0]
+    print(f"total={total} (curated={cur}, raw-episode={total-cur})")
+    print("-- by class (curated) --")
+    for cl, n in c.execute("SELECT class,COUNT(*) FROM failures WHERE curated=1 "
+                           "GROUP BY class ORDER BY 2 DESC"):
+        print(f"  {cl:<4} {CLASSES.get(cl, ''):<26} {n}")
+    print("-- caught_by (curated) --")
+    rows = list(c.execute("SELECT caught_by,COUNT(*) FROM failures WHERE curated=1 "
+                          "GROUP BY caught_by ORDER BY 2 DESC"))
+    known = sum(n for w, n in rows if w != "unknown") or 1
+    for w, n in rows:
+        print(f"  {w:<8} {n}")
+    frank = next((n for w, n in rows if w == "frank"), 0)
+    print(f"  == caught_by=frank ratio: {frank}/{known} = {frank/known:.0%} "
+          f"(of known-catch curated records) ==")
+    print("-- monthly trend (curated, by occurred) --")
+    for m, n, f in c.execute(
+            "SELECT substr(occurred,1,7), COUNT(*), "
+            "SUM(CASE WHEN caught_by='frank' THEN 1 ELSE 0 END) "
+            "FROM failures WHERE curated=1 GROUP BY 1 ORDER BY 1"):
+        print(f"  {m}  n={n:<3} frank-caught={f}")
+    c.close()
+
+def cmd_pattern(days=30, minimum=3):
+    c = db()
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    print(f"-- classes with >={minimum} occurrences since {cutoff} (candidate invariants) --")
+    hits = list(c.execute(
+        "SELECT class, COUNT(*) FROM failures WHERE occurred>=? AND class!='F0' "
+        "GROUP BY class HAVING COUNT(*)>=? ORDER BY 2 DESC", (cutoff, minimum)))
+    for cl, n in hits:
+        print(f"  {cl} {CLASSES.get(cl, '')}: {n}x")
+        for r in _rows("class=? AND occurred>=?", (cl, cutoff), 5):
+            print(f"     [{r['id']}] {(r['summary'] or '')[:90]}")
+        print(f"     -> run: fq promote <id> --rule \"when <trigger>, do <check>\"")
+    if not hits:
+        print("  (none at this threshold)")
+    c.close()
+
+def cmd_promote(rid, rule=None):
+    """PROPOSAL-ONLY: append an instinct CANDIDATE to the Frank-gated candidates
+    file. Never touches instincts.yaml / claude_memory.md / the state store."""
+    rs = _rows("id=?", (rid,), 1)
+    if not rs:
+        raise SystemExit("not found")
+    r = rs[0]
+    rule = rule or (r["prevented_by"] or "").strip()
+    if not rule:
+        raise SystemExit("no --rule given and record has no prevented_by; refusing an empty candidate")
+    CANDIDATES.parent.mkdir(parents=True, exist_ok=True)
+    header = not CANDIDATES.exists()
+    with open(CANDIDATES, "a") as f:
+        if header:
+            f.write("# instinct CANDIDATES from fq promote — PROPOSAL-ONLY, Frank-gated.\n"
+                    "# Nothing here is active until Frank merges it into instincts.yaml.\n"
+                    "candidates:\n")
+        f.write(f"  - rule: {rule!r}\n")
+        f.write(f"    from_failure: fq#{r['id']} [{r['class']}] {r['summary'][:100]!r}\n")
+        f.write(f"    evidence: {(r['evidence'] or '')!r}\n")
+        f.write(f"    proposed: {now()!r}\n")
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    c.execute("UPDATE failures SET status='promoted' WHERE id=?", (rid,))
+    c.commit(); c.close()
+    print(f"candidate appended to {CANDIDATES} (Frank-gated); fq#{rid} -> promoted")
+
+def main():
+    ap = argparse.ArgumentParser(prog="fq", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    pa = sub.add_parser("add")
+    pa.add_argument("cls"); pa.add_argument("session"); pa.add_argument("summary")
+    pa.add_argument("--evidence", default=""); pa.add_argument("--cost", default="")
+    pa.add_argument("--caught-by", default="unknown", dest="caught_by")
+    pa.add_argument("--prevented-by", default="", dest="prevented_by")
+    pa.add_argument("--occurred", default=""); pa.add_argument("--provenance", default="agent")
+    pa.add_argument("--source", default="manual")
+    pa.add_argument("--raw", action="store_true", help="mark uncurated")
+    pl = sub.add_parser("list")
+    pl.add_argument("scope", nargs="?", default="open")
+    pl.add_argument("--class", dest="cls", default=None)
+    pl.add_argument("--since", default=None)
+    pl.add_argument("--curated", action="store_true")
+    pl.add_argument("--limit", type=int, default=200)
+    ps = sub.add_parser("show"); ps.add_argument("id", type=int)
+    sub.add_parser("stats")
+    pp = sub.add_parser("pattern")
+    pp.add_argument("--days", type=int, default=30); pp.add_argument("--min", type=int, default=3)
+    pm = sub.add_parser("promote")
+    pm.add_argument("id", type=int); pm.add_argument("--rule", default=None)
+    pe = sub.add_parser("ingest-episode")
+    pe.add_argument("--episode-id", required=True); pe.add_argument("--summary", required=True)
+    pe.add_argument("--failed", required=True, help="';'-joined failed items")
+    pe.add_argument("--why", default=""); pe.add_argument("--ref", default="")
+    a = ap.parse_args()
+    if a.cmd == "add":
+        rid = add(a.cls, a.session, a.summary, evidence=a.evidence, cost=a.cost,
+                  caught_by=a.caught_by, prevented_by=a.prevented_by,
+                  occurred=a.occurred, provenance=a.provenance, source=a.source,
+                  curated=0 if a.raw else 1)
+        print(f"fq#{rid}")
+    elif a.cmd == "list":
+        cmd_list(a.scope, a.cls, a.since, a.curated, a.limit)
+    elif a.cmd == "show":
+        cmd_show(a.id)
+    elif a.cmd == "stats":
+        cmd_stats()
+    elif a.cmd == "pattern":
+        cmd_pattern(a.days, a.min)
+    elif a.cmd == "promote":
+        cmd_promote(a.id, a.rule)
+    elif a.cmd == "ingest-episode":
+        rid = ingest_episode(a.episode_id, a.summary,
+                             [x.strip() for x in a.failed.split(";") if x.strip()],
+                             why=a.why, ref=a.ref)
+        print(f"fq#{rid}" if rid else "skipped (noise-only)")
+
+if __name__ == "__main__":
+    main()

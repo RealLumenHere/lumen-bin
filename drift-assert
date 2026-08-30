@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+drift-assert v2 (wq#393) — nightly config-drift probe: live fleet state vs an
+explicit golden-fact set. PROPOSAL-ONLY: reports drift, NEVER auto-fixes.
+
+Design notes:
+- Golden facts in lumen_state are prose-embedded (e.g. "swappiness = 10
+  (persisted ...)"), so this probe does NOT parse prose. It carries an
+  EXPLICIT structured assertion set (GOLDEN below) — subject/description/
+  check-command/expected-substring — curated from the state store. When a
+  fact legitimately changes, update GOLDEN here AND ingest to lumen_state
+  (the assertion set is the executable half of the golden facts).
+- Read-only: every check is a read command (sysctl, systemctl show, grep,
+  ip). No node config is ever mutated.
+- Edge-triggered ntfy: only alerts on a CHANGE in the pass/fail set vs the
+  last run (state file), so a persistent known-and-accepted drift does not
+  spam nightly. Full report always written to disk.
+- SSH via the fleet key; per-node timeout; a node that is intentionally
+  offline (khepri/hathot/wadjet-retired) is skipped, not failed.
+"""
+import json, subprocess, os, sys, time, datetime
+from pathlib import Path
+
+KEY = "/home/lumen/.ssh/id_ed25519"
+STATE = Path("/home/lumen/sentinel/drift_assert_state.json")
+OUTDIR = Path("/home/lumen/maint/drift-assert"); OUTDIR.mkdir(parents=True, exist_ok=True)
+NTFY = os.getenv("DRIFT_NTFY_URL", "http://localhost:8080/lumen-alerts")
+
+# Nodes that are deliberately down — skip, never fail.
+SKIP_HOSTS = {"khepri", "hathor", "wadjet"}
+
+# (host, ssh_target). LOCAL = run on Lumen directly.
+HOSTS = {
+    "lumen": "LOCAL",
+    "maat": "maam@100.105.219.34",
+    "bes": "bes@100.110.156.91",
+    "sobek": "sobek@100.86.156.91",
+    "thoth": "thoth@100.75.1.108",
+    "nephthys": "nephthys@100.98.74.87",
+    "anubis": "anubis@100.121.17.5",
+}
+
+# GOLDEN: (id, host, human_desc, shell_check, expected_substring_in_stdout)
+# expected="" means "command must exit 0" (presence/enablement check).
+GOLDEN = [
+    ("lumen-swappiness", "lumen", "vm.swappiness=10 (60-swappiness.conf)",
+     "/usr/sbin/sysctl -n vm.swappiness", "10"),
+    ("lumen-agent-enabled", "lumen", "lumen-agent enabled",
+     "systemctl is-enabled lumen-agent", "enabled"),
+    ("lumen-agent-notify", "lumen", "lumen-agent Type=notify (wq#392 watchdog)",
+     "systemctl show lumen-agent -p Type --value", "notify"),
+    ("litellm-restart", "lumen", "litellm docker restart=unless-stopped",
+     "docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' litellm", "unless-stopped"),
+    ("maat-pg-primary", "maat", "Ma'at postgres in_recovery=false (vault PRIMARY)",
+     "sudo -n -u postgres psql -tAc 'SELECT pg_is_in_recovery()'", "f"),
+    ("maat-pg-bind", "maat", "Ma'at pg listens on LAN 192.168.8.202",
+     "sudo -n -u postgres psql -tAc 'SHOW listen_addresses'", "192.168.8.202"),
+    ("maat-vw-restart", "maat", "vaultwarden restart=unless-stopped",
+     "sudo -n docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' vaultwarden", "unless-stopped"),
+    ("bes-ha-container", "bes", "Home Assistant container up on Bes",
+     "docker ps --format '{{.Names}}' | grep -c homeassistant", "1"),
+    ("nephthys-ollama-enabled", "nephthys", "nephthys ollama enabled",
+     "systemctl is-enabled ollama", "enabled"),
+    ("anubis-gitea-active", "anubis", "anubis gitea active",
+     "systemctl is-active gitea", "active"),
+]
+
+
+def run_check(host, cmd, timeout=25):
+    tgt = HOSTS.get(host)
+    if tgt is None:
+        return None, "no-ssh-target"
+    if tgt == "LOCAL":
+        full = ["bash", "-lc", cmd]
+    else:
+        full = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout=8",
+                "-i", KEY, tgt, cmd]
+    try:
+        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except Exception as e:
+        return None, f"err:{type(e).__name__}"
+
+
+def main():
+    results = []
+    for gid, host, desc, cmd, expected in GOLDEN:
+        if host in SKIP_HOSTS:
+            results.append((gid, host, "SKIP", desc, "host intentionally down"))
+            continue
+        rc, out = run_check(host, cmd)
+        if rc is None:
+            results.append((gid, host, "UNREACHABLE", desc, out))
+        elif expected == "":
+            ok = rc == 0
+            results.append((gid, host, "OK" if ok else "DRIFT", desc,
+                            "" if ok else f"exit={rc} {out[:60]}"))
+        else:
+            ok = expected in out
+            results.append((gid, host, "OK" if ok else "DRIFT", desc,
+                            "" if ok else f"expected '{expected}', got '{out[:60]}'"))
+
+    drift = [r for r in results if r[2] == "DRIFT"]
+    unreach = [r for r in results if r[2] == "UNREACHABLE"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = now.date().isoformat()
+
+    # Full report to disk (always).
+    lines = [f"# drift-assert {now.isoformat()}",
+             f"checks={len(results)} drift={len(drift)} unreachable={len(unreach)}", ""]
+    for gid, host, status, desc, detail in results:
+        lines.append(f"[{status}] {host}/{gid}: {desc}" + (f" — {detail}" if detail else ""))
+    (OUTDIR / f"drift_{today}.md").write_text("\n".join(lines))
+    (OUTDIR / "latest.md").write_text("\n".join(lines))
+
+    # Edge-triggered ntfy: alert only when the failing-set changes.
+    cur_fail = sorted(r[0] for r in drift)
+    try:
+        prev = json.loads(STATE.read_text()).get("fail", [])
+    except Exception:
+        prev = []
+    STATE.write_text(json.dumps({"fail": cur_fail, "at": now.isoformat()}))
+
+    if cur_fail and cur_fail != prev:
+        body = "config drift: " + "; ".join(
+            f"{r[1]}/{r[0]} ({r[4]})" for r in drift)
+        try:
+            subprocess.run(["curl", "-s", "-m", "8", "-d", body[:400],
+                            "-H", "Title: drift-assert: config drift",
+                            "-H", "Priority: high", "-H", "Tags: warning", NTFY],
+                           capture_output=True, timeout=12)
+            subprocess.run(["/home/lumen/bin/aq", "add", "drift", "config-drift",
+                            "config drift detected", body[:300]],
+                           capture_output=True, timeout=12)
+        except Exception:
+            pass
+    elif not cur_fail and prev:
+        # recovery edge
+        try:
+            subprocess.run(["curl", "-s", "-m", "8", "-d", "config drift cleared",
+                            "-H", "Title: drift-assert: cleared", "-H", "Tags: white_check_mark",
+                            NTFY], capture_output=True, timeout=12)
+        except Exception:
+            pass
+
+    print(f"drift-assert: {len(results)} checks, {len(drift)} drift, {len(unreach)} unreachable")
+    for r in drift + unreach:
+        print(f"  [{r[2]}] {r[1]}/{r[0]}: {r[4]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

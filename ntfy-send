@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# ntfy-send — fleet ntfy publisher with delivery verification.
+# Usage: ntfy-send [-t topic] [-p priority] [-T title] [--oob] [--quiet] "message"
+# Exit 0 only if at least one endpoint returned HTTP 200. Never silently succeeds.
+set -uo pipefail
+CONF=${NTFY_SEND_CONF:-/home/lumen/etc/ntfy-send.conf}
+[[ -r $CONF ]] || { echo "ntfy-send: missing $CONF" >&2; exit 2; }
+source "$CONF"
+
+TOPIC=$DEFAULT_TOPIC; PRIO=default; TITLE=""; FORCE_OOB=0; QUIET=0
+while [[ $# -gt 0 ]]; do case "$1" in
+  -t) TOPIC=$2; shift 2;; -p) PRIO=$2; shift 2;; -T) TITLE=$2; shift 2;;
+  --oob) FORCE_OOB=1; shift;; --quiet) QUIET=1; shift;;
+  -h|--help) sed -n '2,4p' "$0"; exit 0;; *) break;;
+esac; done
+MSG="${*:-}"
+[[ -n "$MSG" ]] || { echo "ntfy-send: empty message" >&2; exit 2; }
+
+# wq#1040 alert gate: operator silences (expiry-bound) + burst grouping, decided
+# at this publish chokepoint. Applies to lumen-originated publishes only (the
+# gate + alerts.db are lumen-local). FAILS OPEN on any error (missing script, db
+# lock, bad output). Never gates 'min' priority (heartbeats/canaries/deadman beat).
+if [[ "$PRIO" != "min" ]]; then
+  GATE=$(python3 /home/lumen/agents/alert-queue/aq_gate.py decide "$TOPIC" "$TITLE" "$PRIO" "$MSG" 2>/dev/null) || GATE="PASS"
+  [[ -z "$GATE" ]] && GATE="PASS"
+  case "$GATE" in
+    SILENCE:*|GROUP_HOLD:*)
+      [[ $QUIET -eq 1 ]] || echo "ntfy-send: suppressed [$GATE] topic=$TOPIC"
+      exit 0 ;;
+    GROUP_FLUSH:*)
+      MSG="$MSG"$'\n'"${GATE#GROUP_FLUSH:}" ;;
+  esac
+fi
+
+# Loopback on Lumen, tailnet IP everywhere else.
+PRIMARY=$NTFY_TAILNET
+[[ "$(hostname -s 2>/dev/null)" == "lumen" ]] && PRIMARY=$NTFY_LOCAL
+
+post(){ # base topic -> echoes http_code
+  curl -s -m 10 -o /dev/null -w '%{http_code}' \
+    -H "Priority: $PRIO" ${TITLE:+-H "Title: $TITLE"} \
+    -d "$MSG" "$1/$2" 2>/dev/null
+}
+
+ok=0; detail=""
+code=$(post "$PRIMARY" "$TOPIC")
+if [[ "$code" == "200" ]]; then ok=1; detail+="primary=200 "
+else detail+="primary=$code(FAIL) "; fi
+
+want_oob=$FORCE_OOB
+[[ ",$NTFY_OOB_PRIORITIES," == *",$PRIO,"* ]] && want_oob=1
+[[ $ok -eq 0 ]] && want_oob=1   # primary down -> always try out-of-band
+
+if [[ $want_oob -eq 1 && -n "${NTFY_OOB:-}" ]]; then
+  ocode=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Priority: $PRIO" \
+          ${TITLE:+-H "Title: $TITLE"} -d "$MSG" "$NTFY_OOB" 2>/dev/null)
+  [[ "$ocode" == "200" ]] && { ok=1; detail+="oob=200"; } || detail+="oob=$ocode(FAIL)"
+fi
+
+if [[ $ok -eq 1 ]]; then [[ $QUIET -eq 1 ]] || echo "ntfy-send: delivered [$detail]"; exit 0; fi
+echo "ntfy-send: DELIVERY FAILED [$detail] topic=$TOPIC msg=${MSG:0:80}" >&2
+exit 1

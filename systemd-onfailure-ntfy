@@ -1,0 +1,11 @@
+#!/bin/bash
+# systemd-onfailure-ntfy <unit> (wq#392): fired by ntfy-onfailure@<unit>.service
+# OnFailure hook. Sends an URGENT ntfy with the unit's last state + tail.
+U="${1:?unit required}"
+NTFY="${NTFY_ONFAIL_URL:-http://localhost:8080/lumen-alerts}"
+RES=$(systemctl show "$U" -p Result --value 2>/dev/null)
+NR=$(systemctl show "$U" -p NRestarts --value 2>/dev/null)
+TAIL=$(journalctl -u "$U" -n 6 --no-pager -o cat 2>/dev/null | tr '\n' ' ' | tail -c 300)
+MSG="🔴 $U FAILED (result=$RES restarts=$NR) — $TAIL"
+curl -s -m 8 -d "$MSG" -H "Title: systemd: $U failed" -H "Priority: urgent" -H "Tags: rotating_light" "$NTFY" >/dev/null 2>&1
+/home/lumen/bin/aq add systemd "svc-fail-$U" "$U failed (result=$RES)" "$MSG" 2>/dev/null || true

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# lumen-failed-units — EDGE-TRIGGERED sweep for ANY failed systemd unit.
+#
+# WHY THIS EXISTS (2026-08-13): logrotate.service failed every day from
+# 2026-08-08 to 2026-08-13 and nothing noticed. Every existing corrector
+# (smart-watchdog, self-healer, state-reconcile) checks an ALLOWLIST of named
+# fleet units via `systemctl is-active`. A stock Ubuntu oneshot that nobody
+# enumerated is invisible to all of them. This closes that gap: it asks systemd
+# what is broken instead of asking whether specific known things are alive.
+#
+# DESIGN:
+#  - EDGE-TRIGGERED. Alerts on units NEWLY failed since last run, and posts a
+#    CLEARED notice when a previously-failed unit recovers. A unit that stays
+#    failed does NOT re-alert every cycle -- constant re-alerting is what trains
+#    you to ignore alerts, which is the actual root cause of the 6-day miss.
+#  - It NEVER restarts, resets, or mutates any unit. Reporting only. Correctors
+#    own remediation; this owns visibility. Mixing them is how you get the
+#    two-agents-restarting-lumen-agent race documented in REGISTRY.yaml.
+#  - Fail-open: any internal error exits 0 and leaves state untouched.
+#
+# State: /home/lumen/agents/failed-units/state.json
+set -uo pipefail
+
+STATE_DIR=/home/lumen/agents/failed-units
+STATE="$STATE_DIR/state.json"
+NTFY=/home/lumen/bin/ntfy-send
+AQ=/home/lumen/bin/aq
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+
+NOW=$(systemctl list-units --type=service --type=timer --type=socket --type=mount \
+        --state=failed --no-legend --plain 2>/dev/null \
+      | awk '{print $1}' | sort -u)
+
+PREV=""
+if [[ -r $STATE ]]; then
+  PREV=$(python3 -c "
+import json
+try:
+    print('\n'.join(json.load(open('$STATE')).get('failed', [])))
+except Exception:
+    pass
+" 2>/dev/null)
+fi
+
+NEWLY=$(comm -13 <(printf '%s\n' "$PREV" | grep -v '^$' | sort -u) \
+                 <(printf '%s\n' "$NOW"  | grep -v '^$' | sort -u))
+CLEARED=$(comm -23 <(printf '%s\n' "$PREV" | grep -v '^$' | sort -u) \
+                   <(printf '%s\n' "$NOW"  | grep -v '^$' | sort -u))
+
+notify() { # $1=priority $2=title $3=message
+  [[ -x $NTFY ]] && "$NTFY" -t lumen-alerts -p "$1" -T "$2" --quiet "$3" >/dev/null 2>&1
+  # aq CLI: aq add <source> <key> <title> [msg] -- dedups on (source,key).
+  [[ -x $AQ   ]] && "$AQ" add failed-unit "$2" "$2" "$3" >/dev/null 2>&1
+  return 0
+}
+
+for u in $NEWLY; do
+  [[ -z $u ]] && continue
+  REASON=$(systemctl show "$u" -p Result --value 2>/dev/null)
+  CODE=$(systemctl show "$u" -p ExecMainStatus --value 2>/dev/null)
+  TAIL=$(journalctl -u "$u" --no-pager -n 3 -o cat 2>/dev/null | tr '\n' ' ' | cut -c1-300)
+  notify high "Failed unit: $u" "result=$REASON exit=$CODE :: $TAIL"
+done
+
+for u in $CLEARED; do
+  [[ -z $u ]] && continue
+  notify low "Recovered: $u" "unit no longer in failed state"
+done
+
+python3 - <<PY 2>/dev/null || true
+import json, time
+units = [u for u in """$NOW""".split() if u]
+json.dump({"failed": sorted(set(units)), "checked_at": int(time.time())},
+          open("$STATE", "w"), indent=1)
+PY
+
+if [[ -t 1 || "${1:-}" == "--print" ]]; then
+  if [[ -z $NOW ]]; then echo "no failed units"; else echo "FAILED:"; printf '  %s\n' $NOW; fi
+  [[ -n $NEWLY   ]] && { echo "NEWLY FAILED:"; printf '  %s\n' $NEWLY; }
+  [[ -n $CLEARED ]] && { echo "CLEARED:";      printf '  %s\n' $CLEARED; }
+fi
+exit 0

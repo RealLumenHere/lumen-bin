@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Mint/cache eBay OAuth app token (client_credentials). Creds: /home/lumen/secrets/ebay.env.
+Default: prints access_token to stdout (for tool consumption). --check: prints status ONLY, never the token."""
+import base64, json, os, sys, time, urllib.parse, urllib.request
+
+ENVF = "/home/lumen/secrets/ebay.env"
+
+def load_env():
+    d = {}
+    with open(ENVF) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            d[k.strip()] = v.strip().strip('"').strip("'")
+    return d
+
+E = load_env()
+ENV = (E.get("EBAY_ENV", "production") or "production").lower()
+SANDBOX = "sand" in ENV
+BASE = "https://api.sandbox.ebay.com" if SANDBOX else "https://api.ebay.com"
+CACHE = "/home/lumen/secrets/.ebay_token_%s.json" % ("sb" if SANDBOX else "prod")
+SCOPE = "https://api.ebay.com/oauth/api_scope"
+
+def mint():
+    cred = base64.b64encode(("%s:%s" % (E["EBAY_APP_ID"], E["EBAY_CERT_ID"])).encode()).decode()
+    data = urllib.parse.urlencode({"grant_type": "client_credentials", "scope": SCOPE}).encode()
+    req = urllib.request.Request(BASE + "/identity/v1/oauth2/token", data=data, headers={
+        "Authorization": "Basic " + cred,
+        "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        t = json.load(r)
+    t["obtained_at"] = int(time.time())
+    fd = os.open(CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, json.dumps(t).encode())
+    os.close(fd)
+    return t
+
+def get():
+    try:
+        with open(CACHE) as f:
+            t = json.load(f)
+        if t["obtained_at"] + int(t.get("expires_in", 7200)) - 90 > time.time():
+            return t
+    except Exception:
+        pass
+    return mint()
+
+if __name__ == "__main__":
+    if "--check" in sys.argv:
+        t = get()
+        left = int(t["obtained_at"] + int(t["expires_in"]) - time.time())
+        print("OK env=%s token_len=%d expires_in=%ds cache=%s" % (ENV, len(t["access_token"]), left, CACHE))
+    else:
+        sys.stdout.write(get()["access_token"])

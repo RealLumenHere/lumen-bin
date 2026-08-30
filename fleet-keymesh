@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# fleet-keymesh — full-mesh SSH key trust + host aliases across the Lumen fleet.
+# Rerunnable/idempotent. Bootstrap auth: sshpass fleet password. wq#330-adjacent, 2026-07-18.
+set -uo pipefail
+PASS="lumen2026!"
+SSHOPTS="-o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new"
+NODES="lumen@100.117.66.102 anubis@100.121.17.5 apep@100.82.2.72 bes@100.110.156.91 hathor@100.80.71.13 isis@100.100.129.24 maam@100.105.219.34 nephthys@100.98.74.87 seshat@100.121.243.124 sia@100.111.15.120 thor@100.112.151.100 thoth@100.75.1.108 wadjet@100.116.217.15"
+# name for alias = username except maam->maat
+alias_of(){ [ "$1" = maam ] && echo maat || echo "$1"; }
+TMP=$(mktemp -d); trap "rm -rf $TMP" EXIT
+echo "== Phase 1: ensure per-node key + harvest pubkeys =="
+OK_NODES=""
+for n in $NODES; do
+  u=${n%@*}
+  pk=$(sshpass -p "$PASS" ssh $SSHOPTS "$n" "mkdir -p ~/.ssh && chmod 700 ~/.ssh; [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519 -C \"$u@fleet\" >/dev/null; cat ~/.ssh/id_ed25519.pub" 2>/dev/null)
+  if [ -n "$pk" ]; then echo "$pk" >> "$TMP/fleet_keys"; echo "  $n OK"; OK_NODES="$OK_NODES $n"; else echo "  $n UNREACHABLE - skipped"; fi
+done
+sort -u "$TMP/fleet_keys" -o "$TMP/fleet_keys"
+echo "== Phase 2: build alias config =="
+{ echo "# fleet-keymesh generated $(date +%F)"; for n in $NODES; do u=${n%@*}; h=${n#*@}; a=$(alias_of "$u"); printf "Host %s\n  HostName %s\n  User %s\n  StrictHostKeyChecking accept-new\n" "$a" "$h" "$u"; done; } > "$TMP/fleet_config"
+echo "== Phase 3: distribute authorized_keys + config =="
+for n in $OK_NODES; do
+  sshpass -p "$PASS" scp $SSHOPTS -q "$TMP/fleet_keys" "$TMP/fleet_config" "$n:/tmp/" && \
+  sshpass -p "$PASS" ssh $SSHOPTS "$n" "touch ~/.ssh/authorized_keys; sort -u ~/.ssh/authorized_keys /tmp/fleet_keys > ~/.ssh/ak.new && mv ~/.ssh/ak.new ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; mv /tmp/fleet_config ~/.ssh/fleet_config; touch ~/.ssh/config; grep -q fleet_config ~/.ssh/config || sed -i \"1i Include ~/.ssh/fleet_config\" ~/.ssh/config; chmod 600 ~/.ssh/config; rm -f /tmp/fleet_keys" \
+  && echo "  $n distributed" || echo "  $n FAILED distribute"
+done
+echo "== Phase 4: verify mesh from this node =="
+for n in $OK_NODES; do
+  a=$(alias_of "${n%@*}")
+  r=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$a" "echo OK" 2>/dev/null)
+  echo "  ssh $a -> ${r:-FAIL}"
+done

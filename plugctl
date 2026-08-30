@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""plugctl (wq#334) — uniform smart-plug control over Home Assistant on Bes.
+
+Backend: HA REST API (192.168.8.177:8123), LLAT at /home/lumen/.secrets/bes_ha_token.
+Resolves pN<->node from lumen_state p*.powers_node facts. HA entity per plug is
+recorded in lumen_state (p*.ha_entity) once mapped; if absent, plugctl discovers it
+from HA and tells you the ingest command (does NOT auto-write state).
+
+SAFETY (wq#334 + lumen-change-safety):
+  - HARD DENYLIST in code: turning OFF the plug powering `lumen` (P11) or `maat` (P4)
+    is refused unconditionally (crown-jewel: orchestrator + vault primary).
+  - OFF is refused while the mapped node answers ping, UNLESS --confirm-halted is
+    passed AND the node is confirmed NOT pinging (handshake).
+  - HA unreachable / auth-failed => FAIL LOUD, never guess or assume relay state.
+Commands: status <pN|node> | watts <pN|node> | on <pN|node> | off <pN|node> [--confirm-halted]
+          list
+"""
+import sys, os, json, subprocess, time, urllib.request, urllib.error
+
+HA = "http://192.168.8.177:8123"
+TOKEN_FILE = "/home/lumen/.secrets/bes_ha_token"
+STATE = "/home/lumen/minerva/lumen_state.py"
+OFF_DENYLIST_NODES = {"lumen", "maat"}   # crown jewels; never power off via plugctl
+
+def die(msg, code=2):
+    print(f"plugctl: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def _token():
+    try:
+        t = open(TOKEN_FILE).read().strip()
+    except OSError as e:
+        die(f"cannot read HA token {TOKEN_FILE}: {e}")
+    if not t:
+        die("HA token file is empty")
+    return t
+
+def ha(path, method="GET", body=None):
+    """Call HA REST. FAIL LOUD on any error — never return a guessed state."""
+    url = f"{HA}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Authorization": f"Bearer {_token()}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("HA auth FAILED (401) — token invalid/expired. Mint a Long-Lived "
+                "Access Token in HA (profile > Long-Lived Access Tokens) and write it "
+                f"to {TOKEN_FILE}. NOT guessing relay state.", 3)
+        die(f"HA HTTP {e.code} on {method} {path}: {e.read().decode()[:200]}", 3)
+    except urllib.error.URLError as e:
+        die(f"HA UNREACHABLE at {HA} ({e.reason}) — Bes down? NOT guessing relay "
+            "state.", 3)
+
+def state_facts(subject):
+    """Parse `lumen_state.py current <subject>` into {predicate: value}."""
+    r = subprocess.run(["python3", STATE, "current", subject],
+                       capture_output=True, text=True, timeout=30,
+                       cwd="/home/lumen/minerva")
+    out = {}
+    for line in r.stdout.splitlines():
+        if "=" in line and "." in line.split("=")[0]:
+            lhs, rhs = line.split("=", 1)
+            pred = lhs.strip().split(".", 1)[1].strip()
+            val = rhs.split("(since")[0].strip()
+            out[pred] = val
+    return out
+
+PLUGS = [f"p{i}" for i in range(1, 13)]
+
+def build_map():
+    """{'p7': {'node':'bes','ip':'192.168.8.230','entity':<or None>}, ...}"""
+    m = {}
+    for p in PLUGS:
+        f = state_facts(p)
+        node = f.get("powers_node")
+        if not node:
+            continue
+        m[p] = {"node": node, "ip": f.get("plug_ip"),
+                "entity": f.get("ha_entity"), "plug": p}
+    return m
+
+def resolve(token):
+    """token = 'pN' or a node name -> (pN, info). Fail loud on ambiguity/miss."""
+    m = build_map()
+    if token in m:
+        return token, m[token]
+    hits = [(p, i) for p, i in m.items() if i["node"] == token]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"unknown plug/node '{token}'. Known: "
+            + ", ".join(f"{p}={i['node']}" for p, i in sorted(m.items())))
+    die(f"'{token}' maps to multiple plugs: {[p for p,_ in hits]}")
+
+import re as _re
+
+def _clean_ip(val):
+    """Extract a bare IPv4 from a state value that may carry trailing prose
+    (e.g. '192.168.8.172 TEMPORARY ...' or '192.168.8.174 static enp1s0')."""
+    if not val:
+        return None
+    m = _re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", val)
+    return m.group(1) if m else None
+
+def node_pings(node):
+    """True if the node appears UP. A node is UP if it answers EITHER an ICMP
+    ping to its LAN IP OR an SSH liveness probe. A halted node fails both.
+    NOTE: we ping the IP, never the bare hostname — MagicDNS name resolution is
+    NOT reliable from every host (it failed silently before, reporting live
+    nodes as down). Conservative: if we cannot get a clean address at all, or
+    the address is reachable, return True so OFF is refused."""
+    f = state_facts(node)
+    lan = _clean_ip(f.get("lan_ip"))
+    ts = _clean_ip(f.get("tailscale_ip"))
+    addrs = [a for a in (lan, ts) if a]
+    if not addrs:
+        return True  # unknown address -> treat as up (refuse OFF)
+    # 1) ICMP to any known address
+    for ip in addrs:
+        r = subprocess.run(["ping", "-c", "1", "-W", "2", ip], capture_output=True)
+        if r.returncode == 0:
+            return True
+    # 2) SSH liveness (authoritative: a halted node drops SSH). Try the node's
+    #    own login (user = hostname lowercase) at its LAN IP.
+    for ip in addrs:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+             f"{node}@{ip}", "true"], capture_output=True)
+        if r.returncode == 0:
+            return True
+    return False  # no ICMP, no SSH -> genuinely down
+
+def find_entity(info):
+    """Locate the HA switch entity for a plug by matching its IP/node in the
+    entity registry. Returns entity_id or None."""
+    if info.get("entity"):
+        return info["entity"]
+    # Convention: each plug's primary switch is exactly switch.p<N> in HA.
+    # (Secondary switch.pN_led / _auto_off_enabled / _auto_update_enabled are ignored.)
+    states = ha("/api/states")
+    ids = {s.get("entity_id", "") for s in states}
+    plug = info.get("plug")  # e.g. "p7"
+    if plug and f"switch.{plug}" in ids:
+        return f"switch.{plug}"
+    # fallback: node-name match (older behaviour)
+    node = info["node"]
+    for s in states:
+        eid = s.get("entity_id", "")
+        if not eid.startswith("switch.") or eid.endswith(
+                ("_led", "_auto_off_enabled", "_auto_update_enabled")):
+            continue
+        fn = (s.get("attributes", {}).get("friendly_name", "") + " " + eid).lower()
+        if node in fn:
+            return eid
+    return None
+
+def power_entity_for(switch_eid, info):
+    """Best-effort matching power sensor. Convention: sensor.<base>_power."""
+    base = switch_eid.split(".", 1)[1]
+    for cand in (f"sensor.{base}_current_consumption", f"sensor.{base}_power",
+                 f"sensor.{base}_current_power", f"sensor.{info['node']}_power"):
+        try:
+            s = ha(f"/api/states/{cand}")
+            if s and s.get("state") not in (None, "unknown", "unavailable"):
+                return cand
+        except SystemExit:
+            continue
+    return None
+
+def cmd_status(tok):
+    p, info = resolve(tok)
+    eid = find_entity(info)
+    if not eid:
+        die(f"{p} ({info['node']}): no HA switch entity found. Once known: "
+            f"python3 {STATE} ingest {p} ha_entity <entity_id> --valid-from "
+            "$(date +%F) --source wq#334", 4)
+    s = ha(f"/api/states/{eid}")
+    print(f"{p}  node={info['node']}  entity={eid}  state={s.get('state')}")
+
+def cmd_watts(tok):
+    p, info = resolve(tok)
+    eid = find_entity(info) or die(f"{p}: no switch entity", 4)
+    pe = power_entity_for(eid, info)
+    if not pe:
+        die(f"{p} ({info['node']}): no power sensor found via HA", 4)
+    s = ha(f"/api/states/{pe}")
+    unit = s.get("attributes", {}).get("unit_of_measurement", "W")
+    print(f"{p}  node={info['node']}  {s.get('state')} {unit}")
+
+def cmd_switch(tok, turn_on, confirm_halted):
+    p, info = resolve(tok)
+    node = info["node"]
+    if not turn_on:
+        if node in OFF_DENYLIST_NODES:
+            die(f"REFUSED: {p} powers '{node}' — crown-jewel denylist. plugctl will "
+                "never power this off. Do it physically if truly required.", 5)
+        up = node_pings(node)
+        # Second, independent halt signal: the plug's own power draw. A running
+        # box pulls meaningful watts even if it's unreachable on the network
+        # (guards against a STALE/WRONG IP in state making a live node look down).
+        WATTS_FLOOR = 3.0  # a halted node + plug standby sits well under this
+        watts = None
+        eid_probe = find_entity(info)
+        if eid_probe:
+            pe = power_entity_for(eid_probe, info)
+            if pe:
+                try:
+                    v = ha(f"/api/states/{pe}").get("state")
+                    watts = float(v)
+                except (ValueError, TypeError, SystemExit):
+                    watts = None
+        drawing = (watts is not None and watts >= WATTS_FLOOR)
+        if up and not confirm_halted:
+            die(f"REFUSED: '{node}' still answers ping/SSH. Halt it first, then "
+                "re-run with --confirm-halted.", 5)
+        if up and confirm_halted:
+            die(f"REFUSED: --confirm-halted given but '{node}' STILL answers "
+                "ping/SSH. Not cutting power to a live node.", 5)
+        if drawing:
+            die(f"REFUSED: {p} still draws {watts}W (>= {WATTS_FLOOR}W floor) — "
+                f"'{node}' looks powered even if unreachable. Not cutting. "
+                "(If the node is truly halted and this is standby draw, verify "
+                "the plug watts reading before overriding.)", 5)
+    eid = find_entity(info) or die(f"{p}: no switch entity", 4)
+    svc = "turn_on" if turn_on else "turn_off"
+    ha("/api/services/switch/" + svc, method="POST", body={"entity_id": eid})
+    # HA commits the state change asynchronously; poll briefly so we report the
+    # ACTUAL post-command state, not a stale read.
+    want = "on" if turn_on else "off"
+    st = None
+    for _ in range(10):          # up to ~5s
+        time.sleep(0.5)
+        st = ha(f"/api/states/{eid}").get("state")
+        if st == want:
+            break
+    ok = "OK" if st == want else f"WARNING expected {want}"
+    print(f"{p} ({node}) switch.{svc} -> state now {st}  [{ok}]")
+
+def cmd_list():
+    m = build_map()
+    for p in PLUGS:
+        if p in m:
+            i = m[p]
+            deny = " [OFF-DENYLIST]" if i["node"] in OFF_DENYLIST_NODES else ""
+            print(f"{p:4s} node={i['node']:10s} ip={i['ip'] or '?':16s} "
+                  f"entity={i['entity'] or '(discover)'}{deny}")
+
+USAGE = ("usage: plugctl <cmd> [target]\n"
+         "  list                       show plug->node map\n"
+         "  status <pN|node>           HA switch state\n"
+         "  watts  <pN|node>           current power draw\n"
+         "  on     <pN|node>           turn plug on\n"
+         "  off    <pN|node> [--confirm-halted]   turn plug off (safety-gated)\n"
+         "  selftest                   offline unit test (no HA)\n"
+         "OFF is denylisted for lumen(P11) + maat(P4) and refused while the node pings.")
+
+def selftest():
+    """No-HA unit test: map parse, denylist logic, resolve, ping-gate reasoning."""
+    fails = 0
+    def chk(label, got, want):
+        nonlocal fails
+        ok = got == want
+        fails += not ok
+        print(f"{'PASS' if ok else 'FAIL'} {label:44s} want={want!r:8} got={got!r}")
+    m = build_map()
+    chk("all 12 plugs mapped", len(m), 12)
+    chk("p11 -> lumen", m.get("p11", {}).get("node"), "lumen")
+    chk("p4 -> maat", m.get("p4", {}).get("node"), "maat")
+    chk("lumen in OFF denylist", "lumen" in OFF_DENYLIST_NODES, True)
+    chk("maat in OFF denylist", "maat" in OFF_DENYLIST_NODES, True)
+    # resolve by node name
+    p, info = resolve("bes")
+    chk("resolve bes -> p7", p, "p7")
+    print(f"\n{6-fails}/6 passed")
+    return 1 if fails else 0
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(USAGE); return 0
+    cmd = a[0]
+    if cmd == "selftest":
+        return selftest()
+    if cmd == "list":
+        cmd_list(); return 0
+    if len(a) < 2:
+        die(f"'{cmd}' needs a target (pN or node). {USAGE}")
+    tok = a[1]
+    if cmd == "status":
+        cmd_status(tok)
+    elif cmd == "watts":
+        cmd_watts(tok)
+    elif cmd == "on":
+        cmd_switch(tok, True, False)
+    elif cmd == "off":
+        cmd_switch(tok, False, "--confirm-halted" in a)
+    else:
+        die(f"unknown command '{cmd}'. {USAGE}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

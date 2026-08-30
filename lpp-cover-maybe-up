@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# lpp-cover-maybe-up — ExecStopPost hook on lumen-pokemon-live.service (wq#1021).
+#
+# Raise the idle-splash cover on :8871 ONLY when the live stream is stopping for
+# good — never between auto-restarts (that would fight the restart for the port).
+#
+# Discriminator is $SERVICE_RESULT (set by systemd for ExecStopPost):
+#   success  -> a clean/commanded stop. Distinguish a plain `stop` (stay down ->
+#               cover) from a `restart` (live returns -> no cover, no thrash) by
+#               briefly watching ActiveState.
+#   anything else (exit-code|signal|core-dump|watchdog|...) -> a crash.
+#               Restart=on-failure will retry, so leave the port for it. If it
+#               gives up, the unit goes `failed` and
+#               OnFailure=lumen-kiosk-idle.service raises the cover instead.
+set -u
+
+result="${SERVICE_RESULT:-unknown}"
+if [ "$result" != "success" ]; then
+  exit 0
+fi
+
+# Commanded stop. If live re-enters activating/active within ~1.5s it was a
+# restart — do not raise the cover. Poll fast to keep any real-stop 502 gap tiny.
+for _ in 1 2 3; do
+  state="$(/usr/bin/systemctl show -P ActiveState lumen-pokemon-live.service 2>/dev/null)"
+  case "$state" in
+    active|activating|reloading) exit 0 ;;
+  esac
+  sleep 0.5
+done
+
+# Live is staying down: raise the splash so pokemon.lumennode.uk shows the cover
+# instead of 502. --no-block avoids entangling with live's own stop transaction.
+/usr/bin/sudo -n /usr/bin/systemctl --no-block start lumen-kiosk-idle.service
+exit 0

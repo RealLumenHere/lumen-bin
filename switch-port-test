@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# switch-port-test — per-port iperf3 walk for the Sodola SL-SWTGW2224AS bench validation.
+# Run FROM the fixed endpoint (default assumes Lumen, iperf3 server local on ens1 IP).
+# The MOVING endpoint is reached over SSH; Frank re-cables it port to port.
+# Usage: switch-port-test --remote sia@192.168.8.175 --remote-iface enp1s0 --local-ip 192.168.8.160 [--csv path]
+#   --remote        SSH target of the moving endpoint (its ALWAYS-UP mgmt path, e.g. onboard 1G or tailscale IP)
+#   --remote-iface  the 2.5G iface on the moving endpoint that plugs into the switch
+#   --remote-ip     data-path IP of that iface (default: auto-detect via ssh ip -4 addr)
+#   --local-ip      data-path IP of the fixed endpoint iface (iperf3 server bind)
+# Per port: prompts for port number -> checks remote ethtool speed (must be 2500) ->
+# iperf3 fwd + reverse 15s -> logs CSV. Ctrl-C safe; re-run appends.
+set -u
+REMOTE="" ; RIFACE="" ; RIP="" ; LIP="" ; CSV="/home/lumen/firmware/sodola-sl-swtgw2224as/port_test_$(date +%Y%m%d_%H%M).csv"
+while [ $# -gt 0 ]; do case "$1" in
+  --remote) REMOTE="$2"; shift 2;; --remote-iface) RIFACE="$2"; shift 2;;
+  --remote-ip) RIP="$2"; shift 2;; --local-ip) LIP="$2"; shift 2;;
+  --csv) CSV="$2"; shift 2;; *) echo "unknown arg $1"; exit 1;; esac; done
+[ -z "$REMOTE" ] || [ -z "$RIFACE" ] || [ -z "$LIP" ] && { echo "need --remote, --remote-iface, --local-ip"; exit 1; }
+command -v iperf3 >/dev/null || { echo "iperf3 missing locally"; exit 1; }
+ssh -o ConnectTimeout=8 "$REMOTE" "command -v iperf3 >/dev/null" || { echo "iperf3 missing on $REMOTE"; exit 1; }
+[ -z "$RIP" ] && RIP=$(ssh "$REMOTE" "ip -4 addr show $RIFACE 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1" ) 
+[ -z "$RIP" ] && { echo "could not detect data IP on $REMOTE:$RIFACE — pass --remote-ip"; exit 1; }
+echo "fixed(server): $LIP   moving(client): $REMOTE iface $RIFACE ip $RIP"
+echo "csv: $CSV"
+[ -f "$CSV" ] || echo "timestamp,port,neg_speed,fwd_mbps,fwd_retr,rev_mbps,verdict,notes" > "$CSV"
+# local iperf3 server (kill any stale one we own)
+pkill -f "iperf3 -s -B $LIP" 2>/dev/null; sleep 1
+iperf3 -s -B "$LIP" -D || { echo "server start failed"; exit 1; }
+trap 'pkill -f "iperf3 -s -B $LIP" 2>/dev/null; echo; echo "server stopped. csv: $CSV"' EXIT
+while true; do
+  echo; read -r -p "Cable moved. Switch PORT number (q=quit): " PORT
+  [ "$PORT" = "q" ] && break
+  case "$PORT" in (*[!0-9]*|"") echo "numeric port"; continue;; esac
+  echo -n "  waiting for link on $RIFACE ... "
+  SPEED=""
+  for i in $(seq 1 20); do
+    SPEED=$(ssh "$REMOTE" "ethtool $RIFACE 2>/dev/null | awk -F': ' '/Speed/{print \$2}'")
+    case "$SPEED" in 2500*|1000*|100Mb*) break;; esac; sleep 1
+  done
+  echo "negotiated: ${SPEED:-none}"
+  if [ "${SPEED%%M*}" != "2500" ]; then
+    echo "  FAIL: not 2500 (pair fault / bad port / bad cable — cable is your control)"
+    read -r -p "  note: " NOTE
+    echo "$(date -Iseconds),$PORT,${SPEED:-none},,,,FAIL_LINK,$NOTE" >> "$CSV"; continue
+  fi
+  echo "  iperf3 forward (moving->fixed) 15s..."
+  F=$(ssh "$REMOTE" "iperf3 -c $LIP -B $RIP -t 15 -J" 2>/dev/null)
+  FM=$(echo "$F" | python3 -c "import sys,json;d=json.load(sys.stdin);print(round(d['end']['sum_sent']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
+  FR=$(echo "$F" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['end']['sum_sent'].get('retransmits',-1))" 2>/dev/null || echo -1)
+  echo "  forward: ${FM} Mbps, retr ${FR}"
+  echo "  iperf3 reverse (fixed->moving) 15s..."
+  R=$(ssh "$REMOTE" "iperf3 -c $LIP -B $RIP -t 15 -R -J" 2>/dev/null)
+  RM=$(echo "$R" | python3 -c "import sys,json;d=json.load(sys.stdin);print(round(d['end']['sum_received']['bits_per_second']/1e6))" 2>/dev/null || echo 0)
+  echo "  reverse: ${RM} Mbps"
+  V="PASS"; [ "$FM" -lt 2200 ] || [ "$RM" -lt 2200 ] && V="FAIL_RATE"
+  echo "  verdict: $V"
+  echo "$(date -Iseconds),$PORT,2500,$FM,$FR,$RM,$V," >> "$CSV"
+done

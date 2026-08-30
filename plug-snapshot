@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# plug-snapshot - publish combined P-series (Tapo/KLAP) + E-series (Athom/HA) plug
+# state to Glance. E-plugs come via eplug-fetch.py (HA-only path); merged here so
+# the widget shows one list. Fails soft on E-series so P-series always publishes.
+set -euo pipefail
+OUT=/home/lumen/glance/assets/plugs.json
+TMP="$OUT.tmp"
+
+PJSON="$(/home/lumen/bin/plug-ctl all json 2>/dev/null)"
+EJSON="$(/home/lumen/bin/eplug-fetch.py 2>/dev/null || echo [])"
+
+PJSON="$PJSON" EJSON="$EJSON" python3 - > "$TMP" <<PYMERGE
+import json, os
+p = json.loads(os.environ["PJSON"])
+try:
+    e = json.loads(os.environ["EJSON"])
+except Exception:
+    e = []
+plugs = list(p.get("plugs", []))
+plugs.extend(e)
+# total across every plug that reports on
+total = 0.0
+for pl in plugs:
+    try:
+        total += float(pl.get("watts", 0) or 0)
+    except (TypeError, ValueError):
+        pass
+out = {"updated": p.get("updated"), "plugs": plugs, "total_watts": round(total, 1)}
+print(json.dumps(out))
+PYMERGE
+
+mv "$TMP" "$OUT"

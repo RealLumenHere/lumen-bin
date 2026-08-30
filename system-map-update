@@ -1,0 +1,21 @@
+#!/bin/bash
+# Regenerate SYSTEM_MAP.md; alert Frank on lumen-alerts iff the map changed.
+# Called by: system-map.timer (daily), state-regen (after every fact ingest),
+# or manually after any service/pipeline change.
+set -u
+MAP=/home/lumen/SYSTEM_MAP.md
+PREV=/tmp/system_map_prev.md
+[ -f "$MAP" ] && cp "$MAP" "$PREV"
+/home/lumen/bin/system-map-gen >/dev/null 2>&1 || exit 1
+if [ -f "$PREV" ] && ! diff -q "$PREV" "$MAP" >/dev/null 2>&1; then
+    # ignore timestamp-only diffs (line 2 carries the generation time)
+    if ! diff <(tail -n +3 "$PREV") <(tail -n +3 "$MAP") >/dev/null 2>&1; then
+        SUMMARY=$(diff <(tail -n +3 "$PREV") <(tail -n +3 "$MAP") | grep -E '^[<>]' | head -6 | cut -c1-100 | tr '\n' ';')
+        # wq#972 (R2 alert hygiene): info-class, fired ~120x/7d (state-regen runs on
+        # every fact ingest) and drowned the page topic. Route to the digest topic;
+        # lumen-alerts stays for critical/aq-escalation only.
+        curl -s -m 10 -d "SYSTEM_MAP.md changed: ${SUMMARY:0:600}" \
+             -H "Title: System map updated" -H "Tags: card_index" \
+             http://127.0.0.1:8080/lumen-updates >/dev/null 2>&1
+    fi
+fi

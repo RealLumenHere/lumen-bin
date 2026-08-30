@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# gh-lane-worker — unattended github-lane drainer. One claude session per ticket.
+# usage: gh-lane-worker <agent-base> [max-tickets]
+# Launch via lumen-run so the MCP gateway cannot reap it:
+#   lumen-run start --name gh-w1 -- /home/lumen/bin/gh-lane-worker gh-w1 6
+set -uo pipefail
+export PATH=/home/lumen/.npm-global/bin:$PATH
+BASE=${1:?agent base name required}; MAX=${2:-6}; LANE=${3:-github}
+LOG=/home/lumen/agents/work-queue/logs
+mkdir -p "$LOG"
+WQ_AGENT=$(/home/lumen/bin/wq whoami --register "$BASE" 2>&1 | grep -oE "${BASE}-[0-9a-f]{6}" | head -1)
+[ -n "$WQ_AGENT" ] || { echo "could not register identity for $BASE"; exit 1; }
+export WQ_AGENT
+echo "worker $WQ_AGENT starting, max $MAX tickets"
+
+PROMPT=$(cat <<PEOF
+You are ${WQ_AGENT}, an autonomous work-queue agent on Frank's Lumen fleet, on host lumen with
+full shell access. Your identity is already registered: export WQ_AGENT=${WQ_AGENT} in every
+shell you run, and use that exact string as your agent name for wq and slock.
+
+READ THESE THREE FILES IN FULL BEFORE DOING ANYTHING:
+  /home/lumen/agents/work-queue/GITHUB_DISPATCH.md      (your operating loop and lane rules)
+  /home/lumen/instructions/playbooks/github-standards.md (the law for every repo/commit/PR)
+  /home/lumen/agents/work-queue/LANE_BOUNDARIES.md      (how not to collide with other lanes)
+
+Then do EXACTLY ONE ticket, end to end, and stop:
+  1. OUT=\\\$(/home/lumen/bin/wq claim \\\$WQ_AGENT --lane $LANE --ttl 120)
+     If it returns NONE, print the single line LANE_DRAINED and stop immediately.
+     If it errors, print CLAIM_ERROR plus the error and stop. Never work unclaimed.
+  2. wq show the id and read every path it references.
+  3. python3 /home/lumen/minerva/lumen_episode.py precheck "<one-line plan>"
+  4. Do the work to completion, obeying the standard and the lane boundaries.
+  5. Write the report to /home/lumen/agents/work-queue/reports/<id>_<slug>.md, verdict FIRST,
+     with the exact commands you ran and before/after evidence. CONFIRMED vs INFERRED explicit.
+  6. /home/lumen/bin/wq done <id> --notes "report: reports/<id>_<slug>.md; <one-line outcome>"
+  7. Release any slock you took. Print the line TICKET_CLOSED <id> and stop.
+
+HARD RULES:
+- A PreToolUse guard hook blocks house-forbidden commands (reboot/shutdown, systemctl
+  stop/disable/mask, dd, docker --remove-orphans, ip link set, macchanger, git push
+  --force, rm -rf outside your worktree/tmp, docker except ps/logs, reading credentials).
+  A block means re-scope your approach — do not retry the same command.
+- Frank is asleep. Never ask a question, never wait for input, never guess a decision that the
+  ticket marks as his. If a ticket needs a Frank decision that is not already recorded in the
+  ticket, wq block <id> "<reason>" and stop.
+- Never force-push. Never rewrite published history. Never push to main on a Class A repo -
+  use /home/lumen/bin/lumen-pr. main on lumen-plays-pokemon now REQUIRES a PR and a passing
+  'typecheck' check; a direct push will be rejected server-side.
+- Never delete a branch that has an open PR. Destructive work is dry-run first, with the plan
+  written into the report and posted to the board BEFORE acting.
+- GITHUB_TOKEN comes from /home/lumen/agent/.env. Never echo it, never commit it, never put it
+  in a report.
+- If you cannot finish honestly, say so in the report and wq release <id> rather than closing a
+  half-done ticket. An accurate blocked ticket is worth more than a false green.
+PEOF
+)
+
+for i in $(seq 1 "$MAX"); do
+  echo "=== $WQ_AGENT iteration $i $(date -u +%FT%TZ) ==="
+  # wq#625 retrofit onto the T2a acceptEdits+deny+guard-hook pack, off the old bypass
+  # mode (BUILD_PLAN.md §T2a / design/T2A_WORKER_HARNESS_DESIGN.md §11). Loop/sentinel
+  # logic is unchanged; a hook-blocked command means re-scope, not retry (see PROMPT above).
+  out=$(cd /home/lumen && env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+    timeout 3600 claude -p "$PROMPT" \
+      --model claude-sonnet-5 --effort high \
+      --settings /home/lumen/foreman/harness/worker-settings.json \
+      --permission-mode acceptEdits \
+      --add-dir /home/lumen/agents/work-queue \
+      < /dev/null 2>&1)
+  printf '%s\n' "$out" > "$LOG/${WQ_AGENT}-iter${i}.log"
+  printf '%s\n' "$out" | tail -5
+  if printf '%s' "$out" | grep -q 'LANE_DRAINED'; then echo "lane drained, stopping"; break; fi
+  if printf '%s' "$out" | grep -q 'CLAIM_ERROR'; then echo "claim error, stopping"; break; fi
+  sleep 10
+done
+curl -s -H "Title: $WQ_AGENT" -d "github lane worker finished after $i iteration(s). Logs: $LOG/${WQ_AGENT}-iter*.log" http://localhost:8080/lumen-updates >/dev/null 2>&1
+echo "worker $WQ_AGENT done"

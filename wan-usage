@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Report WAN (internet) traffic for the GL-iNet BE9300, Pacific time buckets.
+Usage: wan-usage [--days N] [--iface NAME] [--json]"""
+import argparse, json, os, sqlite3, sys, time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("America/Los_Angeles")
+DB = os.environ.get("WAN_USAGE_DB", "/home/lumen/data/wan_usage.db")
+
+def gb(n):
+    return n / 1_000_000_000
+
+def fmt(n):
+    g = gb(n)
+    return f"{g:8.2f} GB" if g >= 1 else f"{n/1_000_000:8.1f} MB"
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=14)
+    ap.add_argument("--iface", default=None)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    if not os.path.exists(DB):
+        print(f"no database yet at {DB} — has wan-usage-poll run?", file=sys.stderr); return 1
+    db = sqlite3.connect(DB, timeout=20)
+    meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
+    iface = a.iface or meta.get("wan_dev", "sta2")
+
+    rows = db.execute("SELECT hour_ts, rx, tx FROM usage WHERE iface=? ORDER BY hour_ts", (iface,)).fetchall()
+    daily = {}
+    for h, rx, tx in rows:
+        d = datetime.fromtimestamp(h, TZ).date()
+        r, t = daily.get(d, (0, 0))
+        daily[d] = (r + rx, t + tx)
+
+    today = datetime.now(TZ).date()
+    def span(n):
+        start = today - timedelta(days=n - 1)
+        r = sum(v[0] for k, v in daily.items() if k >= start)
+        t = sum(v[1] for k, v in daily.items() if k >= start)
+        return r, t
+    month_r = sum(v[0] for k, v in daily.items() if k.year == today.year and k.month == today.month)
+    month_t = sum(v[1] for k, v in daily.items() if k.year == today.year and k.month == today.month)
+
+    obs_days = len(daily) or 1
+    tot_r = sum(v[0] for v in daily.values())
+    tot_t = sum(v[1] for v in daily.values())
+
+    if a.json:
+        print(json.dumps({
+            "iface": iface, "observed_days": obs_days,
+            "today": daily.get(today, (0, 0)), "last7": span(7), "last30": span(30),
+            "month_to_date": (month_r, month_t),
+            "avg_per_day": (tot_r / obs_days, tot_t / obs_days),
+            "projected_month": (tot_r / obs_days * 30.4, tot_t / obs_days * 30.4),
+            "last_poll": meta.get("last_poll"), "last_error": meta.get("last_error"),
+        }, default=str))
+        return 0
+
+    lp = meta.get("last_poll")
+    age = f"{int(time.time()) - int(lp)}s ago" if lp else "never"
+    print(f"WAN traffic — BE9300 iface {iface}   (last poll {age}, {obs_days} day(s) of data)")
+    print(f"{'':14}{'DOWN':>12}{'UP':>12}{'TOTAL':>12}")
+    def line(label, rt):
+        r, t = rt
+        print(f"{label:14}{fmt(r)}{fmt(t)}{fmt(r+t)}")
+    line("Today", daily.get(today, (0, 0)))
+    line("Yesterday", daily.get(today - timedelta(days=1), (0, 0)))
+    line("Last 7d", span(7))
+    line("Last 30d", span(30))
+    line("Month-to-date", (month_r, month_t))
+    line("Avg/day", (tot_r / obs_days, tot_t / obs_days))
+    line("Proj. month", (tot_r / obs_days * 30.4, tot_t / obs_days * 30.4))
+    print()
+    print(f"Daily breakdown (last {a.days}):")
+    for i in range(a.days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        if d in daily:
+            r, t = daily[d]
+            bar = "#" * min(48, int(gb(r + t) * 2))
+            print(f"  {d}  {fmt(r)} dn {fmt(t)} up  {bar}")
+    err = meta.get("last_error")
+    if err:
+        print(f"\nlast poll error: {err}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

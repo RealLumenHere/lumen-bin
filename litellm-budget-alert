@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""wq#719 — check LiteLLM service key budgets, alert via ntfy at 80% consumed.
+
+wq#948 — match local key files to gateway records by sha256, never by URL query
+string: the raw key used to travel in `GET /key/info?key=sk-...`, which uvicorn's
+access log wrote to stdout in cleartext for `docker logs litellm` to keep forever.
+"""
+import hashlib, json, os, sys, urllib.request, pathlib
+
+LITELLM = "http://localhost:4000"
+MASTER_KEY = pathlib.Path("/home/lumen/.secrets/litellm-master.env").read_text().split("=",1)[1].strip()
+SECRETS_DIR = pathlib.Path("/home/lumen/.secrets/litellm-service-keys")
+THRESHOLD = 0.80  # alert at 80%
+
+def ntfy(msg, priority="high"):
+    """Post to local ntfy."""
+    try:
+        data = msg.encode()
+        req = urllib.request.Request(
+            "http://localhost:8080/lumen-alerts",
+            data=data,
+            headers={
+                "Title": "LiteLLM budget alert",
+                "Priority": priority,
+                "Tags": "warning,dollar",
+            },
+        )
+        # read creds from agent/.env
+        env_path = pathlib.Path("/home/lumen/agent/.env")
+        user = pw = ""
+        for line in env_path.read_text().splitlines():
+            if line.startswith("NTFY_USER="): user = line.split("=",1)[1].strip()
+            if line.startswith("NTFY_PASS="): pw = line.split("=",1)[1].strip()
+        if user and pw:
+            import base64
+            cred = base64.b64encode(f"{user}:{pw}".encode()).decode()
+            req.add_header("Authorization", f"Basic {cred}")
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"ntfy error: {e}", file=sys.stderr)
+
+def key_index():
+    """Map sha256(key) -> gateway record for every key the master key can see.
+
+    /key/list is admin-scoped: the credential rides in the Authorization header,
+    which uvicorn does not log, and each record carries `token` — the sha256 of the
+    key — so a local *.key file can be identified without the secret ever reaching
+    a URL. Raises on request/auth failure.
+    """
+    index, page, pages = {}, 1, 1
+    while page <= pages:
+        req = urllib.request.Request(
+            f"{LITELLM}/key/list?return_full_object=true&include_team_keys=true&size=100&page={page}",
+            headers={"Authorization": f"Bearer {MASTER_KEY}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        for rec in data.get("keys") or []:
+            if isinstance(rec, dict) and rec.get("token"):
+                index[rec["token"]] = rec
+        pages = int(data.get("total_pages") or 1)
+        page += 1
+    return index
+
+def main():
+    try:
+        index = key_index()
+    except Exception as e:
+        msg = f"LiteLLM budget-alert: /key/list failed, NO key confirmed within budget (master key or gateway broken?): {e}"
+        print(msg, file=sys.stderr)
+        ntfy(msg, priority="urgent")
+        return 1
+
+    alerts = []
+    failures = []
+    for kf in sorted(SECRETS_DIR.glob("*.key")):
+        rec = index.get(hashlib.sha256(kf.read_text().strip().encode()).hexdigest())
+        if rec is None:
+            print(f"  {kf.stem:25s} ERROR: no gateway key matches this file (rotated or revoked?)", file=sys.stderr)
+            failures.append(kf.stem)
+            continue
+        alias = rec.get("key_alias") or "unknown"
+        spend = float(rec.get("spend") or 0)
+        budget = float(rec.get("max_budget") or 0)
+        if budget <= 0:
+            continue
+        pct = spend / budget
+        status = "OK" if pct < THRESHOLD else "ALERT"
+        print(f"  {alias:25s} ${spend:8.4f} / ${budget:6.1f} ({pct*100:5.1f}%) {status}")
+        if pct >= THRESHOLD:
+            alerts.append(f"{alias}: ${spend:.2f}/${budget:.0f} ({pct*100:.0f}%)")
+
+    if alerts:
+        msg = "LiteLLM budget threshold breached:\n" + "\n".join(alerts)
+        ntfy(msg, priority="urgent")
+        print(f"\nALERTED: {len(alerts)} key(s) over {THRESHOLD*100:.0f}%")
+    if failures:
+        msg = f"LiteLLM budget-alert: {len(failures)} key file(s) match no key on the gateway (rotated or revoked?): {', '.join(failures)}"
+        ntfy(msg, priority="urgent")
+        print(f"\nFAILED to check {len(failures)} key(s), NOT confirmed within budget: {', '.join(failures)}")
+
+    if alerts or failures:
+        return 1
+    print("\nAll keys within budget.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

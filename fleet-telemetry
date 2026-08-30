@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Fleet telemetry SSH-fanout snapshot collector.
+
+wq#744. This is mission-control/app.py's SOLE live fleet source (/api/fleet
+reads FLEET_SNAPSHOT below; it never queries VictoriaMetrics/node_exporter).
+wq#753 node_exporter feeds Grafana/VictoriaMetrics only and is a separate,
+unwired consumer path — it does NOT replace this collector for MC. Do not
+relabel this stopgap/superseded again without first wiring MC's /api/fleet
+onto node_exporter and retiring this collector+timer (see wq#1013). Roster
+comes from
+`lumen_state.py current` tailscale_ip facts; each node is sampled read-only
+over SSH (user=hostname convention, id_ed25519 key). Lumen itself is sampled
+locally. Runs serially under a global deadline so a 30s-cadence timer never
+overlaps itself, and never lets one dead node block the rest of the snapshot.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+LOCAL_HOST = "lumen"
+SSH_KEY = "/home/lumen/.ssh/id_ed25519"
+OUT_PATH = "/home/lumen/telemetry/fleet_telemetry.json"
+GLOBAL_DEADLINE_S = 25.0
+CONNECT_TIMEOUT_S = 4
+CPU_SAMPLE_INTERVAL_S = 0.3
+
+REMOTE_SCRIPT = """
+cpu1=$(grep '^cpu ' /proc/stat)
+mem="$(cat /proc/meminfo)"
+load=$(cat /proc/loadavg)
+up=$(cat /proc/uptime)
+sleep 0.3
+cpu2=$(grep '^cpu ' /proc/stat)
+echo "CPU1|$cpu1"
+echo "CPU2|$cpu2"
+echo "MEMTOTAL|$(echo "$mem" | awk '/^MemTotal:/{print $2}')"
+echo "MEMAVAIL|$(echo "$mem" | awk '/^MemAvailable:/{print $2}')"
+echo "LOAD|$load"
+echo "UPTIME|$up"
+for f in /sys/class/drm/card*/device/mem_info_vram_used /sys/class/drm/card*/device/mem_info_vram_total; do
+  [ -r "$f" ] && echo "VRAM|$f|$(cat "$f")"
+done
+exit 0
+"""
+
+
+def get_roster():
+    out = subprocess.run(
+        ["python3", "/home/lumen/minerva/lumen_state.py", "current", "", "tailscale_ip"],
+        capture_output=True, text=True, timeout=15,
+    )
+    roster = {}
+    pat = re.compile(r"^\s*(\S+)\.tailscale_ip\s*=\s*(\S+)")
+    for line in out.stdout.splitlines():
+        m = pat.match(line)
+        if m:
+            roster[m.group(1)] = m.group(2)
+    return roster
+
+
+def parse_cpu_line(line):
+    nums = [int(x) for x in line.split()[1:9]]
+    idle = nums[3] + nums[4]
+    return sum(nums), idle
+
+
+def cpu_pct(cpu1_line, cpu2_line):
+    t1, i1 = parse_cpu_line(cpu1_line)
+    t2, i2 = parse_cpu_line(cpu2_line)
+    dt = t2 - t1
+    if dt <= 0:
+        return None
+    return round((1 - (i2 - i1) / dt) * 100, 1)
+
+
+def sample_local():
+    with open("/proc/stat") as f:
+        cpu1 = next(l for l in f if l.startswith("cpu "))
+    time.sleep(CPU_SAMPLE_INTERVAL_S)
+    with open("/proc/stat") as f:
+        cpu2 = next(l for l in f if l.startswith("cpu "))
+
+    meminfo = {}
+    with open("/proc/meminfo") as f:
+        for l in f:
+            k, v = l.split(":", 1)
+            meminfo[k.strip()] = int(v.split()[0])
+
+    with open("/proc/loadavg") as f:
+        load = f.read().split()[:3]
+    with open("/proc/uptime") as f:
+        uptime_s = float(f.read().split()[0])
+
+    vram_used = vram_total = 0
+    vram_present = False
+    for used_path in glob.glob("/sys/class/drm/card*/device/mem_info_vram_used"):
+        total_path = used_path.replace("_used", "_total")
+        try:
+            with open(used_path) as f:
+                u = int(f.read().strip())
+            with open(total_path) as f:
+                t = int(f.read().strip())
+        except OSError:
+            continue
+        vram_used += u
+        vram_total += t
+        vram_present = True
+
+    mem_total_b = meminfo.get("MemTotal", 0) * 1024
+    mem_avail_b = meminfo.get("MemAvailable", meminfo.get("MemFree", 0)) * 1024
+    entry = {
+        "status": "ok",
+        "cpu_pct": cpu_pct(cpu1, cpu2),
+        "mem_used_bytes": mem_total_b - mem_avail_b,
+        "mem_total_bytes": mem_total_b,
+        "loadavg": [float(x) for x in load],
+        "uptime_s": uptime_s,
+    }
+    if vram_present:
+        entry["vram_used_bytes"] = vram_used
+        entry["vram_total_bytes"] = vram_total
+    return entry
+
+
+def parse_remote_output(text):
+    fields = {}
+    vram_used_total = vram_total_total = 0
+    vram_present = False
+    for line in text.splitlines():
+        parts = line.split("|")
+        key = parts[0]
+        if key == "VRAM" and len(parts) == 3:
+            path, val = parts[1], parts[2]
+            try:
+                v = int(val.strip())
+            except ValueError:
+                continue
+            if path.endswith("_used"):
+                vram_used_total += v
+            else:
+                vram_total_total += v
+            vram_present = True
+        elif len(parts) == 2:
+            fields[key] = parts[1]
+
+    if "CPU1" not in fields or "CPU2" not in fields:
+        raise ValueError("missing cpu samples in remote output")
+
+    mem_total_kb = int(fields.get("MEMTOTAL") or 0)
+    mem_avail_kb = int(fields.get("MEMAVAIL") or 0)
+    mem_total_b = mem_total_kb * 1024
+    load = fields.get("LOAD", "").split()[:3]
+    uptime_raw = fields.get("UPTIME", "").split()
+
+    entry = {
+        "status": "ok",
+        "cpu_pct": cpu_pct(fields["CPU1"], fields["CPU2"]),
+        "mem_used_bytes": mem_total_b - mem_avail_kb * 1024,
+        "mem_total_bytes": mem_total_b,
+        "loadavg": [float(x) for x in load] if load else None,
+        "uptime_s": float(uptime_raw[0]) if uptime_raw else None,
+    }
+    if vram_present:
+        entry["vram_used_bytes"] = vram_used_total
+        entry["vram_total_bytes"] = vram_total_total
+    return entry
+
+
+def sample_remote(host, ip, timeout_s):
+    cmd = [
+        "ssh",
+        "-i", SSH_KEY,
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+        "-o", "StrictHostKeyChecking=accept-new",
+        f"{host}@{ip}",
+        "bash", "-s",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, input=REMOTE_SCRIPT, capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "unreachable", "error": "timeout"}
+    if proc.returncode != 0:
+        lines = proc.stderr.strip().splitlines()
+        err = lines[-1] if lines else f"exit {proc.returncode}"
+        return {"status": "unreachable", "error": err[:200]}
+    try:
+        return parse_remote_output(proc.stdout)
+    except Exception as e:
+        return {"status": "unreachable", "error": f"parse_error: {e}"}
+
+
+def main():
+    started = time.monotonic()
+    roster = get_roster()
+    snapshot = {}
+
+    if LOCAL_HOST in roster:
+        snapshot[LOCAL_HOST] = sample_local()
+
+    remote_hosts = [h for h in sorted(roster) if h != LOCAL_HOST]
+    for idx, host in enumerate(remote_hosts):
+        ip = roster[host]
+        remaining = GLOBAL_DEADLINE_S - (time.monotonic() - started)
+        remaining_nodes = len(remote_hosts) - idx
+        if remaining <= 0.3:
+            snapshot[host] = {"status": "unreachable", "error": "global_deadline_exceeded"}
+            continue
+        # Divide what's left evenly across the nodes still queued, so a run of
+        # unreachable hosts early in the (alphabetical) order can't starve the
+        # ones later in line of a chance to be sampled within the deadline.
+        fair_share = remaining / remaining_nodes
+        per_node_timeout = max(0.8, min(fair_share, CONNECT_TIMEOUT_S + 1))
+        snapshot[host] = sample_remote(host, ip, per_node_timeout)
+
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "schema_version": 1,
+        "nodes": snapshot,
+    }
+
+    out_dir = os.path.dirname(OUT_PATH)
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_path = OUT_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, OUT_PATH)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

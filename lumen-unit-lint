@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+lumen-unit-lint — read-only systemd unit hygiene linter (wq#440).
+
+Scans /etc/systemd/system for drift classes that have ACTUALLY bitten this
+box before (see claude_memory.md incidents 2026-04..07):
+  R1 orphan-timer      .timer whose triggered .service does not exist
+  R2 dead-exec         Exec* references a binary path that does not exist
+  R3 startlimit-misplaced  StartLimitIntervalSec/Burst in [Service]
+                           (silently ignored there; must be in [Unit])
+  R4 runtime-enabled   unit enabled runtime-only (won't survive reboot)
+  R5 no-description    unit missing Description=
+  R6 dangling-wants    broken symlink in *.wants/ directories
+  R7 failed-state      unit currently in failed state (informational)
+
+READ-ONLY: never writes, never touches systemd state. Exit 0 always unless
+--strict (then exit 1 if any R1-R4 finding). Usage:
+  lumen-unit-lint [--json] [--strict]
+"""
+import glob, json, os, re, subprocess, sys
+
+UNIT_DIR = "/etc/systemd/system"
+SKIP_SUFFIXES = (".bak", ".disabled", ".prepatch", ".contaminated", ".old",
+                 ".prestateful", ".deleted")
+
+
+def _skip(path):
+    base = os.path.basename(path)
+    return any(s in base for s in SKIP_SUFFIXES)
+
+
+def _parse(path):
+    """Minimal INI parse -> {section: [(key, value), ...]}."""
+    sections, cur = {}, None
+    try:
+        for raw in open(path, errors="replace"):
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            m = re.match(r"\[(.+)\]$", line)
+            if m:
+                cur = m.group(1)
+                sections.setdefault(cur, [])
+            elif "=" in line and cur:
+                k, v = line.split("=", 1)
+                sections[cur].append((k.strip(), v.strip()))
+    except OSError as e:
+        sections["__error__"] = [("read", str(e))]
+    return sections
+
+
+def _get(sections, section, key):
+    return [v for (k, v) in sections.get(section, []) if k == key]
+
+
+def _exec_path(value):
+    """First token of an Exec* line, minus systemd prefixes (-, @, +, !, :)."""
+    v = value.lstrip("-@+!:").strip()
+    if not v:
+        return None
+    tok = v.split()[0]
+    return tok if tok.startswith("/") else None
+
+
+def lint():
+    findings = []
+    units = sorted(p for p in glob.glob(f"{UNIT_DIR}/*")
+                   if p.endswith((".service", ".timer")) and not _skip(p)
+                   and os.path.isfile(p))
+    names = {os.path.basename(p) for p in units}
+
+    for path in units:
+        name = os.path.basename(path)
+        s = _parse(path)
+
+        # R5 no-description
+        if not _get(s, "Unit", "Description"):
+            findings.append(("R5", name, "missing Description="))
+
+        # R3 StartLimit* in [Service]
+        for k, _v in s.get("Service", []):
+            if k in ("StartLimitIntervalSec", "StartLimitBurst",
+                     "StartLimitInterval"):
+                findings.append(("R3", name,
+                                 f"{k} in [Service] is silently ignored — move to [Unit]"))
+
+        # R2 dead Exec* binaries
+        for sec in ("Service",):
+            for k, v in s.get(sec, []):
+                if k.startswith("Exec"):
+                    p = _exec_path(v)
+                    if p and not os.path.exists(p):
+                        findings.append(("R2", name, f"{k} path missing: {p}"))
+
+        # R1 orphan timer
+        if name.endswith(".timer"):
+            target = _get(s, "Timer", "Unit") or [name[:-6] + ".service"]
+            t = target[0]
+            if t not in names and not os.path.exists(f"{UNIT_DIR}/{t}") \
+               and not os.path.exists(f"/lib/systemd/system/{t}") \
+               and not os.path.exists(f"/usr/lib/systemd/system/{t}"):
+                findings.append(("R1", name, f"triggers nonexistent unit: {t}"))
+
+    # R6 dangling wants/requires symlinks
+    for d in glob.glob(f"{UNIT_DIR}/*.wants") + glob.glob(f"{UNIT_DIR}/*.requires"):
+        for link in glob.glob(f"{d}/*"):
+            if os.path.islink(link) and not os.path.exists(link):
+                findings.append(("R6", f"{os.path.basename(d)}/{os.path.basename(link)}",
+                                 "dangling symlink"))
+
+    # R4 runtime-only enablement + R7 failed state (one batched systemctl each)
+    try:
+        out = subprocess.run(
+            ["systemctl", "list-unit-files", "--no-legend", "--no-pager",
+             "--type=service,timer"], capture_output=True, text=True, timeout=30).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "enabled-runtime" \
+               and parts[0] in names:
+                findings.append(("R4", parts[0],
+                                 "enabled runtime-only — will not survive reboot"))
+    except Exception as e:
+        findings.append(("ERR", "systemctl", f"list-unit-files failed: {e}"))
+    try:
+        out = subprocess.run(
+            ["systemctl", "--failed", "--no-legend", "--no-pager", "--plain"],
+            capture_output=True, text=True, timeout=30).stdout
+        for line in out.splitlines():
+            u = line.split()[0] if line.split() else ""
+            if u in names:
+                findings.append(("R7", u, "unit in failed state"))
+    except Exception as e:
+        findings.append(("ERR", "systemctl", f"--failed query failed: {e}"))
+
+    return findings, len(units)
+
+
+def main():
+    as_json = "--json" in sys.argv
+    strict = "--strict" in sys.argv
+    findings, n = lint()
+    hard = [f for f in findings if f[0] in ("R1", "R2", "R3", "R4")]
+    if as_json:
+        print(json.dumps({"scanned": n,
+                          "findings": [{"rule": r, "unit": u, "msg": m}
+                                       for r, u, m in findings]}, indent=2))
+    else:
+        print(f"lumen-unit-lint: scanned {n} live units in {UNIT_DIR}")
+        for r, u, m in sorted(findings):
+            print(f"  [{r}] {u}: {m}")
+        print(f"  total: {len(findings)} findings "
+              f"({len(hard)} hard R1-R4, {len(findings)-len(hard)} info)")
+    sys.exit(1 if (strict and hard) else 0)
+
+
+if __name__ == "__main__":
+    main()

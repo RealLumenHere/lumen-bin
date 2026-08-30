@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""minerva-why — read-only viewer for Minerva proposal decisions.
+
+Usage:
+  minerva-why <id-prefix | title substring>     show full reasoning for matching proposal(s)
+  minerva-why --list [status] [N]               list recent proposals (default all statuses, N=20)
+Statuses: reject, defer, blocked, shipped, deploy_ready, deployed, accept, pending
+"""
+import sys, json, sqlite3
+
+DB = '/home/lumen/minerva/minerva.db'
+
+def reason_of(row):
+    dr = row['decision_reason'] or ''
+    er = {}
+    try: er = json.loads(row['eval_result'] or '{}')
+    except Exception: pass
+    parts = []
+    if row['status'] == 'blocked' and er.get('blocking_reason'):
+        parts.append('gate: ' + er['blocking_reason'])
+    if dr: parts.append('triage: ' + dr)
+    if er.get('reason'): parts.append('guard: ' + str(er['reason']))
+    if not parts and er.get('judge_rationale'):
+        parts.append('judge: ' + str(er['judge_rationale']))
+    return parts or ['(no reasoning recorded)']
+
+def main():
+    db = sqlite3.connect(DB); db.row_factory = sqlite3.Row
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h','--help'):
+        print(__doc__); return
+    if args[0] == '--list':
+        status = args[1] if len(args) > 1 and not args[1].isdigit() else None
+        n = int(args[-1]) if args[-1].isdigit() else 20
+        q = "select id,status,title,created_at from proposals"
+        p = ()
+        if status: q += " where status=?"; p = (status,)
+        q += " order by created_at desc limit ?"; p += (n,)
+        for r in db.execute(q, p):
+            print(f"{r['id']}  {r['status']:<12} {r['created_at'][:10]}  {r['title'][:70]}")
+        return
+    needle = ' '.join(args)
+    rows = db.execute(
+        "select * from proposals where id like ? or title like ? order by created_at desc limit 10",
+        (needle + '%', '%' + needle + '%')).fetchall()
+    if not rows:
+        print('no match'); return
+    for r in rows:
+        print(f"\n== {r['id']}  [{r['status']}]  {r['title']}")
+        print(f"   created {r['created_at'][:19]}  decided {(r['decided_at'] or '-')[:19]}")
+        for line in reason_of(r):
+            print(f"   {line}")
+        er = {}
+        try: er = json.loads(r['eval_result'] or '{}')
+        except Exception: pass
+        fc = er.get('failing_claims')
+        if fc: print(f"   failing_claims: {fc}")
+        if er.get('checks'):
+            failed = [k for k,v in er['checks'].items() if not v.get('passed')]
+            passed = [k for k,v in er['checks'].items() if v.get('passed')]
+            print(f"   checks passed: {', '.join(passed)}")
+            if failed: print(f"   checks FAILED: {', '.join(failed)}")
+
+if __name__ == '__main__':
+    main()

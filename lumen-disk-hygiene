@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# lumen-disk-hygiene — conservative recurring dead-space reclamation on Lumen.
+# Built 2026-08-09. Only removes REGENERABLE artifacts. Fail-open, never fatal.
+#
+# HARD RULES (do not relax without Frank):
+#   - NEVER `docker image prune -a`  (deletes stopped-but-wanted images e.g. esphome)
+#   - NEVER `docker volume prune`    (volumes hold live DB data)
+#   - NEVER touch /home/lumen/backups, /home/lumen/models, /data/lumen, /scratch
+#   - Tagged images are removed ONLY by explicit human action, never by this script.
+set -uo pipefail
+
+LOG=/home/lumen/logs/disk-hygiene.log
+NTFY=http://127.0.0.1:8080/lumen-fleet
+THRESH=85          # alert if root usage % >= this AFTER the run
+mkdir -p /home/lumen/logs
+
+ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+say() { echo "[$(ts)] $*" | tee -a "$LOG"; }
+
+used_before=$(df --output=used -k / | tail -1)
+pct_before=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+say "=== hygiene start — root ${pct_before}% used ==="
+
+# 1. Dangling (untagged) docker images only.
+out=$(docker image prune -f 2>&1 | tail -1); say "docker dangling: ${out:-none}"
+
+# 2. Docker build cache.
+out=$(docker builder prune -f 2>&1 | tail -1); say "docker buildcache: ${out:-none}"
+
+# 3. Exited containers older than 30d. Compose recreates init containers on `up`.
+out=$(docker container prune -f --filter until=720h 2>&1 | tail -1)
+say "docker exited>30d: ${out:-none}"
+
+# 4. Journal: cap at 500M (was 1.1G at build time).
+out=$(sudo -n journalctl --vacuum-size=500M 2>&1 | tail -1); say "journal: ${out:-none}"
+
+# 5. APT cache.
+sudo -n apt-get clean 2>/dev/null && say "apt cache cleaned"
+
+# 6. Crash dumps older than 30d.
+n=$(sudo -n find /var/crash -maxdepth 1 -type f -mtime +30 -delete -print 2>/dev/null | wc -l)
+say "crash dumps removed: $n"
+
+# 7. pip/npm caches (fully regenerable).
+out=$(pip cache purge 2>/dev/null | tail -1); say "pip cache: ${out:-skip}"
+npm cache clean --force >/dev/null 2>&1 && say "npm cache cleaned"
+
+# 8. CONTAINER-INTERNAL datastores (added 2026-08-11).
+# The host-only steps above are blind to data INSIDE containers. Langfuse's
+# ClickHouse quietly grew 7.31 GiB of its OWN system logs (asynchronous_metric_log
+# alone hit 6.5 BILLION rows) while its real Langfuse data was under 1 GB. Nothing
+# here would ever have caught it. ClickHouse ships system logs with NO TTL by default.
+#
+# TTLs are set in table metadata (persists on the data volume), but a container
+# recreate or a ClickHouse upgrade can reintroduce untracked tables -- so this
+# RE-ASSERTS them every run. Idempotent: ALTER on an already-TTL'd table is a no-op.
+# Only ever touches database='system'. NEVER touches application data.
+for ch in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -i clickhouse); do
+  for t in asynchronous_metric_log metric_log trace_log processors_profile_log part_log query_log; do
+    col=event_date
+    docker exec "$ch" clickhouse-client -q \
+      "ALTER TABLE system.$t MODIFY TTL ${col} + INTERVAL 7 DAY" >/dev/null 2>&1
+  done
+  # opentelemetry_span_log partitions on finish_date, not event_date.
+  docker exec "$ch" clickhouse-client -q \
+    "ALTER TABLE system.opentelemetry_span_log MODIFY TTL finish_date + INTERVAL 7 DAY" >/dev/null 2>&1
+  sz=$(docker exec "$ch" clickhouse-client -q \
+    "SELECT formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE active AND database='system'" 2>/dev/null)
+  say "clickhouse[$ch] system-log TTLs asserted, system db now ${sz:-unknown}"
+done
+
+# 9. RUNAWAY-GROWTH WATCH (generic). Records each docker volume's size and compares
+# with the previous run. Catches the NEXT unbounded datastore -- whatever it turns
+# out to be -- instead of only the one we already know about. Reports, never deletes:
+# deleting application data automatically is how you lose a database.
+VOLSTATE=/home/lumen/logs/volume-sizes.tsv
+NEWSTATE=$(mktemp)
+# NOTE: glob must expand INSIDE the sudo shell -- /var/lib/docker/volumes is
+# root-only, so an unprivileged glob silently matches nothing (found 2026-08-11:
+# first run reported "0 volumes tracked").
+sudo -n bash -c 'du -sk /var/lib/docker/volumes/*/_data' 2>/dev/null \
+  | awk '{n=$2; sub(/.*\/volumes\//,"",n); sub(/\/_data$/,"",n); print n"\t"$1}' | sort > "$NEWSTATE"
+if [ -s "$VOLSTATE" ]; then
+  join -t$'\t' "$VOLSTATE" "$NEWSTATE" 2>/dev/null | awk -F'\t' -v OFS='\t' '
+    { old=$2; new=$3; growth=new-old;
+      # flag: grew >2GB since last run, or >50% on a base of at least 1GB
+      if (growth > 2097152 || (old > 1048576 && growth > old*0.5))
+        printf "  RUNAWAY %s: %.2fGB -> %.2fGB (+%.2fGB)\n", $1, old/1048576, new/1048576, growth/1048576 }
+  ' > /tmp/runaway.$$ 2>/dev/null
+  if [ -s /tmp/runaway.$$ ]; then
+    while read -r line; do say "$line"; done < /tmp/runaway.$$
+    curl -s -H "Title: Lumen volume runaway growth" -H "Priority: high" \
+         -d "$(cat /tmp/runaway.$$)
+Investigate before it fills root. Check for unbounded logs/telemetry inside the container, not just app data." \
+         "$NTFY" >/dev/null 2>&1
+    say "ALERT sent: runaway volume growth"
+  fi
+  rm -f /tmp/runaway.$$
+fi
+cp -f "$NEWSTATE" "$VOLSTATE" 2>/dev/null; rm -f "$NEWSTATE"
+say "volume sizes recorded ($(wc -l < "$VOLSTATE" 2>/dev/null || echo 0) volumes tracked)"
+
+used_after=$(df --output=used -k / | tail -1)
+pct_after=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+freed=$(( (used_before - used_after) / 1024 ))
+say "=== hygiene done — root ${pct_after}% used, ${freed}MB reclaimed ==="
+
+# Alert only when it matters: still tight after cleaning.
+if [ "$pct_after" -ge "$THRESH" ]; then
+  curl -s -H "Title: Lumen root disk ${pct_after}%" \
+       -H "Priority: high" \
+       -d "Hygiene reclaimed ${freed}MB but root is still ${pct_after}% (threshold ${THRESH}%). Manual review needed — check /home/lumen/models, /home/lumen/backups, /var/lib/containerd." \
+       "$NTFY" >/dev/null 2>&1
+  say "ALERT sent: root ${pct_after}% >= ${THRESH}%"
+fi
+exit 0

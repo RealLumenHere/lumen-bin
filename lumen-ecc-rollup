@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# lumen-ecc-rollup — daily ECC health summary -> lumen-fleet (informational).
+set -uo pipefail
+[ "$(hostname -s)" = "lumen" ] || exit 0
+NTFY=/home/lumen/bin/ntfy-send
+ce=0; ue=0
+for mc in /sys/devices/system/edac/mc/mc*; do
+  [ -d "$mc" ] || continue
+  ce=$(( ce + $(cat "$mc/ce_count" 2>/dev/null||echo 0) ))
+  ue=$(( ue + $(cat "$mc/ue_count" 2>/dev/null||echo 0) ))
+done
+persist=$(ras-mc-ctl --error-count 2>/dev/null | awk 'NR>1{c+=$2;u+=$3} END{printf "CE=%d UE=%d", c+0, u+0}')
+up=$(uptime -p 2>/dev/null)
+last=$(journalctl -k -b 0 2>/dev/null | grep -E 'EDAC MC[0-9]:.*memory' | tail -1 | sed 's/.*EDAC/EDAC/' | cut -c1-120)
+"$NTFY" -t lumen-fleet -p default --quiet -T "Lumen ECC daily: CE=$ce UE=$ue" \
+  "EDAC since boot ($up): CE=$ce UE=$ue. rasdaemon persistent (per-DIMM): ${persist:-n/a}. Last mem event: ${last:-none}. Watching DIMM4 (Ha#1/Chan#1) after 2026-08-11 cluster." || true
