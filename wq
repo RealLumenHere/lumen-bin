@@ -65,7 +65,34 @@ taken from the TICKET, and housekeeping (expired-lease reclaim) runs against tha
 a target whose own lease has expired is reclaimed-then-claimed in one call, loudly. An
 out-of-order claim prints a NOTICE naming the lane head it stepped past. ONE eligibility ruling
 (_eligible) serves the lane scan, the --id check and the head notice — a second copy of these
-checks is how the watchdog's L831 happened, and that path is closed here by construction."""
+checks is how the watchdog's L831 happened, and that path is closed here by construction.
+
+wq#1116 TWO ORCHESTRATORS (2026-08-30): the checks above all key on a REGISTERED identity, and
+on 01:22-01:29Z two claude.ai orchestrator sessions rode one Commander with neither registered.
+Both resolved to `lumen:<pid>`, so wq#502's holder check, wq#530's staleness rules and wq#594's
+concurrency report each had nothing to read. What held was the claim-holder refusal: no two
+workers on one ticket. What did not: B closed wq#1096 while A was still verifying it, and A's
+later `wq done 1096` REPLACED B's note, because owner_ok waved through any caller that could not
+prove an identity. Three changes, and the split between them is the point:
+  OWNERSHIP  owner_ok no longer allows an unregistered caller to write to another identity's LIVE
+    claim. Two exceptions survive, both narrow and both loud: caller and holder are the SAME-HOST
+    hostname:pid fallback (fworker claims as lumen:P1 and its own worker closes as lumen:P2 —
+    genuinely indistinguishable from the collision, and 253 claims in the live DB have that
+    shape), or the claim holds no live lease, which wq#530 already rules is free. Read-only
+    subcommands never reach owner_ok, so `list`/`show` are untouched.
+  EVIDENCE   `done` on an ALREADY-done ticket now refuses (exit 4) instead of silently replacing
+    notes, and takes `--reclose "<reason>"` to do it on the record. This one is deliberately
+    identity-independent: overwriting a closure's evidence is the damage, whoever does it.
+  DRIVERS    `wq orch --acquire <lanes>` leases a lane-set to ONE registered orchestrator, stored
+    as slocks under 'orch:<lane>' so expiry, the never-purge-a-holder rule and retirement's
+    release sweep all apply unchanged. `wq orch` prints who is driving what and since when. It
+    REQUIRES registration, which is the forcing function the incident wanted: every mechanism
+    above keys on a registered identity, so the lease is what makes registering worth doing.
+Residual, stated rather than discovered later: two unregistered same-host drivers can still step
+on each other's in-flight claims. Nothing at this chokepoint can separate them (wq#594's
+docstring works through why no per-instance signal exists) — the orch lease is what covers it,
+and only for callers that take one. Boot-time registration is what closes the rest, and it lives
+outside wq: see ops/wq1116-orch-collision-guard/README.md in claude-foreman."""
 import sqlite3, sys, os, argparse, datetime, socket, re, secrets, json
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 240
@@ -79,6 +106,10 @@ def _envint(name, default):
 PROVISIONAL_MIN = _envint("WQ_PROVISIONAL_MIN", 60)
 STALE_MIN       = _envint("WQ_STALE_MIN", 45)
 ACTIVITY_KEEP   = _envint("WQ_ACTIVITY_KEEP", 5000)
+# wq#1116: orchestrator lane-set lease. Longer than a worker's default by design — an
+# orchestrator outlives the tickets it dispatches, and a lease that expires under a live driver
+# would hand the lane-set to a second one, which is the failure this exists to stop.
+ORCH_TTL_MIN = _envint("WQ_ORCH_TTL", 480)
 # wq#568 budget backstops (minutes / count). NOT the idle threshold — see docstring.
 SESSION_MAX_AGE_MIN = _envint("WQ_SESSION_MAX_AGE", 360)
 SESSION_MAX_TICKETS = _envint("WQ_SESSION_MAX_TICKETS", 8)
@@ -512,6 +543,32 @@ def resolve_identity(a, c=None):
     if ident: return ident.strip(), True
     return f"{socket.gethostname()}:{os.getpid()}", False
 
+# wq#1116 GRANDFATHER — DELETE THIS AND ITS USE ONCE NO PRE-CUTOFF CLAIM IS STILL OPEN.
+# At the time this shipped, fworker claimed a ticket under its OWN `lumen:<pid>` while handing
+# the worker that would close it a different WQ_AGENT (fworker-wq<id>-a<n>), so caller and holder
+# legitimately disagreed on every dispatch. harness/fworker.py now claims under the worker's own
+# identity, but six claims were already in flight under the old scheme and refusing them would
+# have failed closes for work that was already finished. Claims made before the cutoff keep the
+# old warn-and-allow; claims made after it are guarded. Env-overridable so the test suite can
+# pin it rather than depend on the wall clock.
+OWNER_STRICT_FROM = os.environ.get("WQ_OWNER_STRICT_FROM", "2026-08-31 00:00:00")
+def claim_guarded(c, tid):
+    """Is this claim one the wq#1116 ownership rule protects? Two ways it is not:
+
+    NO LIVE LEASE  wq#530 already rules that a claim with no unexpired lease is free —
+      housekeeping reverts it to open and the next claimer takes it — and `blocked` drops the
+      lease outright. Guarding those would protect nobody while refusing dispatcher self-heal
+      its entire job, which is releasing INFRA_CRASH-blocked tickets it never claimed.
+    PRE-CUTOFF     the grandfather above.
+
+    A ticket that has already reached a terminal state is not protected here either; the wholly
+    separate `--reclose` guard covers that, and covers it for registered callers too.
+    """
+    r = c.execute("SELECT lease_expires, claimed_at FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not r or not r[0] or r[0] < now():
+        return False
+    return (r[1] or "") >= OWNER_STRICT_FROM
+
 def owner_ok(c, caller, claimed_by, action, tid):
     """(4) an agent may never heartbeat/close/release another session's claim.
 
@@ -523,8 +580,11 @@ def owner_ok(c, caller, claimed_by, action, tid):
                                                      when another live session owns that base)
       3. caller registered, holder is someone else -> REFUSE. A registered session always knows
                                                      its identity and has no excuse.
-      4. caller UNREGISTERED (bare/fallback)       -> warn + allow, unless WQ_STRICT=1. Only
-                                                     callers that cannot prove identity get slack.
+      4. caller UNREGISTERED (bare/fallback)       -> wq#1116: REFUSE while the claim is one
+                                                     claim_guarded() protects (live lease, made
+                                                     after the grandfather cutoff); otherwise
+                                                     warn + allow. WQ_STRICT=1 refuses either
+                                                     way. Read-only subcommands never reach here.
     """
     if not claimed_by or caller == claimed_by: return True
     caller_is_session = is_session(c, caller)
@@ -532,15 +592,20 @@ def owner_ok(c, caller, claimed_by, action, tid):
         warn(f"wq#{tid} was claimed as bare name '{claimed_by}' before you registered; "
              f"adopting it as {caller}.")
         return True
-    if caller_is_session or STRICT:
-        print(f"REFUSED: wq#{tid} is held by '{claimed_by}', you are '{caller}'.\n"
-              f"  An agent may never {action} another session's claim. If that session is dead,\n"
-              f"  let its lease expire (auto-reverts to open) or have the orchestrator intervene.")
-        return False
-    warn(f"wq#{tid} claimed_by '{claimed_by}' but caller is '{caller}' — caller is an "
-         f"unregistered legacy name, so this {action} is ALLOWED for backcompat. "
-         f"Register with: wq whoami --register <your-agent-name>")
-    return True
+    if not caller_is_session and not STRICT and not claim_guarded(c, tid):
+        warn(f"wq#{tid} is recorded against '{claimed_by}' but is not a guarded live claim "
+             f"(expired lease, blocked, or pre-cutoff), so '{caller}' may {action} it. wq#1116.")
+        return True
+    why = ("A registered session always knows its identity and has no excuse."
+           if caller_is_session else
+           "wq#1116: an unregistered caller may no longer write to another identity's LIVE claim.")
+    print(f"REFUSED: wq#{tid} is held by '{claimed_by}', you are '{caller}'.\n"
+          f"  An agent may never {action} another session's claim. {why}\n"
+          f"  If that session is dead, let its lease expire (auto-reverts to open), or\n"
+          f"  `wq retire {claimed_by}` to revert its claims and drop its slocks on the record.\n"
+          f"  If you ARE that worker: register first — wq whoami --register <your-agent-name>\n"
+          f"  — so your identity survives across wq invocations instead of changing every call.")
+    return False
 def deps_met(c, deps):
     if not deps or not deps.strip(): return True
     for d in [x.strip() for x in deps.split(',') if x.strip()]:
@@ -1074,6 +1139,116 @@ def cmd_concurrency(a):
     print("If a session did not mean to hold these: unset WQ_AGENT; wq whoami --register <name>.")
     sys.exit(1)
 
+ORCH_PREFIX = "orch:"
+ORCH_GLOB = ORCH_PREFIX + "*"
+def orch_leases(c, t_now):
+    """Live orchestrator lane leases as (lane, holder, acquired_at, expires_at, note)."""
+    return [(s[len(ORCH_PREFIX):], h, aq, ex, nt) for s, h, aq, ex, nt in c.execute(
+        "SELECT scope,holder,acquired_at,expires_at,note FROM slocks "
+        "WHERE scope GLOB ? AND expires_at >= ? ORDER BY scope", (ORCH_GLOB, t_now))]
+
+def fmt_orch(rows):
+    """One line per DRIVER, not per lane — 'who is orchestrating' is the question being asked."""
+    by_holder = {}
+    for lane, h, aq, ex, nt in rows:
+        d = by_holder.setdefault(h, {"lanes": [], "since": aq, "until": ex, "note": nt})
+        d["lanes"].append(lane)
+        d["since"] = min(d["since"], aq); d["until"] = min(d["until"], ex)
+    return [f"  {h} active since {d['since']}Z on lanes {','.join(sorted(d['lanes']))} "
+            f"(lease to {d['until']}Z)" + (f" — {d['note']}" if d["note"] else "")
+            for h, d in sorted(by_holder.items())]
+
+def cmd_orch(a):
+    """wq#1116: ONE orchestrator per lane-set, leased and visible before it touches anything.
+
+    wq#594 detects two drivers on one session id AFTER the fact, from the footprint they leave;
+    this is the before-the-fact half. It is deliberately a LEASE and not an identity check for
+    the reason wq#594's docstring already established: two claude.ai sessions riding one
+    Commander leave no per-instance signal at this chokepoint, so nothing here can tell them
+    apart. They cannot both hold the same lane-set lease, though, and the loser is told who is
+    already driving and since when — which is the sentence that was missing at 01:22Z on
+    2026-08-30, when the second session spawned workers into a batch the first was still
+    verifying.
+
+    Registration is REQUIRED to acquire. That is the point rather than a side effect: wq#502's
+    holder checks and wq#594's report both key on a registered identity, and both orchestrators
+    in the incident had skipped `whoami --register`, so every mechanism keyed on it had nothing
+    to read. Making the lease the thing an orchestrator wants is what makes registering the
+    thing it does first.
+
+    Stored as slocks under 'orch:<lane>' rather than a new table: expiry, holder, the
+    never-purge-a-live-holder rule (wq#530) and retirement's release-everything sweep (wq#568)
+    all already operate on slocks, and a new table would have to re-earn every one of them.
+    """
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    c.execute("DELETE FROM slocks WHERE scope GLOB ? AND expires_at < ?", (ORCH_GLOB, now()))
+    ident, _ = resolve_identity(a, c)
+    t_now = now()
+    if getattr(a, "release", False):
+        mine = [lane for lane, h, *_ in orch_leases(c, t_now) if h == ident]
+        release_subs(c, [ORCH_PREFIX + l for l in mine], ident)
+        mark_alive(c, ident, "orch:release")
+        c.execute("COMMIT"); c.close()
+        print(f"{ident}: released orchestrator lease on "
+              f"{','.join(mine) if mine else 'nothing (held none)'}")
+        return
+    if getattr(a, "acquire", None):
+        if not is_session(c, ident):
+            c.execute("COMMIT"); c.close()
+            print(f"REFUSED: '{ident}' is not a registered session, so it cannot hold an\n"
+                  f"  orchestrator lease. An unregistered name changes every wq call, which is\n"
+                  f"  exactly what makes a second driver invisible (wq#1116).\n"
+                  f"    wq whoami --register orch-<slug>     # then export the WQ_AGENT it prints\n"
+                  f"    wq orch --acquire {a.acquire}")
+            sys.exit(2)
+        lanes = parse_subs(a.acquire)
+        if not lanes:
+            c.execute("COMMIT"); c.close()
+            print("REFUSED: --acquire needs at least one lane (e.g. --acquire build,auto)")
+            sys.exit(2)
+        known = configured_lanes()
+        if known is not None:
+            unknown = [l for l in lanes if l not in known and l not in LANE_EXEMPT]
+            if unknown:
+                # A lease on a lane nobody dispatches protects nothing, and reads as if it does.
+                warn(f"lane(s) {','.join(unknown)} have no dispatcher/config.json entry — a lease "
+                     f"on them guards no dispatch (wq#912). Typo, or a lane still to be added?")
+        taken = [(lane, h, aq) for lane, h, aq, _e, _n in orch_leases(c, t_now)
+                 if lane in lanes and h != ident]
+        if taken:
+            rows = orch_leases(c, t_now)
+            c.execute("COMMIT"); c.close()
+            print(f"REFUSED: another orchestrator already holds "
+                  f"{','.join(l for l, _h, _a in taken)}.")
+            for line in fmt_orch(rows): print(line)
+            print(f"  You are {ident}. Two orchestrators on one lane-set is the wq#1116\n"
+                  f"  collision: both spawn workers into the same batch, both close each other's\n"
+                  f"  tickets, and the later `wq done` overwrites the earlier one's notes.\n"
+                  f"  -> Take a DISJOINT lane-set, or wait for that lease to lapse, or, if you\n"
+                  f"     know that session is gone: wq retire {taken[0][1]}")
+            sys.exit(2)
+        ttl = getattr(a, "ttl", None) or ORCH_TTL_MIN
+        acquire_subs(c, [ORCH_PREFIX + l for l in lanes], ident, ttl,
+                     getattr(a, "note", None) or "orchestrator")
+        mark_alive(c, ident, "orch:acquire")
+        rows = orch_leases(c, now())
+        c.execute("COMMIT"); c.close()
+        print(f"{ident}: holds orchestrator lease on {','.join(lanes)} for {ttl}m")
+        for line in fmt_orch(rows): print(line)
+        print("Release it on the way out: wq orch --release (or wq whoami --release).")
+        return
+    rows = orch_leases(c, t_now)
+    c.execute("COMMIT"); c.close()
+    if not rows:
+        print("wq orch: no orchestrator holds a lane-set lease.")
+        print(f"  You are {ident}. Claim one before dispatching: wq orch --acquire <lanes>")
+        return
+    print(f"wq orch: {len(set(h for _l, h, *_ in rows))} orchestrator(s) driving "
+          f"{len(rows)} lane(s):")
+    for line in fmt_orch(rows): print(line)
+    print(f"  (you are {ident})")
+
 def cmd_heartbeat(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
@@ -1256,6 +1431,27 @@ def _finish(a, new_status):
     caller, _ = resolve_identity(a)
     if not owner_ok(c, caller, r[0], new_status if new_status != 'open' else 'release', a.id):
         c.execute("COMMIT"); c.close(); sys.exit(1)
+    # wq#1116: `done` REPLACES notes wholesale, so a second close silently destroys the first
+    # one's evidence — that is how session A's `wq done 1096` erased session B's note two minutes
+    # after B had already closed it. Identity does not enter into this: re-closing a ticket that
+    # is ALREADY done is a write with nothing to gain and a citation to lose, whoever does it.
+    # release/block on a done ticket are deliberate reopens (wq#841) and stay untouched.
+    if new_status == 'done' and (r[2] or '') == 'done':
+        prev = c.execute("SELECT done_at, notes FROM tasks WHERE id=?", (a.id,)).fetchone()
+        reclose = getattr(a, "reclose", None)
+        if not reclose:
+            c.execute("COMMIT"); c.close()
+            print(f"REFUSED: wq#{a.id} is already done (closed {prev[0]}Z) and `done` REPLACES\n"
+                  f"  notes, so this call would destroy the evidence already on the record:\n"
+                  f"    {(prev[1] or '(empty)')[:200]}\n"
+                  f"  If you closed this and the notes need correcting, say so on the record:\n"
+                  f"    wq done {a.id} --notes \"...\" --reclose \"<why the first close was wrong>\"\n"
+                  f"  If you did NOT close it, someone else already finished this ticket — read\n"
+                  f"  `wq show {a.id}` before overwriting it (wq#1116).")
+            sys.exit(4)
+        a.notes = ((getattr(a, 'notes', '') or '') +
+                   (" " if getattr(a, 'notes', '') else "") + f"[RECLOSE: {reclose}]").strip()
+        warn(f"wq#{a.id} re-closed over a {prev[0]}Z close; previous notes: {(prev[1] or '(empty)')[:120]}")
     mark_alive(c, caller, {"done": "done", "open": "release", "blocked": "block"}[new_status])
     if r and r[1]:
         release_subs(c, parse_subs(r[1]), r[0] or "")
@@ -1644,9 +1840,10 @@ s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
+s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/acquire/release the lease"); s.add_argument("--acquire",metavar="LANES",default=None,help="take the lease over a comma/space list of lanes (requires a registered identity)"); s.add_argument("--release",action="store_true",help="drop every orchestrator lease this identity holds"); s.add_argument("--ttl",type=int,default=None,help=f"lease minutes (default WQ_ORCH_TTL={ORCH_TTL_MIN})"); s.add_argument("--note",default=None,help="what this orchestrator is driving"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_orch)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_block)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
