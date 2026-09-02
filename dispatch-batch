@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# dispatch-batch — spawn a batch of wq tickets as detached fworker units, never dying
+# with the caller's shell. wq#1255 / ISSUE-SOLUTIONS-fable.md #18.
+#
+# The naive "loop over tickets, spawn inline" pattern dies when an interactive connector
+# recycles the shell mid-loop (ISSUE-LOG #18: "dispatches never execute"). This script
+# re-execs itself under setsid+nohup before doing any real work, so the CALLER can exit
+# the instant this returns — the batch keeps running, reparented to PID 1 regardless.
+#
+# Each ticket's actual worker launch reuses the production path — orchestrator/router.py's
+# `dispatch-cmd` (repo/model resolution, already fixed for the lane-vs-repo bug class in
+# ISSUE-LOG #35/#41) piped into `lumen-run start`, i.e. a systemd transient unit — rather
+# than a raw nohup/setsid child. lumen-run's own header explains why that matters here: the
+# MCP gateway that recycles this session's shell sends SIGKILL to the whole process group,
+# which nohup/setsid does NOT survive but a `systemd-run --collect` unit does. Tests (and
+# any caller that wants a different worker command) override this via
+# DISPATCH_BATCH_SPAWN_CMD — an executable invoked as `CMD TICKET_ID` that must print
+# `UNIT=<name>` on its last stdout line, mirroring lumen-run's own contract.
+set -euo pipefail
+
+FOREMAN_ROOT="${FOREMAN_ROOT:-/home/lumen/foreman}"
+WQ_BIN="${WQ_BIN:-/home/lumen/bin/wq}"
+ROUTER="${DISPATCH_BATCH_ROUTER:-$FOREMAN_ROOT/orchestrator/router.py}"
+RUN_DIR="${DISPATCH_BATCH_RUN_DIR:-$FOREMAN_ROOT/_runs/dispatch}"
+CLAIM_WAIT_S="${DISPATCH_BATCH_CLAIM_WAIT_S:-60}"
+CLAIM_POLL_S="${DISPATCH_BATCH_CLAIM_POLL_S:-3}"
+
+usage() { echo "usage: dispatch-batch TICKET_ID [TICKET_ID ...]" >&2; exit 64; }
+[ $# -ge 1 ] || usage
+
+default_spawn() {
+  # $1 = ticket id. Builds the production command line via router.py, runs it, and
+  # passes through its stdout — which ends in `UNIT=<name>`, lumen-run's own contract.
+  local id="$1" cmd_line
+  cmd_line=$(python3 "$ROUTER" dispatch-cmd "$id") || return 1
+  eval "$cmd_line"
+}
+
+spawn_ticket() {
+  local id="$1"
+  if [ -n "${DISPATCH_BATCH_SPAWN_CMD:-}" ]; then
+    "$DISPATCH_BATCH_SPAWN_CMD" "$id"
+  else
+    default_spawn "$id"
+  fi
+}
+
+claimed_by_of() {
+  "$WQ_BIN" show "$1" 2>/dev/null | sed -n 's/^claimed_by[[:space:]]*:[[:space:]]*//p'
+}
+
+run_batch() {
+  mkdir -p "$RUN_DIR"
+  local batch_log="$RUN_DIR/batch-$(date +%s)-$$.log"
+  exec >>"$batch_log" 2>&1
+  echo "[dispatch-batch] pid=$$ ppid=$PPID start: $*"
+
+  local overall=0 id log out unit waited claimed
+  for id in "$@"; do
+    log="$RUN_DIR/$id.log"
+    : >"$log"
+    if ! out=$(spawn_ticket "$id" 2>>"$log"); then
+      echo "wq#$id: spawn failed — see $log" | tee -a "$log"
+      overall=1
+      continue
+    fi
+    unit=$(printf '%s\n' "$out" | sed -n 's/^UNIT=//p' | tail -1)
+    if [ -z "$unit" ]; then
+      echo "wq#$id: spawn produced no UNIT= line: $out" | tee -a "$log"
+      overall=1
+      continue
+    fi
+    echo "wq#$id UNIT=$unit" | tee -a "$log"
+
+    waited=0
+    claimed=""
+    while [ "$waited" -lt "$CLAIM_WAIT_S" ]; do
+      claimed=$(claimed_by_of "$id")
+      [ -n "$claimed" ] && [ "$claimed" != "None" ] && break
+      sleep "$CLAIM_POLL_S"
+      waited=$((waited + CLAIM_POLL_S))
+    done
+    if [ -n "$claimed" ] && [ "$claimed" != "None" ]; then
+      echo "wq#$id OK unit=$unit claimed_by=$claimed" | tee -a "$log"
+    else
+      echo "wq#$id NOT-CLAIMED unit=$unit after ${CLAIM_WAIT_S}s" | tee -a "$log"
+      overall=1
+    fi
+  done
+  echo "[dispatch-batch] done rc=$overall"
+  exit "$overall"
+}
+
+if [ "${DISPATCH_BATCH_CHILD:-0}" = "1" ]; then
+  run_batch "$@"
+fi
+
+mkdir -p "$RUN_DIR"
+DISPATCH_BATCH_CHILD=1 setsid nohup "$0" "$@" </dev/null >/dev/null 2>&1 &
+disown
+echo "dispatch-batch: dispatching $# ticket(s) detached — logs under $RUN_DIR"
