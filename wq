@@ -1823,11 +1823,23 @@ def cmd_list(a):
 def cmd_show(a):
     ping("show")
     c = conn(); cur = c.execute("SELECT * FROM tasks WHERE id=?", (a.id,)); r = cur.fetchone(); cols=[d[0] for d in cur.description]; c.close()
-    if not r: print("no such task"); return
+    if not r:
+        if getattr(a, "json", False): print(json.dumps({"error": "no such task"}))
+        else: print("no such task")
+        return
     row = dict(zip(cols, r))
-    for k, v in row.items(): print(f"{k:13}: {v}")
     # wq#661: computed field — never stored, always derived from current state + age.
     ep = effective_pri(row.get("pri", 2), row.get("status", ""), row.get("gate", ""), row.get("created_at", ""))
+    if getattr(a, "json", False):
+        row["effective_pri"] = ep
+        print(json.dumps(row))
+        return
+    # wq#1277: plain-text is one 'key : value' line per field with no escaping, so a
+    # detail (or other) field containing a literal newline gets truncated by callers
+    # that parse this output line-by-line, and any later line with a colon gets
+    # mis-parsed as a bogus key. Escape embedded newlines for line-oriented parsers;
+    # `--json` is the robust path and should be preferred by new callers.
+    for k, v in row.items(): print(f"{k:13}: {v.replace(chr(10), chr(92)+'n') if isinstance(v, str) else v}")
     print(f"effective_pri: {ep}")
 def cmd_edit(a):
     c = conn(); fields=[]; vals=[]
@@ -2077,7 +2089,7 @@ s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason
 s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, and a check-then-create PR lookup"); s.add_argument("kind",choices=["branch","path","pr"]); s.add_argument("id",type=int); s.add_argument("--type",default="feat",help="Conventional Commit type for the branch (default feat)"); s.add_argument("--branch",default=None,help="override the derived branch for the pr check"); s.set_defaults(f=cmd_idem)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
-s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
+s=sub.add_parser("show"); s.add_argument("id",type=int); s.add_argument("--json",action="store_true",help="wq#1277: emit the row as a single JSON object — safe for multi-line detail fields; plain text truncates/mis-parses embedded newlines"); s.set_defaults(f=cmd_show)
 s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
