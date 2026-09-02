@@ -177,15 +177,26 @@ def section_running():
         if m:
             ids.append(int(m.group("id")))
 
+    # wq#1321: the unit list above is already the answer to "how many workers are alive"
+    # — it comes from `lumen-run list` and owes WQ_DB nothing. The query below only
+    # DECORATES those units with model/attempt/age. Keeping it outside the unit list's
+    # scope is the whole point: when queue.db is locked or unreachable, the caller must
+    # still learn that N units are running (POOL tightness is computed from this), and
+    # must be told the decoration is missing rather than shown a silent zero.
     rows_by_id = {}
+    decorate_error = None
     if ids:
-        with wq_conn() as c:
-            qmarks = ",".join("?" * len(ids))
-            for r in c.execute(
-                f"""SELECT id, model, effort, archetype, attempt, lane, status,
-                           CAST((unixepoch()-unixepoch(claimed_at)) AS INTEGER) AS age_s
-                    FROM tasks WHERE id IN ({qmarks})""", ids):
-                rows_by_id[r["id"]] = r
+        try:
+            with wq_conn() as c:
+                qmarks = ",".join("?" * len(ids))
+                for r in c.execute(
+                    f"""SELECT id, model, effort, archetype, attempt, lane, status,
+                               CAST((unixepoch()-unixepoch(claimed_at)) AS INTEGER) AS age_s
+                        FROM tasks WHERE id IN ({qmarks})""", ids):
+                    rows_by_id[r["id"]] = r
+        except sqlite3.Error as e:
+            decorate_error = f"ticket detail unavailable: {e}"
+            rows_by_id = {}
 
     workers = []
     for tid in ids:
@@ -197,14 +208,20 @@ def section_running():
             "model": r["model"] if r else None,
             "archetype": r["archetype"] if r else None,
             "attempt": attempt,
-            "status": r["status"] if r else "unclaimed?",
+            # "unclaimed?" is a claim about the queue, so it may only be made when the
+            # queue actually answered; a failed lookup gets "unknown".
+            "status": r["status"] if r else ("unknown" if decorate_error else "unclaimed?"),
             "age_s": r["age_s"] if r else None,
             "last_event": last["event"] if last else None,
             "last_detail": last["detail"] if last else None,
             "last_ts": last["ts"] if last else None,
         })
     workers.sort(key=lambda w: w["ticket"])
-    return {"count": len(units)}, workers
+    meta = {"count": len(units)}
+    if decorate_error:
+        meta["error"] = decorate_error
+        meta["degraded"] = True
+    return meta, workers
 
 
 def section_board():
@@ -337,7 +354,9 @@ def render_text(data):
     out.append(f"FLEET STATUS  {data['ts']}  ({data['elapsed_s']:.2f}s)")
 
     running = data["running"]["workers"]
-    out.append(f"RUNNING ({len(running)})")
+    running_err = data["running"].get("error")
+    out.append(f"RUNNING ({data['running'].get('count', len(running))})"
+               + (f"  DEGRADED: {running_err}" if running_err else ""))
     for w in running:
         last = f"{w['last_event']}: {w['last_detail']}" if w["last_event"] else "no events"
         out.append(f"  wq{w['ticket']:<6} {str(w['model']):<16} att{w['attempt']} "
@@ -407,7 +426,10 @@ def _safe(fn, *args, default=None):
 
 def collect():
     t0 = time.time()
-    running_meta, running_workers = _safe(section_running, default=({}, []))
+    # wq#1321: the default carries an error key so even a total failure of this section
+    # reads as "unknown", never as an authoritative "zero running, room to dispatch".
+    running_meta, running_workers = _safe(
+        section_running, default=({"error": "running section unavailable"}, []))
     data = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "running": {**running_meta, "workers": running_workers},
@@ -419,7 +441,9 @@ def collect():
         "preflight": section_preflight(),
         "load_mem": section_load_mem(),
     }
-    data["pool"] = section_pool(len(running_workers))
+    # Count every running unit, not just the ticket-shaped ones: the ceiling is a cap on
+    # concurrent units, and a non-ticket unit consumes a slot just the same.
+    data["pool"] = section_pool(running_meta.get("count", len(running_workers)))
     data["elapsed_s"] = time.time() - t0
     return data
 

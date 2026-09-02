@@ -240,3 +240,83 @@ def test_missing_day0_stamp_reported_as_missing(fleet):
     p = subprocess.run([BIN, "--json"], capture_output=True, text=True, env=fleet, timeout=10)
     data = json.loads(p.stdout)
     assert data["day0"]["model-check"]["state"] == "MISSING"
+
+
+# --- 3. wq#1321: WQ_DB failure must degrade RUNNING, never zero it ----------
+# The unit list comes from `lumen-run list` and the ticket detail comes from WQ_DB.
+# Before wq#1321 both lived under one try/except, so a locked queue.db threw away the
+# unit list too and POOL reported "wide open" while the fleet was over its ceiling.
+
+def _stub_units(path, ticket_ids):
+    lines = "\n".join(
+        f'  echo "  lumen-job-fworker-wq{tid}-178836000{i}.service loaded active running'
+        f' [systemd-run] /bin/bash -c \\"python3 fworker.py run --ticket {tid}\\""'
+        for i, tid in enumerate(ticket_ids))
+    path.write_text(f'#!/usr/bin/env bash\nset -euo pipefail\nif [ "$1" = "list" ]; then\n{lines}\nfi\n')
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+@pytest.fixture
+def fleet_over_ceiling(fleet, tmp_path):
+    """4 genuinely running units (CLOUD_CEILING is 3) and an unreachable WQ_DB."""
+    _stub_units(tmp_path / "lumen-run", [42, 43, 44, 45])
+    env = dict(fleet)
+    env["WQ_DB"] = str(tmp_path / "no-such-queue.db")
+    return env
+
+
+def test_wq_db_failure_keeps_unit_count_and_pool_tightness(fleet_over_ceiling):
+    p = subprocess.run([BIN, "--json"], capture_output=True, text=True,
+                       env=fleet_over_ceiling, timeout=10)
+    assert p.returncode == 0, p.stderr
+    data = json.loads(p.stdout)
+
+    assert data["running"]["count"] == 4
+    assert [w["ticket"] for w in data["running"]["workers"]] == [42, 43, 44, 45]
+    assert data["pool"]["running_units"] == 4
+    assert data["pool"]["tight"] is True
+
+
+def test_wq_db_failure_surfaces_an_error_instead_of_faking_detail(fleet_over_ceiling):
+    p = subprocess.run([BIN, "--json"], capture_output=True, text=True,
+                       env=fleet_over_ceiling, timeout=10)
+    data = json.loads(p.stdout)
+
+    assert data["running"]["degraded"] is True
+    assert "unavailable" in data["running"]["error"]
+    w = data["running"]["workers"][0]
+    assert w["model"] is None and w["age_s"] is None
+    # not "unclaimed?" — that asserts something about the queue we could not read
+    assert w["status"] == "unknown"
+
+
+def test_wq_db_failure_text_output_marks_running_degraded(fleet_over_ceiling):
+    p = subprocess.run([BIN], capture_output=True, text=True,
+                       env=fleet_over_ceiling, timeout=10)
+    assert p.returncode == 0, p.stderr
+    assert "RUNNING (4)" in p.stdout
+    assert "DEGRADED" in p.stdout
+    assert "POOL  running=4" in p.stdout and "TIGHT" in p.stdout
+
+
+def test_wq_db_failure_leaves_the_other_sections_reporting_errors(fleet_over_ceiling):
+    """Sibling sections genuinely depend on WQ_DB — they must say so, not read empty."""
+    p = subprocess.run([BIN, "--json"], capture_output=True, text=True,
+                       env=fleet_over_ceiling, timeout=10)
+    data = json.loads(p.stdout)
+    assert "error" in data["board"]
+    assert "error" in data["blocked"]
+
+
+def test_healthy_wq_db_still_decorates_and_counts_every_unit(fleet, tmp_path):
+    """The wq#1321 split must not change the happy path: 42 is in the DB, 43 is not."""
+    _stub_units(tmp_path / "lumen-run", [42, 43])
+    p = subprocess.run([BIN, "--json"], capture_output=True, text=True, env=fleet, timeout=10)
+    data = json.loads(p.stdout)
+
+    assert data["running"]["count"] == 2
+    assert "error" not in data["running"] and "degraded" not in data["running"]
+    assert data["pool"]["running_units"] == 2
+    by_id = {w["ticket"]: w for w in data["running"]["workers"]}
+    assert by_id[42]["model"] == "claude-sonnet-5"
+    assert by_id[43]["status"] == "unclaimed?"
