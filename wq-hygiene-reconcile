@@ -25,7 +25,7 @@ from flagging to REPAIRING, with the wq DB as the only truth:
 
 Mirrors two things from wq (/home/lumen/bin/wq) that could not be imported directly
 (the module runs its CLI at import time, no __main__ guard): the wq#759 artifact
-regexes (find_artifact) and the wq#899 merge-state check (pr_merge_state), trimmed to
+regexes (find_artifacts) and the wq#899 merge-state check (pr_merge_state), trimmed to
 the forge-API-only path (no local git head-on-main special case — a cron scanning many
 repos has no single meaningful cwd to run that from).
 
@@ -78,25 +78,45 @@ def repos():
     return DEFAULT_REPOS
 
 
+def find_artifacts(notes):
+    """Every citation in `notes`, in text order, as [(kind, detail)]; kind in
+    'url'|'sha'|'path'. Duplicates collapse; a note with no citation gives [].
+
+    wq#1320: the first cut of this returned the FIRST regex hit and scanned for URLs
+    across the whole note before looking at sha tokens, so the winner did not depend on
+    where each citation appeared. Roughly one in seven of this fleet's done-ticket notes
+    cites several artifacts at once ('foreman PR#219 <url> + lumen-bin PR#53 <url> +
+    kb 65a5c39'), which let one incidental, still-open PR link mask the real landed
+    evidence sitting beside it — a false rot page one way, a missed repair the other.
+    """
+    found, seen = [], set()
+    for raw in (notes or "").split():
+        tok = raw.strip(".,;:()[]\"'")
+        if not tok:
+            continue
+        m = ARTIFACT_URL_RE.search(raw)
+        if m:
+            kind, detail = "url", m.group(0).rstrip(".,)")
+        elif ARTIFACT_SHA_RE.fullmatch(tok):
+            kind, detail = "sha", tok
+        elif (not tok.startswith("http")
+              and ("/" in tok or re.search(r"\.[A-Za-z0-9]{1,5}$", tok))
+              and os.path.exists(tok)):
+            kind, detail = "path", tok
+        else:
+            continue
+        if (kind, detail) not in seen:
+            seen.add((kind, detail))
+            found.append((kind, detail))
+    return found
+
+
 def find_artifact(notes):
-    """(kind, detail) or (None, None). kind in 'url'|'sha'|'path'."""
-    notes = notes or ""
-    m = ARTIFACT_URL_RE.search(notes)
-    if m:
-        return "url", m.group(0).rstrip(".,)")
-    for raw in notes.split():
-        tok = raw.strip(".,;:()[]\"'")
-        if tok and ARTIFACT_SHA_RE.fullmatch(tok):
-            return "sha", tok
-    for raw in notes.split():
-        tok = raw.strip(".,;:()[]\"'")
-        if not tok or tok.startswith("http"):
-            continue
-        if "/" not in tok and not re.search(r"\.[A-Za-z0-9]{1,5}$", tok):
-            continue
-        if os.path.exists(tok):
-            return "path", tok
-    return None, None
+    """(kind, detail) of the FIRST citation, or (None, None). Kept for callers that
+    only want to know whether a note cites anything at all; anything that decides a
+    ticket's fate must use find_artifacts (wq#1320)."""
+    found = find_artifacts(notes)
+    return found[0] if found else (None, None)
 
 
 def git(repo, *args, timeout=15):
@@ -199,22 +219,66 @@ def repair(tid, fence, evidence_text, dry_run):
             "rc": p.returncode, "out": (p.stdout + p.stderr).strip()[:300]}
 
 
-def repair_candidate(notes):
-    """(evidence_text, None) if this open/claimed ticket's notes cite evidence that
-    verifies as landed right now, else (None, None)."""
-    kind, detail = find_artifact(notes)
+VERIFIED, FAILED, UNKNOWN = "verified", "failed", "unknown"
+
+
+def check_artifact(kind, detail):
+    """(verdict, text) for ONE citation. VERIFIED = it landed, FAILED = it definitively
+    did not, UNKNOWN = the check itself could not answer (forge down, no token, a URL
+    that is not a pull request)."""
     if kind == "sha":
         repo, verified = sha_landed(detail)
-        if verified:
-            return f"sha {detail} is an ancestor of origin/main in {repo} {detail}"
-    elif kind == "url" and PR_URL_RE.search(detail):
+        if verified is True:
+            return VERIFIED, f"sha {detail} is an ancestor of origin/main in {repo}"
+        if verified is False:
+            return FAILED, (f"evidence sha {detail} is in {repo} but no longer verifies "
+                            f"as an ancestor of origin/main")
+        return FAILED, (f"evidence sha {detail} no longer verifies as an ancestor of "
+                        f"origin/main in any known repo")
+    if kind == "url":
+        if not PR_URL_RE.search(detail):
+            return UNKNOWN, f"{detail} is not a pull-request URL"
         verdict, why = pr_merge_state(detail)
         if verdict == "merged":
-            return f"PR {detail} merged ({why})"
-    elif kind == "path":
+            return VERIFIED, f"PR {detail} merged ({why})"
+        if verdict == "open":
+            return FAILED, f"evidence PR no longer shows merged: {why}"
+        return UNKNOWN, f"PR {detail} state undetermined: {why}"
+    if kind == "path":
         if os.path.exists(detail):
-            return f"evidence file exists at {detail}"
-    return None
+            return VERIFIED, f"evidence file exists at {detail}"
+        return FAILED, f"evidence file vanished: {detail}"
+    return UNKNOWN, str(detail)
+
+
+def evidence_verdict(notes):
+    """(verdict, texts) over EVERY citation in the note — wq#1320.
+
+      VERIFIED  at least one citation landed and none definitively failed
+      FAILED    at least one citation definitively failed and none landed
+      UNKNOWN   no citations, every check inconclusive, or a MIX of landed and failed
+
+    Mixed is inconclusive on purpose, in both directions. It must not auto-close a
+    ticket whose other cited work is still open, and it must not page Frank about a
+    done ticket that does still have landed evidence behind it — a note that merely
+    mentions someone else's open PR alongside its own merged one is the common case,
+    not the rot this sweep is hunting.
+    """
+    results = [check_artifact(kind, detail) for kind, detail in find_artifacts(notes)]
+    landed = [text for verdict, text in results if verdict == VERIFIED]
+    rotted = [text for verdict, text in results if verdict == FAILED]
+    if landed and not rotted:
+        return VERIFIED, landed
+    if rotted and not landed:
+        return FAILED, rotted
+    return UNKNOWN, [text for _verdict, text in results]
+
+
+def repair_candidate(notes):
+    """evidence_text if this open/claimed ticket's notes cite evidence that verifies as
+    landed right now, else None."""
+    verdict, texts = evidence_verdict(notes)
+    return "; ".join(texts) if verdict == VERIFIED else None
 
 
 def sweep_open(conn, dry_run):
@@ -237,19 +301,8 @@ def sweep_open(conn, dry_run):
 # ---------------------------------------------------------------- re-verify (done tickets rot)
 def rot_reason(notes):
     """None if this done ticket's cited evidence still verifies, else a reason string."""
-    kind, detail = find_artifact(notes)
-    if kind == "sha":
-        repo, verified = sha_landed(detail)
-        if verified is not True:
-            return f"evidence sha {detail} no longer verifies as an ancestor of origin/main in any known repo"
-    elif kind == "url" and PR_URL_RE.search(detail):
-        verdict, why = pr_merge_state(detail)
-        if verdict == "open":
-            return f"evidence PR no longer shows merged: {why}"
-    elif kind == "path":
-        if not os.path.exists(detail):
-            return f"evidence file vanished: {detail}"
-    return None
+    verdict, texts = evidence_verdict(notes)
+    return "; ".join(texts) if verdict == FAILED else None
 
 
 def load_state(path):

@@ -6,14 +6,30 @@ subprocess pattern as test_wq_reap.py: a real `wq` against a throwaway sqlite DB
 throwaway git repo standing in for a "known repo" so sha-ancestor checks are real, not
 mocked. ntfy-send is swapped for a stub that logs its argv instead of publishing.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sqlite3
 import subprocess
 
+import pytest
+
 WQ_BIN = os.environ.get("WQ_BIN", "/home/lumen/bin/wq")
 RECONCILE_BIN = os.environ.get("RECONCILE_BIN", "/home/lumen/bin/wq-hygiene-reconcile")
 FMT = "%Y-%m-%d %H:%M:%S"
+
+
+@pytest.fixture(scope="module")
+def reconcile():
+    """The reconcile script imported as a module, so the evidence logic can be tested
+    directly with forge/git verdicts forced — the wq#1320 false-alarm scenario needs a
+    PR that reads back as still-open, which no offline subprocess run can produce."""
+    loader = importlib.machinery.SourceFileLoader("wq_hygiene_reconcile", RECONCILE_BIN)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def git(repo, *args, check=True):
@@ -183,6 +199,114 @@ def test_dry_run_reports_without_mutating_or_alerting(tmp_path):
     assert not ntfy_log.exists()
     assert not (tmp_path / "state.json").exists()
     assert not (tmp_path / "stamp.json").exists()
+
+
+# ---------------------------------------------------------------- wq#1320: multi-artifact notes
+# Real done-ticket notes on this fleet routinely cite several artifacts at once
+# ("foreman PR#219 <url> + lumen-bin PR#53 <url> + kb 65a5c39"). The first cut of
+# find_artifact stopped at the first regex hit, and looked for URLs before shas
+# regardless of order in the text, so an incidental PR link could decide a ticket's fate
+# while the real evidence next to it was never inspected.
+
+LANDED_SHA = "1111111aaaa2222222bbbb3333333cccc4444444"
+OPEN_PR = "http://forge.example/lumen/foreman/pulls/219"
+MERGED_PR = "http://forge.example/lumen/lumen-bin/pulls/53"
+
+
+def force_verdicts(reconcile, monkeypatch, merged_urls=(), landed_shas=()):
+    monkeypatch.setattr(reconcile, "sha_landed", lambda sha: (
+        ("/home/lumen/kb", True) if sha in landed_shas else (None, None)))
+    monkeypatch.setattr(reconcile, "pr_merge_state", lambda url: (
+        ("merged", f"{url} merged") if url in merged_urls
+        else ("open", f"{url} is still OPEN")))
+
+
+def test_find_artifacts_collects_every_citation_in_text_order(reconcile):
+    notes = f"foreman PR#219 {OPEN_PR} + lumen-bin PR#53 {MERGED_PR} + kb {LANDED_SHA}"
+    assert reconcile.find_artifacts(notes) == [
+        ("url", OPEN_PR), ("url", MERGED_PR), ("sha", LANDED_SHA)]
+
+
+def test_find_artifacts_sees_a_sha_that_precedes_a_url(reconcile):
+    """The old URL-search-first order made this sha invisible wherever it sat."""
+    assert reconcile.find_artifacts(f"landed {LANDED_SHA}, tracked in {OPEN_PR}") == [
+        ("sha", LANDED_SHA), ("url", OPEN_PR)]
+
+
+def test_done_ticket_not_flagged_when_a_later_citation_still_verifies(
+        reconcile, monkeypatch):
+    """The wq#1320 false page: a merely-referenced, still-open PR matched first must not
+    page Frank about a done ticket whose own sha evidence is landed."""
+    force_verdicts(reconcile, monkeypatch, landed_shas={LANDED_SHA})
+    notes = f"tracking {OPEN_PR}; this ticket's work landed as {LANDED_SHA}"
+    assert reconcile.rot_reason(notes) is None
+
+
+def test_done_ticket_still_flagged_when_nothing_verifies(reconcile, monkeypatch):
+    force_verdicts(reconcile, monkeypatch)
+    notes = f"tracking {OPEN_PR}; landed as {LANDED_SHA}"
+    reason = reconcile.rot_reason(notes)
+    assert reason is not None
+    assert LANDED_SHA in reason and OPEN_PR in reason
+
+
+def test_open_ticket_repaired_from_a_sha_cited_after_an_unrelated_url(
+        reconcile, monkeypatch):
+    """The symmetric false negative: the sha is real and landed, but the URL ahead of it
+    was the only thing ever inspected."""
+    force_verdicts(reconcile, monkeypatch, merged_urls={MERGED_PR},
+                   landed_shas={LANDED_SHA})
+    evidence = reconcile.repair_candidate(f"see {MERGED_PR}, landed as {LANDED_SHA}")
+    assert evidence is not None
+    assert MERGED_PR in evidence and LANDED_SHA in evidence
+
+
+def test_mixed_evidence_neither_repairs_nor_flags(reconcile, monkeypatch):
+    """One citation landed, another definitively did not: too ambiguous to auto-close a
+    ticket whose other cited work is still open, and too weak to page on."""
+    force_verdicts(reconcile, monkeypatch, landed_shas={LANDED_SHA})
+    notes = f"{OPEN_PR} still open; {LANDED_SHA} landed"
+    assert reconcile.evidence_verdict(notes)[0] == reconcile.UNKNOWN
+    assert reconcile.repair_candidate(notes) is None
+    assert reconcile.rot_reason(notes) is None
+
+
+def test_unreachable_forge_does_not_veto_a_landed_sha(reconcile, monkeypatch):
+    """An UNKNOWN citation carries no information, so it must not block a repair the
+    remaining evidence justifies — otherwise a forge outage stalls the sweep."""
+    monkeypatch.setattr(reconcile, "sha_landed", lambda sha: ("/home/lumen/kb", True))
+    monkeypatch.setattr(reconcile, "pr_merge_state",
+                        lambda url: ("unknown", "forge unreachable"))
+    assert reconcile.repair_candidate(f"{OPEN_PR} and {LANDED_SHA}") is not None
+
+
+def test_repair_finds_landed_sha_cited_after_a_pr_link_end_to_end(tmp_path):
+    """Same regression through the real CLI: no forge token, so the PR link resolves
+    UNKNOWN, and the landed sha behind it is what must be found."""
+    repo, sha = make_repo_with_landed_commit(tmp_path)
+    env, _ntfy_log = make_env(tmp_path, [repo])
+    ticket_id = wq_add(env, "cites a tracking PR before its own landed sha")
+    set_notes(env["WQ_DB"], ticket_id, f"tracked in {OPEN_PR} — landed as {sha}")
+
+    result = run_reconcile(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"REPAIR wq#{ticket_id}: repaired" in result.stdout
+    assert wq_show(env, ticket_id)["status"] == "done"
+
+
+def test_done_ticket_not_flagged_over_a_stale_citation_end_to_end(tmp_path):
+    """A done note citing a bogus sha ahead of its real one used to flag on the bogus
+    one alone; the real landed sha beside it now settles it."""
+    repo, sha = make_repo_with_landed_commit(tmp_path)
+    env, ntfy_log = make_env(tmp_path, [repo])
+    ticket_id = wq_add(env, "done, cites a stale sha ahead of the real one")
+    stale = "deadbeefcafe0123456789abcdef0123456789"
+    wq(env, "done", str(ticket_id), "--notes", f"superseded {stale}; shipped as {sha}")
+
+    result = run_reconcile(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"FLAG wq#{ticket_id}" not in result.stdout
+    assert not ntfy_log.exists()
 
 
 def test_live_claim_is_not_touched_even_with_landed_evidence(tmp_path):
