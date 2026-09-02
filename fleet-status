@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""fleet-status — wq#1292: whole fleet state in ONE call, for the orchestrator (an
+expensive Opus context that otherwise runs 5+ queries per turn: wq board, ps/lumen-run
+for running workers, aq for alerts, Day-0 detector logs, preflight stamps, load/mem).
+Read-only: sqlite (queue.db, alerts.db) + files (logs, event jsonl, preflight stamps,
+/proc). No network, no writes. Must run in well under 3s.
+
+Usage: fleet-status [--json] [--classify TEXT]
+
+--classify TEXT   print the block-reason classifier's label for TEXT and exit (0 args
+                  cost, used by tests/test_fleet_status.py instead of importing this
+                  extension-less script — same pattern as instincts-render/aq_escalate).
+
+Env overrides (all default to the live paths; tests point these at scratch fixtures,
+same pattern as wq's WQ_DB / aq's AQ_DB):
+  WQ_DB, AQ_DB, FLEET_STATUS_LOGS_DIR, FLEET_STATUS_EVENTS_DIR,
+  FOREMAN_PREFLIGHT_STAMP_DIR, FOREMAN_LUMEN_RUN_BIN, FOREMAN_HARNESS_DIR
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+
+WQ_DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
+AQ_DB = os.environ.get("AQ_DB", "/home/lumen/agents/alert-queue/alerts.db")
+LOGS_DIR = os.environ.get("FLEET_STATUS_LOGS_DIR", "/home/lumen/logs")
+EVENTS_DIR = os.environ.get("FLEET_STATUS_EVENTS_DIR", "/home/lumen/foreman/events")
+HARNESS_DIR = os.environ.get("FOREMAN_HARNESS_DIR", "/home/lumen/foreman/harness")
+PREFLIGHT_DIR = os.environ.get("FOREMAN_PREFLIGHT_STAMP_DIR",
+                                os.path.join(HARNESS_DIR, "runtime", "preflight"))
+
+sys.path.insert(0, HARNESS_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Blocked-ticket root-cause classifier (2026-09-02 sweep vocabulary). No prior
+# ruleset existed anywhere in kb/ — these regexes were built from the real
+# block_reason text of every currently-blocked ticket (`sqlite3 queue.db
+# "select block_reason from tasks where status='blocked'"`, 41 rows, 2026-09-02),
+# ordered most-specific-literal-tag first, prose-heuristic last. See
+# tests/test_fleet_status.py for the real-row regression fixtures.
+# ---------------------------------------------------------------------------
+BLOCK_CLASS_RULES = [
+    ("PERMISSION_LOOP", re.compile(r"PERMISSION_LOOP", re.I)),
+    ("crash-hang", re.compile(r"WORK_BLOCKED:\s*(HANG|CRASH)", re.I)),
+    ("FRANK", re.compile(
+        r"FRANK[-_ ]?(GATED|DECISION)|frank_gated|Needs?\s+Frank\b"
+        r"|Frank'?s?\s+(physical|hands)|Frank\s+directive|Frank-only"
+        r"|Frank\s+hardware|ORDERED\s+by\s+Frank"
+        r"|Frank\b.{0,40}\b(purchase|buy|decide|decision)", re.I)),
+    ("FALSE_COMPLETE", re.compile(
+        r"FALSE_COMPLETE|false-fixed pattern"
+        r"|orchestrator'?s?\s+claim(ed)?.{0,40}(fixed|done)"
+        r"|claimed.{0,40}(fixed|resolved).{0,60}re-?verif", re.I)),
+    ("sandbox", re.compile(
+        r"[Ss]tructurally impossible for a headless"
+        r"|live synchronous drill|guard\.sh|hard blocker as documented"
+        r"|requires? .{0,20}live presence", re.I)),
+    ("done-unlanded", re.compile(
+        r"[Ff]ix is complete.{0,40}(verified|pushed)"
+        r"|[Ww]ork complete and verified|GATE MET"
+        r"|already (committed|merged|pushed)|verified live.{0,40}DONE", re.I)),
+    ("infra", re.compile(
+        r"hardware-blocked|DEAD hardware|ORIGIN_DOWN|BOTH GONE|no hardware"
+        r"|not a harness gap|not (code-)?fixable by this worker|403s? on", re.I)),
+]
+
+
+def classify_block(reason):
+    text = reason or ""
+    for label, pattern in BLOCK_CLASS_RULES:
+        if pattern.search(text):
+            return label
+    return "other"
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def age_str(seconds):
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h}h"
+
+
+def wq_conn():
+    c = sqlite3.connect(f"file:{WQ_DB}?mode=ro", uri=True, timeout=5)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def aq_conn():
+    c = sqlite3.connect(f"file:{AQ_DB}?mode=ro", uri=True, timeout=5)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def tail_last_line(path, max_bytes=65536):
+    """Cheap tail: seek from the end instead of reading the whole file."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    with open(path, "rb") as f:
+        f.seek(max(0, size - max_bytes))
+        data = f.read()
+    lines = [ln for ln in data.split(b"\n") if ln.strip()]
+    if not lines:
+        return None
+    try:
+        return lines[-1].decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def last_action_for(ticket_id, attempt):
+    """Newest event line for a running ticket: exact id+attempt file first, else the
+    most-recently-modified fworker-wq<id>-a*.jsonl (attempt may be stale/unknown)."""
+    candidates = []
+    if attempt:
+        candidates.append(os.path.join(EVENTS_DIR, f"fworker-wq{ticket_id}-a{attempt}.jsonl"))
+    globbed = sorted(
+        glob.glob(os.path.join(EVENTS_DIR, f"fworker-wq{ticket_id}-a*.jsonl")),
+        key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+        reverse=True,
+    )
+    for p in globbed:
+        if p not in candidates:
+            candidates.append(p)
+    for path in candidates:
+        line = tail_last_line(path)
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        detail = ev.get("reason") or ev.get("snippet") or ""
+        detail = detail.replace("\n", " ")[:80]
+        return {"event": ev.get("event", "?"), "detail": detail, "ts": ev.get("ts")}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# sections
+# ---------------------------------------------------------------------------
+def section_running():
+    try:
+        import concurrency
+    except Exception as e:
+        return {"error": f"concurrency import failed: {e}"}, []
+    try:
+        units = concurrency.list_running_units()
+    except concurrency.LumenRunError as e:
+        return {"error": str(e)}, []
+
+    ids = []
+    for name in units:
+        m = concurrency.TICKET_UNIT_RE.match(name)
+        if m:
+            ids.append(int(m.group("id")))
+
+    rows_by_id = {}
+    if ids:
+        with wq_conn() as c:
+            qmarks = ",".join("?" * len(ids))
+            for r in c.execute(
+                f"""SELECT id, model, effort, archetype, attempt, lane, status,
+                           CAST((unixepoch()-unixepoch(claimed_at)) AS INTEGER) AS age_s
+                    FROM tasks WHERE id IN ({qmarks})""", ids):
+                rows_by_id[r["id"]] = r
+
+    workers = []
+    for tid in ids:
+        r = rows_by_id.get(tid)
+        attempt = r["attempt"] if r else None
+        last = last_action_for(tid, attempt)
+        workers.append({
+            "ticket": tid,
+            "model": r["model"] if r else None,
+            "archetype": r["archetype"] if r else None,
+            "attempt": attempt,
+            "status": r["status"] if r else "unclaimed?",
+            "age_s": r["age_s"] if r else None,
+            "last_event": last["event"] if last else None,
+            "last_detail": last["detail"] if last else None,
+            "last_ts": last["ts"] if last else None,
+        })
+    workers.sort(key=lambda w: w["ticket"])
+    return {"count": len(units)}, workers
+
+
+def section_board():
+    with wq_conn() as c:
+        rows = c.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status ORDER BY n DESC").fetchall()
+    return {r["status"]: r["n"] for r in rows}
+
+
+def section_blocked():
+    with wq_conn() as c:
+        rows = c.execute("SELECT id, block_reason FROM tasks WHERE status='blocked' ORDER BY id").fetchall()
+    groups = {}
+    for r in rows:
+        label = classify_block(r["block_reason"])
+        groups.setdefault(label, []).append(r["id"])
+    return {"total": len(rows), "groups": groups}
+
+
+def section_landed(window_s=7200):
+    with wq_conn() as c:
+        rows = c.execute(
+            """SELECT id, notes,
+                      CAST((unixepoch()-unixepoch(done_at)) AS INTEGER) AS age_s
+               FROM tasks
+               WHERE status='done' AND done_at IS NOT NULL
+                 AND (unixepoch()-unixepoch(done_at)) <= ?
+               ORDER BY done_at DESC""", (window_s,)).fetchall()
+    landed, unlanded = [], []
+    for r in rows:
+        (landed if "merged" in (r["notes"] or "").lower() else unlanded).append(r["id"])
+    return {"landed": landed, "done_unlanded": unlanded}
+
+
+def section_alerts():
+    try:
+        with aq_conn() as c:
+            total = c.execute("SELECT COUNT(*) FROM alerts WHERE status='open'").fetchone()[0]
+            by_pri = c.execute(
+                "SELECT priority, COUNT(*) FROM alerts WHERE status='open' GROUP BY priority"
+            ).fetchall()
+        return {"open": total, "by_priority": {r[0]: r[1] for r in by_pri}}
+    except sqlite3.OperationalError as e:
+        return {"error": str(e)}
+
+
+# cron interval (seconds), staleness = 3x interval slack for a missed run. See
+# crontab: model-check */15, wq-health :07/:22/:37/:52 (~15m), secret-check :03/:33
+# (~30m), log-watch */5.
+DAY0_DETECTORS = [
+    ("model-check", None, "model-check.log", 15 * 60),
+    ("wq-health", ".stamp.wq-health", "wq-health-cron.log", 15 * 60),
+    ("secret-check", ".stamp.secret-check", "secret-check.log", 30 * 60),
+    ("log-watch", ".stamp.log-watch", "log-watch.log", 5 * 60),
+]
+
+
+def section_day0():
+    out = {}
+    for name, stamp_name, log_name, interval_s in DAY0_DETECTORS:
+        path = os.path.join(LOGS_DIR, stamp_name) if stamp_name else os.path.join(LOGS_DIR, log_name)
+        try:
+            mtime = os.path.getmtime(path)
+            age_s = time.time() - mtime
+            state = "OK" if age_s <= interval_s * 3 else "STALE"
+        except OSError:
+            age_s, state = None, "MISSING"
+        out[name] = {"state": state, "age_s": age_s}
+    return out
+
+
+def section_preflight():
+    out = {}
+    for path in sorted(glob.glob(os.path.join(PREFLIGHT_DIR, "*.ok"))):
+        repo = os.path.basename(path)[:-3]
+        try:
+            with open(path) as f:
+                stamp = json.load(f)
+            proofed_at = stamp.get("proofed_at")
+            ts = datetime.strptime(proofed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+            state = "OK" if age_s <= 6 * 3600 * 3 else "STALE"
+        except (OSError, ValueError, KeyError):
+            age_s, state = None, "UNREADABLE"
+        out[repo] = {"state": state, "age_s": age_s}
+    return out
+
+
+def section_load_mem():
+    out = {"cores": os.cpu_count()}
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        out["load1"], out["load5"], out["load15"] = float(parts[0]), float(parts[1]), float(parts[2])
+    except OSError:
+        pass
+    try:
+        meminfo = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                meminfo[k] = int(v.strip().split()[0])
+        total = meminfo.get("MemTotal", 0)
+        avail = meminfo.get("MemAvailable", 0)
+        out["mem_total_kb"] = total
+        out["mem_avail_kb"] = avail
+        out["mem_used_pct"] = round((1 - avail / total) * 100, 1) if total else None
+    except OSError:
+        pass
+    return out
+
+
+def section_pool(running_count):
+    try:
+        import concurrency
+        ceiling = concurrency.CLOUD_CEILING
+    except Exception:
+        ceiling = None
+    return {
+        "running_units": running_count,
+        "cloud_ceiling": ceiling,
+        "tight": (ceiling is not None and running_count >= ceiling),
+    }
+
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+def render_text(data):
+    out = []
+    out.append(f"FLEET STATUS  {data['ts']}  ({data['elapsed_s']:.2f}s)")
+
+    running = data["running"]["workers"]
+    out.append(f"RUNNING ({len(running)})")
+    for w in running:
+        last = f"{w['last_event']}: {w['last_detail']}" if w["last_event"] else "no events"
+        out.append(f"  wq{w['ticket']:<6} {str(w['model']):<16} att{w['attempt']} "
+                    f"age {age_str(w['age_s']):<6} last: {last}")
+
+    board = data["board"]
+    if "error" in board:
+        out.append(f"BOARD  error: {board['error']}")
+    else:
+        board_line = " ".join(f"{k}={v}" for k, v in board.items())
+        out.append(f"BOARD  {board_line}  total={sum(board.values())}")
+
+    blocked = data["blocked"]
+    if "error" in blocked:
+        out.append(f"BLOCKED  error: {blocked['error']}")
+    else:
+        out.append(f"BLOCKED ({blocked['total']})")
+        for label, ids in sorted(blocked["groups"].items(), key=lambda kv: -len(kv[1])):
+            out.append(f"  {label:<16} {len(ids):>3}  {ids}")
+
+    landed = data["landed"]
+    if "error" in landed:
+        out.append(f"LANDED  error: {landed['error']}")
+    else:
+        out.append(f"LANDED last 2h: {len(landed['landed'])} landed, "
+                   f"{len(landed['done_unlanded'])} done-unlanded "
+                   f"(of {len(landed['landed']) + len(landed['done_unlanded'])} done)")
+
+    alerts = data["alerts"]
+    if "error" in alerts:
+        out.append(f"ALERTS  error: {alerts['error']}")
+    else:
+        pri = " ".join(f"{k}={v}" for k, v in alerts["by_priority"].items())
+        out.append(f"ALERTS  open={alerts['open']}  ({pri})")
+
+    day0 = data["day0"]
+    out.append("DAY-0 DETECTORS  " + "  ".join(
+        f"{name}={d['state']}({age_str(d['age_s'])})" for name, d in day0.items()))
+
+    preflight = data["preflight"]
+    if preflight:
+        out.append("PREFLIGHT  " + "  ".join(
+            f"{repo}={d['state']}({age_str(d['age_s'])})" for repo, d in preflight.items()))
+    else:
+        out.append("PREFLIGHT  (no stamps found)")
+
+    lm = data["load_mem"]
+    out.append(f"LOAD/MEM  load={lm.get('load1')}/{lm.get('load5')}/{lm.get('load15')}"
+               f" ({lm.get('cores')} cores)  mem_used={lm.get('mem_used_pct')}%")
+
+    pool = data["pool"]
+    tight = " TIGHT" if pool["tight"] else ""
+    out.append(f"POOL  running={pool['running_units']} cloud_ceiling={pool['cloud_ceiling']}{tight}")
+
+    return "\n".join(out)
+
+
+def _safe(fn, *args, default=None):
+    """queue.db is the live, shared, WAL-mode DB other sessions write to concurrently
+    (observed transient 'database is locked' during development) — a brief lock
+    contention on one section must not blank the whole screen."""
+    try:
+        return fn(*args)
+    except sqlite3.OperationalError as e:
+        return {"error": str(e)} if default is None else default
+
+
+def collect():
+    t0 = time.time()
+    running_meta, running_workers = _safe(section_running, default=({}, []))
+    data = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "running": {**running_meta, "workers": running_workers},
+        "board": _safe(section_board),
+        "blocked": _safe(section_blocked),
+        "landed": _safe(section_landed),
+        "alerts": section_alerts(),
+        "day0": section_day0(),
+        "preflight": section_preflight(),
+        "load_mem": section_load_mem(),
+    }
+    data["pool"] = section_pool(len(running_workers))
+    data["elapsed_s"] = time.time() - t0
+    return data
+
+
+def main():
+    ap = argparse.ArgumentParser(description="fleet-status — whole fleet state in one call")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--classify", metavar="TEXT",
+                     help="print the block-reason classifier label for TEXT and exit")
+    args = ap.parse_args()
+
+    if args.classify is not None:
+        print(classify_block(args.classify))
+        return 0
+
+    data = collect()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(render_text(data))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
