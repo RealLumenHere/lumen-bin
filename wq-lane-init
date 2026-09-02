@@ -4,8 +4,14 @@
 # Creates <LANE>_DISPATCH.md from the template, the project's progress board,
 # and prints the paste-ready dispatch prompt. Idempotent: refuses to clobber.
 set -euo pipefail
-WQDIR=/home/lumen/agents/work-queue
+WQDIR="${WQ_LANE_INIT_WQDIR:-/home/lumen/agents/work-queue}"
 DISPATCHER_CONFIG="${FOREMAN_DISPATCHER_CONFIG:-/home/lumen/foreman/dispatcher/config.json}"
+# wq#1282 (ISSUE-LOG #23): a new lane is STAGED here, not written into the tracked
+# config.json. Editing config.json in place dirtied the primary foreman tree, which
+# false-blocked every subsequent `lumen-pr land` (wq#771/wq#792 guard) — and it never
+# dispatched anything anyway, because the dispatcher reads config.json at HEAD (wq#772).
+# runtime/ is gitignored, so staging a lane leaves the tree clean.
+LANE_STATE="${FOREMAN_LANE_STATE:-$(dirname "$DISPATCHER_CONFIG")/runtime/lane_state.json}"
 LANE="${1:?lane name}"; DIR="${2:?project dir}"; DESC="${3:?project description}"
 LOCK="${4:-$LANE-service}"
 LANE_UC="$(echo "$LANE" | tr a-z- A-Z_)"
@@ -16,45 +22,80 @@ BOARD="$WQDIR/boards/${LANE_UC}_QUEUE_PROGRESS.md"
 [ -e "$DISPATCH" ] && { echo "EXISTS: $DISPATCH — not overwriting"; exit 1; }
 [ -d "$DIR" ] || { echo "no such project dir: $DIR"; exit 1; }
 
-# ── wq#876: register lane in dispatcher config FIRST ──
+# ── wq#876: register lane with the dispatcher FIRST ──
 # If this fails the lane isn't half-initialized (no dispatch/board yet).
-# flock serializes concurrent wq-lane-init runs against the same config.json.
+# flock serializes concurrent wq-lane-init runs against the same lane_state.json.
 CONFIG_NOTE="  dispatcher: WARNING — $DISPATCHER_CONFIG not found, lane NOT registered"
 if [ -f "$DISPATCHER_CONFIG" ]; then
-  CONFIG_STATUS="$(python3 - "$DISPATCHER_CONFIG" "$LANE" <<'PYEOF'
-import fcntl, json, os, sys, tempfile
+  CONFIG_STATUS="$(python3 - "$LANE_STATE" "$DISPATCHER_CONFIG" "$LANE" <<'PYEOF'
+import fcntl, json, os, subprocess, sys, tempfile
 
-path, lane = sys.argv[1], sys.argv[2]
-lockpath = path + ".lock"
+state_path, config_path, lane = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def committed_lanes(path):
+    """config.json as the DISPATCHER sees it — at HEAD, never the working tree (wq#772).
+    Staging a lane that is already live would be a confusing no-op."""
+    repo_dir = os.path.dirname(os.path.abspath(path))
+
+    def git(*a):
+        p = subprocess.run(["git", "-C", repo_dir, *a],
+                           capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            raise RuntimeError(f"git {' '.join(a)}: {p.stderr.strip()}")
+        return p.stdout
+
+    toplevel = git("rev-parse", "--show-toplevel").strip()
+    rel = os.path.relpath(os.path.abspath(path), toplevel)
+    return set(json.loads(git("show", f"HEAD:{rel}")).get("lanes", {}))
+
+
 try:
+    if lane in committed_lanes(config_path):
+        print("LIVE")
+        sys.exit(0)
+except Exception as e:
+    # Can't read HEAD (not a repo, detached, unreadable) — stage anyway and say why.
+    print(f"WARN:committed-config unreadable: {e}", file=sys.stderr)
+
+try:
+    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
     # wq#876: separate lockfile so rename() can't invalidate the lock
-    lfd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o644)
+    lfd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(lfd, fcntl.LOCK_EX)
-        # read the actual config AFTER acquiring the lock
-        with open(path) as f:
-            cfg = json.load(f)
-        lanes = cfg.setdefault("lanes", {})
+        # read the actual state AFTER acquiring the lock
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        lanes = state.get("lanes")
+        if not isinstance(lanes, dict):
+            lanes = state["lanes"] = {}
         if lane in lanes:
-            print("EXISTS")
+            print("STAGED_EXISTS")
         else:
             lanes[lane] = {
                 "enabled": False,
                 "max_per_day": 999,
-                "note": "auto-registered by wq-lane-init (wq#846); enable explicitly",
+                "note": "auto-registered by wq-lane-init (wq#846); "
+                        "commit into config.json to make it live",
             }
             # atomic write: tmp in same dir, rename over original
-            dirn = os.path.dirname(path) or "."
-            tfd, tmp = tempfile.mkstemp(dir=dirn, suffix=".tmp", prefix=".config-")
+            dirn = os.path.dirname(state_path) or "."
+            tfd, tmp = tempfile.mkstemp(dir=dirn, suffix=".tmp", prefix=".lane_state-")
             try:
                 with os.fdopen(tfd, "w") as tf:
-                    json.dump(cfg, tf, indent=2)
+                    json.dump(state, tf, indent=2)
                     tf.write("\n")
-                os.rename(tmp, path)
+                os.rename(tmp, state_path)
             except BaseException:
                 os.unlink(tmp)
                 raise
-            print("ADDED")
+            print("STAGED")
     finally:
         os.close(lfd)
 except Exception as e:
@@ -64,16 +105,21 @@ except Exception as e:
 PYEOF
 )" || CONFIG_STATUS="ERROR"
   case "$CONFIG_STATUS" in
-    ADDED)
-      CONFIG_NOTE="  dispatcher: lane '$LANE' added to $DISPATCHER_CONFIG as DISABLED"
+    STAGED)
+      CONFIG_NOTE="  dispatcher: lane '$LANE' STAGED in $LANE_STATE as DISABLED"
       CONFIG_NOTE="$CONFIG_NOTE
-    enable: python3 -c \"import json,sys; c=json.load(open(sys.argv[1])); c['lanes']['$LANE']['enabled']=True; json.dump(c,open(sys.argv[1],'w'),indent=2)\" $DISPATCHER_CONFIG"
+    staged is not live — the dispatcher reads config.json at HEAD (wq#772), so add the
+    lane to $DISPATCHER_CONFIG and COMMIT it (via lumen-pr) to make it dispatchable.
+    dispatch_config_lint.py will FAIL until you do."
       ;;
-    EXISTS)
-      CONFIG_NOTE="  dispatcher: lane '$LANE' already present in $DISPATCHER_CONFIG"
+    STAGED_EXISTS)
+      CONFIG_NOTE="  dispatcher: lane '$LANE' already staged in $LANE_STATE (not yet committed to $DISPATCHER_CONFIG)"
+      ;;
+    LIVE)
+      CONFIG_NOTE="  dispatcher: lane '$LANE' already live in $DISPATCHER_CONFIG (committed)"
       ;;
     *)
-      CONFIG_NOTE="  dispatcher: WARNING — failed to register lane in $DISPATCHER_CONFIG (see stderr)"
+      CONFIG_NOTE="  dispatcher: WARNING — failed to stage lane in $LANE_STATE (see stderr)"
       ;;
   esac
 fi

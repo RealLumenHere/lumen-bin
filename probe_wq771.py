@@ -284,8 +284,8 @@ open(os.path.join(p4, "config.json"), "w").write('{"lanes": {"build": {}}}\n')
 sha4 = branch_commit(w4, "config.json", '{"lanes": {}, "cloud_ceiling": 5}\n')
 PR["head"] = {"sha": sha4, "ref": "fix/probe"}
 rc, out = land(w4, LUMEN_PR_ALLOW_DIRTY=1)
-check("B5 LUMEN_PR_ALLOW_DIRTY=1 lands, and says so loudly",
-      rc == 0 and merged_yet() and "LANDING OVER TARGET-ONLY WORK ON PURPOSE" in out,
+check("B5 LUMEN_PR_ALLOW_DIRTY=1 no longer lands — retired, refuses and says so (wq#1282)",
+      rc != 0 and not merged_yet() and "RETIRED" in out,
       f"rc={rc} out={out[-300:]!r}")
 
 p5, w5 = forge_repo("untracked")
@@ -368,8 +368,8 @@ git(p9, "commit -qm 'feat(probe): another local-only commit'")
 sha9 = branch_commit(w9, "config.json", '{"lanes": {}, "cloud_ceiling": 5}\n')
 PR["head"] = {"sha": sha9, "ref": "fix/probe"}
 rc, out = land(w9, LUMEN_PR_ALLOW_DIRTY=1)
-check("D3 LUMEN_PR_ALLOW_DIRTY=1 lands over an un-pushed commit too, and says so loudly",
-      rc == 0 and merged_yet() and "LANDING OVER TARGET-ONLY WORK ON PURPOSE" in out,
+check("D3 LUMEN_PR_ALLOW_DIRTY=1 does not rescue an un-pushed commit either (wq#1282)",
+      rc != 0 and not merged_yet() and "RETIRED" in out,
       f"rc={rc} out={out[-300:]!r}")
 
 r5 = real_repo("dcheck-unpushed")

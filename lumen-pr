@@ -28,9 +28,11 @@
 # /home/lumen/agent/.env (wq#524). Gitea repos take the same ladder from
 # /home/lumen/.secrets/gitea-lumen.token. Never printed, never committed.
 #
-# LUMEN_PR_ALLOW_DIRTY=1 overrides the wq#771 target-tree guard for one invocation, and
-# prints a banner saying so. It is not a way to make a noisy check quiet: the check is
-# only ever noisy when someone's uncommitted work is about to be superseded.
+# wq#1282 (ISSUE-LOG #23): LUMEN_PR_ALLOW_DIRTY is RETIRED. The wq#771 target-tree guard
+# has no override. It was added for a false-block that no longer exists — the daemons
+# rewriting tracked runtime state — and once that state moved under gitignored runtime/
+# dirs, every remaining trip of the guard is a true positive: real work about to be
+# silently superseded. Setting the variable now fails loudly rather than landing.
 set -uo pipefail
 
 BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
@@ -347,7 +349,7 @@ lint_body_sections() { # lint_body_sections <body-text>
 # actually runs out of — and refuse when any path this PR touches is uncommitted there.
 # Other linked worktrees are agent scratch and are NOT checked; the primary tree is the
 # one whose uncommitted state is live configuration.
-# LUMEN_PR_ALLOW_DIRTY=1 overrides, loudly, for the deliberate case.
+# There is no override (wq#1282): resolve the target tree, then re-run the land.
 #
 # wq#792: uncommitted working-tree state was the first shape of this loss, not the whole
 # of it. An un-pushed local COMMIT on the target's default branch is the same class: a
@@ -446,13 +448,8 @@ dirty_target_guard() {
     return 1
   fi
 
-  if [ "${LUMEN_PR_ALLOW_DIRTY:-0}" = 1 ]; then
-    {
-      printf 'lumen-pr: !!! LUMEN_PR_ALLOW_DIRTY=1 — LANDING OVER TARGET-ONLY WORK ON PURPOSE !!!\n'
-      printf 'lumen-pr: !!! holder=%s repo=%s paths=%s\n' "$GITLOCK_HOLDER" "$SLUG" "$(printf '%s' "$hits" | tr '\n' ' ')"
-      printf 'lumen-pr: !!! say so in the ticket notes; this is the 2026-08-21 dispatcher stall by hand\n'
-    } >&2
-    return 1
+  if [ -n "${LUMEN_PR_ALLOW_DIRTY:-}" ]; then
+    note "LUMEN_PR_ALLOW_DIRTY is RETIRED (wq#1282) and does nothing — resolve the target tree instead." >&2
   fi
 
   die "refusing to land over work the target tree $primary has that origin does not (listed above).
@@ -475,7 +472,8 @@ dirty_target_guard() {
         rm -- $primary/<path>                                       # untracked
         git -C $primary reset --hard origin/$DEFAULT_BRANCH          # discard un-pushed commit(s) — destructive
 
-      Deliberate exception, logged loudly: LUMEN_PR_ALLOW_DIRTY=1 lumen-pr land ..."
+      There is no override (LUMEN_PR_ALLOW_DIRTY retired, wq#1282). Runtime state that used
+      to trip this guard now lives under gitignored runtime/ dirs, so a hit here is real work."
 }
 
 # The paths a PR touches. Resolved LOCALLY where possible: merge-base(origin/default, head)
