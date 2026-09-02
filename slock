@@ -19,7 +19,24 @@ wq#532 (2026-08-14) — three changes, each traced to a coordination failure on 
 EXIT STATUS IS THE SAFETY SIGNAL AND A PIPE DESTROYS IT. `slock acquire ... | tail -2 && cmd`
 runs cmd even on DENIED, because a pipeline exits with the LAST command's status. Never pipe an
 acquire. Better: do not hand-wrap a critical section at all — `lumen-pr land` now takes the repo
-lock itself (wq#532a)."""
+lock itself (wq#532a).
+
+wq#1182 (2026-09-02) — FENCE. slock was already DB-backed (WAL + BEGIN IMMEDIATE, never a
+bare flock file) with a TTL and a session-unique holder, so two of the three properties
+wq#1158 hardened `wq` leases with were already here. The missing one is a fence: `acquire`,
+`extend` and `release` all key on the HOLDER STRING alone, and a holder string is exactly
+the thing that gets reused when the same identity's lease expires, gets reaped, and is
+handed back out — same shape as the zombie wq#1158 closed for ticket claims. `acquire`
+now mints a monotonic `fence` on every GRANT (never on a same-holder REFRESH of a still-live
+lock, so a caller renewing on schedule never has to re-read its own fence) and prints
+`FENCE=<n>`. `extend`/`release` take an OPTIONAL `--fence <n>`; a caller that passes one is
+refused (exit 5) if the live lock has moved past it. Opt-in and additive: every existing
+caller in the fleet (dc-narrow-deploy.sh, foreman_dispatcher.py, ...) passes no `--fence` and
+sees byte-identical behavior. See kb/fleet-upgrade-plan-review.md's slock audit for why this
+was "add a fence" rather than "retire slock for wq leases" — slock locks ARBITRARY subsystem
+scopes (vault-ha, litellm, ...) that never map onto a wq ticket, so folding it into the wq
+lease table would need every caller rewritten for no safety gain the fence doesn't already
+buy more cheaply."""
 import sqlite3, sys, os, argparse, datetime, socket, re
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 30
@@ -55,6 +72,12 @@ def init():
     c.execute("""CREATE TABLE IF NOT EXISTS slocks(
         scope TEXT PRIMARY KEY, holder TEXT, acquired_at TEXT,
         expires_at TEXT, note TEXT DEFAULT '')""")
+    # wq#1182: inert until a caller passes --fence, so this is safe to auto-add like any
+    # other column — unlike wq's lease_owner/fence/attempt, nothing here changes protocol
+    # just by existing.
+    cols = {r[1] for r in c.execute("PRAGMA table_info(slocks)")}
+    if "fence" not in cols:
+        c.execute("ALTER TABLE slocks ADD COLUMN fence INTEGER DEFAULT 0")
     c.commit(); c.close()
 def default_holder():
     # wq#502: share the wq session identity so slock holders are session-unique too.
@@ -127,8 +150,14 @@ def cmd_acquire(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
     t_now = now()
+    # wq#1182: read the fence BEFORE the reap-expired delete below. The counter must survive
+    # its own row being deleted — that delete-and-reinsert IS the reap-then-regrant cycle the
+    # fence exists to catch, so resetting to 1 here would erase the exact history a stale
+    # zombie caller needs refused against.
+    prev = c.execute("SELECT fence FROM slocks WHERE scope=?", (scope,)).fetchone()
+    prev_fence = int((prev[0] if prev else 0) or 0)
     c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
-    r = c.execute("SELECT holder, expires_at, note FROM slocks WHERE scope=?", (scope,)).fetchone()
+    r = c.execute("SELECT holder, expires_at, note, fence FROM slocks WHERE scope=?", (scope,)).fetchone()
     if r and r[0] != holder:
         c.execute("COMMIT"); c.close()
         print(f"DENIED: '{scope}' held by {r[0]} until {r[1]}Z" + (f" — {r[2]}" if r[2] else ""))
@@ -139,14 +168,19 @@ def cmd_acquire(a):
     my_lane = mine[1] if mine else None
     blocked_higher = waiting_higher_priority(c, scope, my_pri, my_lane)
     exp = lease_from(a.ttl)
-    c.execute("""INSERT INTO slocks(scope,holder,acquired_at,expires_at,note) VALUES(?,?,?,?,?)
+    # wq#1182: a GRANT (r is None — never held, or held-and-reaped since expiry) mints a new
+    # fence. A REFRESH (r exists, same holder, still live) keeps it: nothing invalidated the
+    # holder's standing, so a caller renewing on schedule must not have its own last fence
+    # go stale out from under it.
+    fence = prev_fence + (0 if r else 1)
+    c.execute("""INSERT INTO slocks(scope,holder,acquired_at,expires_at,note,fence) VALUES(?,?,?,?,?,?)
                  ON CONFLICT(scope) DO UPDATE SET holder=excluded.holder,
-                   expires_at=excluded.expires_at, note=excluded.note""",
-              (scope, holder, t_now, exp, a.note or ''))
+                   expires_at=excluded.expires_at, note=excluded.note, fence=excluded.fence""",
+              (scope, holder, t_now, exp, a.note or '', fence))
     c.execute("COMMIT"); c.close()
     verb = "REFRESHED" if r else "ACQUIRED"
     ctx = f" for wq#{mine[0]} [{mine[1]}/p{mine[2]}]" if mine else ""
-    print(f"{verb} '{scope}' by {holder}{ctx} until {exp}Z (ttl {a.ttl}m)")
+    print(f"{verb} '{scope}' by {holder}{ctx} until {exp}Z (ttl {a.ttl}m) FENCE={fence}")
     if blocked_higher:
         print(f"PRIORITY INVERSION WARNING: {len(blocked_higher)} higher-priority ticket(s) in "
               f"another lane declare '{scope}':")
@@ -156,17 +190,34 @@ def cmd_acquire(a):
         print("  release it and let the higher-priority ticket through. This is a warning, not a")
         print("  refusal — it can only see tickets that DECLARE the subsystem, so it is a partial")
         print("  view of who is waiting.")
+def fence_check(a, live_fence, scope):
+    """wq#1182 — optional stale-fence refusal shared by release/extend. `--fence` unset (the
+    default, every existing caller) skips this entirely: it never fires for a caller that
+    never asked for it. Returns None (proceed) or an exit code."""
+    want = getattr(a, "fence", None)
+    if want is None:
+        return None
+    if int(want) != int(live_fence or 0):
+        print(f"REFUSED: stale fence (wq#1182) — you hold fence {want} for '{scope}', the "
+              f"live lock is at fence {live_fence or 0}. Your claim ended and '{scope}' was "
+              f"re-acquired since; this call would act on a scope you no longer hold.\n"
+              f"  If you are a resumed session: stop here, do not resume the guarded work.")
+        return 5
+    return None
 def cmd_release(a):
     holder = a.holder or default_holder()
     scope = a.scope.strip().lower()
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
-    r = c.execute("SELECT holder FROM slocks WHERE scope=?", (scope,)).fetchone()
+    r = c.execute("SELECT holder, fence FROM slocks WHERE scope=?", (scope,)).fetchone()
     if not r:
         c.execute("COMMIT"); c.close(); print(f"'{scope}' not held (nothing to release)"); return
     if r[0] != holder and not a.force:
         c.execute("COMMIT"); c.close()
         print(f"REFUSED: '{scope}' held by {r[0]}, you are {holder}. Use --force to override."); sys.exit(1)
+    rc = fence_check(a, r[1], scope)
+    if rc is not None:
+        c.execute("COMMIT"); c.close(); sys.exit(rc)
     c.execute("DELETE FROM slocks WHERE scope=?", (scope,))
     c.execute("COMMIT"); c.close()
     print(f"RELEASED '{scope}'" + (f" (forced, was {r[0]})" if r[0] != holder else ""))
@@ -176,20 +227,23 @@ def cmd_extend(a):
     scope = a.scope.strip().lower()
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
-    r = c.execute("SELECT holder FROM slocks WHERE scope=?", (scope,)).fetchone()
+    r = c.execute("SELECT holder, fence FROM slocks WHERE scope=?", (scope,)).fetchone()
     if not r or r[0] != holder:
         c.execute("COMMIT"); c.close()
         print(f"REFUSED: '{scope}' " + (f"held by {r[0]}, not you ({holder})" if r else "not held — acquire first"))
         sys.exit(1)
+    rc = fence_check(a, r[1], scope)
+    if rc is not None:
+        c.execute("COMMIT"); c.close(); sys.exit(rc)
     exp = lease_from(a.ttl)
     c.execute("UPDATE slocks SET expires_at=? WHERE scope=?", (exp, scope))
     c.execute("COMMIT"); c.close()
-    print(f"EXTENDED '{scope}' until {exp}Z")
+    print(f"EXTENDED '{scope}' until {exp}Z FENCE={r[1] or 0}")
 def cmd_who(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
     c.execute("DELETE FROM slocks WHERE expires_at < ?", (now(),))
-    q, args = "SELECT scope,holder,acquired_at,expires_at,note FROM slocks", ()
+    q, args = "SELECT scope,holder,acquired_at,expires_at,note,fence FROM slocks", ()
     if a.scope: q += " WHERE scope=?"; args = (a.scope.strip().lower(),)
     rows = c.execute(q + " ORDER BY scope", args).fetchall()
     c.execute("COMMIT"); c.close()
@@ -198,15 +252,15 @@ def cmd_who(a):
     for r in rows:
         t = ticket_for_holder(c2, r[1], r[4] or '')
         ctx = f"  wq#{t[0]} [{t[1]}/p{t[2]}/{t[3]}]" if t else "  (no ticket)"
-        print(f"{r[0]:<20} {r[1]:<28} acquired {r[2]}Z expires {r[3]}Z{ctx}"
+        print(f"{r[0]:<20} {r[1]:<28} acquired {r[2]}Z expires {r[3]}Z FENCE={r[5] or 0}{ctx}"
               + (f"  # {r[4]}" if r[4] else ""))
         if t: print(f"{'':<20} {t[4][:76]}")
     c2.close()
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("acquire"); s.add_argument("scope"); s.add_argument("--ttl",type=parse_ttl,default=DEFAULT_TTL_MIN); s.add_argument("--holder"); s.add_argument("--note"); s.set_defaults(f=cmd_acquire)
-s=sub.add_parser("release"); s.add_argument("scope"); s.add_argument("--holder"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_release)
-s=sub.add_parser("extend"); s.add_argument("scope"); s.add_argument("--ttl",type=parse_ttl,default=DEFAULT_TTL_MIN); s.add_argument("--holder"); s.set_defaults(f=cmd_extend)
+s=sub.add_parser("release"); s.add_argument("scope"); s.add_argument("--holder"); s.add_argument("--force",action="store_true"); s.add_argument("--fence",type=int); s.set_defaults(f=cmd_release)
+s=sub.add_parser("extend"); s.add_argument("scope"); s.add_argument("--ttl",type=parse_ttl,default=DEFAULT_TTL_MIN); s.add_argument("--holder"); s.add_argument("--fence",type=int); s.set_defaults(f=cmd_extend)
 s=sub.add_parser("who"); s.add_argument("scope",nargs="?"); s.set_defaults(f=cmd_who)
 init()
 a = p.parse_args()
