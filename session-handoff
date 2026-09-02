@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""session-handoff — wq#1294: resume a fleet orchestrator session in one read.
+
+Regenerates /home/lumen/kb/SESSION-HANDOFF.md from live state (queue.db +
+detector stamp files) and commits it. A fresh orchestrator session reads this
+ONE file instead of re-deriving fleet state across ~10 turns of board/queue
+exploration.
+
+Usage:
+  session-handoff                 regenerate + git commit
+  session-handoff --note "TEXT"   append TEXT to the in-progress log, then regenerate
+  session-handoff --no-commit     write the file but skip git add/commit (for testing)
+"""
+import argparse
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+WQ_DB = "/home/lumen/agents/work-queue/queue.db"
+KB_DIR = "/home/lumen/kb"
+OUT_PATH = os.path.join(KB_DIR, "SESSION-HANDOFF.md")
+NOTES_PATH = os.path.join(KB_DIR, ".session-handoff-notes.log")
+LOG_DIR = "/home/lumen/logs"
+NOTES_KEEP = 20
+
+# name -> laststate file under LOG_DIR (None if the detector keeps no persistent
+# state beyond its liveness stamp). Paths come from the detector scripts themselves
+# (lumen-wq-health, lumen-log-watch, lumen-secret-check, lumen-model-check).
+DETECTORS = [
+    ("model-check", None),
+    ("wq-health", ".wq-health.laststate"),
+    ("secret-check", ".secret-check.laststate"),
+    ("log-watch", ".log-watch.laststate"),
+]
+
+PR_URL_RE = re.compile(r"https?://\S+/pulls?/\d+")
+WQ_TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def db_conn():
+    c = sqlite3.connect(f"file:{WQ_DB}?mode=ro", uri=True, timeout=5)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=5000")
+    return c
+
+
+def fmt_age(ts, fmt=WQ_TS_FMT):
+    """wq timestamps are naive UTC strings ('%Y-%m-%d %H:%M:%S'); render as a
+    relative age so the doc stays readable without cross-referencing 'now'."""
+    if not ts:
+        return "?"
+    try:
+        t = datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ts
+    secs = max(0, (datetime.now(timezone.utc) - t).total_seconds())
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{secs / 3600:.1f}h ago"
+    return f"{secs / 86400:.1f}d ago"
+
+
+def section_inflight(c):
+    rows = c.execute(
+        "SELECT id, lane, claimed_by, claimed_at, title FROM tasks "
+        "WHERE status='claimed' ORDER BY lane, id"
+    ).fetchall()
+    if not rows:
+        return "(none claimed)\n"
+    return "\n".join(
+        f"- wq#{r['id']} [{r['lane']}] {r['claimed_by'] or '?'} "
+        f"(claimed {fmt_age(r['claimed_at'])}) — {r['title']}"
+        for r in rows
+    ) + "\n"
+
+
+def section_landed_prs(c, limit=10, scan=300):
+    """Last N done tickets whose notes cite a PR url. The note IS the verdict
+    line: `wq done` requires it to name a verifiable artifact (wq#759), and for
+    a PR artifact `wq done` itself already refused the close unless the PR had
+    landed or was explicitly recorded --unmerged (wq#899) — so a done ticket's
+    notes are already a checked verdict, not a bare link."""
+    rows = c.execute(
+        "SELECT id, done_at, notes FROM tasks WHERE status='done' AND notes IS NOT NULL "
+        "ORDER BY done_at DESC LIMIT ?",
+        (scan,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        if len(out) >= limit:
+            break
+        note = (r["notes"] or "").replace("\n", " ")
+        if not PR_URL_RE.search(note):
+            continue
+        out.append(f"- wq#{r['id']} ({fmt_age(r['done_at'])}): {note[:180]}")
+    return ("\n".join(out) + "\n") if out else "(no recent done tickets carry a PR URL in notes)\n"
+
+
+def classify_block_reason(reason):
+    m = re.match(r"^([A-Z][A-Z_ ]{2,30}):", reason or "")
+    if m:
+        return m.group(1).strip()
+    if (reason or "").lower().startswith("duplicate of"):
+        return "DUPLICATE"
+    return "UNTAGGED"
+
+
+def section_blocked(c):
+    rows = c.execute(
+        "SELECT id, block_reason FROM tasks WHERE status='blocked' ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "(none blocked)\n"
+    classes = {}
+    for r in rows:
+        classes.setdefault(classify_block_reason(r["block_reason"]), []).append(r["id"])
+    ordered = sorted(classes.items(), key=lambda kv: -len(kv[1]))
+    return "\n".join(
+        f"- {cls}: {len(ids)} — {', '.join('wq#' + str(i) for i in ids)}"
+        for cls, ids in ordered
+    ) + "\n"
+
+
+def section_frank(c):
+    rows = c.execute(
+        "SELECT id, status, decision_prompt, orch_recommendation, frank_response "
+        "FROM tasks WHERE status IN ('frank_gated','pending_review') ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "(none open)\n"
+    lines = []
+    for r in rows:
+        if r["status"] == "pending_review":
+            if r["frank_response"]:
+                tail = f"answered, awaiting ORCH review: {r['frank_response'][:120]}"
+            else:
+                tail = f"awaiting Frank: {(r['decision_prompt'] or '')[:120]}"
+        else:
+            tail = "awaiting ORCH to set decision_prompt (`wq decide`)"
+        lines.append(f"- wq#{r['id']} [{r['status']}] {tail}")
+    return "\n".join(lines) + "\n"
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def section_detectors():
+    lines = []
+    for name, state_file in DETECTORS:
+        stamp = os.path.join(LOG_DIR, f".stamp.{name}")
+        try:
+            mtime = os.path.getmtime(stamp)
+            age = fmt_age(
+                datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(WQ_TS_FMT)
+            )
+        except OSError:
+            age = "never ran (no stamp)"
+        state = read_file(os.path.join(LOG_DIR, state_file)) if state_file else None
+        lines.append(f"- {name}: last run {age}" + (f" — {state}" if state else ""))
+    return "\n".join(lines) + "\n"
+
+
+def append_note(note):
+    line = f"{now()} — {note}"
+    prior = read_file(NOTES_PATH)
+    lines = (prior.splitlines() if prior else []) + [line]
+    lines = lines[-NOTES_KEEP:]
+    with open(NOTES_PATH, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def build(c):
+    parts = [
+        f"# SESSION HANDOFF\n\nGenerated {now()} by session-handoff (wq#1294). Read this file "
+        "fully before re-deriving fleet state by hand — it replaces ~10 turns of board/queue "
+        "exploration for a fresh orchestrator session.\n",
+        "## In-flight workers\n\n" + section_inflight(c),
+        "## Last landed PRs\n\n" + section_landed_prs(c),
+        "## Blocked, by class\n\n" + section_blocked(c),
+        "## Open FRANK decisions\n\n" + section_frank(c),
+        "## Detector state\n\n" + section_detectors(),
+        "## What the orchestrator was in the middle of\n\n"
+        + (read_file(NOTES_PATH) or "(no notes recorded — pass --note \"...\" to leave one)")
+        + "\n",
+    ]
+    return "\n".join(parts)
+
+
+def git_commit(paths):
+    present = [p for p in paths if os.path.exists(p)]
+    try:
+        subprocess.run(["git", "-C", KB_DIR, "add", *present], check=True, capture_output=True)
+        staged = subprocess.run(["git", "-C", KB_DIR, "diff", "--cached", "--quiet"])
+        if staged.returncode == 0:
+            print("session-handoff: no change, skipping commit")
+            return
+        subprocess.run(
+            ["git", "-C", KB_DIR, "commit", "-m", f"kb: session-handoff refresh {now()}"],
+            check=True,
+            capture_output=True,
+        )
+        print("session-handoff: committed")
+    except subprocess.CalledProcessError as e:
+        detail = e.stderr.decode(errors="replace")[:300] if e.stderr else str(e)
+        print(f"session-handoff: git commit failed: {detail}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--note", help="append a free-text note to the in-progress log")
+    ap.add_argument("--no-commit", action="store_true", help="write the file only, skip git commit")
+    a = ap.parse_args()
+
+    if a.note:
+        append_note(a.note)
+
+    c = db_conn()
+    try:
+        doc = build(c)
+    finally:
+        c.close()
+
+    with open(OUT_PATH, "w") as f:
+        f.write(doc)
+    print(f"session-handoff: wrote {OUT_PATH}")
+
+    if not a.no_commit:
+        git_commit([OUT_PATH, NOTES_PATH])
+
+
+if __name__ == "__main__":
+    main()
