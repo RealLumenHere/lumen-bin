@@ -1,0 +1,10 @@
+[Unit]
+Description=wq-hygiene-reconcile — flag-then-repair done-but-open/stale-claimed/merged-PR-but-open tickets (wq#1257)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lumen
+ExecStart=/usr/bin/python3 /home/lumen/bin/wq-hygiene-reconcile
+Nice=5

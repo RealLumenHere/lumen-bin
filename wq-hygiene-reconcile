@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""wq-hygiene-reconcile — kb/ISSUE-SOLUTIONS-fable.md #7 (wq#1257).
+
+Extends the existing wq-hygiene sweep (harness/reaper.py flags stale-claimed leases)
+from flagging to REPAIRING, with the wq DB as the only truth:
+
+  1. OPEN/CLAIMED tickets whose `notes` already cite verifiable evidence of
+     completion (a commit sha that is an ancestor of origin/main in a known repo, a
+     PR that the forge reports merged, or a cited file that exists) are done-but-open
+     or merged-PR-but-open: the board says open, reality says done. REPAIR: a
+     fence-guarded `wq done` closes the ticket with note
+     `reconciled-by=wq-hygiene, evidence=<ref>` (same text precedent already on
+     wq#1129/1221/1226). A ticket under a LIVE guarded claim is left alone — wq's own
+     owner_ok refuses the close, so this is defense in depth, not the only guard.
+
+  2. DONE tickets (within --lookback-days) have their already-gated evidence
+     RE-verified periodically, because currency rots: a cited sha can be
+     garbage-collected, a PR can be reverted, an evidence.json can be cleaned up.
+     If the citation no longer checks out, don't guess — FLAG to FRANK via ntfy,
+     transition-based (a state file dedups so a still-broken ticket alerts once per
+     failure, not once per run — the alert-storm rule).
+
+  3. A ticket with no evidence citation at all in either bucket is genuinely open
+     or genuinely fine — untouched.
+
+Mirrors two things from wq (/home/lumen/bin/wq) that could not be imported directly
+(the module runs its CLI at import time, no __main__ guard): the wq#759 artifact
+regexes (find_artifact) and the wq#899 merge-state check (pr_merge_state), trimmed to
+the forge-API-only path (no local git head-on-main special case — a cron scanning many
+repos has no single meaningful cwd to run that from).
+
+Usage:
+    wq-hygiene-reconcile [--dry-run] [--lookback-days N] [--state-file PATH]
+                          [--stamp-file PATH] [--ntfy-topic TOPIC]
+
+Env overrides (test seams):
+    WQ_DB                    sqlite path (default /home/lumen/agents/work-queue/queue.db)
+    WQ_BIN                   wq CLI path (default /home/lumen/bin/wq)
+    WQ_HYGIENE_REPOS         comma-separated repo paths to search for sha evidence
+                              (default: foreman, lumen-bin, mailbot, pokemon)
+    WQ_HYGIENE_NTFY_BIN      ntfy-send path (default: ntfy-send on PATH)
+    GITHUB_TOKEN / GITEA_TOKEN_FILE   forge auth, same lookup wq itself uses
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+WQ_BIN = os.environ.get("WQ_BIN", "/home/lumen/bin/wq")
+DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
+NTFY_BIN = os.environ.get("WQ_HYGIENE_NTFY_BIN", "ntfy-send")
+AGENT = "wq-hygiene"
+FMT = "%Y-%m-%d %H:%M:%S"
+
+DEFAULT_REPOS = [
+    "/home/lumen/foreman",
+    "/home/lumen/bin",
+    "/home/lumen/mailbot",
+    "/home/lumen/pokemon",
+]
+
+# ---------------------------------------------------------------- mirrors wq#759 (find_artifact)
+ARTIFACT_URL_RE = re.compile(r"https?://\S*/(?:pulls?|commits?)/\S+")
+ARTIFACT_SHA_RE = re.compile(r"(?=[0-9a-f]{7,40}$)[0-9a-f]*[a-f][0-9a-f]*")
+PR_URL_RE = re.compile(r"https?://([^/\s]+)/([^/\s]+)/([^/\s]+?)/pulls?/(\d+)")
+
+
+def repos():
+    override = os.environ.get("WQ_HYGIENE_REPOS")
+    if override:
+        return [p for p in override.split(",") if p]
+    return DEFAULT_REPOS
+
+
+def find_artifact(notes):
+    """(kind, detail) or (None, None). kind in 'url'|'sha'|'path'."""
+    notes = notes or ""
+    m = ARTIFACT_URL_RE.search(notes)
+    if m:
+        return "url", m.group(0).rstrip(".,)")
+    for raw in notes.split():
+        tok = raw.strip(".,;:()[]\"'")
+        if tok and ARTIFACT_SHA_RE.fullmatch(tok):
+            return "sha", tok
+    for raw in notes.split():
+        tok = raw.strip(".,;:()[]\"'")
+        if not tok or tok.startswith("http"):
+            continue
+        if "/" not in tok and not re.search(r"\.[A-Za-z0-9]{1,5}$", tok):
+            continue
+        if os.path.exists(tok):
+            return "path", tok
+    return None, None
+
+
+def git(repo, *args, timeout=15):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def sha_landed(sha):
+    """(repo, verified) — verified True/False once a repo has this commit, else
+    (None, None) if the sha isn't found in any known repo at all."""
+    for repo in repos():
+        if not os.path.isdir(os.path.join(repo, ".git")):
+            continue
+        if git(repo, "cat-file", "-e", sha + "^{commit}").returncode != 0:
+            continue
+        for ref in ("origin/main", "main"):
+            if git(repo, "rev-parse", "--verify", "--quiet", ref).returncode != 0:
+                continue
+            if git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0:
+                return repo, True
+        return repo, False
+    return None, None
+
+
+# ---------------------------------------------------------------- mirrors wq#899 (pr_merge_state)
+MERGE_STATE_TIMEOUT = float(os.environ.get("WQ_MERGE_STATE_TIMEOUT", "8"))
+
+
+def _forge_token(host):
+    if host in ("github.com", "www.github.com"):
+        return os.environ.get("GITHUB_TOKEN", "").strip() or None
+    path = os.environ.get("GITEA_TOKEN_FILE") or "/home/lumen/.secrets/gitea-lumen.token"
+    try:
+        with open(path) as fh:
+            tok = fh.read().strip()
+            return tok or None
+    except OSError:
+        return None
+
+
+def _forge_get(host, path, token):
+    import urllib.request
+    import urllib.error
+    if host in ("github.com", "www.github.com"):
+        base, auth = "https://api.github.com", f"Bearer {token}"
+    else:
+        base, auth = f"http://{host}/api/v1", f"token {token}"
+    req = urllib.request.Request(base + path, headers={
+        "Authorization": auth, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=MERGE_STATE_TIMEOUT) as r:
+            return json.load(r)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"_error": str(e)[:120]}
+
+
+def pr_merge_state(url):
+    """('merged'|'open'|'unknown', detail). Forge-API-only (no local head-on-main
+    fallback — see module docstring)."""
+    m = PR_URL_RE.search(url or "")
+    if not m:
+        return "unknown", "not a pull-request URL"
+    host, owner, repo, num = m.group(1), m.group(2), m.group(3), m.group(4)
+    token = _forge_token(host)
+    if not token:
+        return "unknown", f"no forge token for {host}"
+    pr = _forge_get(host, f"/repos/{owner}/{repo}/pulls/{num}", token)
+    if "_error" in pr or not isinstance(pr, dict) or "state" not in pr:
+        return "unknown", f"{host} unreachable or refused: {pr.get('_error', 'bad response')}"
+    if pr.get("merged"):
+        return "merged", f"{owner}/{repo}#{num} merged"
+    if pr.get("state") == "closed":
+        return "open", f"{owner}/{repo}#{num} was CLOSED without merging"
+    return "open", f"{owner}/{repo}#{num} is still OPEN"
+
+
+# ---------------------------------------------------------------- repair (open/claimed -> done)
+def lease_fenced(conn):
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+    return {"fence"} <= cols
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(FMT)
+
+
+def repair(tid, fence, evidence_text, dry_run):
+    note = f"reconciled-by=wq-hygiene, evidence={evidence_text}"
+    if dry_run:
+        return {"id": tid, "action": "would-repair", "note": note}
+    cmd = [WQ_BIN, "done", str(tid), "--notes", note]
+    if fence is not None:
+        cmd += ["--fence", str(fence)]
+    env = dict(os.environ)
+    env["WQ_AGENT"] = AGENT
+    env["WQ_DB"] = DB
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=30)
+    ok = p.returncode == 0
+    return {"id": tid, "action": "repaired" if ok else "repair-refused", "note": note,
+            "rc": p.returncode, "out": (p.stdout + p.stderr).strip()[:300]}
+
+
+def repair_candidate(notes):
+    """(evidence_text, None) if this open/claimed ticket's notes cite evidence that
+    verifies as landed right now, else (None, None)."""
+    kind, detail = find_artifact(notes)
+    if kind == "sha":
+        repo, verified = sha_landed(detail)
+        if verified:
+            return f"sha {detail} is an ancestor of origin/main in {repo} {detail}"
+    elif kind == "url" and PR_URL_RE.search(detail):
+        verdict, why = pr_merge_state(detail)
+        if verdict == "merged":
+            return f"PR {detail} merged ({why})"
+    elif kind == "path":
+        if os.path.exists(detail):
+            return f"evidence file exists at {detail}"
+    return None
+
+
+def sweep_open(conn, dry_run):
+    fenced = lease_fenced(conn)
+    cols = "id, notes" + (", fence" if fenced else "")
+    rows = conn.execute(
+        f"SELECT {cols} FROM tasks WHERE status='open' OR "
+        f"(status='claimed' AND (lease_expires IS NULL OR lease_expires < ?))",
+        (now(),)).fetchall()
+    repaired = []
+    for row in rows:
+        tid, notes = row[0], row[1]
+        fence_val = row[2] if fenced else None
+        evidence = repair_candidate(notes)
+        if evidence:
+            repaired.append(repair(tid, fence_val, evidence, dry_run))
+    return rows, repaired
+
+
+# ---------------------------------------------------------------- re-verify (done tickets rot)
+def rot_reason(notes):
+    """None if this done ticket's cited evidence still verifies, else a reason string."""
+    kind, detail = find_artifact(notes)
+    if kind == "sha":
+        repo, verified = sha_landed(detail)
+        if verified is not True:
+            return f"evidence sha {detail} no longer verifies as an ancestor of origin/main in any known repo"
+    elif kind == "url" and PR_URL_RE.search(detail):
+        verdict, why = pr_merge_state(detail)
+        if verdict == "open":
+            return f"evidence PR no longer shows merged: {why}"
+    elif kind == "path":
+        if not os.path.exists(detail):
+            return f"evidence file vanished: {detail}"
+    return None
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def flag(tid, reason, state, topic, dry_run):
+    key = str(tid)
+    reason_hash = hashlib.sha256(reason.encode()).hexdigest()[:16]
+    transitioned = state.get(key) != reason_hash
+    state[key] = reason_hash
+    if not transitioned:
+        return {"id": tid, "action": "flag-suppressed(no-transition)", "reason": reason}
+    if dry_run:
+        return {"id": tid, "action": "would-flag", "reason": reason}
+    msg = f"wq#{tid}: {reason}"
+    p = subprocess.run([NTFY_BIN, "-t", topic, "-p", "high",
+                        "-T", f"wq-hygiene: wq#{tid} evidence no longer verifies", msg],
+                       capture_output=True, text=True, timeout=15)
+    return {"id": tid, "action": "flagged", "reason": reason, "ntfy_rc": p.returncode}
+
+
+def sweep_done(conn, lookback_days, state, topic, dry_run):
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(days=lookback_days)).strftime(FMT)
+    rows = conn.execute("SELECT id, notes FROM tasks WHERE status='done' AND done_at >= ?",
+                        (cutoff,)).fetchall()
+    flagged = []
+    for tid, notes in rows:
+        key = str(tid)
+        reason = rot_reason(notes)
+        if reason:
+            flagged.append(flag(tid, reason, state, topic, dry_run))
+        elif key in state:
+            del state[key]
+    return rows, flagged
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--lookback-days", type=int,
+                    default=int(os.environ.get("WQ_HYGIENE_LOOKBACK_DAYS", "14")))
+    ap.add_argument("--state-file",
+                    default=os.environ.get("WQ_HYGIENE_STATE",
+                                           "/tmp/.wq-hygiene-reconcile.state.json"))
+    ap.add_argument("--stamp-file",
+                    default=os.environ.get("WQ_HYGIENE_STAMP",
+                                           "/tmp/.wq-hygiene-reconcile.stamp"))
+    ap.add_argument("--ntfy-topic",
+                    default=os.environ.get("WQ_HYGIENE_NTFY_TOPIC", "lumen-alerts"))
+    a = ap.parse_args(argv)
+
+    conn = sqlite3.connect(DB)
+    open_rows, repaired = sweep_open(conn, a.dry_run)
+    state = load_state(a.state_file)
+    done_rows, flagged = sweep_done(conn, a.lookback_days, state, a.ntfy_topic, a.dry_run)
+    conn.close()
+
+    if not a.dry_run:
+        save_state(a.state_file, state)
+        with open(a.stamp_file, "w") as f:
+            json.dump({"ts": now(), "scanned_open": len(open_rows),
+                      "scanned_done": len(done_rows),
+                      "repaired": sum(1 for r in repaired if r["action"] == "repaired"),
+                      "flagged": sum(1 for r in flagged if r["action"] == "flagged")}, f)
+
+    for r in repaired:
+        print(f"REPAIR wq#{r['id']}: {r['action']} — {r['note']}")
+    for r in flagged:
+        print(f"FLAG wq#{r['id']}: {r['action']} — {r['reason']}")
+    n_repaired = sum(1 for r in repaired if r["action"] == "repaired")
+    n_flagged = sum(1 for r in flagged if r["action"] == "flagged")
+    print(f"scanned {len(open_rows)} open/stale-claimed, {len(done_rows)} done "
+         f"(lookback={a.lookback_days}d) | repaired={n_repaired} flagged={n_flagged}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
