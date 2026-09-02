@@ -261,6 +261,93 @@ def init():
     c.execute("CREATE INDEX IF NOT EXISTS idx_retired_base ON retired_sessions(base_name)")
     c.commit(); c.close()
 
+# ---------------------------------------------------------------- wq#1158 lease/fence layer
+# PROBLEM. `owner_ok` compares NAMES, and a respawned worker has the same name it always had.
+# So the one thing the ownership rule cannot see is the case it most needs to: a session whose
+# lease expired, whose ticket was reclaimed and re-claimed (often by its own replacement under
+# the same base name), and which then wakes up and runs `wq done`. Every guard passes. The
+# replacement's evidence is overwritten by a worker that has been asleep for hours.
+#
+# A fence token separates them without needing to tell the two processes apart at all. Every
+# claim bumps `fence`; a holder is handed the value its claim minted; a write-back that carries
+# a fence must match the one on the row. The zombie is holding fence 3 against a row that has
+# moved on to 4, so its write is refused — not because wq worked out that it was a zombie, but
+# because being one is exactly what a stale fence means.
+#
+# NOT AUTO-APPLIED, unlike every other column on tasks. init() adds those on the next
+# invocation, which is fine when a column is inert storage. These four are not inert: the
+# moment they exist, the claim protocol changes for every in-flight claim on a queue shared by
+# live sessions. That is an operator's decision with a backup behind it, so the columns are
+# owned by migrations/wq1158_lease_fence.py and wq FEATURE-DETECTS them. Pre-migration, wq
+# behaves exactly as it did before — except that `--fence` is REFUSED rather than ignored,
+# because a caller that passes a fence is relying on it.
+LEASE_COLS = ("lease_owner", "lease_expires_at", "fence", "attempt")
+_FENCED = None
+def lease_fenced(c):
+    """True when this DB has had the wq#1158 migration applied. Cached per invocation."""
+    global _FENCED
+    if _FENCED is None:
+        _FENCED = set(LEASE_COLS) <= {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+    return _FENCED
+def epoch_of(ts):
+    """FMT text -> unix epoch int. Returns None for NULL/unparseable, which every caller
+    treats as 'no lease', matching how the TEXT column has always been read."""
+    try:
+        return int(datetime.datetime.strptime(ts, FMT)
+                   .replace(tzinfo=datetime.timezone.utc).timestamp())
+    except (TypeError, ValueError):
+        return None
+def lease_set_sql(c, owner, expires):
+    """SET fragment + params that keep the epoch mirror in step with lease_expires.
+
+    `lease_expires` (TEXT) stays the single source of truth: every pre-existing reader —
+    queue-status, mctl, reap, promote_leases, the watchdogs — reads it, and wq#1158 does not
+    get to make nine call sites disagree about when a lease ends. `lease_expires_at` is its
+    epoch mirror, written HERE and only here so the two cannot drift apart in one site's
+    hand-rolled UPDATE."""
+    if not lease_fenced(c): return "", []
+    return ", lease_owner=?, lease_expires_at=?", [owner, epoch_of(expires)]
+def lease_clear_sql(c):
+    return ", lease_owner=NULL, lease_expires_at=NULL" if lease_fenced(c) else ""
+def fence_of(c, tid):
+    r = c.execute("SELECT fence FROM tasks WHERE id=?", (tid,)).fetchone() if lease_fenced(c) else None
+    return int(r[0] or 0) if r else None
+def fence_guard(c, a, tid, action):
+    """Resolve --fence into (sql fragment, params) for the write-back, refusing loudly on a
+    stale one. The predicate goes ON the UPDATE as well as being checked here: the check gives
+    the human-readable refusal, the predicate is what makes the refusal atomic."""
+    want = getattr(a, "fence", None)
+    if want is None: return "", []
+    if not lease_fenced(c):
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: --fence {want} was given but this queue has NOT had the wq#1158 "
+              f"migration applied, so there is no fence to check. Refusing rather than "
+              f"ignoring it — a caller that passes a fence is relying on it.\n"
+              f"  Apply it: python3 migrations/wq1158_lease_fence.py --db <queue.db> --yes")
+        sys.exit(5)
+    cur = fence_of(c, tid)
+    if cur is None:
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: no such task {tid}"); sys.exit(1)
+    if cur != int(want):
+        holder, exp = c.execute("SELECT lease_owner, lease_expires FROM tasks WHERE id=?",
+                                (tid,)).fetchone()
+        c.execute("COMMIT"); c.close()
+        # A fence ABOVE the live one was never minted by any claim — that is a made-up token,
+        # not a stale one, and saying "your claim ended" would send the reader looking for a
+        # lease expiry that never happened.
+        why = (f"  Fence {want} has never been minted for this ticket (claims have only reached "
+               f"{cur}), so this token did not come from a `wq claim`. Nothing was written."
+               if int(want) > cur else
+               f"  Your claim ended and the ticket was claimed again since. Your `{action}` would "
+               f"overwrite work done under the newer claim, so it is refused.\n"
+               f"  If you are a resumed session: stop here. Do not re-claim and do not re-run the\n"
+               f"  work — read `wq show {tid}` first; the current holder may already have finished it.")
+        print(f"REFUSED: stale fence (wq#1158) — you hold fence {want} for wq#{tid}, the live "
+              f"claim is at fence {cur} (holder {holder or 'none'}, lease {exp or 'none'}).\n{why}")
+        sys.exit(5)
+    return " AND fence=?", [int(want)]
+
 # ---------------------------------------------------------------- wq#502 identity layer
 def warn(msg): sys.stderr.write(f"WARNING: {msg}\n")
 
@@ -320,7 +407,8 @@ def promote_leases(c, ident):
         full = int(ttl) if ttl else DEFAULT_TTL_MIN
         target = lease_from(full)
         if target <= exp: continue
-        c.execute("UPDATE tasks SET lease_expires=? WHERE id=?", (target, tid))
+        frag, fparams = lease_set_sql(c, ident, target)
+        c.execute(f"UPDATE tasks SET lease_expires=?{frag} WHERE id=?", [target] + fparams + [tid])
         subs = parse_subs(subsystems)
         if subs: acquire_subs(c, subs, ident, full, f"wq#{tid}")
         n += 1
@@ -371,8 +459,8 @@ def release_session_holdings(c, sid):
     tickets = [r[0] for r in c.execute(
         "SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'", (sid,))]
     if tickets:
-        c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
-                     lease_expires=NULL, lease_ttl=NULL
+        c.execute(f"""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
+                     lease_expires=NULL, lease_ttl=NULL{lease_clear_sql(c)}
                      WHERE claimed_by=? AND status='claimed'""", (sid,))
     locks = [r[0] for r in c.execute("SELECT scope FROM slocks WHERE holder=?", (sid,))]
     if locks:
@@ -875,8 +963,8 @@ def cmd_claim(a):
                            WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL
                              AND lease_expires < ?""", (lane, t_now)).fetchall()
     if expired:
-        c.execute("""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
-                     lease_expires=NULL, lease_ttl=NULL
+        c.execute(f"""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
+                     lease_expires=NULL, lease_ttl=NULL{lease_clear_sql(c)}
                      WHERE lane=? AND status='claimed' AND lease_expires IS NOT NULL
                        AND lease_expires < ?""", (lane, t_now))
     reclaim_lines = []
@@ -977,8 +1065,39 @@ def cmd_claim(a):
     prior_held = [h for h in session_holdings(c, agent, t_now)[0] if h != pick]
     prov = min(PROVISIONAL_MIN, a.ttl)
     lease = lease_from(prov)
-    c.execute("""UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
-                 lease_ttl=? WHERE id=?""", (agent, t_now, lease, a.ttl, pick))
+    # wq#1158: ONE guarded statement, not a read-then-write. BEGIN IMMEDIATE already serialises
+    # this against a sibling claimer, so the predicate is not what makes today's claim safe — it
+    # is what keeps it safe: the rule now lives IN the statement rather than in the transaction
+    # discipline of the 200 lines above it, and RETURNING is what mints the fence. Zero rows back
+    # means the row moved out from under the scan and somebody else won.
+    #
+    # The expiry test demands BOTH columns agree the lease is dead. They are written together
+    # (lease_set_sql) so they should never disagree — but if they ever do, requiring both makes
+    # the reclaim MORE conservative, never less. A divergence must not be able to steal a live
+    # ticket; at worst it declines to reclaim a dead one, which `wq reap` sweeps anyway.
+    fence = None
+    if lease_fenced(c):
+        won = c.execute(
+            """UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
+                   lease_ttl=?, lease_owner=?, lease_expires_at=?,
+                   fence=COALESCE(fence,0)+1, attempt=COALESCE(attempt,0)+1
+               WHERE id=? AND (status='open'
+                               OR (status='claimed'
+                                   AND COALESCE(lease_expires_at,0) < unixepoch()
+                                   AND COALESCE(lease_expires,'') < ?))
+               RETURNING id, fence""",
+            (agent, t_now, lease, a.ttl, agent, epoch_of(lease), pick, t_now)).fetchone()
+        if won is None:
+            c.execute("ROLLBACK"); c.close()
+            for line in reclaim_lines: print(line)
+            print(f"RACE-LOST: wq#{pick} was claimed by someone else between the lane scan and "
+                  f"the write. Nothing was taken and nothing was clobbered — this is the "
+                  f"wq#1158 atomic claim working. Re-run `wq claim` for the next ticket.")
+            return
+        fence = won[1]
+    else:
+        c.execute("""UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
+                     lease_ttl=? WHERE id=?""", (agent, t_now, lease, a.ttl, pick))
     if picked_subs:
         acquire_subs(c, picked_subs, agent, prov, f"wq#{pick}")
     c.execute("COMMIT")
@@ -999,6 +1118,13 @@ def cmd_claim(a):
         print(f"  Long uninterrupted work with no wq calls: run `wq heartbeat {t[0]}` first.")
     else:
         print(f"CLAIMED {t[0]} (pri {t[1]}) by {agent} — lease until {lease}Z (ttl {a.ttl}m; heartbeat to extend)")
+    if fence is not None:
+        # wq#1158: printed on its own line, in a fixed shape, because a worker loop has to be
+        # able to capture it — `FENCE=<n>` is what a shell reads back out of the claim output.
+        print(f"FENCE={fence}")
+        print(f"  Pass it to every write-back: wq heartbeat/done/release/block {t[0]} --fence {fence}")
+        print(f"  If a write is refused for a stale fence, your claim ended and someone else "
+              f"holds this ticket now. Stop; do not re-claim.")
     if picked_subs: print(f"LOCKED subsystems: {', '.join(picked_subs)}")
     if head_notice: print(head_notice)
     if prior_held:
@@ -1259,9 +1385,19 @@ def cmd_heartbeat(a):
     caller, _ = resolve_identity(a)
     if not owner_ok(c, caller, r[1], "heartbeat", a.id):
         c.execute("COMMIT"); c.close(); sys.exit(1)
+    # wq#1158: the fence check comes BEFORE mark_alive, because mark_alive PROMOTES leases —
+    # a zombie must not get to extend a lease it no longer holds on its way to being refused.
+    fcl, fpar = fence_guard(c, a, a.id, "heartbeat")
     mark_alive(c, caller, "heartbeat")
     lease = lease_from(a.ttl)
-    c.execute("UPDATE tasks SET lease_expires=?, lease_ttl=? WHERE id=?", (lease, a.ttl, a.id))
+    frag, fparams = lease_set_sql(c, r[1], lease)
+    cur = c.execute(f"UPDATE tasks SET lease_expires=?, lease_ttl=?{frag} WHERE id=?{fcl}",
+                    [lease, a.ttl] + fparams + [a.id] + fpar)
+    if cur.rowcount == 0:
+        c.execute("ROLLBACK"); c.close()
+        print(f"REFUSED: heartbeat {a.id} matched no row under fence "
+              f"{getattr(a,'fence',None)} — the claim moved while this call was in flight "
+              f"(wq#1158)."); sys.exit(5)
     subs = parse_subs(r[2])
     if subs: acquire_subs(c, subs, r[1], a.ttl, f"wq#{a.id}")  # extends held slocks for same holder
     c.execute("COMMIT"); c.close()
@@ -1452,22 +1588,35 @@ def _finish(a, new_status):
         a.notes = ((getattr(a, 'notes', '') or '') +
                    (" " if getattr(a, 'notes', '') else "") + f"[RECLOSE: {reclose}]").strip()
         warn(f"wq#{a.id} re-closed over a {prev[0]}Z close; previous notes: {(prev[1] or '(empty)')[:120]}")
+    # wq#1158: checked before mark_alive for the same reason as heartbeat — promotion is a
+    # write, and a stale-fence caller gets to make none. `fence` is deliberately NOT cleared or
+    # reset by any of these three transitions: it is monotonic per ticket, so a holder that
+    # released and re-claimed cannot land a write minted under the earlier claim.
+    fcl, fpar = fence_guard(c, a, a.id, {"done": "done", "open": "release",
+                                         "blocked": "block"}[new_status])
     mark_alive(c, caller, {"done": "done", "open": "release", "blocked": "block"}[new_status])
     if r and r[1]:
         release_subs(c, parse_subs(r[1]), r[0] or "")
+    clr = lease_clear_sql(c)
     if new_status == 'done':
-        c.execute("UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL, "
-                  "lease_ttl=NULL, block_reason=NULL, blocked_at=NULL WHERE id=?",
-                  (now(), getattr(a,'notes','') or '', a.id))
+        cur = c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL, "
+                        f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL{clr} WHERE id=?{fcl}",
+                        [now(), getattr(a,'notes','') or '', a.id] + fpar)
     elif new_status == 'open':
-        c.execute("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
-                  "lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL "
-                  "WHERE id=?", (a.id,))
+        cur = c.execute(f"UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
+                        f"lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL"
+                        f"{clr} WHERE id=?{fcl}", [a.id] + fpar)
     elif new_status == 'blocked':
         # wq#741: block_reason/blocked_at are the structural home for this — notes keeps
         # getting the same string too, so `wq show`/`wq list` need no changes.
-        c.execute("UPDATE tasks SET status='blocked', notes=?, block_reason=?, blocked_at=?, "
-                  "lease_expires=NULL WHERE id=?", (a.reason, a.reason, now(), a.id))
+        cur = c.execute(f"UPDATE tasks SET status='blocked', notes=?, block_reason=?, blocked_at=?, "
+                        f"lease_expires=NULL{clr} WHERE id=?{fcl}",
+                        [a.reason, a.reason, now(), a.id] + fpar)
+    if cur.rowcount == 0:
+        c.execute("ROLLBACK"); c.close()
+        print(f"REFUSED: {new_status} on wq#{a.id} matched no row under fence "
+              f"{getattr(a,'fence',None)} — the claim moved while this call was in flight "
+              f"(wq#1158)."); sys.exit(5)
     reopened = bump_reopened(c, a.id) if is_reopen(r[2], new_status) else 0
     c.execute("COMMIT"); c.close()
     return reopened
@@ -1815,7 +1964,7 @@ def cmd_reap(a):
     expired = c.execute(q, params).fetchall()
     if expired and not a.dry_run:
         uq = ("UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
-              "lease_expires=NULL, lease_ttl=NULL WHERE "
+              f"lease_expires=NULL, lease_ttl=NULL{lease_clear_sql(c)} WHERE "
               "(status='claimed' OR (status='open' AND claimed_by IS NOT NULL)) AND "
               "lease_expires IS NOT NULL AND lease_expires < ?")
         uparams = [t_now]
@@ -1834,6 +1983,85 @@ def cmd_reap(a):
               f"title={title!r}")
     suffix = " [dry-run, not applied]" if a.dry_run and expired else ""
     print(f"reaped {len(expired)} ticket(s){suffix}")
+# ---------------------------------------------------------------- wq#1158 idempotency helper
+# The fence stops a duplicate worker from CORRUPTING the ticket. It does nothing about the side
+# effects that worker already had outside the DB — and the expensive one is a second pull
+# request, which costs a human a review and leaves two branches that both look authoritative.
+#
+# The fix is to make every side effect keyed on the TICKET rather than on the session that
+# happens to be doing it: same ticket -> same branch name -> same output directory -> and a PR
+# lookup on that branch that answers "already exists" instead of creating a second one. Two
+# workers then converge on one artifact rather than racing to make two.
+#
+# Branch shape is <type>/wq<id>-<title-slug>, NOT the bare `wq-<id>` the ticket sketched:
+# lumen-pr's BRANCH_RE requires a Conventional-Commit type segment and rejects anything else
+# outright, so `wq-1158` could not be pushed by the tool that opens every PR here. Determinism
+# is the requirement and it holds — the name is a pure function of (type, id, title).
+CONV_TYPES = ("feat", "fix", "docs", "style", "refactor", "perf", "test",
+              "build", "ci", "chore", "revert")
+def idem_slug(title, cap=48):
+    s = re.sub(r"^\s*\[[^\]]*\]\s*", "", title or "")          # drop a [DRAFT]/[WIP] prefix
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+    if len(s) > cap:
+        s = s[:cap].rstrip("-")
+    return s or "task"
+def idem_branch(tid, title, typ="feat"):
+    return f"{typ}/wq{tid}-{idem_slug(title)}"
+def idem_path(tid):
+    return os.path.join(SCRATCH_ROOT, f"wq{tid}")
+def cmd_idem(a):
+    """Deterministic, ticket-keyed names for the side effects a duplicate worker would double."""
+    c = conn()
+    row = c.execute("SELECT id, title FROM tasks WHERE id=?", (a.id,)).fetchone()
+    c.close()
+    if not row:
+        print(f"REFUSED: no such task {a.id}"); sys.exit(1)
+    if a.type not in CONV_TYPES:
+        print(f"REFUSED: --type must be one of {'|'.join(CONV_TYPES)} (lumen-pr BRANCH_RE, "
+              f"github-standards.md §2), got {a.type!r}"); sys.exit(2)
+    branch = a.branch or idem_branch(row[0], row[1], a.type)
+    if a.kind == "branch":
+        print(branch); return
+    if a.kind == "path":
+        # Ticket-keyed, deliberately NOT session-keyed (the opposite of `wq scratch`, wq#598).
+        # Per-session paths keep two workers from noticing each other; that is right for ad-hoc
+        # files and wrong for a ticket's output, where the whole point is that the second worker
+        # lands on the first one's artifacts instead of quietly building a parallel set.
+        print(idem_path(row[0])); return
+    # kind == "pr": check-then-create, keyed on the branch. wq NEVER creates the PR — lumen-pr
+    # owns that, with guards this command has no business duplicating. All this answers is
+    # "does one already exist for this ticket's branch", which is the question a second worker
+    # fails to ask.
+    gh = os.environ.get("WQ_GH_BIN", "gh")
+    try:
+        import subprocess
+        pr = subprocess.run([gh, "pr", "list", "--head", branch, "--state", "all",
+                             "--limit", "1", "--json", "url,state,number"],
+                            capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"UNKNOWN {branch} — could not ask the forge ({e.__class__.__name__}). Treat as "
+              f"unknown, not as absent: creating a PR on an unanswered check is how the "
+              f"duplicate gets made.")
+        sys.exit(4)
+    if pr.returncode != 0:
+        print(f"UNKNOWN {branch} — `gh pr list` failed ({(pr.stderr or '').strip()[:200]}). "
+              f"Treat as unknown, not as absent.")
+        sys.exit(4)
+    try:
+        found = json.loads(pr.stdout or "[]")
+    except ValueError:
+        print(f"UNKNOWN {branch} — unparseable gh output. Treat as unknown, not as absent.")
+        sys.exit(4)
+    if found:
+        print(f"EXISTS {found[0].get('url')} state={found[0].get('state')} branch={branch}")
+        print(f"  wq#{a.id} already has a pull request. Push to {branch} and update that PR — "
+              f"do NOT open a second one.")
+        return
+    print(f"ABSENT {branch}")
+    sys.exit(3)
+
+FENCE_HELP = ("wq#1158: the fence token `wq claim` printed as FENCE=<n>. Refuses the write if "
+              "the ticket has been claimed again since — pass it and a resumed session is inert")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
@@ -1842,10 +2070,11 @@ s=sub.add_parser("whoami",help="show identity / --register <name> to mint a sess
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
 s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/acquire/release the lease"); s.add_argument("--acquire",metavar="LANES",default=None,help="take the lease over a comma/space list of lanes (requires a registered identity)"); s.add_argument("--release",action="store_true",help="drop every orchestrator lease this identity holds"); s.add_argument("--ttl",type=int,default=None,help=f"lease minutes (default WQ_ORCH_TTL={ORCH_TTL_MIN})"); s.add_argument("--note",default=None,help="what this orchestrator is driving"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_orch)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
-s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_done)
-s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_release)
-s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_block)
+s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_heartbeat)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
+s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_release)
+s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_block)
+s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, and a check-then-create PR lookup"); s.add_argument("kind",choices=["branch","path","pr"]); s.add_argument("id",type=int); s.add_argument("--type",default="feat",help="Conventional Commit type for the branch (default feat)"); s.add_argument("--branch",default=None,help="override the derived branch for the pr check"); s.set_defaults(f=cmd_idem)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.set_defaults(f=cmd_show)
