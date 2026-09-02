@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# sync-live <repo-path> <expected-sha>: the only sanctioned way to resync a live
+# (primary) tree to a commit that has actually landed on origin/main. Retires raw
+# `git checkout`/`git reset --hard`/`git clean -f` against a primary tree — those
+# are PreToolUse-blocked for workers (harness/guard.sh wq#900/wq#1256, #19 in
+# kb/ISSUE-SOLUTIONS-fable.md) precisely so this is the only path left standing.
+#
+# Structurally encodes "verify origin contains the commit before checkout": the
+# expected SHA is mandatory and comes from the land step's output, never guessed.
+set -euo pipefail
+
+usage() {
+  echo "usage: sync-live <repo-path> <expected-sha>" >&2
+  exit 1
+}
+
+[ $# -eq 2 ] || usage
+REPO=$1
+EXPECTED=$2
+
+cd "$REPO"
+git fetch origin
+git merge-base --is-ancestor "$EXPECTED" origin/main \
+  || { echo "REFUSE: $EXPECTED not in origin/main — land first"; exit 1; }
+[ -z "$(git status --porcelain)" ] \
+  || { echo "REFUSE: dirty live tree — resolve first"; exit 1; }
+git checkout main && git reset --hard "$EXPECTED"
