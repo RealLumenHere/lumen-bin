@@ -289,6 +289,48 @@ def lease_fenced(c):
     if _FENCED is None:
         _FENCED = set(LEASE_COLS) <= {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
     return _FENCED
+# wq#1331: per-ticket capability tags (claude-foreman WORKER_EXEC_CAPABILITY_GAP.md
+# §2.3 closed set). The column is owned by migrations/wq1331_needs.py — same contract
+# as wq#1158: wq FEATURE-DETECTS it, and `--needs` is REFUSED (never silently dropped)
+# pre-migration, because a caller passing tags is relying on foreman's resolver
+# honouring them. The reader lives in claude-foreman harness/needs.py; this validator
+# only guards what gets stored.
+NEEDS_TAGS = ("ssh", "root", "restart", "copy", "repo", "dir", "bench", "power")
+_NEEDS_TAG_RE = re.compile(r"(?:needs:)?([a-z_-]+)\(([^)]*)\)")
+_NEEDS_READY = None
+def needs_ready(c):
+    """True when this DB has had the wq#1331 migration applied. Cached per invocation."""
+    global _NEEDS_READY
+    if _NEEDS_READY is None:
+        _NEEDS_READY = "needs" in {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+    return _NEEDS_READY
+def validate_needs(text):
+    """(ok, error) for a needs value about to be stored. '' clears."""
+    text = (text or "").strip()
+    if not text:
+        return True, None
+    parsed = _NEEDS_TAG_RE.findall(text)
+    leftover = _NEEDS_TAG_RE.sub("", text).replace(",", "").strip()
+    if leftover:
+        return False, f"unparseable needs fragment: {leftover!r} (want tag(arg), comma-separated)"
+    for name, arg in parsed:
+        if name not in NEEDS_TAGS:
+            return False, f"unknown needs tag {name!r} (vocabulary: {', '.join(NEEDS_TAGS)})"
+        if not arg.strip():
+            return False, f"needs tag {name}() has an empty argument"
+        if name in ("repo", "dir") and not arg.strip().startswith("/"):
+            return False, f"needs:{name}({arg}) must be an absolute path"
+    return True, None
+def check_needs_or_die(c, val):
+    """Shared by add/edit: refuse --needs pre-migration or with an invalid value."""
+    if not needs_ready(c):
+        print("REFUSED: --needs requires the wq#1331 migration (tasks.needs column):\n"
+              "  python3 migrations/wq1331_needs.py --db <queue.db> --yes")
+        c.close(); sys.exit(1)
+    ok, err = validate_needs(val)
+    if not ok:
+        print(f"REFUSED: {err}")
+        c.close(); sys.exit(1)
 def epoch_of(ts):
     """FMT text -> unix epoch int. Returns None for NULL/unparseable, which every caller
     treats as 'no lease', matching how the TEXT column has always been read."""
@@ -905,9 +947,14 @@ def cmd_add(a):
     frank_gated = getattr(a, "frank_gated", False)
     gate_type = getattr(a, "gate_type", None) or ("frank_decision" if frank_gated else None)
     init_status = "frank_gated" if frank_gated else "open"
+    needs_val = getattr(a, "needs", None)
+    if needs_val is not None:
+        check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
     c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,model,effort,archetype,status,gate_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (a.lane, a.pri, a.title, a.detail or '', a.deps or '', ",".join(subs), a.gate or '', now(),
                model, effort, (a.archetype or None), init_status, gate_type))
+    if needs_val is not None:
+        c.execute("UPDATE tasks SET needs=? WHERE id=last_insert_rowid()", (needs_val.strip(),))
     c.commit(); print(f"added task {c.execute('SELECT last_insert_rowid()').fetchone()[0]} [{a.lane}]"
                       + (f" status={init_status}" if frank_gated else "")
                       + (f" subsystems={','.join(subs)}" if subs else "")
@@ -1841,6 +1888,23 @@ def cmd_show(a):
     # `--json` is the robust path and should be preferred by new callers.
     for k, v in row.items(): print(f"{k:13}: {v.replace(chr(10), chr(92)+'n') if isinstance(v, str) else v}")
     print(f"effective_pri: {ep}")
+def cmd_note(a):
+    """wq#1331: APPEND a line to notes — never overwrite (wq#1116's `done` lesson:
+    wholesale notes replacement destroys evidence). Built for harness bookkeeping,
+    e.g. fworker's uncharged LAUNCH_FAILURE record on a ticket left open."""
+    ping("note")
+    line = (a.text or "").strip()
+    if not line:
+        print("REFUSED: empty note"); sys.exit(1)
+    c = conn()
+    row = c.execute("SELECT notes FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not row:
+        print("no such task"); c.close(); sys.exit(1)
+    prev = row[0] or ""
+    stamped = f"[{now()}] {line}"
+    c.execute("UPDATE tasks SET notes=? WHERE id=?",
+              ((prev + "\n" if prev else "") + stamped, a.id))
+    c.commit(); print(f"noted {a.id}: {line}"); c.close()
 def cmd_edit(a):
     c = conn(); fields=[]; vals=[]
     # wq#841: `wq edit --status open` on a done/rejected ticket IS the reopen path the fleet
@@ -1849,10 +1913,14 @@ def cmd_edit(a):
     if a.status is not None:
         row = c.execute("SELECT status FROM tasks WHERE id=?", (a.id,)).fetchone()
         prev_status = row[0] if row else None
+    needs_val = getattr(a, "needs", None)
+    if needs_val is not None:
+        check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
-                    ("gate_type",getattr(a,"gate_type",None))):
+                    ("gate_type",getattr(a,"gate_type",None)),
+                    ("needs",needs_val.strip() if needs_val is not None else None)):
         if val is not None: fields.append(f"{col}=?"); vals.append(val)
     # wq#617: --model/--effort are validated as a pair; "" clears (back to unassigned).
     if a.model is not None or a.effort is not None:
@@ -1863,7 +1931,7 @@ def cmd_edit(a):
         if a.model == "": e = None    # clearing the model clears the pair
         m, e = norm_tuple(m, e)
         fields += ["model=?", "effort=?"]; vals += [m, e]
-    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype/--gate-type"); c.close(); return
+    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype/--gate-type/--needs"); c.close(); return
     vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
     reopened = bump_reopened(c, a.id) if is_reopen(prev_status, a.status) else 0
     c.commit()
@@ -2076,7 +2144,7 @@ FENCE_HELP = ("wq#1158: the fence token `wq claim` printed as FENCE=<n>. Refuses
               "the ticket has been claimed again since — pass it and a resumed session is inert")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
@@ -2090,7 +2158,8 @@ s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, a
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.add_argument("--json",action="store_true",help="wq#1277: emit the row as a single JSON object — safe for multi-line detail fields; plain text truncates/mis-parses embedded newlines"); s.set_defaults(f=cmd_show)
-s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("note",help="wq#1331: APPEND one timestamped line to notes (never overwrites)"); s.add_argument("id",type=int); s.add_argument("text"); s.set_defaults(f=cmd_note)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
 s=sub.add_parser("closure-quality",help="wq#759: evidence-quality trend per lane per week"); s.add_argument("--lane",default=None); s.add_argument("--weeks",type=int,default=8); s.set_defaults(f=cmd_closure_quality)

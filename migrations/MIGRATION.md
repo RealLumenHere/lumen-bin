@@ -88,3 +88,24 @@ Either way the exposure is strictly smaller than today's, where *no* claim has a
 
 Foreman one-worker-per-node systemd, and the `slock` audit. Separate tickets; the ticket scopes
 this one to the wq claim/lease/fence core.
+
+---
+
+# wq#1331 — `tasks.needs` capability tags
+
+Same ownership contract as wq#1158: the column is created ONLY by
+`migrations/wq1331_needs.py`; wq feature-detects it and REFUSES `--needs` (with a
+pointer at the script) until it has run. The column is inert storage for wq — the
+readers are claude-foreman's `harness/needs.py` (router `needs:repo` override,
+fworker `needs:dir` add-dir union and spawn preflight,
+`research/WORKER_EXEC_CAPABILITY_GAP.md` §2.3/§3.2).
+
+```sh
+python3 migrations/wq1331_needs.py --db /home/lumen/agents/work-queue/queue.db          # report
+python3 migrations/wq1331_needs.py --db /home/lumen/agents/work-queue/queue.db --yes    # apply
+python3 migrations/wq1331_needs.py --db /home/lumen/agents/work-queue/queue.db --rollback --yes
+```
+
+Backups (`queue.db.bak-wq1331-*`) are written before any write, every run. Runtime
+rollback without touching the DB: `FOREMAN_NEEDS_DISABLE=1` in foreman makes the
+resolver ignore needs and the spawn assertions log-only.
