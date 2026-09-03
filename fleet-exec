@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""fleet-exec — the ONE broker a worker gets for fleet execution (wq#1332,
+foreman/research/WORKER_EXEC_CAPABILITY_GAP.md §2.4).
+
+  fleet-exec run     <node> -- <cmd> [args...]
+  fleet-exec copy    <node> <local-path> <remote-dir>
+  fleet-exec restart <node> <unit> [restart|reload|start]   # default: restart
+  fleet-exec grant                                          # print this worker's grant
+
+v1 verbs only: run, copy, restart. sudo/bench/power are v2 (fleet_exec_policy.py
+already has their check_* functions so the policy matrix is provable now; this CLI
+just doesn't expose the subcommands yet).
+
+Every verb: (1) grant file present/readable/sha256 matches FOREMAN_GRANT_SHA/not
+expired/ticket matches WQ_AGENT's claim; (2) node is a known fleet subject; (3)
+node+verb present in the grant; (4) node+verb+argv permitted by the static policy
+(fleet-exec-policy.yaml) — argv is shlex-parsed by the CALLER's shell (Claude Code's
+Bash tool), never re-joined into a string here; (5) restart only: holddown
+registered on the target node first; (6) execute over ssh, BatchMode, one audit
+line before and one after. Any doubt at any step is a DENY, exit 2, reason on
+stderr — this script has no `--` escape into `bash -c` anywhere in its own logic.
+
+Rollback (design §5.1/5.3): remove the `Bash(/home/lumen/bin/fleet-exec *)` allow
+rule from worker-settings.json/base.json (workers can no longer invoke this at
+all) and/or `chmod 000` fleet-exec-policy.yaml (every call then denies with
+rule=policy_unreadable — fleet_exec_policy.load_policy fails closed on that).
+"""
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fleet_exec_policy as P
+
+POLICY_PATH = os.environ.get("FLEET_EXEC_POLICY_PATH", "/home/lumen/foreman/harness/fleet-exec-policy.yaml")
+AUDIT_PATH = os.environ.get("FLEET_EXEC_AUDIT_PATH", "/home/lumen/foreman/events/fleet-exec.jsonl")
+WORKER_AUDIT_PATH = os.environ.get("FLEET_EXEC_WORKER_AUDIT_PATH")  # set per-worker by fworker.build_env
+SSH_KEY = os.environ.get("FLEET_EXEC_SSH_KEY", "/home/lumen/.ssh/id_ed25519")
+CONNECT_TIMEOUT_S = 10
+HOLDDOWN_BIN = "/home/lumen/bin/holddown"
+
+_WQ_AGENT_RE = re.compile(r"^fworker-wq(\d+)$")
+
+
+def die(msg):
+    print(f"fleet-exec: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def ticket_from_wq_agent(wq_agent):
+    m = _WQ_AGENT_RE.match(wq_agent or "")
+    return m.group(1) if m else None
+
+
+def known_nodes():
+    """Roster of live fleet subjects (same source fleet-telemetry already uses:
+    lumen_state.py's tailscale_ip facts). Unreachable minerva -> empty roster, which
+    fails every node closed rather than skipping the check."""
+    try:
+        out = subprocess.run(
+            ["python3", "/home/lumen/minerva/lumen_state.py", "current", "", "tailscale_ip"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    roster = set()
+    pat = re.compile(r"^\s*(\S+)\.tailscale_ip\s*=")
+    for line in out.stdout.splitlines():
+        m = pat.match(line)
+        if m:
+            roster.add(m.group(1))
+    return roster
+
+
+def audit(record):
+    P.append_jsonl(AUDIT_PATH, record)
+    if WORKER_AUDIT_PATH:
+        P.append_jsonl(WORKER_AUDIT_PATH, record)
+
+
+def deny(ticket, attempt, worker, node, verb, argv, rule, reason):
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb=verb, argv=argv, decision="deny", rule=rule))
+    die(f"DENY [{rule}]: {reason}")
+
+
+def load_context():
+    """Grant + identity, shared by every verb. Returns (grant, ticket, attempt,
+    worker) or calls deny()/die() itself — never returns a half-valid context."""
+    wq_agent = os.environ.get("WQ_AGENT", "")
+    ticket = ticket_from_wq_agent(wq_agent) or os.environ.get("FOREMAN_TICKET_ID")
+    attempt = os.environ.get("FOREMAN_ATTEMPT")
+    grant_path = os.environ.get("FOREMAN_GRANT_FILE")
+    grant_sha = os.environ.get("FOREMAN_GRANT_SHA")
+    if not ticket:
+        die("no ticket identity (WQ_AGENT/FOREMAN_TICKET_ID unset) — refusing to guess")
+    grant, err = P.load_grant(grant_path, grant_sha, ticket, wq_agent)
+    if err:
+        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=wq_agent, node=None,
+                              verb=sys.argv[1] if len(sys.argv) > 1 else None, argv=sys.argv[1:],
+                              decision="deny", rule=f"grant:{err}"))
+        die(f"DENY [grant:{err}]: grant file did not verify")
+    return grant, ticket, attempt, wq_agent
+
+
+def load_policy_or_die(ticket, attempt, worker, node, verb, argv):
+    try:
+        return P.load_policy(POLICY_PATH)
+    except P.PolicyError as e:
+        deny(ticket, attempt, worker, node, verb, argv, "policy_unreadable", str(e))
+
+
+def check_node_known(ticket, attempt, worker, node, verb, argv):
+    if node not in known_nodes():
+        deny(ticket, attempt, worker, node, verb, argv, "unknown_node",
+             f"{node!r} is not a live fleet subject (lumen_state.py current)")
+
+
+def run_ssh(node, remote_argv, *, input_text=None, timeout=90):
+    cmd = ["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes",
+           "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+           "-o", "StrictHostKeyChecking=accept-new", node, "--",
+           *[shlex.quote(a) for a in remote_argv]]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text)
+
+
+def cmd_run(args, grant, ticket, attempt, worker):
+    node, argv = args.node, args.cmd
+    policy = load_policy_or_die(ticket, attempt, worker, node, "run", argv)
+    check_node_known(ticket, attempt, worker, node, "run", argv)
+    ssh_grants = P.find_grants(grant, "ssh", node)
+    if not any("run" in g.get("verbs", []) for g in ssh_grants):
+        deny(ticket, attempt, worker, node, "run", argv, "grant:no_ssh_run",
+             f"no ssh grant for {node} with verb run")
+    ok, rule, reason = P.check_run(node, argv, policy)
+    if not ok:
+        deny(ticket, attempt, worker, node, "run", argv, rule, reason)
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="run", argv=argv, decision="allow", rule=rule))
+    t0 = time.time()
+    try:
+        p = run_ssh(node, argv)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                              verb="run", argv=argv, decision="allow", rule="ssh_transport_error",
+                              exit_code=1, elapsed_s=time.time() - t0))
+        die(f"ssh transport error: {e}")
+    out = (p.stdout or "") + (p.stderr or "")
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="run", argv=argv, decision="allow", rule=rule,
+                          exit_code=p.returncode, elapsed_s=time.time() - t0,
+                          out_sha256=P.sha256_bytes(out.encode()), out_head=out[:240]))
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    sys.exit(p.returncode)
+
+
+def cmd_copy(args, grant, ticket, attempt, worker):
+    node, local_path, remote_dir = args.node, args.local_path, args.remote_dir
+    argv = [local_path, remote_dir]
+    policy = load_policy_or_die(ticket, attempt, worker, node, "copy", argv)
+    check_node_known(ticket, attempt, worker, node, "copy", argv)
+    copy_grants = P.find_grants(grant, "copy", node)
+    if not any(g.get("dir") == remote_dir for g in copy_grants):
+        deny(ticket, attempt, worker, node, "copy", argv, "grant:no_copy_dir",
+             f"no copy grant for {node}:{remote_dir}")
+    ok, rule, reason = P.check_copy(node, remote_dir, policy)
+    if not ok:
+        deny(ticket, attempt, worker, node, "copy", argv, rule, reason)
+    if not os.path.isfile(local_path) or os.path.islink(local_path):
+        deny(ticket, attempt, worker, node, "copy", argv, "local_path_invalid",
+             f"{local_path!r} is not a regular file")
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="copy", argv=argv, decision="allow", rule=rule))
+    t0 = time.time()
+    cmd = ["scp", "-i", SSH_KEY, "-o", "BatchMode=yes",
+           "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+           "-o", "StrictHostKeyChecking=accept-new",
+           local_path, f"{node}:{remote_dir}/"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                              verb="copy", argv=argv, decision="allow", rule="scp_transport_error",
+                              exit_code=1, elapsed_s=time.time() - t0))
+        die(f"scp transport error: {e}")
+    out = (p.stdout or "") + (p.stderr or "")
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="copy", argv=argv, decision="allow", rule=rule,
+                          exit_code=p.returncode, elapsed_s=time.time() - t0,
+                          out_sha256=P.sha256_bytes(out.encode()), out_head=out[:240]))
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    sys.exit(p.returncode)
+
+
+def cmd_restart(args, grant, ticket, attempt, worker):
+    node, unit, action = args.node, args.unit, args.action
+    argv = [unit, action]
+    policy = load_policy_or_die(ticket, attempt, worker, node, "restart", argv)
+    check_node_known(ticket, attempt, worker, node, "restart", argv)
+    restart_grants = P.find_grants(grant, "restart", node)
+    if not any(g.get("unit") == unit for g in restart_grants):
+        deny(ticket, attempt, worker, node, "restart", argv, "grant:no_restart_unit",
+             f"no restart grant for {node}:{unit}")
+    ok, rule, reason = P.check_restart(node, unit, policy)
+    if not ok:
+        deny(ticket, attempt, worker, node, "restart", argv, rule, reason)
+    try:
+        expires = datetime.fromisoformat(grant["expires"].replace("Z", "+00:00"))
+    except ValueError:
+        expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+    minutes = max(5, int((expires - datetime.now(timezone.utc)).total_seconds() // 60))
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="restart", argv=argv, decision="allow", rule=rule))
+    t0 = time.time()
+    holddown_argv = [HOLDDOWN_BIN, "set", unit, "--reason", f"fleet-exec wq{ticket} attempt{attempt}",
+                      "--ticket", f"wq{ticket}", "--restore-by", f"+{minutes}m"]
+    try:
+        hd = run_ssh(node, holddown_argv, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                              verb="restart", argv=argv, decision="allow", rule="holddown_transport_error",
+                              exit_code=1, elapsed_s=time.time() - t0))
+        die(f"holddown registration transport error: {e}")
+    if hd.returncode != 0:
+        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                              verb="restart", argv=argv, decision="allow", rule="holddown_failed",
+                              exit_code=1, elapsed_s=time.time() - t0,
+                              out_head=((hd.stdout or "") + (hd.stderr or ""))[:240]))
+        print(f"fleet-exec: holddown registration failed on {node} for {unit} — "
+              f"restart NOT attempted: {(hd.stderr or hd.stdout)[:300]}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        p = run_ssh(node, ["systemctl", action, unit])
+    except (OSError, subprocess.TimeoutExpired) as e:
+        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                              verb="restart", argv=argv, decision="allow", rule="ssh_transport_error",
+                              exit_code=1, elapsed_s=time.time() - t0))
+        die(f"ssh transport error: {e}")
+    out = (p.stdout or "") + (p.stderr or "")
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="restart", argv=argv, decision="allow", rule=rule,
+                          exit_code=p.returncode, elapsed_s=time.time() - t0,
+                          out_sha256=P.sha256_bytes(out.encode()), out_head=out[:240]))
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    sys.exit(p.returncode)
+
+
+def cmd_grant(args, grant, ticket, attempt, worker):
+    import json
+    print(json.dumps(grant, indent=2, sort_keys=True))
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="fleet-exec")
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    r = sub.add_parser("run")
+    r.add_argument("node")
+    r.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    c = sub.add_parser("copy")
+    c.add_argument("node")
+    c.add_argument("local_path")
+    c.add_argument("remote_dir")
+
+    rs = sub.add_parser("restart")
+    rs.add_argument("node")
+    rs.add_argument("unit")
+    rs.add_argument("action", nargs="?", default="restart", choices=["restart", "reload", "start"])
+
+    sub.add_parser("grant")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.verb == "run" and args.cmd[:1] == ["--"]:
+        args.cmd = args.cmd[1:]
+    grant, ticket, attempt, worker = load_context()
+    {
+        "run": cmd_run,
+        "copy": cmd_copy,
+        "restart": cmd_restart,
+        "grant": cmd_grant,
+    }[args.verb](args, grant, ticket, attempt, worker)
+
+
+if __name__ == "__main__":
+    main()
