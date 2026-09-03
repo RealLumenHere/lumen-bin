@@ -175,6 +175,26 @@ def configured_lanes():
         return set(cfg.get("lanes", {}).keys())
     except (OSError, ValueError):
         return None
+FOREMAN_MODELS_YAML = os.environ.get("FOREMAN_MODELS_YAML",
+                                     "/home/lumen/foreman/research/models.yaml")
+def known_archetypes():
+    """wq#1368: archetypes with a live routing row in models.yaml — the set
+    orchestrator/router.py's Manifest.chain() can actually route a ticket through. None
+    means the manifest couldn't be read — callers must fail OPEN, same as
+    configured_lanes() (wq#912): a missing/unreadable file (or no PyYAML) never blocks
+    `wq add`/`wq edit`. wq#1358/#1359 carried archetype='build' (a LANE name, not an
+    archetype) straight onto a ticket the dispatcher could never route, which crashed
+    the whole dispatch pass until the dispatcher itself was hardened separately."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        with open(FOREMAN_MODELS_YAML) as f:
+            data = yaml.safe_load(f) or {}
+        return set((data.get("routing") or {}).keys())
+    except (OSError, ValueError):
+        return None
 def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
 def now(): return utcnow().strftime(FMT)
 def lease_from(minutes): return (utcnow() + datetime.timedelta(minutes=minutes)).strftime(FMT)
@@ -954,6 +974,19 @@ def cmd_add(a):
               f"Exempt (deliberately unlisted): {', '.join(sorted(LANE_EXEMPT))}\n"
               f"Use an existing lane, add one to dispatcher/config.json first, or --force to override.")
         sys.exit(1)
+    # wq#1368: refuse an archetype with no routing row — the dispatcher would never be
+    # able to route this ticket (it used to crash the whole pass on this exact shape;
+    # the dispatcher is now hardened too, but a ticket that can never route is still a
+    # ticket that never dispatches). Same fail-open shape as the wq#912 lane check above.
+    if a.archetype:
+        archs = known_archetypes()
+        if archs is not None and a.archetype not in archs and not a.force:
+            print(f"REFUSED: archetype {a.archetype!r} has no routing row in models.yaml — "
+                  f"the dispatcher would never be able to route this ticket (wq#1368).")
+            print(f"Known archetypes: {', '.join(sorted(archs))}\n"
+                  f"Omit --archetype to let the router classify it, use a known one, or "
+                  f"--force to override.")
+            sys.exit(1)
     c = conn()
     if not a.force:
         nt = norm_title(a.title)
@@ -1939,6 +1972,15 @@ def cmd_edit(a):
     needs_val = getattr(a, "needs", None)
     if needs_val is not None:
         check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
+    # wq#1368: same routing-row check as cmd_add, fail-open on an unreadable manifest.
+    # '' clears the archetype (falls back to classify_archetype at dispatch) and is
+    # always allowed — only a non-empty, unroutable value is refused.
+    if a.archetype:
+        archs = known_archetypes()
+        if archs is not None and a.archetype not in archs:
+            print(f"REFUSED: archetype {a.archetype!r} has no routing row in models.yaml "
+                  f"(wq#1368). Known archetypes: {', '.join(sorted(archs))}")
+            c.close(); sys.exit(1)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
