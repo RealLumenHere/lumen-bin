@@ -124,6 +124,29 @@ def git(repo, *args, timeout=15):
                           timeout=timeout)
 
 
+def _patch_landed(repo, sha, ref):
+    """True if `sha`'s patch is equivalent to a commit already on `ref` (wq#1322):
+    the forge squash-merges PRs, so a worker's cited pre-merge sha is real and
+    reachable but is never an ancestor of main — only its patch-id survives the
+    squash. `git cherry <ref> <sha>` walks the range ref..sha (the feature branch,
+    including a dangling/GC-pending sha) and marks each commit '-' when an
+    equivalent patch-id is already reachable from ref, '+' otherwise. `sha` is
+    resolved to its full 40-char form first — a worker's cited sha is routinely
+    abbreviated, but `git cherry` always prints full shas, so a raw string match
+    against an abbreviated `sha` silently never hits."""
+    full = git(repo, "rev-parse", "--verify", "--quiet", sha + "^{commit}").stdout.strip()
+    if not full:
+        return False
+    p = git(repo, "cherry", ref, full)
+    if p.returncode != 0:
+        return False
+    for line in p.stdout.splitlines():
+        mark, _, csha = line.strip().partition(" ")
+        if csha == full:
+            return mark == "-"
+    return False
+
+
 def sha_landed(sha):
     """(repo, verified) — verified True/False once a repo has this commit, else
     (None, None) if the sha isn't found in any known repo at all."""
@@ -136,6 +159,8 @@ def sha_landed(sha):
             if git(repo, "rev-parse", "--verify", "--quiet", ref).returncode != 0:
                 continue
             if git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0:
+                return repo, True
+            if _patch_landed(repo, sha, ref):
                 return repo, True
         return repo, False
     return None, None

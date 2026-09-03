@@ -59,6 +59,32 @@ def make_repo_with_landed_commit(tmp_path):
     return repo, sha
 
 
+def make_repo_with_squash_merged_branch(tmp_path):
+    """wq#1322: a feature-branch commit whose PATCH landed on main via a squash
+    merge — the branch sha itself is never an ancestor of main, but a different
+    commit on main carries an identical diff. Returns (repo_dir, branch_sha)."""
+    repo = tmp_path / "squash_repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "test@test")
+    git(repo, "config", "user.name", "test")
+    (repo / "base.txt").write_text("base\n")
+    git(repo, "add", "base.txt")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "branch", "-M", "main")
+
+    git(repo, "checkout", "-qb", "feat/thing")
+    (repo / "feature.txt").write_text("feature work\n")
+    git(repo, "add", "feature.txt")
+    git(repo, "commit", "-qm", "feat: thing")
+    branch_sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "feat/thing", "--", "feature.txt")
+    git(repo, "commit", "-qm", "feat: thing (#1) squash-merged")
+    return repo, branch_sha
+
+
 def make_stub_ntfy(tmp_path):
     log = tmp_path / "ntfy.log"
     stub = tmp_path / "ntfy-send-stub"
@@ -325,3 +351,59 @@ def test_live_claim_is_not_touched_even_with_landed_evidence(tmp_path):
 
     after = wq_show(env, ticket_id)
     assert after["status"] == "claimed"
+
+
+def test_sha_landed_recognizes_a_squash_merged_patch(reconcile, tmp_path, monkeypatch):
+    """wq#1322: the branch sha a worker cites is never an ancestor of main once the
+    forge squash-merges its PR — only the patch survives, under a different sha. Without
+    the fix this would report (repo, False) forever, an unrepairable, unrepairing false
+    rot flag."""
+    repo, branch_sha = make_repo_with_squash_merged_branch(tmp_path)
+    monkeypatch.setenv("WQ_HYGIENE_REPOS", str(repo))
+    found_repo, verified = reconcile.sha_landed(branch_sha)
+    assert found_repo == str(repo)
+    assert verified is True
+
+
+def test_sha_landed_recognizes_a_squash_merged_patch_from_an_abbreviated_sha(
+        reconcile, tmp_path, monkeypatch):
+    """The done-note convention cites abbreviated shas (`be7f0f6`, not the full 40
+    chars), but `git cherry` always prints full shas — a raw string match against the
+    abbreviated form silently never hits, which is what actually produced wq#1322's 14
+    false flags in the live dry-run."""
+    repo, branch_sha = make_repo_with_squash_merged_branch(tmp_path)
+    monkeypatch.setenv("WQ_HYGIENE_REPOS", str(repo))
+    found_repo, verified = reconcile.sha_landed(branch_sha[:7])
+    assert found_repo == str(repo)
+    assert verified is True
+
+
+def test_sha_landed_still_fails_a_sha_whose_patch_never_landed(reconcile, tmp_path,
+                                                                monkeypatch):
+    """The patch-id equivalence check must not widen into 'sha exists anywhere' — a
+    branch sha whose diff was never applied to main stays unverified."""
+    repo, _branch_sha = make_repo_with_squash_merged_branch(tmp_path)
+    git(repo, "checkout", "-q", "-b", "feat/other", "main")
+    (repo / "unrelated.txt").write_text("never merged\n")
+    git(repo, "add", "unrelated.txt")
+    git(repo, "commit", "-qm", "feat: never merged")
+    stray_sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+    monkeypatch.setenv("WQ_HYGIENE_REPOS", str(repo))
+
+    found_repo, verified = reconcile.sha_landed(stray_sha)
+    assert found_repo == str(repo)
+    assert verified is False
+
+
+def test_repair_finds_squash_merged_sha_end_to_end(tmp_path):
+    """Same regression through the real CLI: a done-but-open ticket citing a
+    squash-merged branch sha must be repaired, not left as a standing false page."""
+    repo, branch_sha = make_repo_with_squash_merged_branch(tmp_path)
+    env, _ntfy_log = make_env(tmp_path, [repo])
+    ticket_id = wq_add(env, "done-but-open: squash-merged pre-merge sha cited")
+    set_notes(env["WQ_DB"], ticket_id, f"landed as {branch_sha}")
+
+    result = run_reconcile(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"REPAIR wq#{ticket_id}: repaired" in result.stdout
+    assert wq_show(env, ticket_id)["status"] == "done"
