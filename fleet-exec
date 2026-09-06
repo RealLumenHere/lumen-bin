@@ -15,10 +15,16 @@ Every verb: (1) grant file present/readable/sha256 matches FOREMAN_GRANT_SHA/not
 expired/ticket matches WQ_AGENT's claim; (2) node is a known fleet subject; (3)
 node+verb present in the grant; (4) node+verb+argv permitted by the static policy
 (fleet-exec-policy.yaml) — argv is shlex-parsed by the CALLER's shell (Claude Code's
-Bash tool), never re-joined into a string here; (5) restart only: holddown
-registered on the target node first; (6) execute over ssh, BatchMode, one audit
-line before and one after. Any doubt at any step is a DENY, exit 2, reason on
-stderr — this script has no `--` escape into `bash -c` anywhere in its own logic.
+Bash tool), never re-joined into a string here; (5) restart only: the unit is read
+BEFORE the action (LoadState must be `loaded`), passwordless sudo is prechecked, a
+holddown is registered ON LUMEN, and the unit is polled back to `active` AFTER;
+(6) execute over ssh, BatchMode, one audit line before and one after. Any doubt at
+any step is a DENY, exit 2, reason on stderr — this script has no `--` escape into
+`bash -c` anywhere in its own logic.
+
+Privilege (design BROKER_WIRING.md §2.4.1): the only sudo this broker ever emits is
+the literal `sudo -n ...` built here, never worker argv. `never.sudo_argv_deny` still
+governs the (unshipped) v2 `sudo` verb; this is not that verb.
 
 Rollback (design §5.1/5.3): remove the `Bash(/home/lumen/bin/fleet-exec *)` allow
 rule from worker-settings.json/base.json (workers can no longer invoke this at
@@ -42,9 +48,30 @@ AUDIT_PATH = os.environ.get("FLEET_EXEC_AUDIT_PATH", "/home/lumen/foreman/events
 WORKER_AUDIT_PATH = os.environ.get("FLEET_EXEC_WORKER_AUDIT_PATH")  # set per-worker by fworker.build_env
 SSH_KEY = os.environ.get("FLEET_EXEC_SSH_KEY", "/home/lumen/.ssh/id_ed25519")
 CONNECT_TIMEOUT_S = 10
+# Lumen-side helpers. HOLDDOWN_BIN is invoked LOCALLY (§2.4.2): the healer and the
+# flag dir live on Lumen, and /home/lumen/bin/holddown does not exist on any other
+# node — the old remote invocation could only ever fail.
 HOLDDOWN_BIN = "/home/lumen/bin/holddown"
+RESTORE_BIN = "/home/lumen/bin/fleet-exec-restore"
+NTFY_BIN = "/home/lumen/bin/ntfy-send"
+LUMEN_STATE_BIN = "/home/lumen/minerva/lumen_state.py"
+ALERT_TOPIC = "lumen-alerts"
+# §2.4.3 verify-after budget: 30s for the action itself, then ONE rescue start and
+# a shorter 15s re-poll before the unit is declared un-restarted.
+VERIFY_POLL_S = 30
+RESCUE_POLL_S = 15
+POLL_INTERVAL_S = 1
+SHOW_PROPS = "LoadState,ActiveState,SubState,ActiveEnterTimestampMonotonic"
 
 _WQ_AGENT_RE = re.compile(r"^fworker-wq(\d+)$")
+
+# ssh reserves exit 255 for its OWN failures, but a remote command is free to exit
+# 255 too, so a transport verdict needs one of ssh's own diagnostics as well.
+_SSH_TRANSPORT_STDERR = re.compile(
+    r"ssh: connect to host|Connection timed out|Connection refused|No route to host|"
+    r"Could not resolve hostname|Host key verification failed|Permission denied \(publickey|"
+    r"kex_exchange_identification|Connection closed by|Operation timed out|"
+    r"Network is unreachable|Broken pipe")
 
 
 def die(msg):
@@ -63,7 +90,7 @@ def known_nodes():
     fails every node closed rather than skipping the check."""
     try:
         out = subprocess.run(
-            ["python3", "/home/lumen/minerva/lumen_state.py", "current", "", "tailscale_ip"],
+            ["python3", LUMEN_STATE_BIN, "current", "", "tailscale_ip"],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -78,15 +105,38 @@ def known_nodes():
 
 
 def audit(record):
+    """§2.4.6: every line carries the grant sha, so an offline replay joins
+    grant.json -> attempt-N.json -> fleet-exec.jsonl -> events/<worker>.jsonl on
+    grant_sha alone, with no timestamp matching."""
+    record.setdefault("grant_sha", os.environ.get("FOREMAN_GRANT_SHA"))
     P.append_jsonl(AUDIT_PATH, record)
     if WORKER_AUDIT_PATH:
         P.append_jsonl(WORKER_AUDIT_PATH, record)
 
 
-def deny(ticket, attempt, worker, node, verb, argv, rule, reason):
+def deny(ticket, attempt, worker, node, verb, argv, rule, reason, **extra):
     audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                          verb=verb, argv=argv, decision="deny", rule=rule))
+                          verb=verb, argv=argv, decision="deny", rule=rule, **extra))
     die(f"DENY [{rule}]: {reason}")
+
+
+def notify(priority, title, message):
+    """Best effort: an alert that fails to publish must never change the broker's
+    verdict, so every error here is swallowed."""
+    try:
+        subprocess.run([NTFY_BIN, "-t", ALERT_TOPIC, "-p", priority, "-T", title, message],
+                       capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def ingest_fact(subject, predicate, value):
+    """Best effort, same reason as notify()."""
+    try:
+        subprocess.run(["python3", LUMEN_STATE_BIN, "ingest", subject, predicate, value,
+                        "--source", "fleet-exec"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def load_context():
@@ -129,6 +179,106 @@ def run_ssh(node, remote_argv, *, input_text=None, timeout=90):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text)
 
 
+def run_local(argv, *, timeout=60):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+def is_transport_error(p):
+    return p.returncode == 255 and bool(_SSH_TRANSPORT_STDERR.search(p.stderr or ""))
+
+
+def transport_fail(ticket, attempt, worker, node, verb, argv, detail, t0):
+    """§2.4.4: an offline node fails closed, alerts, and leaves a fact behind so the
+    next dispatch pass skips this node instead of spawning into the same wall.
+    Never returns — exit stays 2."""
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb=verb, argv=argv, decision="allow", rule="ssh_transport_error",
+                          exit_code=2, elapsed_s=time.time() - t0, out_head=detail[:240]))
+    ingest_fact(node, "broker_last_transport_error",
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    notify("high", f"fleet-exec: {node} unreachable",
+           f"wq{ticket} {verb} {' '.join(argv)} — {detail[:300]}")
+    die(f"ssh transport error to {node}: {detail[:300]}")
+
+
+def transport_guard(ticket, attempt, worker, node, verb, argv, t0):
+    """Returns a run_ssh wrapper that turns any transport failure into
+    transport_fail() — the callers below never see a half-connected result."""
+    def call(remote_argv, *, timeout=90):
+        try:
+            p = run_ssh(node, remote_argv, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            transport_fail(ticket, attempt, worker, node, verb, argv, str(e), t0)
+        if is_transport_error(p):
+            transport_fail(ticket, attempt, worker, node, verb, argv,
+                           (p.stderr or "").strip(), t0)
+        return p
+    return call
+
+
+def unit_state(ssh, unit):
+    """`systemctl show` on a unit that does not exist still exits 0 with
+    LoadState=not-found, which is exactly the read §2.4.3 gates on."""
+    p = ssh(["systemctl", "show", "-p", SHOW_PROPS, unit], timeout=30)
+    state = {}
+    for line in (p.stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            state[key.strip()] = value.strip()
+    return {"load": state.get("LoadState", "unknown"),
+            "active": state.get("ActiveState", "unknown"),
+            "sub": state.get("SubState", "unknown"),
+            "active_enter_monotonic": state.get("ActiveEnterTimestampMonotonic", "")}
+
+
+def poll_active(ssh, unit, seconds):
+    """Poll `systemctl is-active` at POLL_INTERVAL_S until it reports active or the
+    budget runs out. Returns (active, last_reading)."""
+    deadline = time.time() + seconds
+    last = "unknown"
+    while True:
+        p = ssh(["systemctl", "is-active", unit], timeout=30)
+        last = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()[0:1]
+        last = last[0] if last else "unknown"
+        if last == "active":
+            return True, last
+        if time.time() >= deadline:
+            return False, last
+        time.sleep(POLL_INTERVAL_S)
+
+
+def holddown_key(node, unit):
+    """§2.4.2: the flag lives on Lumen, so a remote unit is namespaced <unit>@<node>.
+    node=lumen keeps the plain local name the healer already understands."""
+    return unit if node == "lumen" else f"{unit}@{node}"
+
+
+def grant_minutes(grant):
+    try:
+        expires = datetime.fromisoformat(grant["expires"].replace("Z", "+00:00"))
+    except (KeyError, ValueError, AttributeError):
+        expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return max(5, int((expires - datetime.now(timezone.utc)).total_seconds() // 60))
+
+
+def holddown_set_argv(node, unit, ticket, attempt, minutes):
+    argv = [HOLDDOWN_BIN, "set", holddown_key(node, unit),
+            "--reason", f"fleet-exec wq{ticket} attempt{attempt}",
+            "--ticket", f"wq{ticket}", "--restore-by", f"+{minutes}m"]
+    if node != "lumen":
+        argv += ["--restore-cmd", f"{RESTORE_BIN} {node} {unit}"]
+    return argv
+
+
+def holddown_drop(node, unit):
+    try:
+        run_local([HOLDDOWN_BIN, "drop", holddown_key(node, unit)], timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def cmd_run(args, grant, ticket, attempt, worker):
     node, argv = args.node, args.cmd
     policy = load_policy_or_die(ticket, attempt, worker, node, "run", argv)
@@ -143,13 +293,8 @@ def cmd_run(args, grant, ticket, attempt, worker):
     audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
                           verb="run", argv=argv, decision="allow", rule=rule))
     t0 = time.time()
-    try:
-        p = run_ssh(node, argv)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                              verb="run", argv=argv, decision="allow", rule="ssh_transport_error",
-                              exit_code=1, elapsed_s=time.time() - t0))
-        die(f"ssh transport error: {e}")
+    ssh = transport_guard(ticket, attempt, worker, node, "run", argv, t0)
+    p = ssh(argv)
     out = (p.stdout or "") + (p.stderr or "")
     audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
                           verb="run", argv=argv, decision="allow", rule=rule,
@@ -175,9 +320,15 @@ def cmd_copy(args, grant, ticket, attempt, worker):
     if not os.path.isfile(local_path) or os.path.islink(local_path):
         deny(ticket, attempt, worker, node, "copy", argv, "local_path_invalid",
              f"{local_path!r} is not a regular file")
+    t0 = time.time()
+    # §2.4.5: a missing drop dir is a DENY before the allow line, not an scp that
+    # fails after the broker has already said yes.
+    ssh = transport_guard(ticket, attempt, worker, node, "copy", argv, t0)
+    if ssh(["test", "-d", remote_dir], timeout=30).returncode != 0:
+        deny(ticket, attempt, worker, node, "copy", argv, "copy_dir_missing",
+             f"{remote_dir!r} does not exist on {node} (provision it: mkdir -p)")
     audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
                           verb="copy", argv=argv, decision="allow", rule=rule))
-    t0 = time.time()
     cmd = ["scp", "-i", SSH_KEY, "-o", "BatchMode=yes",
            "-o", f"ConnectTimeout={CONNECT_TIMEOUT_S}",
            "-o", "StrictHostKeyChecking=accept-new",
@@ -185,10 +336,7 @@ def cmd_copy(args, grant, ticket, attempt, worker):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
-        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                              verb="copy", argv=argv, decision="allow", rule="scp_transport_error",
-                              exit_code=1, elapsed_s=time.time() - t0))
-        die(f"scp transport error: {e}")
+        transport_fail(ticket, attempt, worker, node, "copy", argv, f"scp: {e}", t0)
     out = (p.stdout or "") + (p.stderr or "")
     audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
                           verb="copy", argv=argv, decision="allow", rule=rule,
@@ -211,46 +359,84 @@ def cmd_restart(args, grant, ticket, attempt, worker):
     ok, rule, reason = P.check_restart(node, unit, policy)
     if not ok:
         deny(ticket, attempt, worker, node, "restart", argv, rule, reason)
-    try:
-        expires = datetime.fromisoformat(grant["expires"].replace("Z", "+00:00"))
-    except ValueError:
-        expires = datetime.now(timezone.utc) + timedelta(minutes=5)
-    minutes = max(5, int((expires - datetime.now(timezone.utc)).total_seconds() // 60))
-    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                          verb="restart", argv=argv, decision="allow", rule=rule))
+    # ---- gate order above is verbatim; everything below is AFTER the allow decision ----
     t0 = time.time()
-    holddown_argv = [HOLDDOWN_BIN, "set", unit, "--reason", f"fleet-exec wq{ticket} attempt{attempt}",
-                      "--ticket", f"wq{ticket}", "--restore-by", f"+{minutes}m"]
+    ssh = transport_guard(ticket, attempt, worker, node, "restart", argv, t0)
+
+    # §2.4.3 verify-before-act: a typo must not create a holddown.
+    before = unit_state(ssh, unit)
+    if before["load"] != "loaded":
+        deny(ticket, attempt, worker, node, "restart", argv, "unit_not_found",
+             f"{unit!r} on {node} has LoadState={before['load']}, not loaded", before=before)
+
+    # §2.4.1 privilege precheck: without passwordless sudo the action is a polkit
+    # refusal, so refuse here rather than leaving a holddown behind a failed restart.
+    sudo_probe = ssh(["sudo", "-n", "true"], timeout=30)
+    if sudo_probe.returncode != 0:
+        notify("high", f"fleet-exec: no passwordless sudo on {node}",
+               f"wq{ticket} restart {unit}@{node} refused: `sudo -n true` exited "
+               f"{sudo_probe.returncode}")
+        deny(ticket, attempt, worker, node, "restart", argv, "sudo_nopasswd_missing",
+             f"`sudo -n true` on {node} exited {sudo_probe.returncode} — restart not attempted",
+             before=before)
+
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="restart", argv=argv, decision="allow", rule=rule,
+                          before=before))
+
+    # §2.4.2 stop-restore contract, registered on LUMEN (the healer and the flag dir
+    # are here); the restore path back to the node is fleet-exec-restore.
+    hd_argv = holddown_set_argv(node, unit, ticket, attempt, grant_minutes(grant))
     try:
-        hd = run_ssh(node, holddown_argv, timeout=30)
+        hd = run_local(hd_argv, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
         audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                              verb="restart", argv=argv, decision="allow", rule="holddown_transport_error",
-                              exit_code=1, elapsed_s=time.time() - t0))
-        die(f"holddown registration transport error: {e}")
+                              verb="restart", argv=argv, decision="allow",
+                              rule="holddown_local_error", exit_code=1,
+                              elapsed_s=time.time() - t0, before=before, verified=False))
+        die(f"holddown registration failed locally: {e}")
     if hd.returncode != 0:
         audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
                               verb="restart", argv=argv, decision="allow", rule="holddown_failed",
-                              exit_code=1, elapsed_s=time.time() - t0,
+                              exit_code=1, elapsed_s=time.time() - t0, before=before,
+                              verified=False,
                               out_head=((hd.stdout or "") + (hd.stderr or ""))[:240]))
-        print(f"fleet-exec: holddown registration failed on {node} for {unit} — "
+        print(f"fleet-exec: holddown registration failed for {holddown_key(node, unit)} — "
               f"restart NOT attempted: {(hd.stderr or hd.stdout)[:300]}", file=sys.stderr)
         sys.exit(1)
-    try:
-        p = run_ssh(node, ["systemctl", action, unit])
-    except (OSError, subprocess.TimeoutExpired) as e:
-        audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                              verb="restart", argv=argv, decision="allow", rule="ssh_transport_error",
-                              exit_code=1, elapsed_s=time.time() - t0))
-        die(f"ssh transport error: {e}")
+
+    p = ssh(["sudo", "-n", "systemctl", action, unit])
     out = (p.stdout or "") + (p.stderr or "")
-    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
-                          verb="restart", argv=argv, decision="allow", rule=rule,
-                          exit_code=p.returncode, elapsed_s=time.time() - t0,
-                          out_sha256=P.sha256_bytes(out.encode()), out_head=out[:240]))
+
+    # §2.4.3 verify-after: is-active decides, not the action's own exit code.
+    active, last = poll_active(ssh, unit, VERIFY_POLL_S)
+    rescue_rc = None
+    if not active or p.returncode != 0:
+        rescue_rc = ssh(["sudo", "-n", "systemctl", "start", unit]).returncode
+        active, last = poll_active(ssh, unit, RESCUE_POLL_S)
+    after = unit_state(ssh, unit)
+    verified = bool(active) and (p.returncode == 0 or rescue_rc == 0)
+
+    record = P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                             verb="restart", argv=argv, decision="allow", rule=rule,
+                             exit_code=0 if verified else 1, elapsed_s=time.time() - t0,
+                             before=before, after=after, verified=verified,
+                             out_sha256=P.sha256_bytes(out.encode()), out_head=out[:240])
+    audit(record)
     sys.stdout.write(p.stdout)
     sys.stderr.write(p.stderr)
-    sys.exit(p.returncode)
+    if verified:
+        holddown_drop(node, unit)
+        sys.exit(0)
+    # Holddown is deliberately LEFT ACTIVE: the healer keeps restoring the unit until
+    # a human drops the flag, and the worker cannot claim a restart it did not get.
+    notify("urgent", f"fleet-exec: {unit} on {node} not active after {action}",
+           f"wq{ticket} before={before['active']}/{before['sub']} "
+           f"after={after['active']}/{after['sub']} (is-active={last}); holddown "
+           f"{holddown_key(node, unit)} LEFT ACTIVE — healer will restore.")
+    print(f"fleet-exec: {unit} on {node} is {last!r} after {action} + one rescue start; "
+          f"holddown {holddown_key(node, unit)} left ACTIVE", file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_grant(args, grant, ticket, attempt, worker):
