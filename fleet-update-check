@@ -30,25 +30,42 @@ NTFY = "/home/lumen/bin/ntfy-send"
 WQ = "/home/lumen/bin/wq"
 STUCK_SECS = 24 * 3600
 
-# name -> ssh target ("" = local). Sources: fleet-auth-ssh-probe roster +
-# lumen_state (bes/sia/sobek/gameboy use username==hostname per provision SOP).
-NODES = {
-    "lumen": "",
-    # thor excluded: Frank's workstation, maintenance tooling must never touch it (wq#854)
-    "thoth": "thoth@100.75.1.108",
-    "seshat": "seshat@100.121.243.124",
-    "anubis": "anubis@100.121.17.5",
-    "apep": "apep@100.82.2.72",
-    "maat": "maam@100.105.219.34",
-    "wadjet": "wadjet@100.116.217.15",
-    "nephthys": "nephthys@100.98.74.87",
-    "isis": "isis@100.100.129.24",
-    "hathor": "hathor@100.80.71.13",
-    "bes": "bes@100.110.156.91",
-    "sia": "sia@100.111.15.120",
-    "sobek": "sobek@100.86.156.91",
-    "gameboy": "gameboy@100.118.56.59",
-}
+# wq#1456: the roster comes from the fleet inventory (DESIGN_SOT.md) — no NODES list lives here.
+# name -> ssh target ("" = this host). fleet_inventory.maintenance_targets(): MONITORED, status
+# active, not governance.never_restart (thor: Frank's workstation, maintenance tooling must never
+# touch it, wq#854), A11 §5 order. A decommissioned box (nephthys), a parked one (hathor,
+# wadjet) or one whose ssh user is still VERIFY never appears; the skip reason goes to stderr.
+FLEET_INVENTORY_DIR = os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet/inventory")
+sys.path.insert(0, FLEET_INVENTORY_DIR)
+import fleet_inventory as inv  # noqa: E402
+
+
+def _roster():
+    skipped = []
+    try:
+        nodes = dict(inv.maintenance_targets(local="", skipped=skipped))
+    except inv.InventoryError as e:
+        print(f"fleet-update-check: inventory unreadable and no last-good roster: {e}", file=sys.stderr)
+        sys.exit(1)
+    for _name, why in skipped:
+        print(f"[roster] {why} — not probed", file=sys.stderr)
+    return nodes
+
+
+NODES = _roster()
+
+
+def _ollama_nodes():
+    """(name, ip) for the ollama version probe: this host via loopback + every maintenance
+    target with the inference role, by tailscale ip."""
+    out = []
+    for rec in inv.select(**inv.MAINTENANCE_FILTERS):
+        name = rec["identity"]["name"]
+        if inv.is_local(rec):
+            out.append((name, "127.0.0.1"))
+        elif "inference" in (rec.get("roles") or []) and name in NODES:
+            out.append((name, NODES[name].split("@", 1)[1]))
+    return out
 
 def sh(cmd, timeout=25):
     """Run local command -> (rc, stdout+stderr)."""
@@ -177,8 +194,7 @@ def probe_apps():
     a["latest"] = latest
     # ollama per inference node via API (tailnet)
     a["ollama"] = {}
-    for n, ip in (("lumen", "127.0.0.1"), ("isis", "100.100.129.24"),
-                  ("hathor", "100.80.71.13"), ("nephthys", "100.98.74.87")):
+    for n, ip in _ollama_nodes():
         j = http_json(f"http://{ip}:11434/api/version", 6)
         if j and j.get("version"):
             a["ollama"][n] = j["version"]
