@@ -258,7 +258,10 @@ def check_bench(node, tool, policy):
 
 def audit_record(*, ticket, attempt, worker, node, verb, argv, decision, rule,
                   exit_code=None, elapsed_s=None, out_sha256=None, out_head=None,
-                  ts=None):
+                  ts=None, before=None, after=None, verified=None, grant_sha=None):
+    """before/after/verified/grant_sha are BROKER_WIRING.md §2.4.6: the unit state
+    the broker read on each side of the action, whether it came back active, and the
+    sha that joins this line to grant.json and events/<worker>.jsonl."""
     rec = {
         "ts": ts if ts is not None else time.time(),
         "ticket": ticket,
@@ -278,6 +281,14 @@ def audit_record(*, ticket, attempt, worker, node, verb, argv, decision, rule,
         rec["out_sha256"] = out_sha256
     if out_head is not None:
         rec["out_head"] = out_head
+    if before is not None:
+        rec["before"] = before
+    if after is not None:
+        rec["after"] = after
+    if verified is not None:
+        rec["verified"] = bool(verified)
+    if grant_sha is not None:
+        rec["grant_sha"] = grant_sha
     return rec
 
 

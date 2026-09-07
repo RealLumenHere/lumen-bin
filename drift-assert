@@ -15,8 +15,12 @@ Design notes:
 - Edge-triggered ntfy: only alerts on a CHANGE in the pass/fail set vs the
   last run (state file), so a persistent known-and-accepted drift does not
   spam nightly. Full report always written to disk.
-- SSH via the fleet key; per-node timeout; a node that is intentionally
-  offline (khepri/hathot/wadjet-retired) is skipped, not failed.
+- SSH via the fleet key; per-node timeout; a node the inventory says is
+  intentionally offline (parked hathor/wadjet, bench khepri) is skipped, not failed.
+- wq#1456: HOSTS and SKIP_HOSTS come from the fleet inventory (DESIGN_SOT.md);
+  GOLDEN stays the per-node policy (WHICH fact to assert) but names no host the
+  inventory does not know — a decommissioned box (nephthys) has no ssh path there,
+  so a GOLDEN row for it would report SKIP "not in inventory roster", never a fault.
 """
 import json, subprocess, os, sys, time, datetime
 from pathlib import Path
@@ -26,19 +30,23 @@ STATE = Path("/home/lumen/sentinel/drift_assert_state.json")
 OUTDIR = Path("/home/lumen/maint/drift-assert"); OUTDIR.mkdir(parents=True, exist_ok=True)
 NTFY = os.getenv("DRIFT_NTFY_URL", "http://localhost:8080/lumen-alerts")
 
-# Nodes that are deliberately down — skip, never fail.
-SKIP_HOSTS = {"khepri", "hathor", "wadjet"}
+FLEET_INVENTORY_DIR = os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet/inventory")
+sys.path.insert(0, FLEET_INVENTORY_DIR)
+import fleet_inventory as inv  # noqa: E402
 
-# (host, ssh_target). LOCAL = run on Lumen directly.
-HOSTS = {
-    "lumen": "LOCAL",
-    "maat": "maam@100.105.219.34",
-    "bes": "bes@100.110.156.91",
-    "sobek": "sobek@100.86.156.91",
-    "thoth": "thoth@100.75.1.108",
-    "nephthys": "nephthys@100.98.74.87",
-    "anubis": "anubis@100.121.17.5",
-}
+
+def _roster():
+    """HOSTS: (name -> ssh_target, LOCAL = this host) for every live-status box with an ssh path.
+    SKIP_HOSTS: the ones the inventory does not MONITOR (deliberately down) — skip, never fail."""
+    try:
+        hosts = dict(inv.ssh_targets(monitored=False, statuses=("active", "standby", "bench"), local="LOCAL"))
+    except inv.InventoryError as e:
+        print(f"drift-assert: inventory unreadable and no last-good roster: {e}", file=sys.stderr)
+        sys.exit(2)
+    return hosts, {n for n in hosts if not inv.is_monitored(n)}
+
+
+HOSTS, SKIP_HOSTS = _roster()
 
 # GOLDEN: (id, host, human_desc, shell_check, expected_substring_in_stdout)
 # expected="" means "command must exit 0" (presence/enablement check).
@@ -59,8 +67,6 @@ GOLDEN = [
      "sudo -n docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' vaultwarden", "unless-stopped"),
     ("bes-ha-container", "bes", "Home Assistant container up on Bes",
      "docker ps --format '{{.Names}}' | grep -c homeassistant", "1"),
-    ("nephthys-ollama-enabled", "nephthys", "nephthys ollama enabled",
-     "systemctl is-enabled ollama", "enabled"),
     ("anubis-gitea-active", "anubis", "anubis gitea active",
      "systemctl is-active gitea", "active"),
 ]
@@ -88,7 +94,10 @@ def main():
     results = []
     for gid, host, desc, cmd, expected in GOLDEN:
         if host in SKIP_HOSTS:
-            results.append((gid, host, "SKIP", desc, "host intentionally down"))
+            results.append((gid, host, "SKIP", desc, "host intentionally down (inventory: not monitored)"))
+            continue
+        if host not in HOSTS:
+            results.append((gid, host, "SKIP", desc, "not in inventory ssh roster (decommissioned or no ssh path)"))
             continue
         rc, out = run_check(host, cmd)
         if rc is None:

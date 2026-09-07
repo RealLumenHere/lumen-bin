@@ -12,21 +12,25 @@ declare -A IP=(
   [p13]=192.168.8.181 [p14]=192.168.8.124
 )
 ORDER="p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p13 p14"
-# Display labels only — canonical source is lumen_state.py (node.power_plug facts)
+# Display labels only. wq#1456: the canonical plug<->box mapping is hardware.power_hw.plug_id in
+# /home/lumen/fleet/inventory/machines/<name>.yaml (`fleet-inv plugs`); moving a box = editing
+# its YAML, never this script. A plug no machine claims shows as pN-unoccupied.
+# LABELS ARE OBSERVATIONS WITH A DATE, NOT ASSIGNMENTS. Parked boxes get UNPLUGGED
+# (fleet.power_policy: circuit budget + wake-on-AC-recovery), so a machine sits on
+# whatever plug happened to be free. Verify occupancy from a wattage transition +
+# live ssh before trusting any name. 2026-08-22 (Frank): P3 IS HATHOR'S PLUG. Khepri was
+# plugged into P3 exactly ONCE (2026-08-14 22:52, 0W->128W) purely so its hardware could be
+# verified, then removed — a single verification event is NOT an assignment.
+FLEET_INV=${FLEET_INV:-/home/lumen/bin/fleet-inv}
 declare -A LABEL=(
-  # LABELS ARE OBSERVATIONS WITH A DATE, NOT ASSIGNMENTS. Parked boxes get UNPLUGGED
-  # (fleet.power_policy: circuit budget + wake-on-AC-recovery), so a machine sits on
-  # whatever plug happened to be free. Verify occupancy from a wattage transition +
-  # live ssh before trusting any name here. 2026-08-22 (Frank): P3 IS HATHOR'S PLUG.
-  # Khepri was plugged into P3 exactly ONCE (2026-08-14 22:52, 0W->128W) purely so its
-  # hardware could be verified, then removed. That one-off observation was wrongly left
-  # as the standing label for 8 days. A single verification event is NOT an assignment.
-  [p1]=p1-unoccupied [p2]=nephthys [p3]=hathor [p4]=maat [p5]=isis
-  [p6]=seshat [p7]=bes [p8]=sia [p9]=anubis [p10]=thoth [p11]=lumen
   # 2026-08-10 (Frank): HOUSEHOLD plugs, NOT Lumen fleet nodes. Power-monitored
-  # only; excluded from fleet ops (no updates/reboots/probes/envelopes).
+  # only; excluded from fleet ops (no updates/reboots/probes/envelopes). Not machines,
+  # so not in the inventory — the one hand-kept pair.
   [p13]="riley-pc" [p14]="parker-pc"
 )
+plugs=$("$FLEET_INV" plugs) || { echo "plug-ctl: fleet-inv plugs failed (inventory unreadable?)" >&2; exit 1; }
+while IFS=$'\t' read -r pid name _; do [[ -n "$pid" ]] && LABEL[${pid,,}]=$name; done <<<"$plugs"
+for n in $ORDER; do LABEL[$n]=${LABEL[$n]:-$n-unoccupied}; done
 k() { "$KASA" --host "$1" --username "$TAPO_USER" --password "$TAPO_PASS" "${@:2}" 2>/dev/null; }
 watts_one() { # name ip -> "name state watts"
   local out st w

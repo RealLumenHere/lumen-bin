@@ -31,26 +31,37 @@ WINDOWS_DIR = "/home/lumen/maint/windows"
 NTFY = "/home/lumen/bin/ntfy-send"
 WQ = "/home/lumen/bin/wq"
 
-DECLARED_ABSENT_DEFAULT = {"hathor", "wadjet"}  # A11 §3a: tailnet-offline / bench
-# thor never appears: excluded from fleet-update-check NODES dict (wq#854)
+# wq#1456: roster AND ordering data come from the fleet inventory (DESIGN_SOT.md) — no node
+# names live here. The A11 §5 ordering law (wq#852/854) is encoded per node as ops.maint_tier in
+# /home/lumen/fleet/inventory/machines/<name>.yaml: 1 leaf · 1.5 inference leaf · 2 service ·
+# 3 vault standby (the rehearsal) · 4 vault primary · 5 lumen (runs the runner, last). Tiers run
+# low-to-high; ties by name. Thor never appears (governance.never_restart, Frank's workstation).
+FLEET_INVENTORY_DIR = os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet/inventory")
+sys.path.insert(0, FLEET_INVENTORY_DIR)
+import fleet_inventory as inv  # noqa: E402
 
-# Ordering law, A11 §5 (updated wq#852/854). Tiers run low-to-high; ties
-# keep this list order. Thor excluded entirely (Frank's workstation).
-TIER1_LEAF = ["gameboy", "apep", "thoth", "seshat", "sia"]
-TIER1B_INFERENCE = ["nephthys", "hathor", "isis"]  # Mac Pro inference trio
-TIER2_SERVICE = ["anubis", "bes"]
-TIER3_STANDBY = ["sobek", "wadjet"]
-TIER4_PRIMARY = ["maat"]
-TIER5_LAST = ["lumen"]
-NODE_ORDER = TIER1_LEAF + TIER1B_INFERENCE + TIER2_SERVICE + TIER3_STANDBY + TIER4_PRIMARY + TIER5_LAST
+
+def _roster():
+    try:
+        order = [n for n, _ in inv.maintenance_targets()]
+        # A11 §3a declared-absent: boxes with an ssh path that the inventory parks (standby/bench,
+        # e.g. hathor, wadjet, khepri). They are never probed as maintenance targets, and if a
+        # stale state.json still carries one it gets an explicit ABSENT item, never a silent skip.
+        absent = {n for n, _ in inv.ssh_targets(monitored=False, statuses=("standby", "bench"), maintenance=True)}
+    except inv.InventoryError as e:
+        print(f"fleet-maint-assemble: inventory unreadable and no last-good roster: {e}", file=sys.stderr)
+        sys.exit(2)
+    return order, absent
+
+
+NODE_ORDER, DECLARED_ABSENT_DEFAULT = _roster()
+
 
 def node_tier(node):
-    for tier, roster in ((1, TIER1_LEAF), (1.5, TIER1B_INFERENCE),
-                         (2, TIER2_SERVICE), (3, TIER3_STANDBY),
-                         (4, TIER4_PRIMARY), (5, TIER5_LAST)):
-        if node in roster:
-            return (tier, roster.index(node))
-    return (6, 0)  # unlisted-but-reachable: sort after lumen, flag for review
+    """(tier, name): ops.maint_tier from the inventory; 6 = unlisted-but-reachable, sorts
+    after lumen, flagged for review."""
+    rec = inv.get(node)
+    return (inv.maint_tier(rec) if rec else 6.0, node)
 
 LANE_RANK = {"SEC": 0, "APP": 1, "APT": 2, "REBOOT": 3, "FW": 9}
 
@@ -274,12 +285,21 @@ def build_items(nodes, apps):
             items.append(it)
 
     # ABSENT — declared-absent nodes get an explicit line item, never a
-    # silent skip (A11 §5).
-    for n in DECLARED_ABSENT_DEFAULT:
-        if n in nodes and "unreachable" in nodes[n]:
-            items.append({
+    # silent skip (A11 §5). wq#1456: the inventory parks them (they are not probed
+    # at all any more), so the item says so; a probed-but-unreachable one keeps
+    # the probe's own reason.
+    for n in sorted(DECLARED_ABSENT_DEFAULT):
+        if n in nodes and "unreachable" not in nodes[n]:
+            continue  # reachable after all (e.g. --nodes override): it is a normal node this run
+        if n in nodes:
+            why = f"declared absent: {nodes[n]['unreachable']}"
+        else:
+            st = (inv.get(n) or {}).get("status") or {}
+            why = (f"declared absent per inventory: status={st.get('status')}, "
+                   f"monitor={str(st.get('monitor')).lower()} — not probed")
+        items.append({
                 "lane": "ABSENT", "node": n, "component": None, "current": None,
-                "target": None, "detail": f"declared absent: {nodes[n]['unreachable']}",
+                "target": None, "detail": why,
                 "advisory_id": None, "advisory_desc": None, "apply": "n/a",
                 "rollback": "n/a", "health_probe": "n/a", "backup_precondition": None,
             })
