@@ -160,6 +160,40 @@ def test_restart_allowed_for_node_with_no_never_row():
 
 
 # ---------------------------------------------------------------------------
+# allow.restart — opt-in allowlist on top of never.restart (wq#1484)
+# ---------------------------------------------------------------------------
+
+def test_restart_allow_section_hit():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"isis": ["ollama*", "node_exporter"]}}
+    ok, rule, _ = P.check_restart("isis", "ollama", policy)
+    assert ok, rule
+
+
+def test_restart_allow_section_miss():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"isis": ["ollama*"]}}
+    ok, rule, _ = P.check_restart("isis", "sshd", policy)
+    assert not ok
+    assert rule == "policy:restart_not_allowed"
+
+
+def test_restart_never_beats_allow():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"lumen": ["vaultwarden*"]}}
+    ok, rule, _ = P.check_restart("lumen", "vaultwarden", policy)
+    assert not ok
+    assert rule == "policy:never_restart"
+
+
+def test_restart_no_allow_section_unchanged():
+    assert "allow" not in POLICY
+    ok, rule, _ = P.check_restart("isis", "anything.service", POLICY)
+    assert ok, rule
+    assert rule == "policy:restart_allowed"
+
+
+# ---------------------------------------------------------------------------
 # sudo_argv_deny — v2, but the policy matrix is provable now
 # ---------------------------------------------------------------------------
 
@@ -297,6 +331,40 @@ def test_copy_denied_undeclared_dir():
     ok, rule, _ = P.check_copy("isis", "/etc", POLICY)
     assert not ok
     assert rule == "policy:copy_dir_not_allowed"
+
+
+# ---------------------------------------------------------------------------
+# check_ssh_node — opt-in allow.ssh gate (wq#1484), no caller wires it in yet
+# ---------------------------------------------------------------------------
+
+def test_ssh_allow_section_hit():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"ssh": ["isis", "sobek"]}
+    ok, rule, _ = P.check_ssh_node("isis", policy)
+    assert ok, rule
+
+
+def test_ssh_allow_section_miss():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"ssh": ["sobek"]}
+    ok, rule, _ = P.check_ssh_node("isis", policy)
+    assert not ok
+    assert rule == "policy:ssh_not_allowed"
+
+
+def test_ssh_never_beats_allow():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"ssh": ["thor"]}
+    ok, rule, _ = P.check_ssh_node("thor", policy)
+    assert not ok
+    assert rule == "policy:never_nodes"
+
+
+def test_ssh_no_allow_section_unchanged():
+    assert "allow" not in POLICY
+    ok, rule, _ = P.check_ssh_node("isis", POLICY)
+    assert ok, rule
+    assert rule == "policy:ssh_allowed"
 
 
 def test_copy_denied_unknown_node():

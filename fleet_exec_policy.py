@@ -209,7 +209,28 @@ def check_restart(node, unit, policy):
     for g in globs:
         if _pattern_ok(unit, g):
             return False, "policy:never_restart", f"{unit} matches never.restart[{node}]={g!r}"
+    # allow.restart is opt-in: a policy with no "allow" section (or no "restart" key
+    # under it) keeps the old default-allow behaviour. Once present, it's an
+    # allowlist — the unit must match one of the node's globs or it's denied.
+    allow = policy.get("allow", {})
+    if "restart" in allow:
+        allowed_globs = allow["restart"].get(node, [])
+        if not any(_pattern_ok(unit, g) for g in allowed_globs):
+            return False, "policy:restart_not_allowed", f"{unit} not in allow.restart[{node}]"
     return True, "policy:restart_allowed", unit
+
+
+def check_ssh_node(node, policy):
+    """Opt-in ssh gate against allow.ssh — no caller wires this in yet (fleet-exec's
+    CLI is untouched by wq#1484); it exists so a future caller can require an
+    explicit allow.ssh match instead of relying on never.nodes alone. Same
+    no-allow-section-means-unchanged default as check_restart."""
+    if node in THOR_HARDLOCK or node in policy["never"].get("nodes", []):
+        return False, "policy:never_nodes", f"{node} allows no ssh verb"
+    allow = policy.get("allow", {})
+    if "ssh" in allow and not any(_pattern_ok(node, g) for g in allow["ssh"]):
+        return False, "policy:ssh_not_allowed", f"{node} not in allow.ssh"
+    return True, "policy:ssh_allowed", node
 
 
 def check_power(node, policy):
