@@ -15,6 +15,11 @@ set -euo pipefail
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
+# lumen-bin branch-guard (wq#1476): refuse a commit made straight on the default branch. main advances only by
+# fast-forward after a PR merges (lumen-pr land). Runs first so a direct-to-main attempt is
+# refused before any test gate spends time. Logic + install/status live in .githooks/branch-guard.
+[ "${LUMEN_BRANCH_GUARD_RAN:-}" = 1 ] || "$REPO_ROOT/.githooks/branch-guard" commit || exit 1
+
 STAGED=$(git diff --cached --name-only)
 
 # wq#958: instincts-render is on every session's context path. If it ships broken, rules stop
