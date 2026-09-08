@@ -1,6 +1,6 @@
 #!/bin/bash
 # rotate-fleet-pw.sh — serialized fleet sudo-password rotation (wq#304 plan section 2, staged wq#305).
-# FRANK RUNS THIS. Invocation:  bash /home/lumen/bin/rotate-fleet-pw.sh [--revert NODE] [--include-khepri]
+# FRANK RUNS THIS. Invocation:  bash /home/lumen/bin/rotate-fleet-pw.sh [--include-bench] [--revert NODE] [--list]
 # Reads NEW pw from /home/lumen/secrets/.new_fleet_pw, OLD from /home/lumen/.fleet_pw.
 # The password value NEVER appears in argv, xtrace, or any echoed command line:
 #  - set +x enforced; values live only in shell variables inside this process
@@ -15,8 +15,29 @@ umask 077
 NEW_F=/home/lumen/secrets/.new_fleet_pw
 OLD_F=/home/lumen/.fleet_pw
 KEY=/home/lumen/.ssh/id_ed25519
-TKEY=/home/lumen/.ssh/thoth_ed25519
 SSHO="-o BatchMode=yes -o ConnectTimeout=10 -o PreferredAuthentications=publickey"
+FLEET_INV=${FLEET_INV:-/home/lumen/bin/fleet-inv}
+
+# wq#1456: the node table comes from the fleet inventory (`fleet-inv ssh-list`, DESIGN_SOT.md) —
+# no list lives here. This script deliberately uses ALL live statuses (--all), not MONITORED():
+# a parked/standby box (hathor, wadjet) still holds the OLD password and must be flipped, so it
+# is powered on for the rotation or the run HALTs at it — the fail-safe this script wants.
+# Decommissioned/dead/in-storage boxes (nephthys) are gone for good and never appear.
+#   --order maint  = blast-radius ascending per A11 §5 (ops.maint_tier), vault pair among the last
+#   --self LOCAL   = this host flips its own password locally (no ssh)
+#   ssh_key column = per-node key file (thoth: network.ssh.key); '-' = $KEY
+# Bench boxes (khepri) join only with --include-bench (alias --include-khepri; wq#304 section
+# 1.2: excluded until audited).   --list prints the resolved table and exits (no secrets read).
+STATUSES=active,standby
+case "${1:-}" in
+  --include-khepri|--include-bench) STATUSES=active,standby,bench; shift ;;
+esac
+ROSTER=$("$FLEET_INV" ssh-list --all --status "$STATUSES" --order maint --self LOCAL --fields name,user,host,ssh_key) \
+  || { echo "FATAL: fleet-inv ssh-list failed (inventory unreadable?) — no node table, nothing flipped"; exit 1; }
+[ -n "$ROSTER" ] || { echo "FATAL: empty roster from inventory — nothing flipped"; exit 1; }
+# node table: name|user|host|keyfile
+NODES=$(printf '%s\n' "$ROSTER" | awk -F'\t' -v k="$KEY" '{ kf=($4=="-")?k:$4; print $1"|"$2"|"$3"|"kf }')
+if [ "${1:-}" = "--list" ]; then printf '%s\n' "$NODES"; exit 0; fi
 
 [ -r "$NEW_F" ] || { echo "FATAL: $NEW_F missing/unreadable"; exit 1; }
 [ -r "$OLD_F" ] || { echo "FATAL: $OLD_F missing/unreadable"; exit 1; }
@@ -24,27 +45,6 @@ NEW=$(tr -d '\n' < "$NEW_F")
 OLD=$(tr -d '\n' < "$OLD_F")
 [ -n "$NEW" ] || { echo "FATAL: new pw empty"; exit 1; }
 [ "$NEW" != "$OLD" ] || { echo "FATAL: new == old"; exit 1; }
-
-# node table: name|user|host|keyfile   (order = blast-radius ascending, vault pair LAST)
-NODES="
-bes|bes|100.110.156.91|$KEY
-apep|apep|100.82.2.72|$KEY
-seshat|seshat|192.168.8.219|$KEY
-anubis|anubis|192.168.8.232|$KEY
-isis|isis|100.100.129.24|$KEY
-hathor|hathor|100.80.71.13|$KEY
-nephthys|nephthys|192.168.8.176|$KEY
-thor|thor|100.112.151.100|$KEY
-thoth|thoth|192.168.8.218|$TKEY
-lumen|lumen|LOCAL|-
-maat|maam|100.105.219.34|$KEY
-wadjet|wadjet|100.116.217.15|$KEY
-"
-# khepri excluded until audited (wq#304 section 1.2); --include-khepri appends it.
-case "${1:-}" in
-  --include-khepri) NODES="$NODES
-khepri|khepri|100.120.16.78|$KEY"; shift ;;
-esac
 
 REVERT_NODE=""
 if [ "${1:-}" = "--revert" ]; then

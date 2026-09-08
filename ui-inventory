@@ -8,7 +8,7 @@ SOURCES OF TRUTH (all read-only):
   - docker ps                     running containers
   - systemctl                     lumen-*.service units
   - ss -ltn                       local listeners
-  - lumen_state.py current        fleet nodes
+  - fleet inventory (machines/*.yaml, MONITORED)   fleet nodes  (wq#1456)
 
 The ONLY hand-maintained data here is PRESENTATION metadata (title/group) and
 the INFRA set (hostnames that are machine endpoints, not user-facing links).
@@ -25,7 +25,11 @@ CF_CONFIG   = Path("/etc/cloudflared/config.yml")
 GLANCE_YML  = Path("/home/lumen/glance/glance.yml")
 MC_LINKS_TS = Path("/home/lumen/mission-control/ui/src/lib/api.ts")
 OUT_JSON    = Path("/home/lumen/sentinel/ui_inventory.json")
-STATE_PY    = "/home/lumen/minerva/lumen_state.py"
+
+# wq#1456: fleet nodes come from the fleet inventory, not a lumen_state scrape.
+FLEET_INVENTORY_DIR = os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet/inventory")
+sys.path.insert(0, FLEET_INVENTORY_DIR)
+import fleet_inventory as inv  # noqa: E402
 
 # Machine endpoints — real services, deliberately NOT dashboard links.
 # Adding a hostname here is a deliberate act; anything not listed is user-facing.
@@ -142,20 +146,25 @@ def discover_listeners():
 
 
 def discover_nodes():
-    rc, out, _ = sh(["python3", STATE_PY, "current"], timeout=90)
+    """wq#1456: fleet nodes come from the fleet inventory (DESIGN_SOT.md), MONITORED() only, so a
+    decommissioned or parked box never reaches a dashboard. Same keys as the old lumen_state
+    scrape (tailscale_ip, lan_ip, role, status, hardware) so downstream readers are unchanged."""
+    try:
+        recs = inv.monitored()
+    except inv.InventoryError as e:
+        print(f"ui-inventory: inventory unreadable and no last-good roster: {e}", file=sys.stderr)
+        return {}
     nodes = {}
-    for line in (out or "").splitlines():
-        m = re.match(r"\s*([a-z0-9_.\-']+)\.([a-z0-9_\-]+)\s*=\s*(.*?)\s*\(since", line, re.I)
-        if not m:
-            continue
-        subj, pred, val = m.group(1), m.group(2), m.group(3)
-        if pred in ("tailscale_ip", "lan_ip", "role", "status", "hardware"):
-            nodes.setdefault(subj, {})[pred] = val
-    # a node is a subject with a tailscale ip; drop plugs/aliases
-    return {k: v for k, v in nodes.items()
-            if v.get("tailscale_ip") and not k.startswith(("tapo", "p1", "p2", "p3",
-                                                           "p4", "p5", "p6", "p7",
-                                                           "p8", "p9"))}
+    for rec in recs:
+        net, st, ident = rec.get("network") or {}, rec.get("status") or {}, rec.get("identity") or {}
+        nodes[ident["name"]] = {
+            "tailscale_ip": inv._clean(net.get("tailscale_ip")) or "",
+            "lan_ip": inv._clean(net.get("lan_ip")) or "",
+            "role": ", ".join(rec.get("roles") or []),
+            "status": st.get("status", ""),
+            "hardware": inv._clean(ident.get("make_model")) or "",
+        }
+    return nodes
 
 
 HOST_RE = re.compile(r"https?://([a-z0-9.\-]+\.lumennode\.uk)[^\s\"'<>)]*", re.I)

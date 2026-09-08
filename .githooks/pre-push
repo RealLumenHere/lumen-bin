@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# lumen-bin branch-guard (wq#1476): refuse any push that updates or deletes the default branch.
+# main advances only server-side via PR merge (lumen-pr land). Logic lives in .githooks/branch-guard.
+# Skips when the common-dir dispatcher (branch-guard install) already ran this check.
+[ "${LUMEN_BRANCH_GUARD_RAN:-}" = 1 ] && exit 0
+exec "$(git rev-parse --show-toplevel)/.githooks/branch-guard" push "$@"

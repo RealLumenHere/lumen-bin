@@ -1,12 +1,30 @@
 #!/usr/bin/env bash
 # fleet-keymesh — full-mesh SSH key trust + host aliases across the Lumen fleet.
 # Rerunnable/idempotent. Bootstrap auth: sshpass fleet password. wq#330-adjacent, 2026-07-18.
+#
+# wq#1456: the roster comes from the fleet inventory (`fleet-inv ssh-list`, DESIGN_SOT.md) —
+# no NODES list lives here. Every box whose status is active/standby/bench with a resolvable
+# user@tailscale_ip is meshed: parked standby boxes (hathor, wadjet) stay in so they rejoin the
+# mesh the day they are powered on (UNREACHABLE ones are skipped below, as before), while
+# decommissioned/dead/in-storage boxes (nephthys) never appear. Adding sobek (wq#1447) is now
+# one YAML edit, not a script edit.   `fleet-keymesh --list` prints the roster and exits.
 set -uo pipefail
-PASS="lumen2026!"
+FLEET_INV=${FLEET_INV:-/home/lumen/bin/fleet-inv}
+ROSTER=$("$FLEET_INV" ssh-list --all --status active,standby,bench) \
+  || { echo "fleet-keymesh: fleet-inv ssh-list failed — refusing to mesh without a roster" >&2; exit 1; }
+[ -n "$ROSTER" ] || { echo "fleet-keymesh: empty roster from inventory — refusing to run" >&2; exit 1; }
+if [ "${1:-}" = "--list" ]; then printf '%s\n' "$ROSTER"; exit 0; fi
+PASS=$(cat /home/lumen/.fleet_pw)  # rotated fleet pw lives in the 0600 file, never inline
 SSHOPTS="-o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new"
-NODES="lumen@100.117.66.102 anubis@100.121.17.5 apep@100.82.2.72 bes@100.110.156.91 hathor@100.80.71.13 isis@100.100.129.24 maam@100.105.219.34 nephthys@100.98.74.87 seshat@100.121.243.124 sia@100.111.15.120 thor@100.112.151.100 thoth@100.75.1.108 wadjet@100.116.217.15"
-# name for alias = username except maam->maat
-alias_of(){ [ "$1" = maam ] && echo maat || echo "$1"; }
+# NODES = user@host words (the shape the phases below loop over); ALIAS[user@host] = inventory
+# name, which is the ssh alias (maat, not its login user maam).
+declare -A ALIAS=()
+NODES=""
+while IFS=$'\t' read -r name tgt; do
+  [ -n "$name" ] || continue
+  ALIAS[$tgt]=$name; NODES="$NODES $tgt"
+done <<<"$ROSTER"
+alias_of(){ echo "${ALIAS[$1]:-${1%@*}}"; }
 TMP=$(mktemp -d); trap "rm -rf $TMP" EXIT
 echo "== Phase 1: ensure per-node key + harvest pubkeys =="
 OK_NODES=""
@@ -17,7 +35,7 @@ for n in $NODES; do
 done
 sort -u "$TMP/fleet_keys" -o "$TMP/fleet_keys"
 echo "== Phase 2: build alias config =="
-{ echo "# fleet-keymesh generated $(date +%F)"; for n in $NODES; do u=${n%@*}; h=${n#*@}; a=$(alias_of "$u"); printf "Host %s\n  HostName %s\n  User %s\n  StrictHostKeyChecking accept-new\n" "$a" "$h" "$u"; done; } > "$TMP/fleet_config"
+{ echo "# fleet-keymesh generated $(date +%F) from fleet inventory"; for n in $NODES; do u=${n%@*}; h=${n#*@}; a=$(alias_of "$n"); printf "Host %s\n  HostName %s\n  User %s\n  StrictHostKeyChecking accept-new\n" "$a" "$h" "$u"; done; } > "$TMP/fleet_config"
 echo "== Phase 3: distribute authorized_keys + config =="
 for n in $OK_NODES; do
   sshpass -p "$PASS" scp $SSHOPTS -q "$TMP/fleet_keys" "$TMP/fleet_config" "$n:/tmp/" && \
@@ -26,7 +44,7 @@ for n in $OK_NODES; do
 done
 echo "== Phase 4: verify mesh from this node =="
 for n in $OK_NODES; do
-  a=$(alias_of "${n%@*}")
+  a=$(alias_of "$n")
   r=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$a" "echo OK" 2>/dev/null)
   echo "  ssh $a -> ${r:-FAIL}"
 done

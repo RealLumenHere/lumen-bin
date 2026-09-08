@@ -58,15 +58,26 @@ G5_T1_S = int(os.environ.get("FLEET_MAINT_G5_T1_S", "60"))
 G5_T2_S = int(os.environ.get("FLEET_MAINT_G5_T2_S", "300"))
 
 # A11 §5 — "Fixed, encoded in the runner, not left to the assembler's judgement."
-NODE_ORDER = [
-    "gameboy", "apep", "thoth", "seshat", "sia",   # 1. leaf nodes first
-    "nephthys", "hathor", "isis",                   # 1b. inference leaf (Mac Pro trio)
-    "anubis", "bes",                                # 2. service nodes
-    "sobek", "wadjet",                              # 3. vault standby — the rehearsal
-    "maat",                                         # 4. vault primary — last among remote
-    "lumen",                                        # 5. runs the runner — always last
-    # thor excluded: Frank's workstation, never touched by maintenance
-]
+# wq#1456: the law is still fixed, but its per-node data lives in the fleet inventory
+# (ops.maint_tier in machines/<name>.yaml: 1 leaf · 1.5 inference leaf · 2 service · 3 vault
+# standby · 4 vault primary · 5 lumen, last; ties by name) and the membership is
+# fleet_inventory.maintenance_targets() — MONITORED, active, not governance.never_restart (thor).
+# A decommissioned box (nephthys) or a parked one (hathor, wadjet) is not in the order, so a
+# batch item naming it is refused by validate_batch below instead of being run.
+FLEET_INVENTORY_DIR = os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet/inventory")
+sys.path.insert(0, FLEET_INVENTORY_DIR)
+import fleet_inventory as inv  # noqa: E402
+
+
+def _node_order():
+    try:
+        return [n for n, _ in inv.maintenance_targets()]
+    except inv.InventoryError as e:
+        print(f"fleet-maint-run: inventory unreadable and no last-good roster: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+NODE_ORDER = _node_order()
 
 REQUIRED_FOR_APPLY = ("pre_state_cmd", "rollback_cmd", "rollback_dryrun_cmd")
 

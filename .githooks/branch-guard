@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# branch-guard — refuse commits and pushes that land straight on the default branch.
+#
+# WHY (wq#1476, Ticket B of /home/lumen/fleet/lumen-bin-hygiene-scope.md): /home/lumen/bin is
+# the canonical checkout AND the live running bin. Three times (wq#792, wq#794, wq#927) a
+# commit went straight onto its main with no branch and no PR; repo-sweep and
+# git-hygiene-sweep only found it hours later, after landed PRs were already undeployable.
+# Detection after the fact is the backstop. This is the prevention: main advances ONLY by
+# fast-forward after a PR merges (lumen-pr land does exactly that and never commits or
+# pushes main itself, so it is unaffected).
+#
+# Deterministic, no LLM, no env override. `--no-verify` still works and is still caught by
+# repo-sweep (wq#800) + git-hygiene-sweep, which is why they stay on their timers.
+#
+# Modes:
+#   branch-guard commit             (from a pre-commit hook) refuse if HEAD is on the default branch
+#   branch-guard push               (from a pre-push hook)   read pre-push stdin; refuse any update or
+#                                                            delete of the default branch
+#   branch-guard install [<repo>]   wire the guard into <repo>'s COMMON hooks dir (.git/hooks): thin
+#                                   pre-commit/pre-push dispatchers that run this guard, then chain to
+#                                   the tracked .githooks/<hook> the checked-out branch carries. Common-dir
+#                                   hooks apply to the primary tree AND every linked worktree whatever
+#                                   branch each is on, and touch no working-tree file (dropping files into
+#                                   the working tree's .githooks/ would block that tree's next checkout).
+#                                   Idempotent; backs up anything it replaces to /home/lumen/backups.
+#   branch-guard uninstall [<repo>] reverse install: remove the dispatchers, restore core.hooksPath
+#   branch-guard status  [<repo>]   report whether <repo> is guarded, and by which path
+#
+# The tracked copies (.githooks/pre-push and the block in .githooks/pre-commit) are the same guard
+# carried by the repo, for clones that use core.hooksPath=.githooks. They skip when the dispatcher
+# already ran (LUMEN_BRANCH_GUARD_RAN=1) so a guarded repo never runs the check twice.
+set -uo pipefail
+
+ZERO=0000000000000000000000000000000000000000
+BACKUP_DIR=/home/lumen/backups/lumen-bin-hooks
+MARK='# lumen-bin branch-guard (wq#1476)'
+
+repo_root() { git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null; }
+
+# Default branch = what origin/HEAD points at; main if that is unset. master always protected
+# too, so a repo whose origin/HEAD was never set cannot slip through on a naming difference.
+default_branch() {
+  local d
+  d=$(git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+  d=${d#origin/}
+  printf '%s\n' "${d:-main}"
+}
+is_protected() { [ "$1" = "$2" ] || [ "$1" = main ] || [ "$1" = master ]; }
+
+refuse() {
+  local root="$1" what="$2" branch="$3"
+  cat >&2 <<MSG
+branch-guard: REFUSED $what straight to '$branch' in $root
+  '$branch' advances only by fast-forward after a PR merges. Do the work on a branch in a worktree:
+    lumen-pr start $root <type>/<slug> --worktree
+    lumen-pr commit <worktree> "<type>(scope): subject" --refs wq#N
+    lumen-pr open   <worktree> --title "..." --body-file F
+    lumen-pr land   <worktree> <pr>
+  Nothing was changed. Staged work you already have here moves to a branch intact with:
+    git -C $root switch -c fix/<slug>
+  --no-verify is not a way around this: repo-sweep and git-hygiene-sweep still file a ticket
+  for an unpushed '$branch'.   (wq#1476, /home/lumen/fleet/lumen-bin-hygiene-scope.md)
+MSG
+  exit 1
+}
+
+cmd_commit() {
+  local root branch def
+  root=$(repo_root .) || exit 0
+  branch=$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null) || exit 0   # detached: not main
+  def=$(default_branch "$root")
+  is_protected "$branch" "$def" && refuse "$root" "commit" "$branch"
+  exit 0
+}
+
+cmd_push() {
+  local root def local_ref local_sha remote_ref remote_sha
+  root=$(repo_root .) || exit 0
+  def=$(default_branch "$root")
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${remote_ref:-}" ] || continue
+    case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac   # tags etc. are not branches
+    is_protected "${remote_ref#refs/heads/}" "$def" || continue
+    if [ "${local_sha:-}" = "$ZERO" ]; then
+      refuse "$root" "push (DELETE of ${remote_ref#refs/heads/})" "${remote_ref#refs/heads/}"
+    fi
+    refuse "$root" "push" "${remote_ref#refs/heads/}"
+  done
+  exit 0
+}
+
+# ── install / uninstall / status ────────────────────────────────────────────────────
+SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+WAS_FILE=lumen-branch-guard.hooksPath.was
+
+common_hooks() {   # absolute path of <repo>'s common hooks dir (shared by all its worktrees)
+  local c; c=$(cd "$1" && cd "$(git rev-parse --git-common-dir)" && pwd) || return 1
+  printf '%s/hooks\n' "$c"
+}
+
+backup() {   # backup <file> -> BACKUP_DIR/<name>.<ts>.bak ; prints the backup path
+  local f="$1" ts; [ -f "$f" ] || return 0
+  mkdir -p "$BACKUP_DIR"; ts=$(date +%Y%m%d_%H%M%S)
+  cp -p "$f" "$BACKUP_DIR/$(basename "$f").$ts.bak" && echo "  $(basename "$f"): backed up -> $BACKUP_DIR/$(basename "$f").$ts.bak"
+}
+
+# write_file <dst> <content-via-stdin>: no-op if identical; else backup + atomic replace.
+write_file() {
+  local dst="$1" tmp; tmp=$(mktemp "$(dirname "$dst")/.$(basename "$dst").XXXXXX") || return 1
+  cat > "$tmp"; chmod 0755 "$tmp"
+  if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then rm -f "$tmp"; echo "  $(basename "$dst"): current"; return 0; fi
+  backup "$dst"; mv -f "$tmp" "$dst" && echo "  $(basename "$dst"): installed"
+}
+
+dispatcher_precommit() { cat <<'D'
+#!/usr/bin/env bash
+# lumen-bin branch-guard dispatcher (wq#1476) — common-dir hook: runs for every worktree of this repo,
+# whatever branch it is on. Refuses a commit on the default branch, then chains to the tracked
+# .githooks/pre-commit the checked-out branch carries (wq#886 wq test gate etc.).
+# Managed by .githooks/branch-guard install|uninstall — do not hand-edit.
+set -uo pipefail
+H=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+"$H/branch-guard" commit || exit 1
+export LUMEN_BRANCH_GUARD_RAN=1
+T=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -x "$T/.githooks/pre-commit" ] && exec "$T/.githooks/pre-commit" "$@"
+exit 0
+D
+}
+dispatcher_prepush() { cat <<'D'
+#!/usr/bin/env bash
+# lumen-bin branch-guard dispatcher (wq#1476) — common-dir hook: runs for every worktree of this repo.
+# Refuses any push that updates or deletes the default branch, then chains to the tracked
+# .githooks/pre-push the checked-out branch carries, replaying the same stdin.
+# Managed by .githooks/branch-guard install|uninstall — do not hand-edit.
+set -uo pipefail
+H=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+IN=$(cat)
+printf '%s\n' "$IN" | "$H/branch-guard" push "$@" || exit 1
+export LUMEN_BRANCH_GUARD_RAN=1
+T=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -x "$T/.githooks/pre-push" ] && { printf '%s\n' "$IN" | exec "$T/.githooks/pre-push" "$@"; }
+exit 0
+D
+}
+
+cmd_install() {
+  local t hooks hp rc=0
+  t=$(repo_root "${1:-$SRC_DIR}") || { echo "branch-guard: not a git repo: ${1:-$SRC_DIR}" >&2; exit 2; }
+  hooks=$(common_hooks "$t") || exit 2
+  echo "branch-guard: installing into $hooks (common hooks dir of $t; source $SRC_DIR)"
+  mkdir -p "$hooks"
+  write_file "$hooks/branch-guard" < "$SRC_DIR/branch-guard" || rc=1
+  dispatcher_precommit | write_file "$hooks/pre-commit" || rc=1
+  dispatcher_prepush   | write_file "$hooks/pre-push"   || rc=1
+  hp=$(git -C "$t" config --get core.hooksPath 2>/dev/null || true)
+  if [ -n "$hp" ]; then
+    # hooksPath would route git AROUND the common dir. Unset it and remember what it was.
+    [ -f "$hooks/$WAS_FILE" ] || printf '%s\n' "$hp" > "$hooks/$WAS_FILE"
+    git -C "$t" config --unset core.hooksPath && echo "  core.hooksPath: unset (was '$hp'; recorded in $hooks/$WAS_FILE for uninstall)"
+  else
+    echo "  core.hooksPath: unset (current)"
+  fi
+  [ "$rc" = 0 ] && cmd_status "$t"
+  exit "$rc"
+}
+
+cmd_uninstall() {
+  local t hooks f
+  t=$(repo_root "${1:-$SRC_DIR}") || { echo "branch-guard: not a git repo: ${1:-$SRC_DIR}" >&2; exit 2; }
+  hooks=$(common_hooks "$t") || exit 2
+  echo "branch-guard: uninstalling from $hooks"
+  for f in pre-commit pre-push; do
+    if [ -f "$hooks/$f" ] && grep -q 'lumen-bin branch-guard dispatcher' "$hooks/$f"; then
+      backup "$hooks/$f"; rm -f "$hooks/$f"; echo "  $f: removed"
+    else echo "  $f: not ours, left alone"; fi
+  done
+  [ -f "$hooks/branch-guard" ] && { backup "$hooks/branch-guard"; rm -f "$hooks/branch-guard"; echo "  branch-guard: removed"; }
+  if [ -f "$hooks/$WAS_FILE" ]; then
+    git -C "$t" config core.hooksPath "$(cat "$hooks/$WAS_FILE")" && echo "  core.hooksPath: restored to '$(cat "$hooks/$WAS_FILE")'"
+    rm -f "$hooks/$WAS_FILE"
+  fi
+  echo "branch-guard: uninstalled from $t (tracked .githooks/ copies, if any, still guard clones that use core.hooksPath=.githooks)"
+}
+
+cmd_status() {
+  local t hooks hp def common_ok=1 tracked_ok=1
+  t=$(repo_root "${1:-$SRC_DIR}") || { echo "branch-guard: not a git repo: ${1:-$SRC_DIR}" >&2; exit 2; }
+  hooks=$(common_hooks "$t") || exit 2
+  hp=$(git -C "$t" config --get core.hooksPath 2>/dev/null || true)
+  def=$(default_branch "$t")
+  [ -x "$hooks/branch-guard" ] && grep -q 'lumen-bin branch-guard dispatcher' "$hooks/pre-commit" 2>/dev/null \
+    && grep -q 'lumen-bin branch-guard dispatcher' "$hooks/pre-push" 2>/dev/null && [ -x "$hooks/pre-commit" ] && [ -x "$hooks/pre-push" ] \
+    && common_ok=0
+  [ -x "$t/.githooks/branch-guard" ] && grep -qF "$MARK" "$t/.githooks/pre-commit" 2>/dev/null && [ -x "$t/.githooks/pre-push" ] \
+    && tracked_ok=0
+  if [ -z "$hp" ] && [ "$common_ok" = 0 ]; then
+    echo "branch-guard: GUARDED $t — common-dir dispatchers ($hooks), all worktrees, default branch '$def'"; return 0
+  elif [ "$hp" = ".githooks" ] && [ "$tracked_ok" = 0 ]; then
+    echo "branch-guard: GUARDED $t — tracked .githooks (this checkout only; hooksPath=.githooks), default branch '$def'"; return 0
+  fi
+  echo "branch-guard: NOT GUARDED $t — hooksPath='${hp:-unset}', common dispatchers $([ "$common_ok" = 0 ] && echo present || echo absent), tracked guard $([ "$tracked_ok" = 0 ] && echo present || echo absent)"
+  echo "  fix: $SRC_DIR/branch-guard install $t"
+  return 1
+}
+
+case "${1:-}" in
+  commit)    cmd_commit ;;
+  push)      cmd_push ;;
+  install)   cmd_install "${2:-}" ;;
+  uninstall) cmd_uninstall "${2:-}" ;;
+  status)    cmd_status "${2:-}"; exit $? ;;
+  *) echo "usage: branch-guard commit | push | install [<repo>] | uninstall [<repo>] | status [<repo>]" >&2; exit 2 ;;
+esac
