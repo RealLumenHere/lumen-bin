@@ -160,6 +160,76 @@ def test_restart_allowed_for_node_with_no_never_row():
 
 
 # ---------------------------------------------------------------------------
+# allow.restart / allow.ssh — broker enforces allow, not only the lint (wq#1484)
+# ---------------------------------------------------------------------------
+
+def test_allow_restart_hit():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"isis": ["ollama", "node_exporter*"]}}
+    ok, rule, _ = P.check_restart("isis", "node_exporter", policy)
+    assert ok, rule
+
+
+def test_allow_restart_miss():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"isis": ["ollama"]}}
+    ok, rule, _ = P.check_restart("isis", "anything.service", policy)
+    assert not ok
+    assert rule == "policy:restart_not_allowed"
+
+
+def test_allow_restart_miss_node_absent_from_allow_map():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"sobek": ["node_exporter"]}}
+    ok, rule, _ = P.check_restart("isis", "anything.service", policy)
+    assert not ok
+    assert rule == "policy:restart_not_allowed"
+
+
+def test_never_beats_allow_restart():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"restart": {"lumen": ["vaultwarden*"]}}
+    ok, rule, _ = P.check_restart("lumen", "vaultwarden", policy)
+    assert not ok
+    assert rule == "policy:never_restart"
+
+
+def test_no_allow_section_restart_unchanged():
+    assert "allow" not in POLICY
+    ok, rule, _ = P.check_restart("isis", "anything.service", POLICY)
+    assert ok, rule
+
+
+def test_allow_ssh_hit():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"ssh": ["isis", "sobek"]}
+    ok, rule, _ = P.check_ssh_node("isis", policy)
+    assert ok, rule
+
+
+def test_allow_ssh_miss():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"ssh": ["sobek"]}
+    ok, rule, _ = P.check_ssh_node("isis", policy)
+    assert not ok
+    assert rule == "policy:ssh_not_allowed"
+
+
+def test_never_beats_allow_ssh():
+    policy = json.loads(json.dumps(POLICY))
+    policy["allow"] = {"ssh": ["thor"]}
+    ok, rule, _ = P.check_ssh_node("thor", policy)
+    assert not ok
+    assert rule == "policy:never_nodes"
+
+
+def test_no_allow_section_ssh_unchanged():
+    assert "allow" not in POLICY
+    ok, rule, _ = P.check_ssh_node("isis", POLICY)
+    assert ok, rule
+
+
+# ---------------------------------------------------------------------------
 # sudo_argv_deny — v2, but the policy matrix is provable now
 # ---------------------------------------------------------------------------
 

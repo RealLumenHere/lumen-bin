@@ -209,7 +209,25 @@ def check_restart(node, unit, policy):
     for g in globs:
         if _pattern_ok(unit, g):
             return False, "policy:never_restart", f"{unit} matches never.restart[{node}]={g!r}"
+    allow_restart = policy.get("allow", {}).get("restart")
+    if allow_restart is not None:
+        node_allow = allow_restart.get(node, [])
+        if not any(_pattern_ok(unit, g) for g in node_allow):
+            return False, "policy:restart_not_allowed", \
+                f"{unit} not in allow.restart[{node}]={node_allow!r}"
     return True, "policy:restart_allowed", unit
+
+
+def check_ssh_node(node, policy):
+    """Broker-side allow.ssh gate — opt-in: only called by a caller that wants an
+    allowlist narrower than never.nodes. Absent allow.ssh, behaviour is unchanged."""
+    if node in THOR_HARDLOCK or node in policy["never"].get("nodes", []):
+        return False, "policy:never_nodes", f"{node} allows no verb except readonly run/copy"
+    allow_ssh = policy.get("allow", {}).get("ssh")
+    if allow_ssh is not None:
+        if not any(_pattern_ok(node, g) for g in allow_ssh):
+            return False, "policy:ssh_not_allowed", f"{node} not in allow.ssh={allow_ssh!r}"
+    return True, "policy:ssh_allowed", node
 
 
 def check_power(node, policy):
