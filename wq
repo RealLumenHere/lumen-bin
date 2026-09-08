@@ -124,6 +124,18 @@ ORCH_SESSION_MAX_TICKETS = _envint("WQ_ORCH_SESSION_MAX_TICKETS", 200)
 # wq#568: ntfy path is env-overridable so the probe can point it at a stub and PROVE the
 # notification fires, instead of asserting it from the source. Production never sets it.
 NTFY_BIN = os.environ.get("WQ_NTFY_BIN", "/home/lumen/bin/ntfy-send")
+# wq#1498: fworker.wq_identity(ticket_id) mints this STABLE per-ticket name (harness/fworker.py)
+# and claims under it on every attempt for that ticket — it is never a dead session, only ever a
+# currently-idle one. `wq retire` on it plants a permanent retired_sessions row that refuses
+# every FUTURE spawn for the same ticket too. Env-overridable so tests can probe the boundary
+# without hardcoding the shape twice.
+FWORKER_IDENTITY_RE = re.compile(
+    os.environ.get("WQ_FWORKER_IDENTITY_RE", r"^fworker-wq\d+$"))
+# wq#1498: `lumen-run list` unit column, e.g. "lumen-job-fworker-wq616-1786850106.service" —
+# mirrors harness/concurrency.py's UNIT_RE so a --dead-worker liveness check reads the exact
+# same signal the dispatcher's own concurrency cap does, instead of inventing a second one.
+LUMEN_RUN_UNIT_RE = re.compile(r"lumen-job-(?P<name>\S+?)-\d+\.service")
+LUMEN_RUN_BIN = os.environ.get("WQ_LUMEN_RUN_BIN", "/home/lumen/bin/lumen-run")
 SESSION_RE = re.compile(r"^(?P<base>.+)-(?P<sid>[0-9a-f]{6})$")
 STRICT = os.environ.get("WQ_STRICT", "").strip().lower() in ("1", "true", "yes")
 FMT = "%Y-%m-%d %H:%M:%S"
@@ -175,6 +187,61 @@ def configured_lanes():
         return set(cfg.get("lanes", {}).keys())
     except (OSError, ValueError):
         return None
+FOREMAN_MODELS_YAML = os.environ.get("FOREMAN_MODELS_YAML",
+                                     "/home/lumen/foreman/research/models.yaml")
+def known_models():
+    """wq#1442: alias/bare-shorthand -> full CLI id, mirrors orchestrator/router.py's
+    _build_aliases() (models[].id + models[].alias) so `wq add/edit --model` can
+    canonicalize a raw alias before it lands on a ticket. wq#1436/wq#1434 stored
+    '--model opus-5' verbatim; fworker.py handed that string straight to
+    `claude --model opus-5`, which 404s (model_not_found) since the CLI only knows
+    'claude-opus-5' — two attempts burned and UNKNOWN:CRASH before the router ever
+    got a chance to resolve it (router.resolve_alias only runs for tuples the
+    router itself assigns, not ones typed straight onto a ticket).
+
+    Returns (aliases, ids): aliases maps alias/shorthand -> full id, ids is the
+    full set of accepted ids (a full id is also valid input, mapping to itself).
+    None means the manifest couldn't be read — callers must fail OPEN (wq#912/
+    wq#1368 precedent): a missing/unreadable file never blocks `wq add`."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        with open(FOREMAN_MODELS_YAML) as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, ValueError):
+        return None
+    aliases, ids = {}, set()
+    for m in (data.get("models") or []):
+        mid = m.get("id")
+        if not mid:
+            continue
+        ids.add(mid)
+        alias = m.get("alias")
+        if alias:
+            aliases[alias] = mid
+        if mid.startswith("claude-"):
+            aliases[mid[len("claude-"):]] = mid
+    return aliases, ids
+def known_archetypes():
+    """wq#1368: archetypes with a live routing row in models.yaml — the set
+    orchestrator/router.py's Manifest.chain() can actually route a ticket through. None
+    means the manifest couldn't be read — callers must fail OPEN, same as
+    configured_lanes() (wq#912): a missing/unreadable file (or no PyYAML) never blocks
+    `wq add`/`wq edit`. wq#1358/#1359 carried archetype='build' (a LANE name, not an
+    archetype) straight onto a ticket the dispatcher could never route, which crashed
+    the whole dispatch pass until the dispatcher itself was hardened separately."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        with open(FOREMAN_MODELS_YAML) as f:
+            data = yaml.safe_load(f) or {}
+        return set((data.get("routing") or {}).keys())
+    except (OSError, ValueError):
+        return None
 def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
 def now(): return utcnow().strftime(FMT)
 def lease_from(minutes): return (utcnow() + datetime.timedelta(minutes=minutes)).strftime(FMT)
@@ -186,11 +253,23 @@ def parse_subs(s):
 # only — the CLI takes low|medium|high|xhigh|max, never integers (FOREMAN_RESEARCH §3).
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-def norm_tuple(model, effort):
+def norm_tuple(model, effort, force=False):
     model = (model or "").strip() or None
     effort = (effort or "").strip().lower() or None
     if model and not MODEL_RE.match(model):
         print(f"REFUSED: bad model id {model!r}"); sys.exit(2)
+    if model:
+        known = known_models()
+        if known is not None:
+            aliases, ids = known
+            canonical = aliases.get(model, model)
+            if canonical not in ids and not force:
+                print(f"REFUSED: model {model!r} has no entry in research/models.yaml "
+                      f"(wq#1442) — fworker would hand this straight to `claude --model` "
+                      f"and it 404s (model_not_found) unless it happens to already be a "
+                      f"full CLI id. Known aliases: {', '.join(sorted(aliases))}")
+                sys.exit(2)
+            model = canonical
     if effort and effort not in EFFORTS:
         print(f"REFUSED: effort must be one of {'|'.join(EFFORTS)} (names, never integers), got {effort!r}"); sys.exit(2)
     if effort and not model:
@@ -260,6 +339,14 @@ def init():
     if "response_ts"         not in cols: c.execute("ALTER TABLE tasks ADD COLUMN response_ts TEXT")
     if "review_verdict"      not in cols: c.execute("ALTER TABLE tasks ADD COLUMN review_verdict TEXT")
     if "review_reason"       not in cols: c.execute("ALTER TABLE tasks ADD COLUMN review_reason TEXT")
+    # wq#1461: soft intent marker for a ticket an orchestrator/fworker wants to build the moment
+    # its deps clear. Unlike a claim it is allowed on OPEN tickets whose deps are still unmet
+    # (claim --id already refuses those, wq#582, no --force) — it exists precisely to record
+    # "I'm going to build this" for the window between "deps unmet" and "deps met, claimable".
+    # ADDITIVE — NULL on every pre-existing row = no hold. Expires by TTL (hold_expires) and is
+    # cleared by claim/done/release (see cmd_claim, _finish).
+    if "hold_by"      not in cols: c.execute("ALTER TABLE tasks ADD COLUMN hold_by TEXT")
+    if "hold_expires" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN hold_expires TEXT")
     # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
     # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
     # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
@@ -400,6 +487,12 @@ def fence_guard(c, a, tid, action):
 
 # ---------------------------------------------------------------- wq#502 identity layer
 def warn(msg): sys.stderr.write(f"WARNING: {msg}\n")
+def eprint(*a, **k):
+    """wq#1479: a refusal is an error, and errors go to stderr. `wq done` used to print
+    REFUSED on stdout, so an orchestrator reading `tail -1` of a refused close saw the
+    last line of the explanation and reported two still-blocked tickets as done."""
+    k["file"] = sys.stderr
+    print(*a, **k)
 
 def is_session(c, ident):
     """Authoritative: a string is a session id ONLY if the registry says so. Never guess from
@@ -520,6 +613,38 @@ def release_session_holdings(c, sid):
     if locks:
         c.execute("DELETE FROM slocks WHERE holder=?", (sid,))
     return tickets, locks
+
+def holder_unit_running(name):
+    """wq#1498: is a live `lumen-job-<name>-<ts>.service` unit running right now, per
+    `lumen-run list`? Fails CLOSED (assume running) on any lumen-run trouble — a liveness
+    check that can't reach lumen-run must never be read as 'confirmed dead'."""
+    try:
+        import subprocess
+        p = subprocess.run([LUMEN_RUN_BIN, "list"], capture_output=True, text=True, timeout=15)
+    except Exception:
+        return True
+    if p.returncode != 0:
+        return True
+    for line in p.stdout.splitlines():
+        if "running" not in line:
+            continue
+        m = LUMEN_RUN_UNIT_RE.search(line)
+        if m and m.group("name") == name:
+            return True
+    return False
+
+def holder_is_dead(c, holder):
+    """wq#1498: the liveness check `wq release --dead-worker` uses instead of `wq retire` on a
+    per-ticket fworker identity. Dead means BOTH: no live agent_sessions row (fworker never
+    registers, so this alone can't distinguish idle-between-attempts from actually-dead), AND —
+    when the holder has the fworker-wq<id> shape — no running lumen-job-<holder>-<ts> unit per
+    `lumen-run list`. A holder that isn't the per-ticket shape has no unit-name signal to check,
+    so the session-row check is all that applies to it."""
+    if is_session(c, holder):
+        return False
+    if FWORKER_IDENTITY_RE.match(holder or "") and holder_unit_running(holder):
+        return False
+    return True
 
 def mark_retired(c, sid, base, kind, reason):
     c.execute("""INSERT INTO retired_sessions(session_id, base_name, retired_at, kind, reason)
@@ -749,10 +874,22 @@ def owner_ok(c, caller, claimed_by, action, tid):
     why = ("A registered session always knows its identity and has no excuse."
            if caller_is_session else
            "wq#1116: an unregistered caller may no longer write to another identity's LIVE claim.")
-    print(f"REFUSED: wq#{tid} is held by '{claimed_by}', you are '{caller}'.\n"
+    # wq#1498: fworker-wq<id> is the STABLE per-ticket identity, never a dead session — retiring
+    # it (the old advice below) poisons every future spawn of that ticket. Point at the release
+    # path instead: it verifies liveness and clears the claim without planting that marker.
+    if FWORKER_IDENTITY_RE.match(claimed_by or ""):
+        stale_hint = (f"  `wq release {tid} --dead-worker` releases it on the record once "
+                      f"liveness is verified (no live session, no running unit) — do NOT\n"
+                      f"  `wq retire {claimed_by}`: that is a per-ticket identity, not a dead "
+                      f"session, and retiring it refuses every future spawn of wq#{tid} too "
+                      f"(wq#1498).")
+    else:
+        stale_hint = (f"  `wq retire {claimed_by}` to revert its claims and drop its slocks on "
+                      f"the record.")
+    eprint(f"REFUSED: wq#{tid} is held by '{claimed_by}', you are '{caller}'.\n"
           f"  An agent may never {action} another session's claim. {why}\n"
           f"  If that session is dead, let its lease expire (auto-reverts to open), or\n"
-          f"  `wq retire {claimed_by}` to revert its claims and drop its slocks on the record.\n"
+          f"{stale_hint}\n"
           f"  If you ARE that worker: register first — wq whoami --register <your-agent-name>\n"
           f"  — so your identity survives across wq invocations instead of changing every call.")
     return False
@@ -937,6 +1074,94 @@ def cmd_whoami(a):
     print(f"export WQ_AGENT={sid}")
     print("^ put that in your env; claim/heartbeat/done/release/slock will use it automatically.")
 
+# --- wq#1478 liveness gate helpers ---
+LIVENESS_HARNESS = os.environ.get("FOREMAN_HARNESS", "/home/lumen/foreman/harness")
+LIVENESS_AGENT_BASES = ("liveness-clear", "liveness-clear-test")
+
+def _liveness_module():
+    """Lazy import of harness/liveness_clear.py. None when the harness is not there —
+    every caller is fail-OPEN on None (a missing harness must never block filing a
+    ticket, same shape as configured_lanes())."""
+    try:
+        sys.path.insert(0, LIVENESS_HARNESS)
+        sys.path.insert(0, os.path.join(os.path.dirname(LIVENESS_HARNESS), "dispatcher"))
+        import liveness_clear  # noqa: E402
+        return liveness_clear
+    except Exception as e:  # noqa: BLE001
+        warn(f"liveness gate unavailable ({e.__class__.__name__}: {e}) — filing without it")
+        return None
+
+def _liveness_creation_check(title, detail, lane, frank_gated, force=False, verb="add"):
+    """Refuse (exit 1) a Frank-gate whose premise is already met; warn on a tagless one.
+    FOREMAN_LIVENESS_CLEAR=0 -> warn-only. --force files it with the verdict printed."""
+    lc = _liveness_module()
+    if lc is None:
+        return
+    try:
+        ok, verdict, msg = lc.creation_check(title, detail, lane, frank_gated)
+    except Exception as e:  # noqa: BLE001
+        warn(f"liveness creation check crashed ({e!r}) — filing without it"); return
+    if verdict == "NOT_GATED":
+        return
+    if ok:
+        if verdict == "NO_TAG":
+            warn(f"liveness: {msg}")
+        elif msg:
+            print(f"liveness: {verdict} — {msg}")
+        return
+    if force or os.environ.get("FOREMAN_LIVENESS_CLEAR", "1") == "0":
+        warn(f"liveness {verdict} overridden ({'--force' if force else 'FOREMAN_LIVENESS_CLEAR=0'}): {msg}")
+        return
+    eprint(f"REFUSED: wq#1478 liveness gate — {verb} not done. {msg}")
+    eprint("  A Frank-gate whose premise is already met on live state is the redo loop; fix the")
+    eprint("  premise (or the Liveness: line) instead. --force files it anyway, on the record.")
+    sys.exit(6)
+
+def cmd_liveness_close(a):
+    """wq#1478 Slice 3: close a Frank-gated ticket whose Liveness: premise is SATISFIED.
+    No claim (user lane stays never-agent-claimable); instead THREE narrow guards:
+    caller base must be liveness-clear, the ticket must carry a Liveness: line (or a
+    ledger binding named on the call), status must be one that Frank would see.
+    notes gets the probe verdict verbatim in the wq#759 [NO-ARTIFACT: ...] shape."""
+    ping("liveness-close")
+    caller, _ = resolve_identity(a)
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    base = base_of(c, caller) or caller
+    if base.split("-")[0:2] not in [b.split("-")[0:2] for b in LIVENESS_AGENT_BASES]:
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: liveness-close is for the liveness-clear identity only (caller {caller!r})")
+        sys.exit(1)
+    r = c.execute("SELECT status, detail, notes, lane FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not r:
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {a.id}"); sys.exit(1)
+    st, detail, prev_notes, lane = r
+    if st == 'done':
+        c.execute("COMMIT"); c.close(); print(f"already done wq#{a.id}"); return
+    if st not in ('open', 'blocked', 'frank_gated', 'pending_review'):
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: wq#{a.id} is {st!r} — liveness-close only acts on open/blocked/frank_gated/pending_review")
+        sys.exit(1)
+    has_line = "Liveness:" in (detail or "")
+    if not has_line and not getattr(a, "binding", None):
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: wq#{a.id} has no Liveness: line and no --binding was named — nothing proves the premise")
+        sys.exit(1)
+    verdict = (a.verdict or "").strip()
+    if not verdict or "SATISFIED" not in verdict:
+        c.execute("COMMIT"); c.close()
+        eprint("REFUSED: --verdict must carry the probe's SATISFIED detail verbatim"); sys.exit(1)
+    src = "Liveness: line" if has_line else f"ledger binding {a.binding}"
+    stamped = f"[{now()}] [liveness auto-clear wq#1478] from {st} via {src} [NO-ARTIFACT: liveness: {verdict}]"
+    notes = ((prev_notes + "\n") if prev_notes else "") + stamped
+    clr = lease_clear_sql(c)
+    c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, claimed_by=?, lease_expires=NULL, "
+              f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, hold_by=NULL, hold_expires=NULL{clr} "
+              f"WHERE id=?", (now(), notes, caller, a.id))
+    c.execute("COMMIT"); c.close()
+    print(f"liveness-closed wq#{a.id} ({lane}/{st} -> done): {verdict[:160]}")
+# --- end wq#1478 helpers ---
+
 def cmd_add(a):
     subs = parse_subs(a.subsystems)
     bad = [s for s in subs if s not in CANON_SUBSYSTEMS]
@@ -954,6 +1179,19 @@ def cmd_add(a):
               f"Exempt (deliberately unlisted): {', '.join(sorted(LANE_EXEMPT))}\n"
               f"Use an existing lane, add one to dispatcher/config.json first, or --force to override.")
         sys.exit(1)
+    # wq#1368: refuse an archetype with no routing row — the dispatcher would never be
+    # able to route this ticket (it used to crash the whole pass on this exact shape;
+    # the dispatcher is now hardened too, but a ticket that can never route is still a
+    # ticket that never dispatches). Same fail-open shape as the wq#912 lane check above.
+    if a.archetype:
+        archs = known_archetypes()
+        if archs is not None and a.archetype not in archs and not a.force:
+            print(f"REFUSED: archetype {a.archetype!r} has no routing row in models.yaml — "
+                  f"the dispatcher would never be able to route this ticket (wq#1368).")
+            print(f"Known archetypes: {', '.join(sorted(archs))}\n"
+                  f"Omit --archetype to let the router classify it, use a known one, or "
+                  f"--force to override.")
+            sys.exit(1)
     c = conn()
     if not a.force:
         nt = norm_title(a.title)
@@ -962,11 +1200,13 @@ def cmd_add(a):
             if norm_title(rtitle) == nt:
                 print(f"DUPLICATE — task {rid} [{rlane}/{rstatus}] already has this title:\n  {rtitle}\nUse --force to add anyway.")
                 c.close(); sys.exit(1)
-    model, effort = norm_tuple(a.model, a.effort)
+    model, effort = norm_tuple(a.model, a.effort, force=a.force)
     # wq#662: --frank-gated implies gate_type=frank_decision and status=frank_gated
     frank_gated = getattr(a, "frank_gated", False)
     gate_type = getattr(a, "gate_type", None) or ("frank_decision" if frank_gated else None)
     init_status = "frank_gated" if frank_gated else "open"
+    # wq#1478: creation gate — a Frank-gate whose premise is already met is not filed
+    _liveness_creation_check(a.title, a.detail, a.lane, frank_gated, force=a.force, verb="add")
     needs_val = getattr(a, "needs", None)
     if needs_val is not None:
         check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
@@ -1047,9 +1287,9 @@ def cmd_claim(a):
             + (" on the PROVISIONAL window (no wq call ever followed the claim)" if never_promoted else ""))
     reclaimed = len(expired)
     c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
-    rows = c.execute("SELECT id,deps,subsystems,gate,title FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(lane,)).fetchall()
+    rows = c.execute("SELECT id,deps,subsystems,gate,title,hold_by,hold_expires FROM tasks WHERE lane=? AND status='open' ORDER BY pri ASC, id ASC",(lane,)).fetchall()
     pick = None; picked_subs = []; skips = []; head_notice = None
-    def _eligible(rid, deps, subsystems, gate, title):
+    def _eligible(rid, deps, subsystems, gate, title, hold_by=None, hold_expires=None):
         """wq#582: ONE eligibility ruling for the lane scan, the --id check and the head
         notice. Returns (ok, why, subs, silent) — silent marks deps-unmet, which the scan has
         always passed over without a skip line. A second copy of these checks is how the
@@ -1059,6 +1299,11 @@ def cmd_claim(a):
         # rather than written down, because written down is what failed.
         if (title or "").lstrip().upper().startswith("[DRAFT]"):
             return False, "[DRAFT] — not claimable until the prefix is removed", [], False
+        # wq#1461: a live hold from a DIFFERENT agent blocks claim outright — the whole point
+        # is that only the holder (or an expired hold) may claim. Checked before deps so the
+        # hold reason surfaces even while the ticket is still deps-blocked.
+        if hold_by and hold_expires and hold_expires >= t_now and hold_by != agent:
+            return False, f"held by '{hold_by}' until {hold_expires}Z (wq hold, wq#1461)", [], False
         if not deps_met(c, deps):
             return False, f"deps not met ({deps})", [], True
         ok, why = gate_met(gate)
@@ -1073,9 +1318,9 @@ def cmd_claim(a):
         # Fresh read AFTER housekeeping — the reclaim pass above may just have reverted the
         # target's own expired lease to open, and that is the intended path for taking over a
         # dead session's specific ticket: reclaimed LOUDLY above, then claimed here.
-        rid, st_now, holder, deps, subsystems, gate, title = c.execute(
-            "SELECT id, status, claimed_by, deps, subsystems, gate, title FROM tasks WHERE id=?",
-            (target_id,)).fetchone()
+        rid, st_now, holder, deps, subsystems, gate, title, hold_by, hold_expires = c.execute(
+            "SELECT id, status, claimed_by, deps, subsystems, gate, title, hold_by, hold_expires "
+            "FROM tasks WHERE id=?", (target_id,)).fetchone()
         refuse = None; ok_subs = []
         if st_now == 'claimed':
             refuse = f"held by '{holder}' with a live lease — wq#502: never take another session's claim"
@@ -1090,7 +1335,7 @@ def cmd_claim(a):
         elif st_now != 'open':
             refuse = f"status={st_now}"
         else:
-            ok, why, ok_subs, _silent = _eligible(rid, deps, subsystems, gate, title)
+            ok, why, ok_subs, _silent = _eligible(rid, deps, subsystems, gate, title, hold_by, hold_expires)
             if not ok:
                 refuse = why
         if refuse:
@@ -1101,16 +1346,16 @@ def cmd_claim(a):
             print("  there is deliberately no --force.")
             sys.exit(1)
         pick = rid; picked_subs = ok_subs
-        for h_rid, h_deps, h_ss, h_gate, h_title in rows:
-            h_ok, _w, _s, _sil = _eligible(h_rid, h_deps, h_ss, h_gate, h_title)
+        for h_rid, h_deps, h_ss, h_gate, h_title, h_hold_by, h_hold_exp in rows:
+            h_ok, _w, _s, _sil = _eligible(h_rid, h_deps, h_ss, h_gate, h_title, h_hold_by, h_hold_exp)
             if h_ok:
                 if h_rid != pick:
                     head_notice = (f"NOTICE: out-of-order claim — lane '{lane}' head is "
                                    f"#{h_rid}; wq#{pick} was claimed BY ID (wq#582), on the record.")
                 break
     else:
-        for rid, deps, subsystems, gate, title in rows:
-            ok, why, subs, silent = _eligible(rid, deps, subsystems, gate, title)
+        for rid, deps, subsystems, gate, title, hold_by, hold_expires in rows:
+            ok, why, subs, silent = _eligible(rid, deps, subsystems, gate, title, hold_by, hold_expires)
             if not ok:
                 if not silent:
                     skips.append(f"#{rid} {why}")
@@ -1147,7 +1392,8 @@ def cmd_claim(a):
         won = c.execute(
             """UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
                    lease_ttl=?, lease_owner=?, lease_expires_at=?,
-                   fence=COALESCE(fence,0)+1, attempt=COALESCE(attempt,0)+1
+                   fence=COALESCE(fence,0)+1, attempt=COALESCE(attempt,0)+1,
+                   hold_by=NULL, hold_expires=NULL
                WHERE id=? AND (status='open'
                                OR (status='claimed'
                                    AND COALESCE(lease_expires_at,0) < unixepoch()
@@ -1164,7 +1410,8 @@ def cmd_claim(a):
         fence = won[1]
     else:
         c.execute("""UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
-                     lease_ttl=? WHERE id=?""", (agent, t_now, lease, a.ttl, pick))
+                     lease_ttl=?, hold_by=NULL, hold_expires=NULL WHERE id=?""",
+                  (agent, t_now, lease, a.ttl, pick))
     if picked_subs:
         acquire_subs(c, picked_subs, agent, prov, f"wq#{pick}")
     c.execute("COMMIT")
@@ -1448,7 +1695,7 @@ def cmd_heartbeat(a):
     r = c.execute("SELECT status, claimed_by, subsystems FROM tasks WHERE id=?", (a.id,)).fetchone()
     if not r or r[0] != 'claimed':
         c.execute("COMMIT"); c.close()
-        print(f"REFUSED: task {a.id} is not claimed (status={r[0] if r else 'missing'})"); sys.exit(1)
+        eprint(f"REFUSED: task {a.id} is not claimed (status={r[0] if r else 'missing'})"); sys.exit(1)
     caller, _ = resolve_identity(a)
     if not owner_ok(c, caller, r[1], "heartbeat", a.id):
         c.execute("COMMIT"); c.close(); sys.exit(1)
@@ -1633,10 +1880,29 @@ def _finish(a, new_status):
     c.execute("BEGIN IMMEDIATE")
     r = c.execute("SELECT claimed_by, subsystems, status FROM tasks WHERE id=?", (a.id,)).fetchone()
     if r is None:
-        c.execute("COMMIT"); c.close(); print(f"REFUSED: no such task {a.id}"); sys.exit(1)
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {a.id}"); sys.exit(1)
     caller, _ = resolve_identity(a)
-    if not owner_ok(c, caller, r[0], new_status if new_status != 'open' else 'release', a.id):
-        c.execute("COMMIT"); c.close(); sys.exit(1)
+    holder = r[0]
+    if not owner_ok(c, caller, holder, new_status if new_status != 'open' else 'release', a.id):
+        # wq#1498: `wq release --dead-worker` is the stale-claim path owner_ok's refusal text
+        # now recommends INSTEAD of `wq retire` for a per-ticket fworker identity — retiring
+        # that identity poisons every future spawn of the ticket, this does not. Only reachable
+        # for release (new_status == 'open'), only when the caller declared it explicitly, and
+        # only honored once holder_is_dead() has independently verified the holder is gone.
+        dead_worker = new_status == 'open' and getattr(a, 'dead_worker', False)
+        if dead_worker and holder and holder != caller and holder_is_dead(c, holder):
+            warn(f"wq#{a.id}: holder '{holder}' verified dead (no live session"
+                 + (", no running unit" if FWORKER_IDENTITY_RE.match(holder) else "")
+                 + f") — releasing under --dead-worker on behalf of '{caller}' (wq#1498).")
+            log_activity(c, caller, f"dead-worker-release:{holder}")
+        elif dead_worker:
+            c.execute("COMMIT"); c.close()
+            eprint(f"REFUSED: wq#{a.id} held by '{holder}' — --dead-worker liveness check found "
+                  f"it still alive (a live session row, or a running lumen-job-{holder}-* unit "
+                  f"per `lumen-run list`). Not releasing.")
+            sys.exit(1)
+        else:
+            c.execute("COMMIT"); c.close(); sys.exit(1)
     # wq#1116: `done` REPLACES notes wholesale, so a second close silently destroys the first
     # one's evidence — that is how session A's `wq done 1096` erased session B's note two minutes
     # after B had already closed it. Identity does not enter into this: re-closing a ticket that
@@ -1647,7 +1913,7 @@ def _finish(a, new_status):
         reclose = getattr(a, "reclose", None)
         if not reclose:
             c.execute("COMMIT"); c.close()
-            print(f"REFUSED: wq#{a.id} is already done (closed {prev[0]}Z) and `done` REPLACES\n"
+            eprint(f"REFUSED: wq#{a.id} is already done (closed {prev[0]}Z) and `done` REPLACES\n"
                   f"  notes, so this call would destroy the evidence already on the record:\n"
                   f"    {(prev[1] or '(empty)')[:200]}\n"
                   f"  If you closed this and the notes need correcting, say so on the record:\n"
@@ -1670,11 +1936,13 @@ def _finish(a, new_status):
     clr = lease_clear_sql(c)
     if new_status == 'done':
         cur = c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL, "
-                        f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL{clr} WHERE id=?{fcl}",
+                        f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, hold_by=NULL, "
+                        f"hold_expires=NULL{clr} WHERE id=?{fcl}",
                         [now(), getattr(a,'notes','') or '', a.id] + fpar)
     elif new_status == 'open':
         cur = c.execute(f"UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
-                        f"lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL"
+                        f"lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, "
+                        f"hold_by=NULL, hold_expires=NULL"
                         f"{clr} WHERE id=?{fcl}", [a.id] + fpar)
     elif new_status == 'blocked':
         # wq#741: block_reason/blocked_at are the structural home for this — notes keeps
@@ -1684,7 +1952,7 @@ def _finish(a, new_status):
                         [a.reason, a.reason, now(), a.id] + fpar)
     if cur.rowcount == 0:
         c.execute("ROLLBACK"); c.close()
-        print(f"REFUSED: {new_status} on wq#{a.id} matched no row under fence "
+        eprint(f"REFUSED: {new_status} on wq#{a.id} matched no row under fence "
               f"{getattr(a,'fence',None)} — the claim moved while this call was in flight "
               f"(wq#1158)."); sys.exit(5)
     reopened = bump_reopened(c, a.id) if is_reopen(r[2], new_status) else 0
@@ -1698,7 +1966,7 @@ def cmd_done(a):
     else:
         ok, kind, detail = find_artifact(notes)
         if not ok:
-            print(f"REFUSED: wq#759 evidence gate — task {a.id} not closed. `done` requires "
+            eprint(f"REFUSED: wq#759 evidence gate — task {a.id} not closed. `done` requires "
                   f"--notes naming a verifiable artifact (an existing file path, a PR/commit "
                   f"URL, or a commit sha) or an explicit --no-artifact \"<reason>\" recorded "
                   f"on the ticket. Got notes={notes!r}.")
@@ -1708,7 +1976,7 @@ def cmd_done(a):
             unmerged = getattr(a, "unmerged", None)
             verdict, why = pr_merge_state(detail)
             if verdict == "open" and not unmerged:
-                print(f"REFUSED: wq#899 merge-state gate — task {a.id} not closed. Its evidence "
+                eprint(f"REFUSED: wq#899 merge-state gate — task {a.id} not closed. Its evidence "
                       f"is a pull request that has not landed: {why}. A PR URL proves a branch "
                       f"exists, not that the work is on main — a clean checkout would lose it. "
                       f"Land the PR and re-run `wq done`, or, if the PR is a stale reference and "
@@ -1728,6 +1996,41 @@ def cmd_done(a):
 def _reopen_tag(n): return f" [REOPENED — reopened_count={n}]" if n else ""
 def cmd_release(a): print(f"released {a.id} (subsystem locks released){_reopen_tag(_finish(a, 'open'))}")
 def cmd_block(a):   print(f"blocked {a.id}: {a.reason} (subsystem locks released){_reopen_tag(_finish(a, 'blocked'))}")
+def cmd_hold(a):
+    """wq#1461: soft intent marker for a ticket whose deps are unmet — 'wq claim --id' already
+    refuses those with no --force (wq#582), so an orchestrator directed to build one had no way
+    to record intent before this. Allowed on ANY status='open' ticket (deps met or not); NOT a
+    claim, acquires no lease/subsystem locks. Only the holder (or an expired hold) may re-hold or
+    claim over it — see the hold_by check in cmd_claim's _eligible(). Cleared by claim/done/
+    release; otherwise expires on its own after --ttl minutes."""
+    ping("hold")
+    agent, _ = resolve_identity(a)
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    t_now = now()
+    row = c.execute("SELECT id, lane, status, hold_by, hold_expires FROM tasks WHERE id=?",
+                     (a.id,)).fetchone()
+    if not row:
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {a.id}"); sys.exit(1)
+    rid, lane, status, hold_by, hold_expires = row
+    if lane == 'user':
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} is in the 'user' lane — Frank-only, never agent-holdable")
+        sys.exit(1)
+    if status != 'open':
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: cannot hold wq#{a.id} — status={status} (hold is for open tickets only, "
+              f"deps-blocked included; a claimed/done/blocked ticket needs no intent marker)")
+        sys.exit(1)
+    live = bool(hold_expires) and hold_expires >= t_now
+    if live and hold_by != agent:
+        c.execute("COMMIT"); c.close()
+        print(f"REFUSED: wq#{a.id} is already held by '{hold_by}' until {hold_expires}Z")
+        sys.exit(1)
+    exp = lease_from(a.ttl)
+    c.execute("UPDATE tasks SET hold_by=?, hold_expires=? WHERE id=?", (agent, exp, a.id))
+    c.execute("COMMIT"); c.close()
+    print(f"HELD wq#{a.id} by '{agent}' until {exp}Z (ttl {a.ttl}m)")
 def cmd_preflight(a):
     """Ad-hoc guard: warn if about to touch subsystems with no held lock for this holder."""
     holder = a.holder or os.environ.get("WQ_AGENT", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
@@ -1768,6 +2071,12 @@ def cmd_decide(a):
         print(f"REFUSED: wq#{a.id} is {st!r} — decide only acts on frank_gated tickets"); sys.exit(1)
     prompt = (a.prompt or "").strip()
     rec    = (a.rec or "").strip()
+    # wq#1478: decide gate — queueing a question whose answer is on disk is the redo loop
+    _lc_row = c.execute("SELECT title, detail, lane FROM tasks WHERE id=?", (a.id,)).fetchone()
+    c.execute("COMMIT"); c.close()
+    _liveness_creation_check(_lc_row[0], _lc_row[1], _lc_row[2], True, verb="decide")
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
     if not prompt:
         c.execute("COMMIT"); c.close()
         print("REFUSED: --prompt is required (the decision question + options)"); sys.exit(1)
@@ -1939,6 +2248,15 @@ def cmd_edit(a):
     needs_val = getattr(a, "needs", None)
     if needs_val is not None:
         check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
+    # wq#1368: same routing-row check as cmd_add, fail-open on an unreadable manifest.
+    # '' clears the archetype (falls back to classify_archetype at dispatch) and is
+    # always allowed — only a non-empty, unroutable value is refused.
+    if a.archetype:
+        archs = known_archetypes()
+        if archs is not None and a.archetype not in archs:
+            print(f"REFUSED: archetype {a.archetype!r} has no routing row in models.yaml "
+                  f"(wq#1368). Known archetypes: {', '.join(sorted(archs))}")
+            c.close(); sys.exit(1)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
@@ -1971,6 +2289,20 @@ def cmd_retire(a):
     reason = (a.reason or "retired by operator").strip()
     if not target:
         print("REFUSED: retire needs a session id or base name"); sys.exit(1)
+    # wq#1498: fworker-wq<id> is fworker.wq_identity(ticket_id) — the STABLE name every future
+    # attempt at this ticket claims under, never a dead session. Retiring it plants a permanent
+    # retired_sessions row that STOP-banners every future spawn of the same ticket. This is
+    # exactly the shape that made two orchestrator sessions hand-delete retired_sessions rows on
+    # 2026-09-08 after following owner_ok's own (now-fixed) advice to retire it.
+    if FWORKER_IDENTITY_RE.match(target) and not getattr(a, "dead_worker", False):
+        print(f"REFUSED: '{target}' is a per-ticket fworker identity (fworker.wq_identity()), "
+              f"not a dead session — retiring it would refuse every FUTURE spawn of this ticket "
+              f"too (wq#1498). For a stale claim under this name, use "
+              f"`wq release <ticket-id> --dead-worker` instead: it verifies liveness (no live "
+              f"session, no running unit) and releases the claim on the record without "
+              f"poisoning the identity. Pass --dead-worker here only if you really mean to "
+              f"permanently retire this identity.")
+        sys.exit(1)
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
     sids = [r[0] for r in c.execute(
@@ -2175,19 +2507,22 @@ s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/ac
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_heartbeat)
 s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
-s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_release)
+s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: release a claim held by a DIFFERENT identity if, and only if, it verifiably has no live session and (for fworker-wq<id>) no running unit — the stale-claim path that does not poison a per-ticket identity the way `wq retire` does"); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_block)
+s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)
 s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, and a check-then-create PR lookup"); s.add_argument("kind",choices=["branch","path","pr"]); s.add_argument("id",type=int); s.add_argument("--type",default="feat",help="Conventional Commit type for the branch (default feat)"); s.add_argument("--branch",default=None,help="override the derived branch for the pr check"); s.set_defaults(f=cmd_idem)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.add_argument("--json",action="store_true",help="wq#1277: emit the row as a single JSON object — safe for multi-line detail fields; plain text truncates/mis-parses embedded newlines"); s.set_defaults(f=cmd_show)
 s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("note",help="wq#1331: APPEND one timestamped line to notes (never overwrites)"); s.add_argument("id",type=int); s.add_argument("text"); s.set_defaults(f=cmd_note)
-s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.set_defaults(f=cmd_retire)
+s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: required to retire a fworker-wq<id> per-ticket identity — confirms you mean to permanently poison future spawns of that ticket, not just clear a stale claim (use `wq release --dead-worker` for that instead)"); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
 s=sub.add_parser("closure-quality",help="wq#759: evidence-quality trend per lane per week"); s.add_argument("--lane",default=None); s.add_argument("--weeks",type=int,default=8); s.set_defaults(f=cmd_closure_quality)
 # wq#662: Frank-decision gate protocol
 s=sub.add_parser("decide",help="wq#662 ORCH: set decision_prompt+rec on frank_gated ticket, advance to pending_review"); s.add_argument("id",type=int); s.add_argument("--prompt",required=True,help="the decision question + options Frank must address"); s.add_argument("--rec",required=True,help="ORCH recommendation with reasoning"); s.set_defaults(f=cmd_decide)
+# wq#1478: liveness-close verb
+s=sub.add_parser("liveness-close",help="wq#1478: close a Frank-gated ticket whose Liveness: premise is SATISFIED on live state (liveness-clear identity only, no claim)"); s.add_argument("id",type=int); s.add_argument("--verdict",required=True,help="the probe verdict text, verbatim, must contain SATISFIED"); s.add_argument("--binding",default=None,help="ledger binding used when the ticket has no Liveness: line"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_liveness_close)
 s=sub.add_parser("answer",help="wq#662 Frank/MC: record free-text response on pending_review ticket"); s.add_argument("id",type=int); s.add_argument("text",help="Frank's free-text response"); s.set_defaults(f=cmd_answer)
 s=sub.add_parser("review",help="wq#662 ORCH: accept or reject Frank's response on pending_review ticket"); s.add_argument("id",type=int); s.add_argument("verdict",choices=["accept","reject"]); s.add_argument("--reason",default=None,help="required when rejecting; optional note on accept"); s.set_defaults(f=cmd_review)
 init()
