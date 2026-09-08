@@ -15,19 +15,22 @@ STATE_DIR=/home/lumen/ha/authssh
 mkdir -p "$STATE_DIR"
 FAIL_THRESHOLD=2   # consecutive failures before alerting (ride out a transient blip)
 
-# node:mgmt-path map (REAL management path per fleet doc; Thoth LAN-only by design)
-NODES="
-nephthys nephthys@192.168.8.176
-isis isis@100.100.129.24
-hathor hathor@100.80.71.13
-seshat seshat@192.168.8.219
-anubis anubis@192.168.8.232
-apep apep@100.82.2.72
-wadjet wadjet@100.116.217.15
-maat maam@100.105.219.34
-thoth thoth@192.168.8.218
-thor thor@100.112.151.100
-"
+# wq#1454: the node list is the fleet inventory (monitored nodes with a resolvable
+# user@tailscale_ip), read via `fleet-inv ssh-list` — no roster lives in this file.
+# A YAML typo serves the last-good roster (fleet-inv prints ERROR to stderr) instead
+# of an empty list; an empty list is treated as a probe failure, not "all clear".
+# The local host is skipped (no self-SSH). FLEET_INV overrides the CLI for tests.
+FLEET_INV="${FLEET_INV:-/home/lumen/bin/fleet-inv}"
+SELF="$(hostname -s)"
+NODES="$("$FLEET_INV" ssh-list | awk -v self="$SELF" '$1 != self {print $1, $2}')"
+if [ -z "$NODES" ]; then
+  echo "[$(date -u +%H:%M:%SZ)] ERROR: fleet-inv ssh-list returned no nodes — probe skipped (inventory unreadable?)" >&2
+  exit 1
+fi
+if [ "${1:-}" = "--list" ]; then
+  printf '%s\n' "$NODES"
+  exit 0
+fi
 
 ping_ntfy(){ curl -s -m 8 -d "$1" -H "Title: fleet-auth-ssh-probe" "$NTFY" >/dev/null 2>&1; }
 
