@@ -99,8 +99,29 @@ def test_wrong_branch_is_refused_with_reason_and_never_moves_head(repo):
     assert "on 'parked', not main" in r.stdout
     assert f"git -C {primary} checkout main" in r.stdout
     assert git(primary, "branch", "--show-current").stdout.strip() == "parked"
+    # ISSUE-LOG #237: main is checked out nowhere, so its REF is forwarded (no file moves),
+    # which is what the repo sweep compares against origin. Working tree stays parked.
+    assert "local main REF (checked out nowhere) fast-forwarded 1 commit(s)" in r.stdout
+    assert behind(primary) == 0
+    assert (primary / "f").read_text() == "a\n"
     git(primary, "checkout", "-q", "main")
+    assert (primary / "f").read_text() == "b\n"
+
+
+def test_wrong_branch_leaves_the_ref_alone_when_main_is_checked_out_elsewhere(repo, tmp_path):
+    """A second worktree holding main means moving the ref WOULD move files there — refuse."""
+    primary, wt = repo
+    git(primary, "checkout", "-q", "-b", "parked")
+    main_wt = tmp_path / "main_wt"
+    git(primary, "worktree", "add", "-q", str(main_wt), "main")
+    land_on_origin(wt, "b\n")
+    r = ffprimary(wt)
+    assert r.returncode == 1
+    assert "on 'parked', not main" in r.stdout
+    assert "REF (checked out nowhere)" not in r.stdout
+    git(primary, "fetch", "-q")
     assert behind(primary) == 1
+    assert (main_wt / "f").read_text() == "a\n"
 
 
 def test_git_lock_is_named(repo):

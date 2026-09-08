@@ -448,6 +448,18 @@ ff_primary_after_land() {
     note "primary $tree NOT fast-forwarded: it is on '${cur:-(detached HEAD)}', not $DEFAULT_BRANCH."
     note "  land never moves HEAD in the shared primary tree. When that branch is done:"
     note "  git -C $tree checkout $DEFAULT_BRANCH && lumen-pr ffprimary $tree"
+    # The REF can still be kept current (ISSUE-LOG #237 precedent, wq#1533): when
+    # $DEFAULT_BRANCH is checked out in no worktree at all, moving refs/heads/$DEFAULT_BRANCH
+    # touches no file anywhere, and the repo sweep compares that ref to origin. Only ever
+    # forward (ancestor check), never when any tree has it checked out.
+    if git -C "$tree" rev-parse --verify -q "refs/heads/$DEFAULT_BRANCH" >/dev/null 2>&1 \
+       && ! git -C "$tree" worktree list --porcelain 2>/dev/null | grep -qx "branch refs/heads/$DEFAULT_BRANCH" \
+       && git -C "$tree" merge-base --is-ancestor "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+      behind=$(git -C "$tree" rev-list --count "$DEFAULT_BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)
+      if [ "${behind:-0}" -gt 0 ] && git -C "$tree" branch -f "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
+        note "  local $DEFAULT_BRANCH REF (checked out nowhere) fast-forwarded $behind commit(s) to $(git -C "$tree" rev-parse --short "$DEFAULT_BRANCH") — no files changed"
+      fi
+    fi
     return 1
   fi
   git -C "$tree" rev-parse --verify -q "refs/remotes/origin/$DEFAULT_BRANCH" >/dev/null 2>&1 \
