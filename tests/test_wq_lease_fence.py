@@ -359,7 +359,10 @@ def test_wq759_evidence_gate_still_refuses_a_bare_close(q):
     wq_ok(q, "claim", "--lane", "fence-lane")
     p = wq(q, "done", tid, "--notes", "all finished")
     assert p.returncode == 2
-    assert "wq#759 evidence gate" in p.stdout
+    # wq#1479 (wq:490-495): a refusal is an error, so the whole close path prints REFUSED on
+    # stderr via eprint(). An orchestrator reading `tail -1` of stdout must see nothing.
+    assert "wq#759 evidence gate" in p.stderr, p.stdout + p.stderr
+    assert "REFUSED" not in p.stdout, p.stdout
 
 
 # ---------------------------------------------------------------- idempotency helper
