@@ -39,6 +39,28 @@ if printf '%s\n' "$STAGED" | grep -qx 'instincts-render'; then
   trap - EXIT
 fi
 
+# wq#1536: lumen-pr is the only path onto main for every Class A repo. A land that merges on
+# the forge but leaves the primary behind (the 2026-09-08 fleet-inventory/foreman case) is
+# invisible until the next agent branches from a stale tree. Same shape as wq#958: run the
+# suite against the STAGED copy, no slock (it touches no shared database).
+if printf '%s\n' "$STAGED" | grep -qx 'lumen-pr'; then
+  # its own dir (wq#598: /tmp is a flat shared namespace) because the staged copy sources
+  # lumen-github-identity.sh from the directory it lives in
+  STAGED_PR_DIR=$(mktemp -d /tmp/wq1536-staged-lumen-pr.XXXXXX)
+  trap 'rm -rf "$STAGED_PR_DIR"' EXIT
+  git show :lumen-pr > "$STAGED_PR_DIR/lumen-pr"
+  chmod +x "$STAGED_PR_DIR/lumen-pr"
+  ln -s "$REPO_ROOT/lumen-github-identity.sh" "$STAGED_PR_DIR/lumen-github-identity.sh"
+  if ! bash -n "$STAGED_PR_DIR/lumen-pr" || \
+     ! LUMEN_PR_BIN="$STAGED_PR_DIR/lumen-pr" python3 -m pytest \
+        "$REPO_ROOT/tests/test_lumen_pr_ff_primary.py" -q; then
+    echo "pre-commit(wq#1536): staged lumen-pr fails its regression suite. Refusing." >&2
+    exit 1
+  fi
+  rm -rf "$STAGED_PR_DIR"
+  trap - EXIT
+fi
+
 if ! printf '%s\n' "$STAGED" | grep -qx 'wq'; then
   exit 0
 fi

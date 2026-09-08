@@ -14,6 +14,7 @@
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
 #   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>...  # wq#771/wq#792 target-tree guard
+#   lumen-pr ffprimary <repo-path>         # wq#1536: ff the primary tree to origin/main, or say why not
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
 # trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
@@ -407,6 +408,80 @@ tree_unpushed() { # tree_unpushed <tree>
   git -C "$t" rev-parse --verify -q "refs/remotes/origin/$DEFAULT_BRANCH" >/dev/null 2>&1 || return 0
   git -C "$t" -c core.quotePath=false diff --name-only \
     "origin/$DEFAULT_BRANCH...$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u
+}
+
+# ff_primary_after_land <tree>  (wq#1536)
+# Bring <tree>'s $DEFAULT_BRANCH up to origin/$DEFAULT_BRANCH by fast-forward, or say EXACTLY
+# why not, with the one command that fixes it. Before this, a --worktree land returned right
+# after the merge and never touched the primary at all: /home/lumen/fleet/inventory (PR #6)
+# and /home/lumen/foreman (PR #362) each sat one commit behind origin/main on 2026-09-08
+# until someone ran the ff by hand, while claude_memory.md said land does it. The --primary
+# path did try, but hid git's stderr behind 2>/dev/null and guessed "uncommitted work?".
+# Every exit here prints its reason. Checks, in order: git lock, in-progress operation,
+# wrong branch, diverged (wq#792), dirty overlap (the only dirt that blocks an ff), then the
+# ff itself with git's own stderr kept. Never moves HEAD off another branch — the primary is
+# shared, and parking it elsewhere is someone's deliberate act. Returns 0 on ff or already
+# current, 1 otherwise; callers in land treat 1 as "merged, primary needs a hand", not a die.
+ff_primary_after_land() {
+  local tree="$1" cur p f ahead behind incoming overlap n err
+  [ -d "$tree" ] || { note "primary $tree NOT fast-forwarded: directory does not exist"; return 1; }
+  git -C "$tree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || { note "primary $tree NOT fast-forwarded: not a git work tree"; return 1; }
+  cur=$(git -C "$tree" branch --show-current 2>/dev/null)
+  p=$(git -C "$tree" rev-parse --git-path index.lock 2>/dev/null)
+  case "$p" in /*) : ;; *) p="$tree/$p" ;; esac
+  if [ -e "$p" ]; then
+    note "primary $tree NOT fast-forwarded: git lock present ($p) — another git process is"
+    note "  running there, or one died. If nothing holds it: rm '$p' && lumen-pr ffprimary $tree"
+    return 1
+  fi
+  for f in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+    p=$(git -C "$tree" rev-parse --git-path "$f" 2>/dev/null)
+    case "$p" in /*) : ;; *) p="$tree/$p" ;; esac
+    if [ -e "$p" ]; then
+      note "primary $tree NOT fast-forwarded: an operation is in progress there ($f present)."
+      note "  finish or abort it, then: lumen-pr ffprimary $tree"
+      return 1
+    fi
+  done
+  if [ "$cur" != "$DEFAULT_BRANCH" ]; then
+    note "primary $tree NOT fast-forwarded: it is on '${cur:-(detached HEAD)}', not $DEFAULT_BRANCH."
+    note "  land never moves HEAD in the shared primary tree. When that branch is done:"
+    note "  git -C $tree checkout $DEFAULT_BRANCH && lumen-pr ffprimary $tree"
+    return 1
+  fi
+  git -C "$tree" rev-parse --verify -q "refs/remotes/origin/$DEFAULT_BRANCH" >/dev/null 2>&1 \
+    || { note "primary $tree NOT fast-forwarded: no origin/$DEFAULT_BRANCH ref (never fetched?)"; return 1; }
+  ahead=$(git -C "$tree" rev-list --count "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null || echo 0)
+  if [ "${ahead:-0}" -gt 0 ]; then
+    note "primary $tree NOT fast-forwarded: local $DEFAULT_BRANCH has $ahead commit(s) origin does not (diverged, wq#792):"
+    git -C "$tree" log --oneline "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null | sed 's/^/    /'
+    note "  push them (git -C $tree push origin $DEFAULT_BRANCH) or land them as their own PR, then: lumen-pr ffprimary $tree"
+    return 1
+  fi
+  behind=$(git -C "$tree" rev-list --count "$DEFAULT_BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)
+  if [ "${behind:-0}" = 0 ]; then
+    note "primary $tree already at origin/$DEFAULT_BRANCH ($(git -C "$tree" rev-parse --short HEAD))"
+    return 0
+  fi
+  incoming=$(git -C "$tree" -c core.quotePath=false diff --name-only \
+               "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u)
+  overlap=$(LC_ALL=C comm -12 <(printf '%s\n' "$incoming") <(tree_uncommitted "$tree"))
+  if [ -n "$overlap" ]; then
+    n=$(printf '%s\n' "$overlap" | grep -c .)
+    note "primary $tree NOT fast-forwarded: $n uncommitted path(s) there overlap the $behind incoming commit(s):"
+    printf '%s\n' "$overlap" | sed 's/^/    /'
+    note "  commit or discard them (git -C $tree status --short), then: lumen-pr ffprimary $tree"
+    return 1
+  fi
+  if err=$(git -C "$tree" merge --ff-only "origin/$DEFAULT_BRANCH" -q 2>&1); then
+    note "primary $tree fast-forwarded $behind commit(s) to $(git -C "$tree" rev-parse --short HEAD)"
+    return 0
+  fi
+  note "primary $tree NOT fast-forwarded: git merge --ff-only origin/$DEFAULT_BRANCH failed:"
+  printf '%s\n' "${err:-(git printed nothing)}" | sed 's/^/    /'
+  note "  fix the cause above, then: lumen-pr ffprimary $tree"
+  return 1
 }
 
 # dirty_target_guard <refuse|warn> <label> <newline-separated paths>
@@ -1025,14 +1100,24 @@ cmd_land() {
   git -C "$REPO_PATH" fetch -q origin
   if [ "$gitdir" != "$commondir" ]; then
     note "linked worktree — leaving it on '$cur'. Clean up with: git -C $REPO_PATH worktree remove $REPO_PATH"
+    # wq#1536: this `return` used to be the whole story, so the PRIMARY never moved and every
+    # --worktree land left it one commit behind origin/main. The fetch above already updated
+    # the shared refs; now catch the primary tree up (or print exactly why it cannot be).
+    local primary
+    if primary=$(primary_worktree); then
+      ff_primary_after_land "$primary" || true
+    else
+      note "WARNING: cannot resolve the primary work tree of $SLUG — it was NOT fast-forwarded"
+    fi
+    gitlock_release
+    trap - EXIT INT TERM
     return 0
   fi
   if [ "$cur" = "$head_ref" ]; then
     git -C "$REPO_PATH" checkout -q "$DEFAULT_BRANCH" || die "merged, but could not switch back to $DEFAULT_BRANCH — do it by hand"
   fi
-  git -C "$REPO_PATH" merge --ff-only "origin/$DEFAULT_BRANCH" -q 2>/dev/null \
-    && note "local $DEFAULT_BRANCH fast-forwarded to $(git -C "$REPO_PATH" rev-parse --short HEAD)" \
-    || note "WARNING: could not fast-forward local $DEFAULT_BRANCH (uncommitted work in the tree?) — pull by hand"
+  # wq#1536: same function as the linked-worktree path — no more 2>/dev/null guesswork.
+  ff_primary_after_land "$REPO_PATH" || true
   git -C "$REPO_PATH" branch -q -d "$head_ref" 2>/dev/null \
     && note "deleted local branch $head_ref" \
     || note "local branch $head_ref kept (not fully merged locally, or already gone)"
@@ -1083,6 +1168,19 @@ cmd_dirtycheck() {
   note "clean: none of the $n path(s) given is uncommitted or in an un-pushed commit in $(primary_worktree)"
 }
 
+# wq#1536: the post-land primary catch-up as its own subcommand. Two reasons: it is the fix
+# command every "NOT fast-forwarded" reason points at (re-diagnoses, then ffs — the operator
+# never gets a bare `git merge` that fails for the same unexplained reason), and the test gate
+# can drive the REAL function against a throwaway repo instead of a re-implementation.
+# Local only: fetches, then ff-only on the primary. No forge write, so no scope fence.
+cmd_ffprimary() {
+  need_repo "${1:-}"
+  local primary
+  git -C "$REPO_PATH" fetch -q origin || die "fetch from origin failed in $REPO_PATH"
+  primary=$(primary_worktree) || die "cannot resolve the primary work tree of $SLUG"
+  ff_primary_after_land "$primary"
+}
+
 case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   commit) shift; cmd_commit "$@" ;;
@@ -1097,7 +1195,10 @@ case "${1:-}" in
   # Read-only like check/gitlock. Exists so the probe can exercise the REAL function
   # instead of a re-implementation of it, and so an operator can ask "would this land?"
   dirtycheck) shift; SCOPE_OP=none cmd_dirtycheck "$@" ;;
+  # wq#1536: local ff of the primary to origin/main, the step `land` runs last. No forge
+  # write (the fence guards pushes), so SCOPE_OP=none like the inspections above.
+  ffprimary) shift; SCOPE_OP=none cmd_ffprimary "$@" ;;
   ''|-h|--help|help)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock|dirtycheck)" ;;
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock|dirtycheck|ffprimary)" ;;
 esac
