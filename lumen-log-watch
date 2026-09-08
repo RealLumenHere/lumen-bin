@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# lumen-log-watch: alert only on TRUE brain failures (turn got NO decision) or config errors.
+# EXCLUDES rung_rescued_turn (success) and rung_skipped_breaker_open (normal escalation).
+# The "primary permanently dead -> 100% escalation" cost condition is a separate digest, not this.
+#
+# wq#1487 (2026-09-08): EDGE-TRIGGERED. The old dedup compared the failure COUNT, which
+# changes every 5-min run while the brain is down, so one condition (LPP key budget
+# exhausted) paged "agent brain failing" ~12x/hour for 8h. Now: page on the transition
+# into failing, re-page at most every REPAGE_S while it persists, send a RECOVERED
+# notice on the transition out. Thresholds deterministic; state in $STAMP as JSON.
+set -uo pipefail
+exec 9>/tmp/lumen-log-watch.lock; flock -n 9 || exit 0
+STAMP=${LOG_WATCH_STAMP:-/home/lumen/logs/.log-watch.laststate}; mkdir -p /home/lumen/logs
+NTFY=${LOG_WATCH_NTFY_BIN:-/home/lumen/bin/ntfy-send}
+F=${LOG_WATCH_FILE:-/home/lumen/pokemon/fallback_stats.jsonl}
+THRESH=${LOG_WATCH_THRESHOLD:-3}          # > this many true failures in 15 min = failing
+REPAGE_S=${LOG_WATCH_REPAGE_S:-21600}     # 6h
+CUT=$(date -u -d '15 min ago' +%FT%T 2>/dev/null || echo 0)
+NOW=$(date -u +%s)
+# true failures: a config error, or a turn where nothing rescued it
+N=$(awk -v c="$CUT" -F'"ts":"' 'NF>1{split($2,a,"\"");if(a[1]>c && ($0 ~ /Invalid model|gateway 4[0-9][0-9]|all rungs exhausted|no_valid_decision|turn_failed|HARNESS_DEFECT/) && $0 !~ /rung_rescued/) n++}END{print n+0}' "$F" 2>/dev/null)
+N=${N:-0}
+touch /home/lumen/logs/.stamp.log-watch
+# prior state: JSON {"failing":0|1,"since":epoch,"paged_at":epoch}; legacy stamp held a bare count
+read -r P_FAILING P_SINCE P_PAGED < <(python3 - "$STAMP" <<'PY'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1])); print(int(d.get("failing",0)), int(d.get("since",0)), int(d.get("paged_at",0)))
+except Exception:
+    print(0,0,0)
+PY
+)
+LAST=$(tail -1 "$F" 2>/dev/null | head -c 160)
+if [ "$N" -gt "$THRESH" ]; then
+  if [ "$P_FAILING" -eq 0 ]; then
+    "$NTFY" -p high -T "agent brain failing" "$N TRUE brain failures (no decision) in 15min: $LAST" >/dev/null 2>&1 || true
+    printf '{"failing":1,"since":%s,"paged_at":%s,"n":%s}\n' "$NOW" "$NOW" "$N" > "$STAMP"
+    echo "log-watch: FAILING (edge) n=$N -> paged"
+  elif [ $((NOW - P_PAGED)) -ge "$REPAGE_S" ]; then
+    DUR=$(( (NOW - P_SINCE) / 3600 ))
+    "$NTFY" -p high -T "agent brain STILL failing (${DUR}h)" "$N TRUE brain failures in last 15min, failing since $(date -u -d @"$P_SINCE" +%FT%TZ): $LAST" >/dev/null 2>&1 || true
+    printf '{"failing":1,"since":%s,"paged_at":%s,"n":%s}\n' "$P_SINCE" "$NOW" "$N" > "$STAMP"
+    echo "log-watch: STILL FAILING n=$N -> re-paged (${DUR}h)"
+  else
+    printf '{"failing":1,"since":%s,"paged_at":%s,"n":%s}\n' "$P_SINCE" "$P_PAGED" "$N" > "$STAMP"
+    echo "log-watch: still failing n=$N (page suppressed, next re-page in $(( (P_PAGED + REPAGE_S - NOW) / 60 ))m)"
+  fi
+else
+  if [ "$P_FAILING" -eq 1 ]; then
+    DUR=$(( (NOW - P_SINCE) / 60 ))
+    "$NTFY" -p default -T "agent brain RECOVERED" "true brain failures back to $N/15min after ${DUR}m failing" >/dev/null 2>&1 || true
+    echo "log-watch: RECOVERED (edge) n=$N -> notice sent"
+  fi
+  printf '{"failing":0,"since":0,"paged_at":0,"n":%s}\n' "$N" > "$STAMP"
+  echo "log-watch: TRUE brain failures last 15min = $N (rescued turns excluded)"
+fi

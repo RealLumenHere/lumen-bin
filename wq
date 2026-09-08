@@ -113,6 +113,14 @@ ORCH_TTL_MIN = _envint("WQ_ORCH_TTL", 480)
 # wq#568 budget backstops (minutes / count). NOT the idle threshold — see docstring.
 SESSION_MAX_AGE_MIN = _envint("WQ_SESSION_MAX_AGE", 360)
 SESSION_MAX_TICKETS = _envint("WQ_SESSION_MAX_TICKETS", 8)
+# wq#1374: orchestrator-class sessions (base name starting with orch/foreman/forch — the
+# same convention cmd_decide already uses) run one long caffeinated session driving the whole
+# fleet, closing far more than SESSION_MAX_TICKETS tickets by design. The global backstop
+# retired one mid-command 3x in a single day (ISSUE-LOG #175 item 1), killing in-flight ops
+# each time. Separate, generous env-tunable budgets, read at enforce_retirement time.
+ORCH_SESSION_RE = re.compile(r"^(orch|foreman|forch)", re.IGNORECASE)
+ORCH_SESSION_MAX_AGE_MIN = _envint("WQ_ORCH_SESSION_MAX_AGE", 2880)
+ORCH_SESSION_MAX_TICKETS = _envint("WQ_ORCH_SESSION_MAX_TICKETS", 200)
 # wq#568: ntfy path is env-overridable so the probe can point it at a stub and PROVE the
 # notification fires, instead of asserting it from the source. Production never sets it.
 NTFY_BIN = os.environ.get("WQ_NTFY_BIN", "/home/lumen/bin/ntfy-send")
@@ -494,16 +502,20 @@ def _ntfy(title, msg):
         pass
 
 def release_session_holdings(c, sid):
-    """Revert every claimed ticket to open and drop every slock for this holder. The atomic
-    half of retirement — a respawn cannot land or hold anything, and the orchestrator stops
-    hand-editing status to clean claimed_by residue."""
+    """Revert every claimed/blocked ticket to open and drop every slock for this holder. The
+    atomic half of retirement — a respawn cannot land or hold anything, and the orchestrator
+    stops hand-editing status to clean claimed_by residue. wq#1374: 'blocked' keeps claimed_by
+    set (see cmd_block), so a session that retires while holding a blocked ticket used to leave
+    it stranded under a dead claimed_by — reverting it here collapses the old
+    retire->edit->claim->done dead-worker dance into a single retire call."""
     t_now = now()
     tickets = [r[0] for r in c.execute(
-        "SELECT id FROM tasks WHERE claimed_by=? AND status='claimed'", (sid,))]
+        "SELECT id FROM tasks WHERE claimed_by=? AND status IN ('claimed','blocked')", (sid,))]
     if tickets:
         c.execute(f"""UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL,
-                     lease_expires=NULL, lease_ttl=NULL{lease_clear_sql(c)}
-                     WHERE claimed_by=? AND status='claimed'""", (sid,))
+                     lease_expires=NULL, lease_ttl=NULL, block_reason=NULL,
+                     blocked_at=NULL{lease_clear_sql(c)}
+                     WHERE claimed_by=? AND status IN ('claimed','blocked')""", (sid,))
     locks = [r[0] for r in c.execute("SELECT scope FROM slocks WHERE holder=?", (sid,))]
     if locks:
         c.execute("DELETE FROM slocks WHERE holder=?", (sid,))
@@ -578,14 +590,22 @@ def enforce_retirement(a):
             age = idle_minutes(fs)  # minutes since first_seen; None if unparseable
             done_n = c.execute("SELECT COUNT(*) FROM tasks WHERE claimed_by=? AND status='done'",
                                (ident,)).fetchone()[0]
+            # wq#1374: orchestrator-class identity gets the exempt/higher budget instead of
+            # the global BUILD-worker one.
+            if ORCH_SESSION_RE.match(row[1] or ""):
+                max_age_min, max_tickets = ORCH_SESSION_MAX_AGE_MIN, ORCH_SESSION_MAX_TICKETS
+                age_env, tickets_env = "WQ_ORCH_SESSION_MAX_AGE", "WQ_ORCH_SESSION_MAX_TICKETS"
+            else:
+                max_age_min, max_tickets = SESSION_MAX_AGE_MIN, SESSION_MAX_TICKETS
+                age_env, tickets_env = "WQ_SESSION_MAX_AGE", "WQ_SESSION_MAX_TICKETS"
             trip = None
-            if age is not None and age > SESSION_MAX_AGE_MIN:
-                trip = ("auto-age", f"session age {age:.0f}m exceeds WQ_SESSION_MAX_AGE="
-                                    f"{SESSION_MAX_AGE_MIN}m (budget backstop; raise the env "
+            if age is not None and age > max_age_min:
+                trip = ("auto-age", f"session age {age:.0f}m exceeds {age_env}="
+                                    f"{max_age_min}m (budget backstop; raise the env "
                                     f"for a legitimate marathon session)")
-            elif done_n >= SESSION_MAX_TICKETS:
-                trip = ("auto-tickets", f"{done_n} closed claims reaches WQ_SESSION_MAX_TICKETS="
-                                        f"{SESSION_MAX_TICKETS} (budget backstop)")
+            elif done_n >= max_tickets:
+                trip = ("auto-tickets", f"{done_n} closed claims reaches {tickets_env}="
+                                        f"{max_tickets} (budget backstop)")
             if trip:
                 kind, reason = trip
                 c.isolation_level = None
@@ -1483,7 +1503,10 @@ def find_artifact(notes):
             continue
         if "/" not in tok and not re.search(r"\.[A-Za-z0-9]{1,5}$", tok):
             continue  # doesn't look path-shaped — skip rather than stat() every word
-        for cand in _artifact_path_candidates(tok):
+        # wq#1374: accept a trailing :N or :N-M line-locator (path/to/file.py:88-104) — the
+        # evidence gate's own citation format — without forcing a rewrite to a bare path.
+        path_tok = re.sub(r":\d+(-\d+)?$", "", tok)
+        for cand in _artifact_path_candidates(path_tok):
             if os.path.exists(cand):
                 return True, "path", cand
     return False, None, None

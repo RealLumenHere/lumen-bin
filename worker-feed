@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""wq#1293: one line per running fworker — ticket, model, minutes running, last
+substantive action, stuck heuristic. Read-only, <3s, no transcripts to open by hand.
+
+Data sources:
+  - queue.db (claimed tickets: source of truth for "which tickets are in flight")
+  - /proc via psutil (single pass: which claimed tickets have a live `claude`
+    process, its cwd -> worktree, its start time -> minutes running)
+  - ~/.claude/projects/<escaped-worktree-path>/*.jsonl (the live session
+    transcript the CLI itself writes; newest file's tail = current activity)
+
+NOTE (wq#1293 prior attempts, PERMISSION_LOOP): reading another session's
+~/.claude/projects tree is denied by the CLI's own --add-dir sandbox when this
+runs *as* a guarded fworker session. This tool is meant to be invoked directly
+by the orchestrator (cron/shell), outside that sandbox, where it has ordinary
+filesystem access to every worker's transcript dir.
+"""
+import glob
+import json
+import os
+import sqlite3
+import sys
+import time
+
+import psutil
+
+DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
+WORKTREES_ROOT = os.environ.get("FOREMAN_WORKTREES_ROOT", "/home/lumen/worktrees")
+PROJECTS_ROOT = os.path.expanduser("~/.claude/projects")
+STUCK_N = int(os.environ.get("WORKER_FEED_STUCK_N", "3"))
+TAIL_BYTES = 300_000  # enough for the last few dozen turns without reading a whole multi-MB transcript
+
+
+def claimed_tickets():
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = conn.execute(
+            "SELECT id, lane, claimed_at, model, title FROM tasks WHERE status='claimed'"
+            " ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"id": r[0], "lane": r[1], "claimed_at": r[2], "model": r[3], "title": r[4]} for r in rows]
+
+
+def live_claude_by_cwd():
+    """One /proc pass: cwd -> (pid, create_time) for every running `claude` process."""
+    out = {}
+    for p in psutil.process_iter(attrs=["pid", "name"]):
+        try:
+            if p.info["name"] != "claude":
+                continue
+            cwd = p.cwd()
+            out[cwd] = {"pid": p.pid, "create_time": p.create_time()}
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return out
+
+
+def worktree_for(ticket_id):
+    """Most recently touched wq{id}-a* worktree dir, or None."""
+    matches = glob.glob(os.path.join(WORKTREES_ROOT, f"wq{ticket_id}-a*"))
+    if not matches:
+        return None
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return matches[0]
+
+
+def transcript_dir_for(worktree):
+    escaped = "-" + worktree.lstrip("/").replace("/", "-")
+    return os.path.join(PROJECTS_ROOT, escaped)
+
+
+def newest_transcript(worktree):
+    d = transcript_dir_for(worktree)
+    files = glob.glob(os.path.join(d, "*.jsonl"))
+    if not files:
+        return None
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+
+def tail_events(path, max_bytes=TAIL_BYTES):
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+            f.readline()  # drop partial line from the seek
+        raw = f.read()
+    events = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def brief(value, cap=90):
+    s = str(value).replace("\n", " ").replace("\r", " ")
+    s = " ".join(s.split())
+    return s if len(s) <= cap else s[: cap - 1] + "…"
+
+
+def last_action_and_stuck(events):
+    """Walk transcript tail; return (model, last_action_str, stuck_str_or_None)."""
+    model = None
+    tool_sigs = []  # (name, input_brief) in chronological order
+    last_tool_desc = None
+    last_text = None
+    denial_hits = 0
+    last_denial_snippet = None
+
+    for ev in events:
+        msg = ev.get("message")
+        if not isinstance(msg, dict):
+            continue
+        if ev.get("type") == "assistant" and msg.get("model"):
+            model = msg["model"]
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                name = block.get("name", "?")
+                inp = brief(block.get("input", ""), cap=70)
+                tool_sigs.append((name, inp))
+                last_tool_desc = f"{name}: {inp}"
+            elif btype == "text":
+                text = (block.get("text") or "").strip()
+                if text:
+                    last_text = brief(text, cap=90)
+            elif btype == "tool_result" or ev.get("type") == "user":
+                pass
+        if ev.get("type") == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    result_text = block.get("content")
+                    if isinstance(result_text, list):
+                        result_text = " ".join(
+                            b.get("text", "") for b in result_text if isinstance(b, dict)
+                        )
+                    result_text = result_text or ""
+                    if any(m in result_text for m in ("requires approval", "was blocked", "permission")):
+                        denial_hits += 1
+                        last_denial_snippet = brief(result_text, cap=70)
+                    else:
+                        denial_hits = 0
+
+    last_action = last_tool_desc or last_text or "(no activity yet)"
+
+    stuck = None
+    if len(tool_sigs) >= STUCK_N:
+        window = tool_sigs[-max(STUCK_N * 2, 6):]
+        latest = window[-1]
+        repeat = sum(1 for s in window if s == latest)
+        if repeat >= STUCK_N:
+            stuck = f"STUCK: {latest[0]} repeated {repeat}x"
+    if denial_hits >= 2:
+        loop_msg = f"PERMISSION_LOOP: {denial_hits}x denied ({last_denial_snippet})"
+        stuck = f"{stuck}; {loop_msg}" if stuck else loop_msg
+
+    return model, last_action, stuck
+
+
+def fmt_minutes(seconds):
+    m = int(seconds // 60)
+    if m < 60:
+        return f"{m}m"
+    return f"{m // 60}h{m % 60:02d}m"
+
+
+def main():
+    now = time.time()
+    tickets = claimed_tickets()
+    if not tickets:
+        print("worker-feed: no claimed tickets")
+        return 0
+
+    live = live_claude_by_cwd()
+
+    for t in tickets:
+        wt = worktree_for(t["id"])
+        proc = live.get(wt) if wt else None
+
+        if not proc:
+            print(f"wq{t['id']:<6} {'?':<18} {'?':>6}  NO LIVE PROCESS (claimed_at={t['claimed_at']})")
+            continue
+
+        minutes = fmt_minutes(now - proc["create_time"])
+        tpath = newest_transcript(wt)
+        if not tpath:
+            print(f"wq{t['id']:<6} {t['model'] or '?':<18} {minutes:>6}  (no transcript yet)")
+            continue
+
+        events = tail_events(tpath)
+        model, last_action, stuck = last_action_and_stuck(events)
+        model = model or t["model"] or "?"
+        flag = f"  [{stuck}]" if stuck else ""
+        print(f"wq{t['id']:<6} {model:<18} {minutes:>6}  {last_action}{flag}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""lumen-load-watch — RELATIVE, sustained, edge-triggered load alert (wq#1487).
+
+WHY: Frank got a "crashed" page during a load-26 spike on a 44-core box (60% util).
+No raw-load monitor existed (the page was the foreman CRASH loop), but the fleet had
+no correct load signal either. This is that signal, built right from the start:
+
+  ratio    = load5 / nproc              (relative to the box, never a raw number)
+  FIRE     ratio > FIRE_X   for >= SUSTAIN_S   (default 1.5x cores for 10 min)
+  CLEAR    ratio < CLEAR_X  for >= SUSTAIN_S   (default 1.0x, hysteresis)
+  PAGE     on the FIRE transition; re-page at most every REPAGE_S while firing;
+           RECOVERED notice on CLEAR; aq row (source=load) opened on FIRE and
+           auto-resolved on CLEAR.
+
+Deterministic thresholds; env-overridable for tests. State is one JSON file.
+Run every minute from lumen-load-watch.timer. No exceptions leave this script:
+a broken watcher must not itself become a page storm.
+"""
+import json, os, sys, time, subprocess
+
+FIRE_X   = float(os.environ.get("LOAD_WATCH_FIRE_X", "1.5"))
+CLEAR_X  = float(os.environ.get("LOAD_WATCH_CLEAR_X", "1.0"))
+SUSTAIN_S = int(os.environ.get("LOAD_WATCH_SUSTAIN_S", "600"))
+REPAGE_S = int(os.environ.get("LOAD_WATCH_REPAGE_S", str(6 * 3600)))
+STATE    = os.environ.get("LOAD_WATCH_STATE", "/home/lumen/logs/.load-watch.json")
+NTFY_BIN = os.environ.get("LOAD_WATCH_NTFY_BIN", "/home/lumen/bin/ntfy-send")
+AQ_DIR   = os.environ.get("LOAD_WATCH_AQ_DIR", "/home/lumen/agents/alert-queue")
+HOST     = os.uname().nodename.split(".")[0]
+
+
+def read_load():
+    """(load1, load5, nproc). Overridable for tests via LOAD_WATCH_FAKE='load1,load5,nproc'."""
+    fake = os.environ.get("LOAD_WATCH_FAKE")
+    if fake:
+        l1, l5, n = fake.split(",")
+        return float(l1), float(l5), int(n)
+    with open("/proc/loadavg") as f:
+        p = f.read().split()
+    return float(p[0]), float(p[1]), os.cpu_count() or 1
+
+
+def ntfy(title, msg, prio):
+    try:
+        subprocess.run([NTFY_BIN, "-p", prio, "-T", title, msg],
+                       capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def aq_open(key, title, msg):
+    try:
+        sys.path.insert(0, AQ_DIR)
+        import aq
+        aq.ingest(source="load", key=key, title=title, message=msg, priority="high")
+    except Exception as e:
+        print(f"aq ingest failed (non-fatal): {e}")
+
+
+def aq_resolve(key, note):
+    try:
+        sys.path.insert(0, AQ_DIR)
+        import aq
+        c = aq.db(); ts = aq.now()
+        rows = c.execute("SELECT id FROM alerts WHERE source='load' AND key=? AND status='open'",
+                         (key,)).fetchall()
+        # the ntfy echo rows the subscriber recorded for our own pages (wq#1487 dedup)
+        rows += c.execute("SELECT id FROM alerts WHERE source='ntfy:lumen-alerts' AND status='open' "
+                          "AND key LIKE ?", (f"LOAD%HIGH: {HOST}%",)).fetchall()
+        for (rid,) in rows:
+            c.execute("UPDATE alerts SET status='resolved', note=?, resolved_ts=? WHERE id=? AND status='open'",
+                      (note, ts, rid))
+        c.commit(); c.close()
+    except Exception as e:
+        print(f"aq resolve failed (non-fatal): {e}")
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {"firing": False, "over_since": None, "under_since": None, "fire_since": None, "paged_at": 0}
+
+
+def save_state(st):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE)
+
+
+def main():
+    now = int(os.environ.get("LOAD_WATCH_NOW", "0")) or int(time.time())
+    l1, l5, n = read_load()
+    ratio = l5 / n
+    st = load_state()
+    key = f"{HOST}:load"
+    if ratio > FIRE_X:
+        st["under_since"] = None
+        st["over_since"] = st.get("over_since") or now
+    elif ratio < CLEAR_X:
+        st["over_since"] = None
+        st["under_since"] = st.get("under_since") or now
+    else:  # hysteresis band: hold whatever state we are in
+        st["over_since"] = None if not st.get("firing") else st.get("over_since")
+        st["under_since"] = None
+
+    verdict = "ok"
+    if not st.get("firing"):
+        if st.get("over_since") and now - st["over_since"] >= SUSTAIN_S:
+            st.update(firing=True, fire_since=now, paged_at=now)
+            msg = (f"{HOST}: load5 {l5:.1f} on {n} cores = {ratio:.2f}x for "
+                   f"{SUSTAIN_S // 60}+ min (fire > {FIRE_X}x). load1={l1:.1f}")
+            ntfy(f"LOAD HIGH: {HOST}", msg, "high")
+            aq_open(key, f"load: HIGH {key}", msg)
+            verdict = "FIRE (edge) -> paged"
+        elif st.get("over_since"):
+            verdict = f"over {FIRE_X}x for {now - st['over_since']}s (sustain {SUSTAIN_S}s) — not paging"
+    else:
+        if st.get("under_since") and now - st["under_since"] >= SUSTAIN_S:
+            dur = now - (st.get("fire_since") or now)
+            st.update(firing=False, fire_since=None, over_since=None)
+            msg = f"{HOST}: load5 {l5:.1f} on {n} cores = {ratio:.2f}x (< {CLEAR_X}x) after {dur // 60}m high"
+            ntfy(f"LOAD RECOVERED: {HOST}", msg, "default")
+            aq_resolve(key, f"auto-cleared: {msg}")
+            verdict = "CLEAR (edge) -> recovered"
+        elif now - st.get("paged_at", 0) >= REPAGE_S:
+            st["paged_at"] = now
+            dur = now - (st.get("fire_since") or now)
+            ntfy(f"LOAD STILL HIGH: {HOST}",
+                 f"{HOST}: load5 {l5:.1f} / {n} cores = {ratio:.2f}x, high since {dur // 60}m", "high")
+            verdict = "still firing -> re-paged"
+        else:
+            verdict = "still firing (page suppressed)"
+    save_state(st)
+    print(f"load-watch {HOST}: load1={l1:.1f} load5={l5:.1f} nproc={n} ratio={ratio:.2f}x "
+          f"firing={st.get('firing')} :: {verdict}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001
+        print(f"load-watch: internal error (no page): {e!r}")
