@@ -1097,37 +1097,65 @@ def _liveness_module():
         warn(f"liveness gate unavailable ({e.__class__.__name__}: {e}) — filing without it")
         return None
 
-def _liveness_creation_check(title, detail, lane, frank_gated, force=False, verb="add"):
-    """Refuse (exit 1) a Frank-gate whose premise is already met; warn on a tagless one.
-    FOREMAN_LIVENESS_CLEAR=0 -> warn-only. --force files it with the verdict printed."""
+def _liveness_creation_check(title, detail, lane, frank_gated, force=False, verb="add",
+                              liveness=None, no_probe=None, accept_probe=False):
+    """Refuse a Frank-gate whose premise is already met, or (wq#1676) whose Liveness:
+    line is simply missing — mandatory at the on-ramp now, not a warning. --liveness
+    injects the tag before the check; --no-probe records the physical-task escape hatch
+    and skips the refusal; --accept-probe writes derive_probe()'s proposal when one
+    exists. FOREMAN_LIVENESS_CLEAR=0 -> warn-only (the existing writes-disabled knob);
+    =warn -> NO_TAG itself is warn-only (the NEW 7-day mandatory-tag rollout knob).
+    --force files it anyway, verdict printed. Returns the (possibly Liveness:/[NO-PROBE:
+    -augmented) detail text; callers persist it (add: before INSERT; block/decide: UPDATE)."""
+    detail = detail or ""
+    if liveness:
+        detail = detail.rstrip("\n") + "\nLiveness: " + liveness
     lc = _liveness_module()
     if lc is None:
-        return
+        return detail
     try:
         ok, verdict, msg = lc.creation_check(title, detail, lane, frank_gated)
     except Exception as e:  # noqa: BLE001
-        warn(f"liveness creation check crashed ({e!r}) — filing without it"); return
+        warn(f"liveness creation check crashed ({e!r}) — filing without it"); return detail
     if verdict == "NOT_GATED":
-        return
+        return detail
+    if verdict == "NO_TAG" and no_probe:
+        print(f"liveness: NO_TAG — recorded --no-probe {no_probe!r}, filed without a tag")
+        return detail.rstrip("\n") + f"\n[NO-PROBE: {no_probe}]"
+    if verdict == "NO_TAG" and accept_probe and not liveness:
+        proposal = lc.derive_probe(f"{title or ''}\n{detail}")
+        if proposal:
+            print(f"liveness: --accept-probe writing derived tag: Liveness: {proposal}")
+            detail = detail.rstrip("\n") + "\nLiveness: " + proposal
+            try:
+                ok, verdict, msg = lc.creation_check(title, detail, lane, frank_gated)
+            except Exception as e:  # noqa: BLE001
+                warn(f"liveness creation check crashed ({e!r}) — filing without it"); return detail
+        else:
+            print("liveness: --accept-probe requested but nothing parseable was found")
     if ok:
         if verdict == "NO_TAG":
             warn(f"liveness: {msg}")
         elif msg:
             print(f"liveness: {verdict} — {msg}")
-        return
+        return detail
     if force or os.environ.get("FOREMAN_LIVENESS_CLEAR", "1") == "0":
         warn(f"liveness {verdict} overridden ({'--force' if force else 'FOREMAN_LIVENESS_CLEAR=0'}): {msg}")
-        return
-    eprint(f"REFUSED: wq#1478 liveness gate — {verb} not done. {msg}")
-    eprint("  A Frank-gate whose premise is already met on live state is the redo loop; fix the")
-    eprint("  premise (or the Liveness: line) instead. --force files it anyway, on the record.")
+        return detail
+    eprint(f"REFUSED: wq#1478/wq#1676 liveness gate — {verb} not done. {msg}")
+    eprint("  A Frank-gate needs a machine-checkable premise: --liveness \"<probe>(...)\", or")
+    eprint("  --no-probe \"<why no deterministic check exists>\" for a physical task. --force")
+    eprint("  files it anyway, on the record; FOREMAN_LIVENESS_CLEAR=warn is the 7-day rollout knob.")
     sys.exit(6)
 
 def cmd_liveness_close(a):
-    """wq#1478 Slice 3: close a Frank-gated ticket whose Liveness: premise is SATISFIED.
-    No claim (user lane stays never-agent-claimable); instead THREE narrow guards:
-    caller base must be liveness-clear, the ticket must carry a Liveness: line (or a
-    ledger binding named on the call), status must be one that Frank would see.
+    """wq#1478 Slice 3 + wq#1676 item 4: close (default --to done) or unblock (--to open)
+    a ticket whose Liveness: premise is SATISFIED. No claim (user lane stays never-
+    agent-claimable); THREE narrow guards: caller base must be liveness-clear, the
+    ticket must carry a Liveness: line (or a ledger binding named on the call), status
+    must be one Frank would see. --to open is refused unless the row is currently
+    blocked — a blocked row whose tag clears goes back to open (claimable, the work is
+    still owed), not done; every other prior status only ever closes --to done.
     notes gets the probe verdict verbatim in the wq#759 [NO-ARTIFACT: ...] shape."""
     ping("liveness-close")
     caller, _ = resolve_identity(a)
@@ -1142,11 +1170,16 @@ def cmd_liveness_close(a):
     if not r:
         c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {a.id}"); sys.exit(1)
     st, detail, prev_notes, lane = r
+    to = getattr(a, "to", "done") or "done"
     if st == 'done':
         c.execute("COMMIT"); c.close(); print(f"already done wq#{a.id}"); return
     if st not in ('open', 'blocked', 'frank_gated', 'pending_review'):
         c.execute("COMMIT"); c.close()
         eprint(f"REFUSED: wq#{a.id} is {st!r} — liveness-close only acts on open/blocked/frank_gated/pending_review")
+        sys.exit(1)
+    if to == "open" and st != "blocked":
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: --to open only applies to a blocked row (wq#{a.id} is {st!r}) — wq#1676")
         sys.exit(1)
     has_line = "Liveness:" in (detail or "")
     if not has_line and not getattr(a, "binding", None):
@@ -1158,14 +1191,19 @@ def cmd_liveness_close(a):
         c.execute("COMMIT"); c.close()
         eprint("REFUSED: --verdict must carry the probe's SATISFIED detail verbatim"); sys.exit(1)
     src = "Liveness: line" if has_line else f"ledger binding {a.binding}"
-    stamped = f"[{now()}] [liveness auto-clear wq#1478] from {st} via {src} [NO-ARTIFACT: liveness: {verdict}]"
+    stamped = f"[{now()}] [liveness auto-clear wq#1478] from {st} via {src} -> {to} [NO-ARTIFACT: liveness: {verdict}]"
     notes = ((prev_notes + "\n") if prev_notes else "") + stamped
     clr = lease_clear_sql(c)
-    c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, claimed_by=?, lease_expires=NULL, "
-              f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, hold_by=NULL, hold_expires=NULL{clr} "
-              f"WHERE id=?", (now(), notes, caller, a.id))
+    if to == "open":
+        c.execute(f"UPDATE tasks SET status='open', notes=?, claimed_by=NULL, claimed_at=NULL, "
+                  f"lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, "
+                  f"hold_by=NULL, hold_expires=NULL{clr} WHERE id=?", (notes, a.id))
+    else:
+        c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, claimed_by=?, lease_expires=NULL, "
+                  f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, hold_by=NULL, hold_expires=NULL{clr} "
+                  f"WHERE id=?", (now(), notes, caller, a.id))
     c.execute("COMMIT"); c.close()
-    print(f"liveness-closed wq#{a.id} ({lane}/{st} -> done): {verdict[:160]}")
+    print(f"liveness-closed wq#{a.id} ({lane}/{st} -> {to}): {verdict[:160]}")
 # --- end wq#1478 helpers ---
 
 def cmd_add(a):
@@ -1211,8 +1249,11 @@ def cmd_add(a):
     frank_gated = getattr(a, "frank_gated", False)
     gate_type = getattr(a, "gate_type", None) or ("frank_decision" if frank_gated else None)
     init_status = "frank_gated" if frank_gated else "open"
-    # wq#1478: creation gate — a Frank-gate whose premise is already met is not filed
-    _liveness_creation_check(a.title, a.detail, a.lane, frank_gated, force=a.force, verb="add")
+    # wq#1478: creation gate — a Frank-gate whose premise is already met is not filed;
+    # wq#1676: one with no Liveness: line at all is refused unless --no-probe/--accept-probe
+    a.detail = _liveness_creation_check(a.title, a.detail, a.lane, frank_gated, force=a.force, verb="add",
+                                        liveness=getattr(a, "liveness", None), no_probe=getattr(a, "no_probe", None),
+                                        accept_probe=getattr(a, "accept_probe", False))
     needs_val = getattr(a, "needs", None)
     if needs_val is not None:
         check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
@@ -2199,7 +2240,38 @@ def cmd_done(a):
     print(f"done {a.id} (subsystem locks released)")
 def _reopen_tag(n): return f" [REOPENED — reopened_count={n}]" if n else ""
 def cmd_release(a): print(f"released {a.id} (subsystem locks released){_reopen_tag(_finish(a, 'open'))}")
-def cmd_block(a):   print(f"blocked {a.id}: {a.reason} (subsystem locks released){_reopen_tag(_finish(a, 'blocked'))}")
+def cmd_block(a):
+    # wq#1676: block was ungated — free-text block_reason the sweep can never read. Same
+    # mandatory-tag on-ramp as add/decide (frank_gated=True unconditionally: a block is in
+    # scope for the backlog sweep regardless of lane, so it always needs a probe path).
+    # The liveness gate's detail write only runs when a lightweight ownership+fence
+    # pre-check agrees this block would proceed — a stale/zombie/wrong-owner caller gets
+    # _finish's own refusal (rc=5 stale fence, rc=1 wrong owner) untouched, and this
+    # writes nothing: the liveness gate must never be how a fence gets bypassed.
+    c = conn()
+    r = c.execute("SELECT title, detail, lane, claimed_by FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if r:
+        title, detail, lane, claimed_by = r
+        caller, _ = resolve_identity(a)
+        want_fence = getattr(a, "fence", None)
+        fence_ok = True
+        if want_fence is not None:
+            cur_fence = fence_of(c, a.id)
+            fence_ok = cur_fence is not None and cur_fence == int(want_fence)
+        pre_owner_ok = owner_ok(c, caller, claimed_by, "block", a.id)
+        c.close()
+        if fence_ok and pre_owner_ok:
+            new_detail = _liveness_creation_check(title, detail, lane, True, verb="block",
+                                                  liveness=getattr(a, "liveness", None),
+                                                  no_probe=getattr(a, "no_probe", None),
+                                                  accept_probe=getattr(a, "accept_probe", False))
+            if new_detail != (detail or ""):
+                c2 = conn(); c2.isolation_level = None; c2.execute("BEGIN IMMEDIATE")
+                c2.execute("UPDATE tasks SET detail=? WHERE id=?", (new_detail, a.id))
+                c2.execute("COMMIT"); c2.close()
+    else:
+        c.close()
+    print(f"blocked {a.id}: {a.reason} (subsystem locks released){_reopen_tag(_finish(a, 'blocked'))}")
 def cmd_hold(a):
     """wq#1461: soft intent marker for a ticket whose deps are unmet — 'wq claim --id' already
     refuses those with no --force (wq#582), so an orchestrator directed to build one had no way
@@ -2275,12 +2347,17 @@ def cmd_decide(a):
         print(f"REFUSED: wq#{a.id} is {st!r} — decide only acts on frank_gated tickets"); sys.exit(1)
     prompt = (a.prompt or "").strip()
     rec    = (a.rec or "").strip()
-    # wq#1478: decide gate — queueing a question whose answer is on disk is the redo loop
+    # wq#1478: decide gate — queueing a question whose answer is on disk is the redo loop;
+    # wq#1676: --liveness/--no-probe/--accept-probe stamp the tag at decide time too
     _lc_row = c.execute("SELECT title, detail, lane FROM tasks WHERE id=?", (a.id,)).fetchone()
     c.execute("COMMIT"); c.close()
-    _liveness_creation_check(_lc_row[0], _lc_row[1], _lc_row[2], True, verb="decide")
+    _lc_new_detail = _liveness_creation_check(_lc_row[0], _lc_row[1], _lc_row[2], True, verb="decide",
+                                              liveness=getattr(a, "liveness", None), no_probe=getattr(a, "no_probe", None),
+                                              accept_probe=getattr(a, "accept_probe", False))
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
+    if _lc_new_detail != (_lc_row[1] or ""):
+        c.execute("UPDATE tasks SET detail=? WHERE id=?", (_lc_new_detail, a.id))
     if not prompt:
         c.execute("COMMIT"); c.close()
         print("REFUSED: --prompt is required (the decision question + options)"); sys.exit(1)
@@ -2703,7 +2780,7 @@ FENCE_HELP = ("wq#1158: the fence token `wq claim` printed as FENCE=<n>. Refuses
               "the ticket has been claimed again since — pass it and a resumed session is inert")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
@@ -2712,7 +2789,7 @@ s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own s
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_heartbeat)
 s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--unlanded",default=None,metavar="REASON",help="wq#1673: close while the cited path exists only in a linked worktree and not on main, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: release a claim held by a DIFFERENT identity if, and only if, it verifiably has no live session and (for fworker-wq<id>) no running unit — the stale-claim path that does not poison a per-ticket identity the way `wq retire` does"); s.set_defaults(f=cmd_release)
-s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_block)
+s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_block)
 s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)
 s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, and a check-then-create PR lookup"); s.add_argument("kind",choices=["branch","path","pr"]); s.add_argument("id",type=int); s.add_argument("--type",default="feat",help="Conventional Commit type for the branch (default feat)"); s.add_argument("--branch",default=None,help="override the derived branch for the pr check"); s.set_defaults(f=cmd_idem)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
@@ -2724,9 +2801,9 @@ s=sub.add_parser("retire",help="wq#568: retire a session id or base name — rel
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
 s=sub.add_parser("closure-quality",help="wq#759: evidence-quality trend per lane per week"); s.add_argument("--lane",default=None); s.add_argument("--weeks",type=int,default=8); s.set_defaults(f=cmd_closure_quality)
 # wq#662: Frank-decision gate protocol
-s=sub.add_parser("decide",help="wq#662 ORCH: set decision_prompt+rec on frank_gated ticket, advance to pending_review"); s.add_argument("id",type=int); s.add_argument("--prompt",required=True,help="the decision question + options Frank must address"); s.add_argument("--rec",required=True,help="ORCH recommendation with reasoning"); s.set_defaults(f=cmd_decide)
+s=sub.add_parser("decide",help="wq#662 ORCH: set decision_prompt+rec on frank_gated ticket, advance to pending_review"); s.add_argument("id",type=int); s.add_argument("--prompt",required=True,help="the decision question + options Frank must address"); s.add_argument("--rec",required=True,help="ORCH recommendation with reasoning"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_decide)
 # wq#1478: liveness-close verb
-s=sub.add_parser("liveness-close",help="wq#1478: close a Frank-gated ticket whose Liveness: premise is SATISFIED on live state (liveness-clear identity only, no claim)"); s.add_argument("id",type=int); s.add_argument("--verdict",required=True,help="the probe verdict text, verbatim, must contain SATISFIED"); s.add_argument("--binding",default=None,help="ledger binding used when the ticket has no Liveness: line"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_liveness_close)
+s=sub.add_parser("liveness-close",help="wq#1478: close a Frank-gated ticket whose Liveness: premise is SATISFIED on live state (liveness-clear identity only, no claim)"); s.add_argument("id",type=int); s.add_argument("--verdict",required=True,help="the probe verdict text, verbatim, must contain SATISFIED"); s.add_argument("--binding",default=None,help="ledger binding used when the ticket has no Liveness: line"); s.add_argument("--to",choices=["done","open"],default="done",help="wq#1676: done (default) or open — a blocked row whose tag clears goes blocked->open (claimable), not done"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_liveness_close)
 s=sub.add_parser("answer",help="wq#662 Frank/MC: record free-text response on pending_review ticket"); s.add_argument("id",type=int); s.add_argument("text",help="Frank's free-text response"); s.set_defaults(f=cmd_answer)
 s=sub.add_parser("review",help="wq#662 ORCH: accept or reject Frank's response on pending_review ticket"); s.add_argument("id",type=int); s.add_argument("verdict",choices=["accept","reject"]); s.add_argument("--reason",default=None,help="required when rejecting; optional note on accept"); s.set_defaults(f=cmd_review)
 init()

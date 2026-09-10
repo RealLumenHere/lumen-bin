@@ -275,7 +275,9 @@ def test_stale_fence_is_refused_on_every_write_back(q):
     for args in (["heartbeat", tid],
                  ["done", tid, "--notes", "zombie close", "--no-artifact", "zombie"],
                  ["release", tid],
-                 ["block", tid, "zombie block"]):
+                 # wq#1676: block now gates on a Liveness: line same as add/decide —
+                 # --no-probe clears that gate so this exercises the fence check, not it.
+                 ["block", tid, "zombie block", "--no-probe", "zombie"]):
         p = wq(q, *(args + ["--fence", stale]))
         assert p.returncode == 5, f"{args[0]} should refuse a stale fence:\n{p.stdout}{p.stderr}"
         assert "stale fence" in p.stdout
