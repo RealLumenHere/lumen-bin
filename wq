@@ -347,6 +347,12 @@ def init():
     # cleared by claim/done/release (see cmd_claim, _finish).
     if "hold_by"      not in cols: c.execute("ALTER TABLE tasks ADD COLUMN hold_by TEXT")
     if "hold_expires" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN hold_expires TEXT")
+    # wq#1673 (audit §4 P2, F3): the file this ticket is supposed to PRODUCE, named at `add`.
+    # wq#759 checks that the notes point at something that exists — the wrong subject: a worker
+    # can cite its own scratch report and close a ticket whose named output was never written.
+    # A ticket that knows its deliverable is held to it at `done`. ADDITIVE and opt-in: NULL on
+    # every existing row and on every `add` that omits --deliverable = no check, as before.
+    if "deliverable"  not in cols: c.execute("ALTER TABLE tasks ADD COLUMN deliverable TEXT")
     # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
     # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
     # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
@@ -1215,10 +1221,14 @@ def cmd_add(a):
                model, effort, (a.archetype or None), init_status, gate_type))
     if needs_val is not None:
         c.execute("UPDATE tasks SET needs=? WHERE id=last_insert_rowid()", (needs_val.strip(),))
+    deliverable = (getattr(a, "deliverable", None) or "").strip()
+    if deliverable:
+        c.execute("UPDATE tasks SET deliverable=? WHERE id=last_insert_rowid()", (deliverable,))
     c.commit(); print(f"added task {c.execute('SELECT last_insert_rowid()').fetchone()[0]} [{a.lane}]"
                       + (f" status={init_status}" if frank_gated else "")
                       + (f" subsystems={','.join(subs)}" if subs else "")
                       + (f" gate={a.gate}" if a.gate else "")
+                      + (f" deliverable={deliverable}" if deliverable else "")
                       + (f" model={model}@{effort or '-'}" if model else "")); c.close()
 def cmd_claim(a):
     if a.lane == 'user':
@@ -1726,6 +1736,131 @@ ARTIFACT_URL_RE = re.compile(r"https?://\S*/(?:pulls?|commits?)/\S+")
 # ticket ids) never false-positive as shas.
 ARTIFACT_SHA_RE = re.compile(r"(?=[0-9a-f]{7,40}$)[0-9a-f]*[a-f][0-9a-f]*")
 
+# ------------------------------------------------- wq#1673 evidence-durability gate (F3/F4)
+# PROBLEM (TICKET_CLOSURE_AUDIT.md §4 F4): find_artifact resolves a bare token against the
+# CLOSER's cwd and records the token exactly as typed. Agents run `wq done` from inside the
+# worktree they did the work in, so "reports/foo.md" resolved there, went onto the ticket
+# verbatim, and stopped meaning anything the moment the worktree was removed — 10 of 419
+# closes sampled since 2026-09-01 cite a path nothing under /home/lumen can find today.
+# Three parts, all here:
+#   1. canonicalize — `done` rewrites the accepted token to the absolute path find_artifact
+#      actually stat()ed, so a later reader checks the same file wq did;
+#   2. require it landed — a file that exists only in a LINKED worktree is not evidence, it
+#      is a file about to be deleted with that worktree. Refuse unless the same repo-relative
+#      path is on origin/main (or main), or the caller records --unlanded "<reason>";
+#   3. a sha must resolve (§4 P3) — `git cat-file -e` in the caller's repo or any checkout
+#      under /home/lumen. A 7-hex token nothing can resolve is a typo, not evidence.
+# The audit scoped (2) to `scratch/worktrees/`; the test here is "is this a linked worktree",
+# which is the actual invariant and also covers /home/lumen/worktrees/ — where the fworker
+# BUILD lane runs, and where all 10 dead citations were written.
+# FAIL OPEN ON INFRASTRUCTURE, FAIL CLOSED ON FACTS, same as the wq#899 gate below: no git,
+# no main ref, unreadable repo -> warn and allow.
+GIT_EVIDENCE_TIMEOUT = float(os.environ.get("WQ_GIT_EVIDENCE_TIMEOUT", "8"))
+MAIN_REFS = ("origin/main", "main", "origin/master", "master")
+
+def _git(cwd, *args):
+    """git in `cwd`. None means git itself failed to run — 'no opinion', never 'no'."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
+                              timeout=GIT_EVIDENCE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def _sha_repo_candidates():
+    """Repos a fleet sha could plausibly live in: the caller's cwd first, then every git
+    checkout directly under /home/lumen and its two repo-holding subdirs."""
+    seen, out, kids = set(), [], []
+    for base in ("/home/lumen", "/home/lumen/projects", "/home/lumen/agents"):
+        try:
+            kids += sorted(os.path.join(base, n) for n in os.listdir(base))
+        except OSError:
+            pass
+    for d in [os.getcwd()] + kids:
+        real = os.path.realpath(d)
+        if real in seen or not os.path.isdir(d):
+            continue
+        seen.add(real)
+        if os.path.exists(os.path.join(d, ".git")):
+            out.append(d)
+    return out
+
+_SHA_CACHE = {}
+
+def sha_resolves(sha):
+    """Does this sha name a commit in any repo on this box? True on 'cannot tell' (no git,
+    no repos) — the gate is here to catch a fabricated citation, not to wedge a lane."""
+    if sha in _SHA_CACHE:
+        return _SHA_CACHE[sha]
+    saw_git = False
+    for repo in _sha_repo_candidates():
+        r = _git(repo, "cat-file", "-e", sha + "^{commit}")
+        if r is None:
+            continue
+        saw_git = True
+        if r.returncode == 0:
+            _SHA_CACHE[sha] = True
+            return True
+    _SHA_CACHE[sha] = not saw_git
+    return _SHA_CACHE[sha]
+
+def _worktree_of(path):
+    """(toplevel, is_linked_worktree) for the worktree containing `path`, else (None, False).
+    A linked worktree's --git-dir (…/.git/worktrees/<name>) differs from its --git-common-dir
+    (…/.git); the primary checkout's are the same directory."""
+    d = os.path.dirname(os.path.abspath(path)) or "/"
+    if not os.path.isdir(d):
+        return None, False
+    r = _git(d, "rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir")
+    if r is None or r.returncode != 0:
+        return None, False
+    lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return None, False
+    top, gitdir, common = lines[0], lines[1], lines[2]
+    absolve = lambda p: os.path.realpath(p if os.path.isabs(p) else os.path.join(d, p))
+    return top, absolve(gitdir) != absolve(common)
+
+def evidence_durability(abs_path):
+    """Would this citation still resolve from a clean checkout, or only from the tree the
+    closer happened to be standing in? Returns (verdict, why) — 'durable', 'ephemeral'
+    (linked worktree, absent from main), or 'unknown' (fail open)."""
+    root, linked = _worktree_of(abs_path)
+    if root is None:
+        return "durable", "not inside a git worktree"
+    if not linked:
+        return "durable", f"primary checkout {root}"
+    rel = os.path.relpath(os.path.realpath(abs_path), os.path.realpath(root))
+    if rel.startswith(".."):
+        return "unknown", f"resolved outside the worktree {root} it sits under"
+    checked, saw_git = [], False
+    for ref in MAIN_REFS:
+        rv = _git(root, "rev-parse", "--verify", "--quiet", ref)
+        if rv is None:
+            return "unknown", "git unavailable"
+        saw_git = True
+        if rv.returncode != 0:
+            continue
+        checked.append(ref)
+        e = _git(root, "cat-file", "-e", f"{ref}:{rel}")
+        if e is None:
+            return "unknown", "git unavailable"
+        if e.returncode == 0:
+            return "durable", f"{rel} is on {ref} of {root}"
+    if not checked:
+        return "unknown", f"no main/master ref in {root}" if saw_git else "git unavailable"
+    return "ephemeral", (f"{rel} exists only inside the linked worktree {root} — not on "
+                         f"{'/'.join(checked)}")
+
+def canonicalize_evidence(notes, token, abs_path):
+    """Rewrite the accepted token in `notes` to the absolute path it resolved to, keeping any
+    :N/:N-M line locator. Returns (notes, new_token); a no-op when it was already absolute."""
+    loc = re.search(r":\d+(-\d+)?$", token)
+    new = abs_path + (loc.group(0) if loc else "")
+    if new == token:
+        return notes, token
+    return notes.replace(token, new, 1), new
+
 def _artifact_path_candidates(token):
     """Resolve a bare token to the paths it could mean: as given, relative to the caller's
     cwd (the common case — agents run `wq done` from inside their own worktree), and
@@ -1734,29 +1869,38 @@ def _artifact_path_candidates(token):
         return [token]
     return [token, os.path.join(os.getcwd(), token), os.path.join("/home/lumen", token)]
 
-def find_artifact(notes):
-    """Does `notes` name a verifiable artifact? Returns (ok, kind, detail)."""
+def find_artifact(notes, resolve_sha=False):
+    """Does `notes` name a verifiable artifact? Returns (ok, kind, detail, token) — `token` is
+    the substring of `notes` the answer came from, so a caller can rewrite it in place.
+
+    resolve_sha (wq#1673, audit §4 P3) makes the sha branch prove the commit exists somewhere
+    on this box instead of trusting its shape; it costs a few `git cat-file` calls, so it is
+    off by default and on for `done`, the one caller whose verdict decides a ticket's fate."""
     notes = notes or ""
     m = ARTIFACT_URL_RE.search(notes)
     if m:
-        return True, "url", m.group(0).rstrip(".,)")
+        return True, "url", m.group(0).rstrip(".,)"), m.group(0)
     for raw in notes.split():
         tok = raw.strip(".,;:()[]\"'")
         if tok and ARTIFACT_SHA_RE.fullmatch(tok):
-            return True, "sha", tok
+            if resolve_sha and not sha_resolves(tok):
+                continue  # unresolvable sha — treated like a missing path (audit §4 P3)
+            return True, "sha", tok, tok
     for raw in notes.split():
         tok = raw.strip(".,;:()[]\"'")
         if not tok or tok.startswith("http"):
             continue
-        if "/" not in tok and not re.search(r"\.[A-Za-z0-9]{1,5}$", tok):
-            continue  # doesn't look path-shaped — skip rather than stat() every word
         # wq#1374: accept a trailing :N or :N-M line-locator (path/to/file.py:88-104) — the
         # evidence gate's own citation format — without forcing a rewrite to a bare path.
+        # wq#1673: strip it BEFORE the path-shape test, not after; a bare "wq.py:88-104" has
+        # no slash and no extension at the end, so the shape test used to skip it unread.
         path_tok = re.sub(r":\d+(-\d+)?$", "", tok)
+        if "/" not in path_tok and not re.search(r"\.[A-Za-z0-9]{1,5}$", path_tok):
+            continue  # doesn't look path-shaped — skip rather than stat() every word
         for cand in _artifact_path_candidates(path_tok):
             if os.path.exists(cand):
-                return True, "path", cand
-    return False, None, None
+                return True, "path", cand, tok
+    return False, None, None, None
 
 # ---------------------------------------------------------------- wq#899 merge-state gate
 # PROBLEM (FLEET_OPS_AUDIT_2026-08-23): wq#759 SHAPE-checks the artifact — a PR URL counts as
@@ -1958,18 +2102,51 @@ def _finish(a, new_status):
     reopened = bump_reopened(c, a.id) if is_reopen(r[2], new_status) else 0
     c.execute("COMMIT"); c.close()
     return reopened
+def deliverable_check(ticket_id):
+    """wq#1673 (audit §4 P2): the output the ticket named at `add`, checked at `done`.
+    Returns (verdict, why): 'none' (no deliverable set), 'durable', 'missing' (nowhere on
+    this box), 'ephemeral' (only in a linked worktree), or 'unknown' (fail open)."""
+    c = conn()
+    try:
+        row = c.execute("SELECT deliverable FROM tasks WHERE id=?", (ticket_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return "unknown", "no deliverable column on this queue"  # pre-migration DB
+    finally:
+        c.close()
+    want = (row[0] if row else "") or ""
+    if not want.strip():
+        return "none", ""
+    want = want.strip()
+    for cand in _artifact_path_candidates(want):
+        if os.path.exists(cand):
+            verdict, why = evidence_durability(os.path.realpath(cand))
+            return verdict, f"deliverable {want}: {why}"
+    return "missing", f"deliverable {want} does not exist anywhere this close can see"
+
 def cmd_done(a):
     notes = getattr(a, "notes", "") or ""
     no_artifact = getattr(a, "no_artifact", None)
+    # wq#1673: the ticket's own named output is checked BEFORE the notes, and --no-artifact
+    # does not excuse it — "nothing to cite" and "the thing I was told to build isn't there"
+    # are different claims, and only the first one is a reason to close without evidence.
+    dv, dwhy = deliverable_check(a.id)
+    if dv in ("missing", "ephemeral") and not getattr(a, "unlanded", None):
+        eprint(f"REFUSED: wq#1673 deliverable gate — task {a.id} not closed. {dwhy}. This "
+              f"ticket named the file it had to produce when it was filed; `done` holds it "
+              f"to that. Produce it and land it on main, or record why it is not there with "
+              f"--unlanded \"<reason>\".")
+        sys.exit(7)
+    if dv == "unknown":
+        print(f"WARNING: wq#1673 deliverable gate could not verify ({dwhy}). Closing anyway.")
     if no_artifact:
         a.notes = (notes + (" " if notes else "") + f"[NO-ARTIFACT: {no_artifact}]").strip()
     else:
-        ok, kind, detail = find_artifact(notes)
+        ok, kind, detail, token = find_artifact(notes, resolve_sha=True)
         if not ok:
             eprint(f"REFUSED: wq#759 evidence gate — task {a.id} not closed. `done` requires "
                   f"--notes naming a verifiable artifact (an existing file path, a PR/commit "
-                  f"URL, or a commit sha) or an explicit --no-artifact \"<reason>\" recorded "
-                  f"on the ticket. Got notes={notes!r}.")
+                  f"URL, or a commit sha that resolves in a repo on this box) or an explicit "
+                  f"--no-artifact \"<reason>\" recorded on the ticket. Got notes={notes!r}.")
             sys.exit(2)
         # wq#899: the artifact is a PR URL, so the URL is not the end of the check.
         if kind == "url" and "/pull" in detail:
@@ -1991,6 +2168,33 @@ def cmd_done(a):
                       f"Closing anyway — the gate does not block on forge trouble.")
             elif verdict == "landed":
                 print(f"note: {why} — accepting as landed.")
+        # wq#1673: the artifact is a path, so where it resolved is part of the evidence.
+        elif kind == "path":
+            abs_path = os.path.realpath(detail)
+            a.notes, new_token = canonicalize_evidence(notes, token, abs_path)
+            if new_token != token:
+                print(f"note: evidence path canonicalized to {new_token} (wq#1673).")
+            verdict, why = evidence_durability(abs_path)
+            unlanded = getattr(a, "unlanded", None)
+            if verdict == "ephemeral" and not unlanded:
+                eprint(f"REFUSED: wq#1673 evidence-durability gate — task {a.id} not closed. "
+                      f"Its evidence {why}. That worktree is deleted at the end of this run "
+                      f"and the file goes with it, leaving a citation nobody can check — the "
+                      f"exact shape of 10 dead closes in TICKET_CLOSURE_AUDIT.md F4. Land it "
+                      f"(`lumen-pr land`) and re-run `wq done`; if it just landed, the local "
+                      f"ref may be stale, so `git -C <repo> fetch origin main` and retry. If "
+                      f"the file is deliberately not on main, say so on the record with "
+                      f"--unlanded \"<reason>\".")
+                sys.exit(6)
+            if verdict == "unknown":
+                print(f"WARNING: wq#1673 evidence-durability gate could not verify {abs_path} "
+                      f"({why}). Closing anyway — the gate does not block on git trouble.")
+    # wq#1673: one stamp, whichever of the two durability gates the caller overrode — the
+    # override has to be legible on the ticket even when the path branch never ran.
+    unlanded = getattr(a, "unlanded", None)
+    if unlanded:
+        a.notes = ((getattr(a, "notes", "") or "") +
+                   (" " if getattr(a, "notes", "") else "") + f"[UNLANDED: {unlanded}]").strip()
     _finish(a, 'done')
     print(f"done {a.id} (subsystem locks released)")
 def _reopen_tag(n): return f" [REOPENED — reopened_count={n}]" if n else ""
@@ -2499,14 +2703,14 @@ FENCE_HELP = ("wq#1158: the fence token `wq claim` printed as FENCE=<n>. Refuses
               "the ticket has been claimed again since — pass it and a resumed session is inert")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
 s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/acquire/release the lease"); s.add_argument("--acquire",metavar="LANES",default=None,help="take the lease over a comma/space list of lanes (requires a registered identity)"); s.add_argument("--release",action="store_true",help="drop every orchestrator lease this identity holds"); s.add_argument("--ttl",type=int,default=None,help=f"lease minutes (default WQ_ORCH_TTL={ORCH_TTL_MIN})"); s.add_argument("--note",default=None,help="what this orchestrator is driving"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_orch)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--unlanded",default=None,metavar="REASON",help="wq#1673: close while the cited path exists only in a linked worktree and not on main, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: release a claim held by a DIFFERENT identity if, and only if, it verifiably has no live session and (for fworker-wq<id>) no running unit — the stale-claim path that does not poison a per-ticket identity the way `wq retire` does"); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_block)
 s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)

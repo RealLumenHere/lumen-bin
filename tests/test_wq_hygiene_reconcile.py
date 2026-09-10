@@ -161,12 +161,14 @@ def test_done_ticket_with_vanished_evidence_is_flagged_not_touched(tmp_path):
     repo, _sha = make_repo_with_landed_commit(tmp_path)
     env, ntfy_log = make_env(tmp_path, [repo])
     ticket_id = wq_add(env, "done citing evidence that later vanished")
-    # A sha-shaped citation `wq done` accepts at close time (shape-only gate, wq#759)
-    # but that was never actually landed in any known repo — the rot this sweep exists
-    # to catch.
+    # A sha-shaped citation that was never landed in any known repo — the rot this sweep
+    # exists to catch. wq#1673 made `wq done` resolve a sha instead of trusting its shape,
+    # so this row can no longer be created through the gate; the sweep still has to handle
+    # the ones already on the record, so stage it the way history left it.
     fake_sha = "deadbeefcafe0123456789abcdef0123456789"
-    done = wq(env, "done", str(ticket_id), "--notes", f"closed, evidence {fake_sha}")
+    done = wq(env, "done", str(ticket_id), "--no-artifact", "staging a pre-wq1673 close")
     assert done.returncode == 0, done.stdout + done.stderr
+    set_notes(env["WQ_DB"], ticket_id, f"closed, evidence {fake_sha}")
     before = wq_show(env, ticket_id)
 
     result = run_reconcile(env)
@@ -200,7 +202,9 @@ def test_flag_is_transition_based_not_repeated_every_run(tmp_path):
     env, ntfy_log = make_env(tmp_path, [repo])
     ticket_id = wq_add(env, "done citing evidence that never verifies")
     fake_sha = "0000000cafe0123456789abcdef0123456789ab"
-    wq(env, "done", str(ticket_id), "--notes", f"closed, evidence {fake_sha}")
+    # staged past the gate, as above: wq#1673 refuses an unresolvable sha at close time
+    wq(env, "done", str(ticket_id), "--no-artifact", "staging a pre-wq1673 close")
+    set_notes(env["WQ_DB"], ticket_id, f"closed, evidence {fake_sha}")
 
     first = run_reconcile(env)
     assert f"FLAG wq#{ticket_id}: flagged" in first.stdout
