@@ -29,6 +29,11 @@ verify(){
   done
   echo "## public vault"
   echo -n "  vault.lumennode.uk: "; curl -sS -m6 -o /dev/null -w '%{http_code}\n' https://vault.lumennode.uk/ 2>/dev/null || echo unreachable
+  # wq#1611: unverifiable is a reported quantity — "0 drift" over facts nobody
+  # re-checked is not a clean snapshot. See MINERVA_STALENESS_REVIEW.md §2.3.
+  echo "## fact coverage (lumen_state)"
+  echo -n "  "; python3 /home/lumen/minerva/lumen_coverage.py line 2>/dev/null \
+    || echo "(coverage unavailable — lumen_coverage.py)"
   echo "## recent episodes"
   python3 /home/lumen/minerva/lumen_episode.py recall "recent session work" 2>/dev/null | head -6 | sed 's/^/  /' || echo "  (none)"
   echo "## triage queue (aq — /home/lumen/agents/alert-queue)"
