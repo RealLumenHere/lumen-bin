@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
-# wq-drift-guard — detect when /home/lumen/bin/wq diverges from git HEAD.
+# wq-drift-guard — detect when the deployed wq diverges from reviewed code.
 # wq#886: untracked, shared, mutable binary means any worker can silently
 # clobber the tool every other worker depends on. This guard fires every
 # few minutes and ntfy-alerts on drift so a clobber is caught in minutes
 # instead of hours. Manual: wq-drift-guard [--fix|--status]
+#
+# wq#1653: two different faults leave the deployed wq unreviewed, and this guard
+# used to report both as a clobber:
+#   CLOBBER (exit 1) — repo is on its default branch and $FILE differs from HEAD.
+#     One file was overwritten. --fix restores it.
+#   BRANCH  (exit 4) — the repo itself is parked off its default branch. HEAD is
+#     then not reviewed code, so "$FILE matches HEAD" proves nothing and "$FILE
+#     differs from HEAD" is not a clobber. The whole tree is at fault, it is
+#     primary_tree_guard.py's to restore, and --fix here would deploy $FILE *from
+#     the feature branch*. So BRANCH is reported under its own alert title, takes
+#     precedence over the $FILE comparison, and refuses --fix.
 set -uo pipefail
 
-REPO=/home/lumen/bin
-FILE=wq
+REPO=${WQ_DRIFT_GUARD_REPO:-/home/lumen/bin}
+FILE=${WQ_DRIFT_GUARD_FILE:-wq}
 NTFY_TOPIC=lumen-alerts
 NTFY_TAG=wq-drift
-LOCKFILE=/tmp/.wq-drift-guard.lock
-STATE=/tmp/.wq-drift-guard.state
+LOCKFILE=${WQ_DRIFT_GUARD_LOCK:-/tmp/.wq-drift-guard.lock}
+STATE=${WQ_DRIFT_GUARD_STATE:-/tmp/.wq-drift-guard.state}
+BRANCH_STATE="$STATE.branch"
+PRIMARY_TREE_GUARD=${PRIMARY_TREE_GUARD:-/home/lumen/foreman/harness/primary_tree_guard.py}
 
 # ── one-at-a-time ──
 exec 9>"$LOCKFILE"
@@ -27,15 +40,48 @@ drift() {
 disk_hash() { sha256sum "$REPO/$FILE" 2>/dev/null | cut -d' ' -f1; }
 git_hash()  { git show "HEAD:$FILE" 2>/dev/null | sha256sum | cut -d' ' -f1; }
 
+# The tree's deployment branch: main, then master, else none — the same rule as
+# harness/primary_tree_guard.py default_branch(), which owns the BRANCH fault.
+default_branch() {
+    local cand
+    for cand in main master; do
+        git rev-parse --verify --quiet "refs/heads/$cand" >/dev/null \
+            && { echo "$cand"; return 0; }
+    done
+    return 1
+}
+
+current_branch() { git rev-parse --abbrev-ref HEAD 2>/dev/null; }
+
+# exit 0 = the repo is parked off its default branch. A detached HEAD reports as
+# "HEAD" and counts too: it is equally not the reviewed branch.
+on_branch() {
+    local cur def
+    def=$(default_branch) || return 1
+    cur=$(current_branch)
+    [ -n "$cur" ] && [ "$cur" != "$def" ]
+}
+
 alert() {
-    local msg="$1"
+    local msg="$1" title="${2:-wq DRIFT DETECTED}"
     echo "$msg" >&2
-    ntfy-send -t "$NTFY_TOPIC" -p urgent -T "wq DRIFT DETECTED" "$msg" 2>/dev/null || true
+    ntfy-send -t "$NTFY_TOPIC" -p urgent -T "$title" "$msg" 2>/dev/null || true
+}
+
+branch_msg() {
+    local cur def
+    cur=$(current_branch); def=$(default_branch)
+    echo "$REPO is parked on '$cur', not '$def' — HEAD is not reviewed code, so every tool deployed from $REPO is running branch code (wq#900 class). This is NOT a $FILE clobber and --fix will not touch it. Move the branch work into a worktree (lumen-pr start $REPO <branch> --worktree), then: python3 $PRIMARY_TREE_GUARD check"
 }
 
 ARG="${1-}"
 case "${ARG#--}" in
     status)
+        if on_branch; then
+            echo "BRANCH — $REPO on '$(current_branch)', default '$(default_branch)'"
+            drift && echo "  ($FILE also differs from that branch's HEAD — still a BRANCH fault, not a clobber)"
+            exit 4
+        fi
         if drift; then
             echo "DRIFTED — disk=$(disk_hash) git=$(git_hash)"
             echo "  git diff HEAD -- $FILE:"
@@ -47,6 +93,12 @@ case "${ARG#--}" in
         fi
         ;;
     fix)
+        # BRANCH first: on a feature branch `git checkout HEAD -- $FILE` would deploy
+        # the branch's $FILE over the disk copy and call the tree fixed.
+        if on_branch; then
+            echo "REFUSING --fix: $(branch_msg)"
+            exit 4
+        fi
         if ! drift; then echo "already clean"; exit 0; fi
         FORCE="${2-}"
 
@@ -88,6 +140,21 @@ case "${ARG#--}" in
         echo "clean" > "$STATE"
         ;;
     check|"")
+        if on_branch; then
+            # Own alert title and own dedup record: one alert per (repo, wrong branch)
+            # episode, independent of the $FILE-clobber record so neither mutes the other.
+            cur_branch=$(current_branch)
+            prev_branch=""
+            [ -f "$BRANCH_STATE" ] && prev_branch=$(cat "$BRANCH_STATE" 2>/dev/null)
+            if [ "$cur_branch" != "$prev_branch" ]; then
+                echo "$cur_branch" > "$BRANCH_STATE"
+                alert "$(branch_msg)" "wq REPO OFF DEFAULT BRANCH"
+            else
+                echo "BRANCH — $REPO on '$cur_branch' (already alerted)" >&2
+            fi
+            exit 4
+        fi
+        [ -f "$BRANCH_STATE" ] && rm -f "$BRANCH_STATE"
         if ! drift; then
             # clean — clear any prior alert state
             [ -f "$STATE" ] && rm -f "$STATE"
@@ -107,6 +174,7 @@ case "${ARG#--}" in
         ;;
     *)
         echo "usage: wq-drift-guard [--status|--fix|--check]" >&2
+        echo "exit: 0 clean, 1 CLOBBER, 2 usage/repo error, 3 fix refused (uncommitted work), 4 BRANCH" >&2
         exit 2
         ;;
 esac
