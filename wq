@@ -819,6 +819,7 @@ def resolve_identity(a, c=None):
         print(f"REFUSED: agent name '{ident}' is numeric — that looks like a TICKET id.\n"
               "  `wq claim` does NOT take a ticket id; it hands you the next eligible ticket.\n"
               "  Correct form: wq claim --lane <lane> <your-agent-name>   (or export WQ_AGENT=...)\n"
+              "  To claim THAT ticket: wq claim --id <ticket-id>   (every guard applies, wq#582)\n"
               "  Register a session first: wq whoami --register <your-agent-name>")
         sys.exit(1)
     if ident: return ident.strip(), True
@@ -1866,32 +1867,49 @@ def evidence_durability(abs_path):
     """Would this citation still resolve from a clean checkout, or only from the tree the
     closer happened to be standing in? Returns (verdict, why) — 'durable', 'ephemeral'
     (linked worktree, absent from main), or 'unknown' (fail open)."""
+    verdict, why, _ = _durability(abs_path)
+    return verdict, why
+
+def _durability(abs_path):
+    """evidence_durability plus a third field, `on_main`: True only when the file is committed
+    on a main ref. wq#1702 needs the difference between 'durable because it is on main' and
+    'durable because git does not track it' — only the first one proves something LANDED."""
     root, linked = _worktree_of(abs_path)
     if root is None:
-        return "durable", "not inside a git worktree"
-    if not linked:
-        return "durable", f"primary checkout {root}"
+        return "durable", "not inside a git worktree", False
     rel = os.path.relpath(os.path.realpath(abs_path), os.path.realpath(root))
     if rel.startswith(".."):
-        return "unknown", f"resolved outside the worktree {root} it sits under"
+        return "unknown", f"resolved outside the worktree {root} it sits under", False
     checked, saw_git = [], False
     for ref in MAIN_REFS:
         rv = _git(root, "rev-parse", "--verify", "--quiet", ref)
         if rv is None:
-            return "unknown", "git unavailable"
+            return "unknown", "git unavailable", False
         saw_git = True
         if rv.returncode != 0:
             continue
         checked.append(ref)
         e = _git(root, "cat-file", "-e", f"{ref}:{rel}")
         if e is None:
-            return "unknown", "git unavailable"
+            return "unknown", "git unavailable", False
         if e.returncode == 0:
-            return "durable", f"{rel} is on {ref} of {root}"
+            return "durable", f"{rel} is on {ref} of {root}", True
     if not checked:
-        return "unknown", f"no main/master ref in {root}" if saw_git else "git unavailable"
+        return ("unknown", f"no main/master ref in {root}" if saw_git else "git unavailable", False)
+    if not linked:
+        # wq#1702 (D3): a PRIMARY checkout used to pass unconditionally, so a file written into
+        # /home/lumen/bin and never committed counted as landed — the live-only-hunk class
+        # (wq#1653). Gitignored files are on-box state by design and stay durable; an untracked
+        # or branch-only file in the primary tree is exactly as unlanded as one in a worktree.
+        ig = _git(root, "check-ignore", "-q", "--", rel)
+        if ig is None:
+            return "unknown", "git unavailable", False
+        if ig.returncode == 0:
+            return "durable", f"{rel} is gitignored in {root} (on-box state, not a landing)", False
+        return "ephemeral", (f"{rel} is in the primary checkout {root} but not committed on "
+                             f"{'/'.join(checked)} — written live, never landed"), False
     return "ephemeral", (f"{rel} exists only inside the linked worktree {root} — not on "
-                         f"{'/'.join(checked)}")
+                         f"{'/'.join(checked)}"), False
 
 def canonicalize_evidence(notes, token, abs_path):
     """Rewrite the accepted token in `notes` to the absolute path it resolved to, keeping any
@@ -1961,10 +1979,33 @@ def find_artifact(notes, resolve_sha=False):
 PR_URL_RE = re.compile(r"https?://([^/\s]+)/([^/\s]+)/([^/\s]+?)/pulls?/(\d+)")
 MERGE_STATE_TIMEOUT = float(os.environ.get("WQ_MERGE_STATE_TIMEOUT", "8"))
 
-def _forge_token(host):
-    """Same search order lumen-pr uses. Returned to the caller, never printed."""
+GITHUB_IDENTITY_LIB = os.environ.get("WQ_GITHUB_IDENTITY_LIB", "/home/lumen/bin/lumen-github-identity.sh")
+
+def _github_token(slug):
+    """wq#1702 (D4, audit F1): the token comes from the SAME resolver lumen-pr sources —
+    identity-map entry for the slug, then .secrets/github-frank.token, then agent/.env —
+    run in a subprocess, read from its stdout, never printed. The python copy of that search
+    order is what drifted (wq#1581) and blinded the merge gate for every github.com PR; one
+    resolver cannot drift from itself. $GITHUB_TOKEN stays as the last rung."""
+    import subprocess
+    if slug and os.path.isfile(GITHUB_IDENTITY_LIB):
+        script = ('source "$1" >/dev/null 2>&1 || exit 1; '
+                  'resolve_github_token "$2" >/dev/null 2>&1 || exit 1; printf %s "$GITHUB_TOKEN"')
+        try:
+            r = subprocess.run(["bash", "-c", script, "wq-github-token", GITHUB_IDENTITY_LIB, slug],
+                               capture_output=True, text=True, timeout=MERGE_STATE_TIMEOUT)
+            tok = (r.stdout or "").strip()
+            if r.returncode == 0 and tok:
+                return tok
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return os.environ.get("GITHUB_TOKEN", "").strip() or None
+
+def _forge_token(host, slug=None):
+    """github.com: the lumen-github-identity.sh resolver (wq#1702). Gitea: same file order
+    lumen-pr uses. Returned to the caller, never printed."""
     if host in ("github.com", "www.github.com"):
-        return os.environ.get("GITHUB_TOKEN", "").strip() or None
+        return _github_token(slug)
     for path in (os.environ.get("GITEA_TOKEN_FILE") or "/home/lumen/.secrets/gitea-lumen.token",):
         try:
             with open(path) as fh:
@@ -2030,7 +2071,7 @@ def pr_merge_state(url):
     if not m:
         return "unknown", "not a pull-request URL"
     host, owner, repo, num = m.group(1), m.group(2), m.group(3), m.group(4)
-    token = _forge_token(host)
+    token = _forge_token(host, f"{owner}/{repo}")
     if not token:
         return "unknown", f"no forge token for {host}"
     pr = _forge_get(host, f"/repos/{owner}/{repo}/pulls/{num}", token)
@@ -2143,26 +2184,190 @@ def _finish(a, new_status):
     reopened = bump_reopened(c, a.id) if is_reopen(r[2], new_status) else 0
     c.execute("COMMIT"); c.close()
     return reopened
-def deliverable_check(ticket_id):
-    """wq#1673 (audit §4 P2): the output the ticket named at `add`, checked at `done`.
-    Returns (verdict, why): 'none' (no deliverable set), 'durable', 'missing' (nowhere on
-    this box), 'ephemeral' (only in a linked worktree), or 'unknown' (fail open)."""
+# ------------------------------------------------ wq#1702 the ticket's own terms (D1/D2)
+# wq#1673 added a `deliverable` column and nobody sets it (0 of 1119 tickets since 08-15), so
+# that gate never fired. The terms are already in the ticket text; read them from there.
+# PRECISION OVER RECALL: a false refusal wedges a real close, a miss just falls back to the
+# notes gates above. So only explicit markers count. Backtest over 918 closes (design doc
+# design/wq1702-done-gate.md): `Deliverable:`/`Output:`/`-> path` named 17, all 17 resolve;
+# `Report:` was dropped because tickets use it for INPUTS (#1037).
+_DELIV_EXT = r"(?:md|py|json|jsonl|sh|txt|ya?ml|csv|html|toml|conf|service|timer)"
+_DELIV_PATH = r"`?((?:/|~/|\./)?[\w.@+-]+(?:/[\w.@+-]+)*\." + _DELIV_EXT + r")\b`?"
+DELIVERABLE_MARK_RE = re.compile(r"(?im)\b(?:deliverables?|outputs?)\s*[:=]\s*" + _DELIV_PATH)
+DELIVERABLE_ARROW_RE = re.compile(r"(?:->|\u2192)\s*" + _DELIV_PATH)
+# a ticket that says HOW it lands has made landing part of done (D2)
+LANDING_DEMAND_RE = re.compile(r"(?i)\b(?:via lumen-pr|lumen-pr land)\b")
+
+def derive_deliverable(title, detail):
+    txt = f"{title or ''}\n{detail or ''}"
+    m = DELIVERABLE_MARK_RE.search(txt) or DELIVERABLE_ARROW_RE.search(txt)
+    return os.path.expanduser(m.group(1)) if m else None
+
+def landing_demanded(title, detail):
+    m = LANDING_DEMAND_RE.search(f"{title or ''}\n{detail or ''}")
+    return m.group(0) if m else None
+
+_PRIMARY_ROOTS = None
+
+def _primary_repo_roots():
+    """PRIMARY checkouts one and two levels under /home/lumen (fleet/inventory, projects/x).
+    A linked worktree (.git is a file) is skipped: a deliverable that only resolves inside one
+    is found through cwd instead, and then correctly judged ephemeral. wq#1702 replay: #1455's
+    `www/fleet.html` lives in /home/lumen/fleet/inventory, two levels down."""
+    global _PRIMARY_ROOTS
+    if _PRIMARY_ROOTS is None:
+        roots = []
+        for base in ["/home/lumen"] + sorted(os.path.join("/home/lumen", n) for n in _ls("/home/lumen")):
+            for n in sorted(_ls(base)):
+                d = os.path.join(base, n)
+                if os.path.isdir(os.path.join(d, ".git")) and not os.path.islink(d):
+                    roots.append(d)
+        _PRIMARY_ROOTS = [r for r in dict.fromkeys(roots) if "/worktrees/" not in r + "/"]
+    return _PRIMARY_ROOTS
+
+def _ls(d):
+    try:
+        return [n for n in os.listdir(d) if not n.startswith(".")] if os.path.isdir(d) else []
+    except OSError:
+        return []
+
+def _deliverable_candidates(want, notes):
+    """Where a named output could be: as given / cwd / /home/lumen (wq#1673), then relative
+    to each repo checkout on the box, then any path in the closing notes that ENDS in the
+    named relative path (`reports/x.md` named, `/home/lumen/minerva/v4/reports/x.md` cited)."""
+    out = list(_artifact_path_candidates(want))
+    if not os.path.isabs(want):
+        # the queue's own directory first: `reports/x.md` in a ticket means work-queue/reports
+        bases = [os.path.dirname(os.path.realpath(DB))] + _sha_repo_candidates() + _primary_repo_roots()
+        out += [os.path.join(r, want) for r in bases]
+        tail = "/" + want.lstrip("./")
+        for raw in (notes or "").split():
+            tok = re.sub(r":\d+(-\d+)?$", "", raw.strip(".,;:()[]\"'"))
+            if os.path.isabs(tok) and tok.endswith(tail):
+                out.append(tok)
+    return out
+
+def deliverable_check(ticket_id, notes=""):
+    """wq#1673 (audit §4 P2) + wq#1702: the output the ticket named — the `deliverable` column
+    if set, else the one its own text names (derive_deliverable). Returns (verdict, why):
+    'none', 'durable', 'missing', 'ephemeral', or 'unknown' (fail open)."""
     c = conn()
     try:
-        row = c.execute("SELECT deliverable FROM tasks WHERE id=?", (ticket_id,)).fetchone()
+        row = c.execute("SELECT deliverable, title, detail FROM tasks WHERE id=?", (ticket_id,)).fetchone()
     except sqlite3.OperationalError:
         return "unknown", "no deliverable column on this queue"  # pre-migration DB
     finally:
         c.close()
-    want = (row[0] if row else "") or ""
-    if not want.strip():
+    if not row:
         return "none", ""
-    want = want.strip()
-    for cand in _artifact_path_candidates(want):
-        if os.path.exists(cand):
-            verdict, why = evidence_durability(os.path.realpath(cand))
-            return verdict, f"deliverable {want}: {why}"
-    return "missing", f"deliverable {want} does not exist anywhere this close can see"
+    want, source = (row[0] or "").strip(), "deliverable"
+    if not want:
+        want, source = (derive_deliverable(row[1], row[2]) or ""), "deliverable named in the ticket text"
+    if not want:
+        return "none", ""
+    derived = source != "deliverable"
+    import glob as _glob
+    for cand in _deliverable_candidates(want, notes):
+        # wq#1702 replay: ticket templates name `reports/foo-YYYYMMDD.md`; the file has a date.
+        hits = _glob.glob(_placeholder_glob(cand)) if derived and _PLACEHOLDER_RE.search(cand) else (
+            [cand] if os.path.exists(cand) else [])
+        if hits:
+            verdict, why = evidence_durability(os.path.realpath(sorted(hits)[-1]))
+            return verdict, f"{source} {want}: {why}"
+    if derived and not os.path.isabs(want):
+        # A RELATIVE path the ticket text named but did not anchor is ambiguous, not missing:
+        # the replay back to 06-01 found ~45 real reports under pack dirs no base can guess
+        # (fable-prep/<pack>/reports/...). Fail open, visibly; an absolute path stays a fact.
+        return "unknown", f"{source} {want} is relative and resolved under no known base"
+    return "missing", f"{source} {want} does not exist anywhere this close can see"
+
+_PLACEHOLDER_RE = re.compile(r"YYYY|<[^>/]+>|\{[^}/]+\}")
+
+def _placeholder_glob(p):
+    g = _glob_escape(p)
+    g = g.replace("YYYY", "[0-9][0-9][0-9][0-9]").replace("MM", "[0-9][0-9]").replace("DD", "[0-9][0-9]")
+    return re.sub(r"<[^>/]+>|\{[^}/]+\}", "*", g)
+
+def _glob_escape(p):
+    return re.sub(r"([\[\]?*])", r"[\1]", p)
+
+def _sha_on_main(sha):
+    """(True, why) if the commit is reachable from a main ref of a repo on this box, (False,
+    why) if it exists but only off main, (None, why) if no repo here knows it."""
+    seen = False
+    for repo in _sha_repo_candidates():
+        r = _git(repo, "cat-file", "-e", sha + "^{commit}")
+        if r is None or r.returncode != 0:
+            continue
+        seen = True
+        for ref in MAIN_REFS:
+            rv = _git(repo, "rev-parse", "--verify", "--quiet", ref)
+            if rv is None or rv.returncode != 0:
+                continue
+            a = _git(repo, "merge-base", "--is-ancestor", sha, ref)
+            if a is not None and a.returncode == 0:
+                return True, f"{sha} is on {ref} of {repo}"
+    return (False, f"{sha} exists but is on no main ref") if seen else (None, f"no repo here has {sha}")
+
+def landing_proof(notes, pr_verdicts=None):
+    """wq#1702 (D2): does anything in `notes` prove the work LANDED? Scans every citation, not
+    just the first: a PR the forge calls merged/landed, a sha on a main ref, or a path
+    committed on main. Returns (verdict, why): 'landed', 'unverified' (a PR whose state the
+    forge would not tell us — fail open, stamped), or 'not-landed'."""
+    notes = notes or ""
+    pr_verdicts = dict(pr_verdicts or {})
+    unverified = None
+    for m in PR_URL_RE.finditer(notes):
+        url = m.group(0)
+        if url not in pr_verdicts:
+            pr_verdicts[url] = pr_merge_state(url)
+        v, why = pr_verdicts[url]
+        if v in ("merged", "landed"):
+            return "landed", why
+        if v == "unknown" and unverified is None:
+            unverified = why
+    for raw in notes.split():
+        tok = raw.strip(".,;:()[]\"'")
+        cm = re.search(r"/commits?/([0-9a-f]{7,40})\b", tok)
+        sha = cm.group(1) if cm else (tok if ARTIFACT_SHA_RE.fullmatch(tok) else None)
+        if sha:
+            ok, why = _sha_on_main(sha)
+            if ok:
+                return "landed", why
+            continue
+        if tok.startswith("http"):
+            continue
+        path_tok = re.sub(r":\d+(-\d+)?$", "", tok)
+        if "/" not in path_tok:
+            continue
+        for cand in _artifact_path_candidates(path_tok):
+            if os.path.exists(cand):
+                verdict, why, on_main = _durability(os.path.realpath(cand))
+                if on_main:
+                    return "landed", why
+                break
+    if unverified:
+        return "unverified", unverified
+    return "not-landed", "no merged PR, no commit on a main ref, no path committed on main"
+
+def _stamp(notes, tag):
+    return ((notes or "") + (" " if notes else "") + tag).strip()
+
+def _aq_unverified(ticket_id, why):
+    """One keyed aq row per forge host, only against the LIVE queue (tests use a scratch DB).
+    Best effort: aq trouble never blocks a close."""
+    if os.path.realpath(DB) != os.path.realpath("/home/lumen/agents/work-queue/queue.db"):
+        return
+    import subprocess
+    host = (re.search(r"for ([\w.:-]+)", why) or re.search(r"^([\w.:-]+) unreachable", why))
+    key = f"unverified-pr:{host.group(1) if host else 'forge'}"
+    try:
+        subprocess.run(["aq", "add", "wq-done-gate", key,
+                        "wq done closed over a PR it could not verify",
+                        f"wq#{ticket_id}: {why}. The merge gate failed open; fix the forge/token path."],
+                       capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 def cmd_done(a):
     notes = getattr(a, "notes", "") or ""
@@ -2170,13 +2375,15 @@ def cmd_done(a):
     # wq#1673: the ticket's own named output is checked BEFORE the notes, and --no-artifact
     # does not excuse it — "nothing to cite" and "the thing I was told to build isn't there"
     # are different claims, and only the first one is a reason to close without evidence.
-    dv, dwhy = deliverable_check(a.id)
+    # wq#1702: the named output may come from the ticket text, not just the column.
+    dv, dwhy = deliverable_check(a.id, notes)
     if dv in ("missing", "ephemeral") and not getattr(a, "unlanded", None):
-        eprint(f"REFUSED: wq#1673 deliverable gate — task {a.id} not closed. {dwhy}. This "
-              f"ticket named the file it had to produce when it was filed; `done` holds it "
-              f"to that. Produce it and land it on main, or record why it is not there with "
+        eprint(f"REFUSED: wq#1673/wq#1702 deliverable gate — task {a.id} not closed. {dwhy}. "
+              f"This ticket named the file it had to produce; `done` holds it to that. "
+              f"Produce it and land it on main, or record why it is not there with "
               f"--unlanded \"<reason>\".")
         sys.exit(7)
+    pr_verdicts = {}  # url -> (verdict, why), so the landing check below never re-asks the forge
     if dv == "unknown":
         print(f"WARNING: wq#1673 deliverable gate could not verify ({dwhy}). Closing anyway.")
     if no_artifact:
@@ -2193,6 +2400,9 @@ def cmd_done(a):
         if kind == "url" and "/pull" in detail:
             unmerged = getattr(a, "unmerged", None)
             verdict, why = pr_merge_state(detail)
+            _pm = PR_URL_RE.search(detail)
+            if _pm:
+                pr_verdicts[_pm.group(0)] = (verdict, why)
             if verdict == "open" and not unmerged:
                 eprint(f"REFUSED: wq#899 merge-state gate — task {a.id} not closed. Its evidence "
                       f"is a pull request that has not landed: {why}. A PR URL proves a branch "
@@ -2205,8 +2415,13 @@ def cmd_done(a):
                 a.notes = (a.notes + (" " if a.notes else "") +
                            f"[UNMERGED-PR: {unmerged}]").strip()
             elif verdict == "unknown":
+                # wq#1702 (audit F1 P0): fail open, but never silently — the stamp is what
+                # closure-quality and the next audit count, the aq row is what Frank sees.
                 print(f"WARNING: wq#899 merge-state gate could not verify {detail} ({why}). "
-                      f"Closing anyway — the gate does not block on forge trouble.")
+                      f"Closing anyway — the gate does not block on forge trouble. Stamped "
+                      f"[UNVERIFIED-PR] on the ticket.")
+                a.notes = _stamp(a.notes, f"[UNVERIFIED-PR: {why}]")
+                _aq_unverified(a.id, why)
             elif verdict == "landed":
                 print(f"note: {why} — accepting as landed.")
         # wq#1673: the artifact is a path, so where it resolved is part of the evidence.
@@ -2219,9 +2434,10 @@ def cmd_done(a):
             unlanded = getattr(a, "unlanded", None)
             if verdict == "ephemeral" and not unlanded:
                 eprint(f"REFUSED: wq#1673 evidence-durability gate — task {a.id} not closed. "
-                      f"Its evidence {why}. That worktree is deleted at the end of this run "
-                      f"and the file goes with it, leaving a citation nobody can check — the "
-                      f"exact shape of 10 dead closes in TICKET_CLOSURE_AUDIT.md F4. Land it "
+                      f"Its evidence {why}. A worktree is deleted at the end of its run and a "
+                      f"live edit in a primary tree is overwritten by the next landing, so the "
+                      f"citation stops meaning anything — TICKET_CLOSURE_AUDIT.md F4, wq#1702 "
+                      f"D3. Land it "
                       f"(`lumen-pr land`) and re-run `wq done`; if it just landed, the local "
                       f"ref may be stale, so `git -C <repo> fetch origin main` and retry. If "
                       f"the file is deliberately not on main, say so on the record with "
@@ -2230,6 +2446,31 @@ def cmd_done(a):
             if verdict == "unknown":
                 print(f"WARNING: wq#1673 evidence-durability gate could not verify {abs_path} "
                       f"({why}). Closing anyway — the gate does not block on git trouble.")
+    # wq#1702 (D2): a ticket that says it lands via lumen-pr is not done until something in
+    # the notes proves it landed. --no-artifact does not excuse this; --unlanded (or an
+    # --unmerged already on the record for the same PR) is the on-the-record override.
+    c = conn()
+    try:
+        trow = c.execute("SELECT title, detail FROM tasks WHERE id=?", (a.id,)).fetchone()
+    finally:
+        c.close()
+    demand = landing_demanded(*(trow or (None, None)))
+    if demand and not getattr(a, "unlanded", None) and not getattr(a, "unmerged", None):
+        lv, lwhy = landing_proof(notes, pr_verdicts)
+        if lv == "not-landed":
+            eprint(f"REFUSED: wq#1702 landing gate — task {a.id} not closed. The ticket says it "
+                  f"lands ({demand!r}), and nothing in the notes proves it did: {lwhy}. Cite the "
+                  f"merged PR URL, a commit that is on main, or a path committed on main. If it "
+                  f"legitimately did not need to land (stale, duplicate, no-op), say so on the "
+                  f"record with --unlanded \"<reason>\".")
+            sys.exit(8)
+        if lv == "unverified" and "[UNVERIFIED-PR" not in (a.notes or ""):
+            print(f"WARNING: wq#1702 landing gate could not verify ({lwhy}). Closing anyway, "
+                  f"stamped [UNVERIFIED-PR].")
+            a.notes = _stamp(a.notes, f"[UNVERIFIED-PR: {lwhy}]")
+            _aq_unverified(a.id, lwhy)
+        elif lv == "landed":
+            print(f"note: wq#1702 landing gate — {lwhy}.")
     # wq#1673: one stamp, whichever of the two durability gates the caller overrode — the
     # override has to be legible on the ticket even when the path branch never ran.
     unlanded = getattr(a, "unlanded", None)
@@ -2787,7 +3028,7 @@ s=sub.add_parser("concurrency",help="wq#594: report one session id being driven 
 s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/acquire/release the lease"); s.add_argument("--acquire",metavar="LANES",default=None,help="take the lease over a comma/space list of lanes (requires a registered identity)"); s.add_argument("--release",action="store_true",help="drop every orchestrator lease this identity holds"); s.add_argument("--ttl",type=int,default=None,help=f"lease minutes (default WQ_ORCH_TTL={ORCH_TTL_MIN})"); s.add_argument("--note",default=None,help="what this orchestrator is driving"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_orch)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--unlanded",default=None,metavar="REASON",help="wq#1673: close while the cited path exists only in a linked worktree and not on main, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--unlanded",default=None,metavar="REASON",help="wq#1673/wq#1702: close while the ticket's named output or landing term is not met (worktree-only or uncommitted path, missing deliverable, no landed PR/commit for a 'via lumen-pr' ticket), on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: release a claim held by a DIFFERENT identity if, and only if, it verifiably has no live session and (for fworker-wq<id>) no running unit — the stale-claim path that does not poison a per-ticket identity the way `wq retire` does"); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_block)
 s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)
