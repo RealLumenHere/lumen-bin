@@ -50,18 +50,45 @@ FORCE = {
 }
 
 
+LKG = CFG.with_suffix(".json.lkg")   # last-known-good snapshot, refreshed by dc-config-guard on every clean read
+
+
+def _load(path):
+    try:
+        t = path.read_text()
+        return json.loads(t) if t.strip() else None
+    except Exception:
+        return None
+
+
+def _atomic_write(path, data):
+    # dc-config-atomic (2026-09-08): never leave the file observably empty.
+    import os, tempfile
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".enforce.", dir=str(path.parent))
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    st = os.stat(path.parent)
+    os.chown(tmp, st.st_uid, st.st_gid)   # guard runs as root; keep the file owned by lumen
+    os.replace(tmp, path)
+
+
 def main():
     CFG.parent.mkdir(parents=True, exist_ok=True)
-    cfg = {}
-    if CFG.exists():
-        try:
-            cfg = json.loads(CFG.read_text() or "{}")
-        except Exception:
-            cfg = {}
+    cfg = _load(CFG) if CFG.exists() else None
+    src = "live"
+    if cfg is None:
+        # Empty/garbage config: DO NOT clobber down to FORCE keys (that drops
+        # clientId/version and makes the next child rewrite them -> guard churn).
+        cfg = _load(LKG) if LKG.exists() else None
+        src = "lkg" if cfg is not None else "empty"
+        cfg = cfg or {}
     cfg.update(FORCE)
-    CFG.write_text(json.dumps(cfg, indent=2))
+    _atomic_write(CFG, json.dumps(cfg, indent=2))
     print(f"[dc-enforce:tier1] blockedCommands={len(cfg.get('blockedCommands'))} "
-          f"onboarding={cfg.get('pendingWelcomeOnboarding')}")
+          f"onboarding={cfg.get('pendingWelcomeOnboarding')} base={src}")
 
 
 if __name__ == "__main__":

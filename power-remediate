@@ -49,9 +49,41 @@ NTFY_TOPIC = "lumen-fleet"
 # Policy: eligible nodes ONLY (stateless inference Macs). Anything else is excluded
 # by default, and this hardcoded denylist is a redundant second check, not the
 # primary gate — the primary gate is ELIGIBLE being a closed allowlist.
+# wq#1454: ELIGIBLE is the POLICY allowlist; the set actually ticked is
+# ELIGIBLE ∩ fleet_inventory.monitored() at runtime (eligible_now()), so a node
+# parked/decommissioned in machines/<name>.yaml stops being remediated without a
+# code edit (aq#608/#1070: nephthys kept alerting here after its decommission).
 ELIGIBLE = {"isis", "hathor", "khepri", "nephthys"}
 NEVER_ELIGIBLE = {"lumen", "maat", "wadjet", "anubis", "thoth"}
 assert ELIGIBLE.isdisjoint(NEVER_ELIGIBLE), "policy allowlist/denylist overlap"
+
+FLEET_INVENTORY_ROOT = os.environ.get("FLEET_INVENTORY_ROOT", "/home/lumen/fleet/inventory")
+sys.path.insert(0, FLEET_INVENTORY_ROOT)
+try:
+    import fleet_inventory as _inv
+except Exception as _e:
+    print(f"WARN fleet_inventory unavailable ({_e}) — nothing is eligible (fail-closed)", file=sys.stderr)
+    _inv = None
+
+
+def inventory_monitored():
+    """Names the inventory monitors (last-good cache on a YAML typo), or None if
+    the inventory and its cache are both unreadable."""
+    if _inv is None:
+        return None
+    try:
+        return {rec["identity"]["name"] for rec in _inv.monitored(_inv.load(strict=True, fallback=True))}
+    except Exception as e:
+        print(f"WARN inventory unreadable, no last-good cache ({e}) — nothing is eligible (fail-closed)",
+              file=sys.stderr)
+        return None
+
+
+def eligible_now():
+    """Policy allowlist intersected with the inventory's monitored set. Fail-closed:
+    an unreadable inventory means an empty set (observe-only is the safe default)."""
+    mon = inventory_monitored()
+    return set() if mon is None else (ELIGIBLE & mon)
 
 HOLD_SECONDS   = 900     # 15 min sustained-unreachable before the ladder starts
 WOL_WAIT       = 300     # 5 min after WoL before escalating to AC-cycle
@@ -390,7 +422,11 @@ def cmd_run(dry_run=False):
     conf = load_conf()
     state = load_state()
     now = time.time()
-    for node in sorted(ELIGIBLE):
+    eligible = eligible_now()
+    for node in sorted(set(state) - eligible):
+        log(f"{node}: no longer eligible (not monitored in inventory or off policy) — dropping state")
+        del state[node]
+    for node in sorted(eligible):
         prev = state.get(node, {})
         nxt = tick(node, conf, prev, now, dry_run)
         if nxt:
@@ -404,9 +440,13 @@ def cmd_status():
     conf = load_conf()
     state = load_state()
     print(f"ARMED={conf.get('ARMED','0')}  conf={CONF_PATH}")
-    print(f"eligible: {sorted(ELIGIBLE)}")
+    mon = inventory_monitored()
+    eligible = eligible_now()
+    print(f"policy allowlist: {sorted(ELIGIBLE)}")
+    print(f"inventory-monitored: {sorted(mon) if mon is not None else 'UNAVAILABLE (fail-closed)'}")
+    print(f"eligible: {sorted(eligible)}")
     now = time.time()
-    for node in sorted(ELIGIBLE):
+    for node in sorted(eligible):
         st = state.get(node)
         if not st:
             print(f"  {node}: clear")
@@ -425,6 +465,8 @@ def selftest():
         print(f"{'PASS' if ok else 'FAIL'} {label:52s} want={want!r:8} got={got!r}")
 
     chk("eligible/denylist disjoint", ELIGIBLE.isdisjoint(NEVER_ELIGIBLE), True)
+    chk("eligible_now subset of policy", eligible_now() <= ELIGIBLE, True)
+    chk("eligible_now disjoint from denylist", eligible_now().isdisjoint(NEVER_ELIGIBLE), True)
     chk("clean plug P5 accepted", plug_for({"power_plug": "P5"}), "p5")
     chk("clean plug p2 accepted", plug_for({"power_plug": "p2"}), "p2")
     chk("dirty plug (UNKNOWN) rejected",

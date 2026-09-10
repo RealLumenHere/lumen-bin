@@ -14,6 +14,9 @@ HM=$(grep -c "Lumen patch wq#416" "$D/dist/terminal-manager.js" 2>/dev/null); HM
 # sudo-strip marker is lowercase '[lumen tier-1' in command-manager.js
 SM=$(grep -c "lumen tier-1 re-port" "$D/dist/command-manager.js" 2>/dev/null); SM=${SM:-0}
 [ "${SM//[^0-9]/}" -ge 1 ] 2>/dev/null || PROB+=("command-manager.js sudo-strip marker ABSENT")
+# dc-config-atomic marker in config-manager.js (2026-09-08, guard-thrash root-cause fix)
+AM=$(grep -c "Lumen patch dc-config-atomic" "$D/dist/config-manager.js" 2>/dev/null); AM=${AM:-0}
+[ "${AM//[^0-9]/}" -ge 3 ] 2>/dev/null || PROB+=("config-manager.js dc-config-atomic markers=$AM (expect >=3) — rerun /home/lumen/uplift/dc-config-atomic/apply.sh")
 LASTVER=$(cat "$STATE" 2>/dev/null || echo "")
 if [ -n "$LASTVER" ] && [ "$LASTVER" != "$VER" ]; then
   PROB+=("DC version changed $LASTVER -> $VER (npm bump — patches likely wiped)")
@@ -25,4 +28,4 @@ if [ ${#PROB[@]} -gt 0 ]; then
   /home/lumen/bin/aq add tripwire dc-patch-wipe "DC patches wiped/changed" "$MSG" 2>/dev/null
   echo "FAIL: $MSG"; exit 1
 fi
-echo "OK v$VER: tm_markers=$HM sudo_strip=$SM hs=present"
+echo "OK v$VER: tm_markers=$HM sudo_strip=$SM hs=present atomic=$AM"

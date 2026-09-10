@@ -45,4 +45,13 @@ q "SELECT start_time, provided_model_name AS model, round(total_cost,5) AS cost_
    FROM observations WHERE start_time > now() - toIntervalDay(${D})
    ORDER BY total_cost DESC LIMIT 12 FORMAT PrettyCompact"
 
+echo; echo "### GLM-5.3-FLASH (wq#1573 watch rung, added 2026-09-09)"
+q "SELECT count(*) AS calls, round(sum(total_cost),4) AS cost_usd,
+   sum(usage_details['input']) AS in_tok, sum(usage_details['output']) AS out_tok,
+   round(sum(total_cost)/greatest(count(*),1),6) AS usd_per_call
+   FROM observations
+   WHERE start_time > now() - toIntervalDay(${D})
+     AND provided_model_name LIKE '%glm-5.3-flash%'
+   FORMAT PrettyCompact"
+
 echo; echo "(tip: 'litellm-cost 30' for a 30-day window)"

@@ -149,6 +149,62 @@ def scenario_transient_ticket_failure():
     check("retry -> 1 ticket", n_tickets(wq) == 1, f"got {n_tickets(wq)}")
     check("retry -> exactly 1 page", n_pages(cap) == 1, f"got {n_pages(cap)}")
 
+def add_dispatch_alert(aq, title="[DISPATCH] DISPATCHER STALLED", count=1, status="open",
+                       message="Dispatcher STALLED: last 2 passes all unhealthy."):
+    c = sqlite3.connect(aq)
+    c.execute("INSERT INTO alerts(first_ts,last_ts,source,key,title,message,priority,count,status) "
+              "VALUES(?,?,?,?,?,?,?,?,?)",
+              (_now(), _now(), "ntfy:lumen-alerts", title, title, message, "5", count, status))
+    c.commit(); rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.close()
+    return rid
+
+def scenario_dispatch_boundary():
+    print("[dispatch-boundary] wq#1410: DISPATCHER STALLED below threshold no-op; at threshold escalates")
+    d, aq, wq, cap = fresh()
+    rid = add_dispatch_alert(aq, count=2)
+    run_esc(aq, wq, cap)
+    check("count=2 -> 0 tickets", n_tickets(wq) == 0)
+    check("count=2 -> 0 pages", n_pages(cap) == 0)
+    c = sqlite3.connect(aq); c.execute("UPDATE alerts SET count=3 WHERE id=?", (rid,)); c.commit(); c.close()
+    run_esc(aq, wq, cap)
+    check("count=3 -> 1 ticket", n_tickets(wq) == 1, f"got {n_tickets(wq)}")
+    check("count=3 -> 1 page", n_pages(cap) == 1, f"got {n_pages(cap)}")
+
+def scenario_dispatch_unprefixed_title_still_matches():
+    print("[dispatch-legacy] a pre-wq#1410 unprefixed 'DISPATCHER STALLED' row still escalates (LIKE match)")
+    d, aq, wq, cap = fresh()
+    add_dispatch_alert(aq, title="DISPATCHER STALLED", count=145)  # the real aq#794 shape
+    run_esc(aq, wq, cap)
+    check("legacy title -> 1 ticket", n_tickets(wq) == 1, f"got {n_tickets(wq)}")
+    check("legacy title -> 1 page", n_pages(cap) == 1, f"got {n_pages(cap)}")
+
+def scenario_dispatch_and_probe_rules_are_independent():
+    print("[dispatch-independence] a DISPATCHER STALLED row and a probe row escalate separately, "
+          "neither rule double-counts the other's row")
+    d, aq, wq, cap = fresh()
+    add_alert(aq, key="probe-pokemon-liveness", count=5)
+    add_dispatch_alert(aq, count=5)
+    run_esc(aq, wq, cap)
+    check("probe + dispatch -> 2 tickets", n_tickets(wq) == 2, f"got {n_tickets(wq)}")
+    check("probe + dispatch -> 2 pages", n_pages(cap) == 2, f"got {n_pages(cap)}")
+
+def scenario_dispatch_resolve_gives_fresh_per_incident_count():
+    print("[dispatch-recover] wq#1410 §3.3.3: dispatch_recover.py resolving the row on a healthy "
+          "pass means a new incident starts its count from zero, not lifetime")
+    d, aq, wq, cap = fresh()
+    rid = add_dispatch_alert(aq, count=10)
+    run_esc(aq, wq, cap)
+    check("first incident -> 1 ticket", n_tickets(wq) == 1)
+    # dispatch_recover.reset() resolves the row the moment a healthy pass lands
+    c = sqlite3.connect(aq); c.execute("UPDATE alerts SET status='resolved' WHERE id=?", (rid,)); c.commit(); c.close()
+    run_esc(aq, wq, cap)
+    check("after recovery -> no new ticket yet", n_tickets(wq) == 1, f"got {n_tickets(wq)}")
+    # a NEW stall is a NEW aq row with its own count, not the old lifetime 145
+    add_dispatch_alert(aq, count=3)
+    run_esc(aq, wq, cap)
+    check("new incident (new aq id) -> new ticket", n_tickets(wq) == 2, f"got {n_tickets(wq)}")
+    check("new incident -> new page", n_pages(cap) == 2, f"got {n_pages(cap)}")
+
 def scenario_refire_after_resolve():
     print("[refire] resolve then a NEW aq row -> a NEW escalation (new outage, new ticket)")
     d, aq, wq, cap = fresh()
@@ -169,7 +225,10 @@ def scenario_refire_after_resolve():
 def main():
     for fn in (scenario_boundary, scenario_replay_152, scenario_acked_and_resolved,
                scenario_scoping, scenario_two_distinct, scenario_transient_ticket_failure,
-               scenario_refire_after_resolve):
+               scenario_refire_after_resolve, scenario_dispatch_boundary,
+               scenario_dispatch_unprefixed_title_still_matches,
+               scenario_dispatch_and_probe_rules_are_independent,
+               scenario_dispatch_resolve_gives_fresh_per_incident_count):
         fn()
     print()
     if _fails:

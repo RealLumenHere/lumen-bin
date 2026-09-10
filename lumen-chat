@@ -57,7 +57,7 @@ cmd_new() {
   [[ -n "$model" ]]  && claude_cmd="$claude_cmd --model $model"
   [[ -n "$effort" ]] && claude_cmd="$claude_cmd --effort $effort"
 
-  tmux new-session -d -s "$sn" "$claude_cmd"
+  tmux new-session -d -s "$sn" -c /home/lumen "$claude_cmd"
   echo "created: $sn"
 }
 
@@ -142,7 +142,7 @@ cmd_menu() {
         local cmd_arr=("$CLAUDE_BIN")
         [[ -n "$new_model" ]]  && cmd_arr+=(--model "$new_model")
         [[ -n "$new_effort" ]] && cmd_arr+=(--effort "$new_effort")
-        tmux new-session -d -s "$sn" "${cmd_arr[@]}" 2>/dev/null || true
+        tmux new-session -d -s "$sn" -c /home/lumen "${cmd_arr[@]}" 2>/dev/null || true
         exec tmux attach-session -t "$sn"
         ;;
       [0-9]*)
