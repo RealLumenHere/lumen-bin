@@ -23,6 +23,20 @@ verify(){
   bash /home/lumen/bin/wadjet-ha-failback.sh status 2>/dev/null | sed 's/^/  /' || echo "  (ha status unavailable)"
   { [ -f /home/lumen/ha/AUTO_PROMOTE_ENABLED ] && echo "  auto_promote: ARMED"; } || echo "  auto_promote: DISARMED"
   echo -n "  ha_monitor_timer: "; systemctl is-active wadjet-ha-monitor.timer 2>/dev/null || true
+  echo "## dead-man: critical timer LastTrigger age (wq#1658)"
+  for t in wadjet-ha-monitor.timer lumen-backup-critical.timer; do
+    lt=$(systemctl show "$t" -p LastTriggerUSec --value 2>/dev/null)
+    if [ -z "$lt" ] || [ "$lt" = "n/a" ]; then
+      printf "  %-28s never triggered (or unit missing)\n" "$t:"
+      continue
+    fi
+    lt_s=$(date -d "$lt" +%s 2>/dev/null)
+    if [ -n "$lt_s" ]; then
+      printf "  %-28s %ds ago (%s)\n" "$t:" "$(( $(date +%s) - lt_s ))" "$lt"
+    else
+      printf "  %-28s %s\n" "$t:" "$lt"
+    fi
+  done
   echo "## key services (Lumen)"
   for u in cloudflared desktop-commander-mcp lumen-agent litellm; do
     printf "  %-24s %s\n" "$u:" "$(svc "$u")"

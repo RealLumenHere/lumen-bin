@@ -98,6 +98,13 @@ def load_known_removed():
     return set()
 
 def cmd_snapshot():
+    # wq#1658: close any new dead-man coverage gap before capturing the
+    # baseline, so opting out of cron-stamp coverage is the exception —
+    # failure here must never block the snapshot itself.
+    try:
+        subprocess.run(["/home/lumen/bin/lumen-cron-stamp-dropin-gen", "apply"], timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print("unit-drift: lumen-cron-stamp-dropin-gen skipped: %s" % exc)
     os.makedirs(UNITS_DIR, exist_ok=True); os.makedirs(DROPIN_DIR, exist_ok=True)
     st = scan()
     for d in (UNITS_DIR, DROPIN_DIR):
