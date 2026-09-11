@@ -35,9 +35,21 @@ reuses the exact same open/count/escalations-table mechanism the probe rule uses
 recovery ladder, same wq) resolves the row itself the moment a healthy pass lands, so
 a fresh open row's count is already scoped to one incident, not lifetime.
 
+wq#1674 (research/TICKET_CLOSURE_AUDIT.md F5/P2) adds a third rule, for repo divergence.
+harness/repo_sweep.py used to `wq add` a titled ticket on every fire; wq add's dup guard
+only sees OPEN rows, so each close let the next sweep refile the same title — 9 closes in
+9 days for "[repo-sweep] bin: BEHIND_ONLY", 21 of 419 sampled closes fleet-wide. The sweep
+now writes a keyed aq row (source='repo-sweep', key='{repo}:{VERDICT}', count++ per fire)
+and this rule is the only thing that turns one into a ticket, at
+count>=AQ_ESCALATE_REPO_SWEEP_THRESHOLD. No live re-probe here (unlike the probe rule):
+count is already proof the divergence survived that many separate sweeps — at the 4h
+lumen-repo-sweep cadence a count of 3 is ~12h of persistence, a far stronger signal than
+3 sentinel cycles — and the sweep itself resolves the row the moment the repo is back
+IN_SYNC, so a fresh divergence gets a new aq id and therefore a new ticket.
+
 Env (tests/extension): AQ_DB, WQ_DB, AQ_ESCALATE_THRESHOLD, AQ_ESCALATE_SOURCE,
-AQ_ESCALATE_PRIORITY, AQ_ESCALATE_DISPATCH_THRESHOLD, AQ_ESCALATE_NTFY_URL,
-AQ_ESCALATE_NTFY_CAPTURE (file: no network), AQ_WQ_BIN.
+AQ_ESCALATE_PRIORITY, AQ_ESCALATE_DISPATCH_THRESHOLD, AQ_ESCALATE_REPO_SWEEP_THRESHOLD,
+AQ_ESCALATE_NTFY_URL, AQ_ESCALATE_NTFY_CAPTURE (file: no network), AQ_WQ_BIN.
 """
 import os, sys, json, re, sqlite3, subprocess, urllib.request, datetime
 
@@ -51,6 +63,10 @@ DISPATCH_THRESHOLD = int(os.environ.get("AQ_ESCALATE_DISPATCH_THRESHOLD", "3"))
 DISPATCH_RUNBOOK = ("dispatcher/dispatch_recover.py status (recovery ladder history); "
                      "dispatcher.log for the stalled pass shape; runtime/recover_state.json; "
                      "wq#1410")
+REPO_SWEEP_SOURCE = os.environ.get("AQ_ESCALATE_REPO_SWEEP_SOURCE", "repo-sweep")
+REPO_SWEEP_THRESHOLD = int(os.environ.get("AQ_ESCALATE_REPO_SWEEP_THRESHOLD", "3"))
+REPO_SWEEP_LANE = "auto"  # repo_sweep.repo_hint routes this lane off the ticket's own detail
+REPO_SWEEP_TITLE_PREFIX = "[repo-sweep] "
 NTFY_URL  = os.environ.get("AQ_ESCALATE_NTFY_URL", "http://localhost:8080/lumen-alerts")
 NTFY_CAP  = os.environ.get("AQ_ESCALATE_NTFY_CAPTURE")  # test: append pages to a file, no network
 LANE      = "fleet-fires"
@@ -105,6 +121,24 @@ def _dur(first_ts, last_ts):
     except Exception:
         return "?"
 
+def _wq_add(lane, pri, title, detail, what):
+    """wq add one ticket. Returns its id, reusing the existing id if wq refuses a
+    duplicate title; None on hard failure, so the caller retries next run and
+    never pages without a ticket."""
+    cmd = [WQ_BIN, "add", "--lane", lane, "--pri", str(pri), "--title", title, "--detail", detail]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ), timeout=30)
+    except Exception as e:
+        print(f"  {what} EXC: {e}")
+        return None
+    out = (r.stdout or "") + (r.stderr or "")
+    m = (re.search(r"added task (\d+)", out)
+         or re.search(r"DUPLICATE .* task (\d+)", out))  # open ticket with this title exists
+    if m:
+        return int(m.group(1))
+    print(f"  {what} FAILED: {out.strip()[:200]}")
+    return None
+
 def seed_ticket(row):
     """wq add one fleet-fires P0 ticket naming the runbook. Returns ticket id, or
     None on hard failure. Reuses the existing id if wq refuses a duplicate title."""
@@ -124,21 +158,7 @@ def seed_ticket(row):
         f" this ticket closed. If this is a false positive, fix the probe, do not just ack.\n"
         f"The responder never changes aq status; the sentinel PASS clears the row."
     )
-    cmd = [WQ_BIN, "add", "--lane", LANE, "--pri", "0", "--title", title, "--detail", detail]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ), timeout=30)
-    except Exception as e:
-        print(f"  seed_ticket EXC for {probe} (aq#{row['id']}): {e}")
-        return None
-    out = (r.stdout or "") + (r.stderr or "")
-    m = re.search(r"added task (\d+)", out)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"DUPLICATE .* task (\d+)", out)  # open ticket with this title already exists
-    if m:
-        return int(m.group(1))
-    print(f"  seed_ticket FAILED for {probe} (aq#{row['id']}): {out.strip()[:200]}")
-    return None
+    return _wq_add(LANE, 0, title, detail, f"seed_ticket for {probe} (aq#{row['id']})")
 
 def page(row, ticket_id):
     """Page Frank once, distinct from the raw sentinel alert. Test mode
@@ -151,17 +171,17 @@ def page(row, ticket_id):
             f"{(row['message'] or '')[:300]}")
     return _send_page(row, ticket_id, title, body)
 
-def _send_page(row, ticket_id, title, body):
+def _send_page(row, ticket_id, title, body, priority="urgent", tags="rotating_light,fire"):
     if NTFY_CAP:
         with open(NTFY_CAP, "a") as fh:
             fh.write(json.dumps({"ts": now(), "title": title, "body": body,
-                                 "priority": "urgent", "aq_id": row["id"],
+                                 "priority": priority, "aq_id": row["id"],
                                  "ticket": ticket_id}) + "\n")
         return True
     try:
         req = urllib.request.Request(
             NTFY_URL, data=body.encode(),
-            headers={"Title": title, "Priority": "urgent", "Tags": "rotating_light,fire"},
+            headers={"Title": title, "Priority": priority, "Tags": tags},
             method="POST")
         with urllib.request.urlopen(req, timeout=20) as resp:
             return 200 <= resp.status < 300
@@ -189,21 +209,7 @@ def seed_dispatch_ticket(row):
         f"next pass), this ticket closed. dispatch_recover.py's own reset() resolves aq#"
         f"{row['id']} the moment a healthy pass lands — do not resolve it by hand.\n"
     )
-    cmd = [WQ_BIN, "add", "--lane", LANE, "--pri", "0", "--title", title, "--detail", detail]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ), timeout=30)
-    except Exception as e:
-        print(f"  seed_dispatch_ticket EXC (aq#{row['id']}): {e}")
-        return None
-    out = (r.stdout or "") + (r.stderr or "")
-    m = re.search(r"added task (\d+)", out)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"DUPLICATE .* task (\d+)", out)
-    if m:
-        return int(m.group(1))
-    print(f"  seed_dispatch_ticket FAILED (aq#{row['id']}): {out.strip()[:200]}")
-    return None
+    return _wq_add(LANE, 0, title, detail, f"seed_dispatch_ticket (aq#{row['id']})")
 
 def page_dispatch(row, ticket_id):
     dur = _dur(row["first_ts"], row["last_ts"])
@@ -212,6 +218,42 @@ def page_dispatch(row, ticket_id):
             f"no ack for {dur}.\nAuto-filed fleet-fires wq#{ticket_id}. "
             f"Claim: wq claim --id {ticket_id}\n{(row['message'] or '')[:300]}")
     return _send_page(row, ticket_id, title, body)
+
+# wq#1674: the repo-divergence rule. harness/repo_sweep.py already wrote the exact
+# title/detail the ticket needs into the aq row (it owns that format alongside
+# repo_hint, so the dispatcher's read-back can't drift from the writer) — this seed
+# passes them through and appends the escalation provenance AFTER the detail, never
+# before: repo_hint anchors its repo-path regex at the FIRST line.
+
+def seed_repo_sweep_ticket(row):
+    title = row["title"] or ""
+    detail = row["message"] or ""
+    if not title.startswith(REPO_SWEEP_TITLE_PREFIX) or not detail:
+        print(f"  seed_repo_sweep_ticket SKIPPED (aq#{row['id']}): malformed row "
+              f"(title={title[:60]!r})")
+        return None
+    dur = _dur(row["first_ts"], row["last_ts"])
+    detail = (
+        f"{detail}\n\n"
+        f"Auto-escalated by aq_escalate (wq#1674 repo-sweep rule) from aq#{row['id']} "
+        f"(key={row['key']}).\n"
+        f"Persisted across {row['count']} sweeps — first {row['first_ts']}, last "
+        f"{row['last_ts']} ({dur}).\n"
+        f"Acceptance: repo reconciled, the next sweep reports IN_SYNC and resolves "
+        f"aq#{row['id']} itself — do not resolve the aq row by hand, that is the "
+        f"edge-clear this rule depends on to ticket a future divergence."
+    )
+    return _wq_add(REPO_SWEEP_LANE, 1, title, detail,
+                   f"seed_repo_sweep_ticket {row['key']} (aq#{row['id']})")
+
+def page_repo_sweep(row, ticket_id):
+    """One notification per divergence incident, not a fleet fire: default priority,
+    no siren tags. The urgent channel stays for probes and dispatcher stalls."""
+    title = f"repo divergence persisted: {row['key']} -> wq#{ticket_id}"
+    body = (f"{row['title']}\nUnreconciled across {row['count']} sweeps since "
+            f"{row['first_ts']}.\nAuto-filed wq#{ticket_id} (lane auto). "
+            f"Claim: wq claim --id {ticket_id}")
+    return _send_page(row, ticket_id, title, body, priority="default", tags="mag,twisted_rightwards_arrows")
 
 # wq#1487 (2026-09-08): STATE-BEFORE-ALERT. An open probe row with count>=3 is a
 # HISTORY of failure, not proof the condition is live right now (a probe can pass at
@@ -310,7 +352,20 @@ def run():
     n_ticket += dn_ticket
     n_paged += dn_paged
     n_suppressed += dn_suppressed
-    rows = list(rows) + list(dispatch_rows)
+
+    # wq#1674: repo divergence. Source-scoped, so it never overlaps the two rules above.
+    # reprobe=False is explicit rather than incidental: repo_sweep owns the recheck (it
+    # resolves the row on the next IN_SYNC pass), so there is nothing to re-run here.
+    sweep_rows = c.execute(
+        "SELECT * FROM alerts WHERE source=? AND status='open' AND count>=? "
+        "ORDER BY count DESC",
+        (REPO_SWEEP_SOURCE, REPO_SWEEP_THRESHOLD)).fetchall()
+    sn_ticket, sn_paged, sn_suppressed = _escalate_rows(
+        c, sweep_rows, seed_repo_sweep_ticket, page_repo_sweep, reprobe=False)
+    n_ticket += sn_ticket
+    n_paged += sn_paged
+    n_suppressed += sn_suppressed
+    rows = list(rows) + list(dispatch_rows) + list(sweep_rows)
 
     c.close()
     print(f"aq-escalate: {len(rows)} eligible critical row(s); "

@@ -40,35 +40,67 @@ def fresh():
     return d, aq, wq, cap
 
 def add_alert(aq, source="probe", key="probe-pokemon-liveness", priority="high",
-              count=1, status="open", message="NO TURNS in 60m though ActiveState=active"):
+              count=1, status="open", message="NO TURNS in 60m though ActiveState=active",
+              title=None):
     c = sqlite3.connect(aq)
     c.execute("INSERT INTO alerts(first_ts,last_ts,source,key,title,message,priority,count,status) "
               "VALUES(?,?,?,?,?,?,?,?,?)",
-              (_now(), _now(), source, key, f"probe FAIL: {key}", message, priority, count, status))
+              (_now(), _now(), source, key, title or f"probe FAIL: {key}",
+               message, priority, count, status))
     c.commit(); rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]; c.close()
     return rid
 
-def run_esc(aq, wq, cap, threshold=3, wq_bin=None):
+# wq#1674: the row shape harness/repo_sweep.py writes — the wq title and detail verbatim,
+# so the escalation only has to pass them through. The detail's FIRST line is the
+# repo_hint contract (wq#1094) the dispatcher reads back to route the 'auto' lane.
+SWEEP_REPO = "/home/lumen/bin"
+SWEEP_TITLE = "[repo-sweep] bin: BEHIND_ONLY"
+SWEEP_DETAIL = (f"Automated sweep detected BEHIND_ONLY in {SWEEP_REPO}.\n"
+                f"Output: BEHIND_ONLY {SWEEP_REPO} main ahead=0 behind=3\n\n"
+                f"To inspect: python3 repo_reconcile.py status --repo {SWEEP_REPO}")
+
+def add_sweep_alert(aq, count=1, verdict="BEHIND_ONLY", repo=SWEEP_REPO,
+                    title=SWEEP_TITLE, message=SWEEP_DETAIL):
+    return add_alert(aq, source="repo-sweep", key=f"{repo}:{verdict}", priority="default",
+                     count=count, title=title, message=message)
+
+def run_esc(aq, wq, cap, threshold=3, wq_bin=None, sweep_threshold=3):
     env = dict(os.environ)
     env.update({"AQ_DB": aq, "WQ_DB": wq, "AQ_ESCALATE_NTFY_CAPTURE": cap,
-                "AQ_ESCALATE_THRESHOLD": str(threshold), "AQ_WQ_BIN": wq_bin or REAL_WQ})
+                "AQ_ESCALATE_THRESHOLD": str(threshold),
+                "AQ_ESCALATE_REPO_SWEEP_THRESHOLD": str(sweep_threshold),
+                # wq#1487 added a LIVE re-probe before escalating, and this suite was
+                # never updated for it: the scratch rows name real probes, so every
+                # scenario silently ran sentinel_probes against the live fleet and got
+                # PASS -> row resolved -> 0 tickets. That broke the suite's own
+                # zero-quota/no-network contract as well as its assertions. The rule
+                # under test here is the escalate/suppress ladder; wq#1487's re-probe
+                # gate is exercised by its own knob, off by default in test.
+                "AQ_ESCALATE_LIVE_REPROBE": "0",
+                "AQ_WQ_BIN": wq_bin or REAL_WQ})
     r = subprocess.run([sys.executable, SCRIPT], capture_output=True, text=True, env=env, timeout=60)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
-def n_tickets(wq):
+def tickets(wq, lane="fleet-fires"):
     if not os.path.exists(wq):
-        return 0
-    c = sqlite3.connect(wq)
+        return []
+    c = sqlite3.connect(wq); c.row_factory = sqlite3.Row
     try:
-        n = c.execute("SELECT COUNT(*) FROM tasks WHERE lane='fleet-fires'").fetchone()[0]
+        rs = c.execute("SELECT * FROM tasks WHERE lane=?", (lane,)).fetchall()
     except sqlite3.OperationalError:
-        n = 0
-    c.close(); return n
+        rs = []
+    c.close(); return rs
+
+def n_tickets(wq):
+    return len(tickets(wq))
+
+def pages(cap):
+    if not os.path.exists(cap):
+        return []
+    return [json.loads(l) for l in open(cap) if l.strip()]
 
 def n_pages(cap):
-    if not os.path.exists(cap):
-        return 0
-    return sum(1 for l in open(cap) if l.strip())
+    return len(pages(cap))
 
 def esc_rows(aq):
     c = sqlite3.connect(aq); c.row_factory = sqlite3.Row
@@ -166,10 +198,76 @@ def scenario_refire_after_resolve():
     check("re-fire -> new page", n_pages(cap) == 2, f"got {n_pages(cap)}")
 
 
+# --- wq#1674: repo-sweep rows become a ticket only once they persist ------------------
+
+def scenario_sweep_threshold():
+    print("[sweep] one fire is an alert, not a ticket; the 3rd sweep earns the ticket")
+    d, aq, wq, cap = fresh()
+    add_sweep_alert(aq, count=2)
+    run_esc(aq, wq, cap)
+    check("count<threshold -> 0 tickets", len(tickets(wq, "auto")) == 0)
+    check("count<threshold -> 0 pages", n_pages(cap) == 0)
+    d, aq, wq, cap = fresh()
+    add_sweep_alert(aq, count=3)
+    run_esc(aq, wq, cap)
+    ts = tickets(wq, "auto")
+    check("count>=threshold -> 1 ticket in lane auto", len(ts) == 1, f"got {len(ts)}")
+    if ts:
+        check("title passed through verbatim", ts[0]["title"] == SWEEP_TITLE, ts[0]["title"])
+        check("pri 1 (not a fleet fire)", ts[0]["pri"] == 1, str(ts[0]["pri"]))
+        check("repo_hint contract: detail still starts with the sweep line",
+              ts[0]["detail"].startswith(f"Automated sweep detected BEHIND_ONLY in {SWEEP_REPO}."),
+              ts[0]["detail"][:80])
+        check("provenance appended, not prepended", "wq#1674 repo-sweep rule" in ts[0]["detail"])
+    check("no fleet-fires ticket", n_tickets(wq) == 0)
+    ps = pages(cap)
+    check("exactly 1 page", len(ps) == 1, f"got {len(ps)}")
+    if ps:
+        check("page is not urgent", ps[0]["priority"] == "default", ps[0]["priority"])
+
+def scenario_sweep_one_ticket_per_incident():
+    print("[sweep] F5: repeat sweeps never refile; only a NEW aq row does")
+    d, aq, wq, cap = fresh()
+    rid = add_sweep_alert(aq, count=3)
+    run_esc(aq, wq, cap)
+    check("first escalation -> 1 ticket", len(tickets(wq, "auto")) == 1)
+    # The sweep keeps firing: count++ on the SAME row, nine times over nine days.
+    c = sqlite3.connect(aq); c.execute("UPDATE alerts SET count=12 WHERE id=?", (rid,))
+    c.commit(); c.close()
+    run_esc(aq, wq, cap)
+    run_esc(aq, wq, cap)
+    check("repeat fires -> still 1 ticket", len(tickets(wq, "auto")) == 1,
+          f"got {len(tickets(wq, 'auto'))}")
+    check("repeat fires -> still 1 page", n_pages(cap) == 1, f"got {n_pages(cap)}")
+    # Worker reconciles the repo; the next sweep edge-clears the row. A LATER
+    # divergence is a new row, and therefore honestly a new ticket.
+    c = sqlite3.connect(aq); c.execute("UPDATE alerts SET status='resolved' WHERE id=?", (rid,))
+    c.commit(); c.close()
+    run_esc(aq, wq, cap)
+    check("resolved row -> no new ticket", len(tickets(wq, "auto")) == 1)
+    add_sweep_alert(aq, count=3, title="[repo-sweep] bin: CONTENT_DIVERGED",
+                    verdict="CONTENT_DIVERGED",
+                    message=f"Automated sweep detected CONTENT_DIVERGED in {SWEEP_REPO}.\nOutput: x")
+    run_esc(aq, wq, cap)
+    check("new incident -> new ticket", len(tickets(wq, "auto")) == 2,
+          f"got {len(tickets(wq, 'auto'))}")
+
+def scenario_sweep_malformed_row():
+    print("[sweep] a row that is not a repo-sweep ticket shape files nothing")
+    d, aq, wq, cap = fresh()
+    add_sweep_alert(aq, count=9, title="hand-edited nonsense")
+    add_sweep_alert(aq, count=9, verdict="SAFE_RESET", message="")
+    rc, out = run_esc(aq, wq, cap)
+    check("malformed -> 0 tickets", len(tickets(wq, "auto")) == 0)
+    check("malformed -> 0 pages", n_pages(cap) == 0)
+    check("skip is reported, not silent", "SKIPPED" in out, out[-200:])
+
+
 def main():
     for fn in (scenario_boundary, scenario_replay_152, scenario_acked_and_resolved,
                scenario_scoping, scenario_two_distinct, scenario_transient_ticket_failure,
-               scenario_refire_after_resolve):
+               scenario_refire_after_resolve, scenario_sweep_threshold,
+               scenario_sweep_one_ticket_per_incident, scenario_sweep_malformed_row):
         fn()
     print()
     if _fails:
