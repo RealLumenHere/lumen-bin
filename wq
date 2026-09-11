@@ -940,6 +940,8 @@ def release_subs(c, subs, holder):
     for s in subs:
         c.execute("DELETE FROM slocks WHERE scope=? AND holder=?", (s, holder))
 def cmd_whoami(a):
+    if getattr(a, "eval", False) and not a.register:
+        print("REFUSED: --eval only applies with --register (wq#1720)", file=sys.stderr); sys.exit(1)
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
     purged = purge_stale_sessions(c)
@@ -1031,34 +1033,40 @@ def cmd_whoami(a):
                 print(f"  {sid:<24} base={bn:<16} at={rat}Z  {label}"
                       + (f" — {reason[:60]}" if reason and kind != "deregistered" else ""))
         return
+    # wq#1720: --eval prints ONLY 'export WQ_AGENT=...' on stdout so a caller can
+    # `eval "$(wq whoami --register <name> --eval)"` without a bare `export WQ_AGENT`
+    # (which exports empty, since whoami's normal output is multi-line prose) and without
+    # eval choking on a REFUSED/NOTE line that isn't valid shell. Every other line here
+    # moves to stderr in eval mode; the export line is the only thing eval ever sees.
+    out = (lambda *a_, **k_: print(*a_, **{**k_, "file": sys.stderr})) if getattr(a, "eval", False) else print
     base = a.register.strip()
     if not base or base.isdigit():
         c.execute("COMMIT"); c.close()
-        print("REFUSED: --register needs a non-numeric agent name (e.g. rabbit5, gh1)"); sys.exit(1)
+        out("REFUSED: --register needs a non-numeric agent name (e.g. rabbit5, gh1)"); sys.exit(1)
     blockers, stale, bare = partition_for_base(c, base, None)
     if blockers and not a.force:
         c.execute("COMMIT"); c.close()
-        print(f"REFUSED: base name '{base}' is already registered by a DIFFERENT session:")
+        out(f"REFUSED: base name '{base}' is already registered by a DIFFERENT session:")
         for sid, held, locks, fs, ls, idle in blockers:
             why = ("holds live work" if (held or locks)
                    else f"claim(s) {bare} are held under the BARE name '{base}'" if bare
                    else f"idle only {fmt_idle(idle)}, under the {STALE_MIN}m stale threshold")
-            print(f"  {sid}  tickets={held or 'none'}  slocks={locks or 'none'}  "
-                  f"{fmt_idle(idle)}  -> {why}")
-            print(f"      first_seen={fs}Z last_seen={ls}Z")
-        print("  wq#530: a registration is only stepped over when it is idle past "
-              f"{STALE_MIN}m AND holds\n"
-              "  no lease/slock AND no claim exists under its bare base name. Holding live work\n"
-              "  means NEVER stale — a quiet agent mid-experiment is not a dead one.\n"
-              "  Two sessions sharing a base name is exactly the failure wq#502 fixes:\n"
-              "  every lock check silently inverts and you can take each other's tickets.\n"
-              "  wq#537: this now refuses on EXISTENCE, not just an active lease/slock — the old\n"
-              "  check missed the startup window where a second registration lands before the\n"
-              "  first session has claimed or locked anything.\n"
-              "  -> Pick a DISTINCT agent name, or wait for that session to idle out and be purged\n"
-              f"     ({DEFAULT_TTL_MIN}m from its last activity, sooner if it releases everything\n"
-              "     and a future purge pass runs).\n"
-              "  -> Only if you are certain that session is dead: --force")
+            out(f"  {sid}  tickets={held or 'none'}  slocks={locks or 'none'}  "
+                f"{fmt_idle(idle)}  -> {why}")
+            out(f"      first_seen={fs}Z last_seen={ls}Z")
+        out("  wq#530: a registration is only stepped over when it is idle past "
+            f"{STALE_MIN}m AND holds\n"
+            "  no lease/slock AND no claim exists under its bare base name. Holding live work\n"
+            "  means NEVER stale — a quiet agent mid-experiment is not a dead one.\n"
+            "  Two sessions sharing a base name is exactly the failure wq#502 fixes:\n"
+            "  every lock check silently inverts and you can take each other's tickets.\n"
+            "  wq#537: this now refuses on EXISTENCE, not just an active lease/slock — the old\n"
+            "  check missed the startup window where a second registration lands before the\n"
+            "  first session has claimed or locked anything.\n"
+            "  -> Pick a DISTINCT agent name, or wait for that session to idle out and be purged\n"
+            f"     ({DEFAULT_TTL_MIN}m from its last activity, sooner if it releases everything\n"
+            "     and a future purge pass runs).\n"
+            "  -> Only if you are certain that session is dead: --force")
         sys.exit(2)
     sid = f"{base}-{secrets.token_hex(3)}"
     while c.execute("SELECT 1 FROM agent_sessions WHERE session_id=?", (sid,)).fetchone():
@@ -1069,17 +1077,17 @@ def cmd_whoami(a):
     if stale:
         # NB: distinct loop names. `sid` is the id just minted three lines above, and rebinding
         # it here printed the STALE row's id as the new session's — caught by probe A2.
-        print(f"NOTE: stepped over {len(stale)} STALE registration(s) for base '{base}' (wq#530):")
+        out(f"NOTE: stepped over {len(stale)} STALE registration(s) for base '{base}' (wq#530):")
         for s_sid, _h, _l, _fs, s_ls, s_idle in stale:
-            print(f"  {s_sid}  {fmt_idle(s_idle)} (>{STALE_MIN}m), holding nothing, last={s_ls}Z")
-        print("  They keep their registry rows so the history stays readable; they just no")
-        print("  longer park the name. If one of them is actually alive, say so on the board.")
+            out(f"  {s_sid}  {fmt_idle(s_idle)} (>{STALE_MIN}m), holding nothing, last={s_ls}Z")
+        out("  They keep their registry rows so the history stays readable; they just no")
+        out("  longer park the name. If one of them is actually alive, say so on the board.")
     if blockers and a.force:
         warn(f"--force used: '{base}' already live as {', '.join(b[0] for b in blockers)}")
-    if purged: print(f"(expired {purged} stale session(s) from registry)")
-    print(f"REGISTERED session: {sid}")
+    if purged: out(f"(expired {purged} stale session(s) from registry)")
+    out(f"REGISTERED session: {sid}")
     print(f"export WQ_AGENT={sid}")
-    print("^ put that in your env; claim/heartbeat/done/release/slock will use it automatically.")
+    out("^ put that in your env; claim/heartbeat/done/release/slock will use it automatically.")
 
 # --- wq#1478 liveness gate helpers ---
 LIVENESS_HARNESS = os.environ.get("FOREMAN_HARNESS", "/home/lumen/foreman/harness")
@@ -3081,7 +3089,7 @@ p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
 s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
-s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.set_defaults(f=cmd_whoami)
+s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.add_argument("--eval",action="store_true",help="wq#1720: with --register, print ONLY 'export WQ_AGENT=...' on stdout (everything else to stderr) — for eval \"$(wq whoami --register <name> --eval)\""); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
 s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/acquire/release the lease"); s.add_argument("--acquire",metavar="LANES",default=None,help="take the lease over a comma/space list of lanes (requires a registered identity)"); s.add_argument("--release",action="store_true",help="drop every orchestrator lease this identity holds"); s.add_argument("--ttl",type=int,default=None,help=f"lease minutes (default WQ_ORCH_TTL={ORCH_TTL_MIN})"); s.add_argument("--note",default=None,help="what this orchestrator is driving"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_orch)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
