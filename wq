@@ -2217,19 +2217,23 @@ def _finish(a, new_status):
         c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {a.id}"); sys.exit(1)
     caller, _ = resolve_identity(a)
     holder = r[0]
-    if not owner_ok(c, caller, holder, new_status if new_status != 'open' else 'release', a.id):
+    # wq#1539: the --dead-worker override's OWN eligibility (holder set, holder != caller,
+    # holder_is_dead()) is checked BEFORE owner_ok is called at all — was after. owner_ok
+    # eprints its REFUSED banner unconditionally on refusal, so calling it first made every
+    # successful `release --dead-worker` open its stderr with a false-looking REFUSED line
+    # ahead of the WARNING + released lines. Calling owner_ok only when the override does NOT
+    # apply means a verified-dead holder never triggers that banner at all (wq#1539).
+    dead_worker = new_status == 'open' and getattr(a, 'dead_worker', False)
+    if dead_worker and holder and holder != caller and holder_is_dead(c, holder):
         # wq#1498: `wq release --dead-worker` is the stale-claim path owner_ok's refusal text
-        # now recommends INSTEAD of `wq retire` for a per-ticket fworker identity — retiring
-        # that identity poisons every future spawn of the ticket, this does not. Only reachable
-        # for release (new_status == 'open'), only when the caller declared it explicitly, and
-        # only honored once holder_is_dead() has independently verified the holder is gone.
-        dead_worker = new_status == 'open' and getattr(a, 'dead_worker', False)
-        if dead_worker and holder and holder != caller and holder_is_dead(c, holder):
-            warn(f"wq#{a.id}: holder '{holder}' verified dead (no live session"
-                 + (", no running unit" if FWORKER_IDENTITY_RE.match(holder) else "")
-                 + f") — releasing under --dead-worker on behalf of '{caller}' (wq#1498).")
-            log_activity(c, caller, f"dead-worker-release:{holder}")
-        elif dead_worker:
+        # recommends INSTEAD of `wq retire` for a per-ticket fworker identity — retiring that
+        # identity poisons every future spawn of the ticket, this does not.
+        warn(f"wq#{a.id}: holder '{holder}' verified dead (no live session"
+             + (", no running unit" if FWORKER_IDENTITY_RE.match(holder) else "")
+             + f") — releasing under --dead-worker on behalf of '{caller}' (wq#1498).")
+        log_activity(c, caller, f"dead-worker-release:{holder}")
+    elif not owner_ok(c, caller, holder, new_status if new_status != 'open' else 'release', a.id):
+        if dead_worker:
             c.execute("COMMIT"); c.close()
             eprint(f"REFUSED: wq#{a.id} held by '{holder}' — --dead-worker liveness check found "
                   f"it still alive (a live session row, or a running lumen-job-{holder}-* unit "
