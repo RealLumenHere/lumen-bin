@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""lumen-kernel-watch — daily check for the Linux 7.3 silent user-space
+data-loss fix (wq#1926).
+
+Source: Phoronix, "Linux Patched For Silent User-Space Data Loss Bug That's
+Existed Since 2023" (https://www.phoronix.com/news/Linux-7.3-Fix-Silent-Data-Loss).
+The fix landed in 7.3-rc3; TARGET below is the first release that carries it.
+
+Read-only: compares the running kernel against Ubuntu 26.04's apt candidate
+and alerts via ntfy-send when the candidate has the fix but the running
+kernel doesn't. Never upgrades or reboots — the actual kernel bump stays a
+manual, Frank-gated `apt` step.
+"""
+import re
+import subprocess
+
+TARGET = (7, 3, 0)
+NTFY_BIN = "/home/lumen/bin/ntfy-send"
+
+
+def kernel_version(s):
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', s or "")
+    return tuple(map(int, m.groups())) if m else (0, 0, 0)
+
+
+def apt_candidate():
+    try:
+        out = subprocess.check_output(
+            ['apt-cache', 'policy', 'linux-image-generic'],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if line.strip().startswith('Candidate:'):
+                return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def main():
+    installed = subprocess.check_output(['uname', '-r'], text=True).strip()
+    candidate = apt_candidate()
+    iv = kernel_version(installed)
+    cv = kernel_version(candidate) if candidate else (0, 0, 0)
+
+    if cv >= TARGET and iv < TARGET:
+        msg = (f"Kernel update needed: running {installed} is older than "
+               f"7.3.0 (has the Linux 7.3-rc3 silent-data-loss fix). "
+               f"Candidate: {candidate}. Manual, Frank-gated apt upgrade "
+               "required — no auto-reboot.")
+        subprocess.run(
+            [NTFY_BIN, "-p", "high", "-T", "Kernel data-loss fix available", msg],
+            check=False,
+        )
+    else:
+        print(f"OK running={installed} candidate={candidate} "
+              f"(needs candidate>={'.'.join(map(str, TARGET))} "
+              f"and installed<{'.'.join(map(str, TARGET))} to alert)")
+
+
+if __name__ == "__main__":
+    main()

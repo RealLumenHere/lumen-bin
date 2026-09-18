@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# github-token-check (wq#1133) — daily validity probe for every github.com PAT the
+# fleet wires in. A dead-but-present token silently hard-fails resolve_github_token
+# (rung only falls through on missing/empty), so a 401 must be surfaced proactively,
+# not discovered when an agent trips over it. Opens an aq row on any dead token.
+# Never prints a token value.
+set -uo pipefail
+AQ=/home/lumen/bin/aq
+dead=0; checked=0
+shopt -s nullglob
+for f in /home/lumen/.secrets/github-*.token; do
+  case "$f" in *gitea*) continue;; esac      # gitea tokens are not github.com PATs
+  tok=$(tr -d '\r\n' < "$f"); [ -z "$tok" ] && continue
+  checked=$((checked+1))
+  code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
+         -H 'X-GitHub-Api-Version: 2022-11-28' https://api.github.com/user 2>/dev/null)
+  name=$(basename "$f")
+  if [ "$code" = "200" ]; then
+    printf 'OK    %s\n' "$name"
+  else
+    printf 'DEAD  %s  HTTP=%s\n' "$name" "$code"
+    dead=$((dead+1))
+    [ -x "$AQ" ] && "$AQ" add github-token-check "$name" \
+      "github token $name is HTTP $code (dead) — resolve_github_token will hard-fail any repo pinned to it" \
+      --owner unassigned >/dev/null 2>&1 || true
+  fi
+done
+echo "checked=$checked dead=$dead"
+exit $([ "$dead" -eq 0 ] && echo 0 || echo 1)

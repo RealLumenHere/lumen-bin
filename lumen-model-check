@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# lumen-model-check: verify every configured model exists in a valid universe:
+#   gateway models (LiteLLM /v1/models) UNION fleet CLI models (research/models.yaml ids/aliases).
+# Catches "config points at a nonexistent model" (tonight's LPP/mistral-small class) without
+# false-flagging Claude-Code CLI models. Bridge-safe: localhost + local files only.
+set -uo pipefail
+KEY=$(grep -hoE 'LITELLM_MASTER_KEY=sk-[A-Za-z0-9_-]+' /home/lumen/agent/.env 2>/dev/null | head -1 | cut -d= -f2)
+GW=$(curl -s -m 10 http://localhost:4000/v1/models -H "Authorization: Bearer $KEY" 2>/dev/null | python3 -c "import json,sys;print('\n'.join(m['id'] for m in json.load(sys.stdin).get('data',[])))" 2>/dev/null)
+if [ -z "$GW" ]; then /home/lumen/bin/ntfy-send -p high "model-check: LiteLLM gateway :4000 returned NO models (down?)" 2>/dev/null; echo "gateway down"; exit 1; fi
+CLI=$(grep -oE '(id|alias): +[a-z0-9._-]+' /home/lumen/foreman/research/models.yaml 2>/dev/null | awk '{print $2}' | sort -u)
+VALID=$(printf '%s\n%s\n' "$GW" "$CLI" | sort -u)
+declare -A CFG
+while read -r m; do [ -n "$m" ] && CFG["$m"]="LPP brain-env"; done < <(grep -hoE 'LPP_BRAIN[A-Z_]*=[a-z0-9._-]+' /etc/systemd/system/lumen-pokemon-live.service.d/*.conf 2>/dev/null | cut -d= -f2 | sort -u)
+while read -r m; do [ -n "$m" ] && CFG["$m"]="wq active ticket"; done < <(sqlite3 /home/lumen/agents/work-queue/queue.db "select distinct model from tasks where status in ('open','claimed') and model is not null and model != '';" 2>/dev/null)
+BAD=""
+for m in "${!CFG[@]}"; do printf '%s\n' "$VALID" | grep -qx "$m" || BAD="${BAD} ${m}(${CFG[$m]})"; done
+if [ -n "$BAD" ]; then
+  /home/lumen/bin/ntfy-send -p high -T "model config drift" "invalid model(s) not on gateway or in models.yaml:${BAD}" 2>/dev/null
+  echo "INVALID:${BAD}"; exit 2
+fi
+echo "model-check OK: all ${#CFG[@]} configured models valid (gateway+CLI)"

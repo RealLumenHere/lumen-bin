@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+# fleet-tools-render — render FLEET_TOOLS.md from fleet_tools.yaml, verifying every path exists.
+# Exit 0 = rendered clean. Exit 2 = rendered WITH drift warnings (missing paths flagged inline + on stderr).
+# claude_context.sh injects the .md; drift is visible to every orchestrator at boot, not hidden.
+import sys, yaml, os
+from pathlib import Path
+SRC = Path("/home/lumen/minerva/context/fleet_tools.yaml")
+OUT = Path("/home/lumen/minerva/context/FLEET_TOOLS.md")
+d = yaml.safe_load(open(SRC))
+drift = []
+lines = []
+lines.append("# FLEET_TOOLS — system & fleet-wide capabilities (every orchestrator, every session)")
+lines.append("")
+lines.append(f"_source: minerva/context/fleet_tools.yaml · updated {d.get('updated','?')} · edit the YAML, not this file_")
+lines.append("")
+lines.append(d["note"].strip())
+lines.append("")
+for gname, g in d["groups"].items():
+    lines.append(f"## {gname}")
+    lines.append(f"_{g['desc']}_")
+    lines.append("")
+    for t in g["tools"]:
+        p = t.get("path")
+        mark = ""
+        if p and not os.path.exists(p):
+            drift.append(f"{t['name']}: path missing: {p}")
+            mark = "  ⚠️DRIFT(path missing)"
+        lines.append(f"- **{t['name']}**{mark} — {t['use']}")
+        lines.append(f"  - `{t['invoke']}`")
+    lines.append("")
+if drift:
+    lines.insert(4, "> ⚠️ REGISTRY DRIFT — some tool paths below no longer exist; fix fleet_tools.yaml:")
+    for x in drift:
+        lines.insert(5, f">   - {x}")
+    lines.insert(5+len(drift), "")
+OUT.write_text("\n".join(lines))
+if drift:
+    sys.stderr.write("fleet-tools-render: DRIFT\n" + "\n".join(drift) + "\n")
+    sys.exit(2)
+print(f"rendered {OUT} ({len(d['groups'])} groups, {sum(len(g['tools']) for g in d['groups'].values())} tools, no drift)")

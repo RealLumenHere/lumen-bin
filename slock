@@ -72,6 +72,12 @@ def init():
     c.execute("""CREATE TABLE IF NOT EXISTS slocks(
         scope TEXT PRIMARY KEY, holder TEXT, acquired_at TEXT,
         expires_at TEXT, note TEXT DEFAULT '')""")
+    # wq#1675: wq records SHARED subsystem holds here. slock never takes one — it is an
+    # exclusive-lock tool — but its acquire must SEE them, so the table is created here too
+    # for the case where slock reaches a fresh queue.db first.
+    c.execute("""CREATE TABLE IF NOT EXISTS slocks_ro(
+        scope TEXT NOT NULL, holder TEXT NOT NULL, acquired_at TEXT,
+        expires_at TEXT, note TEXT DEFAULT '', PRIMARY KEY(scope,holder))""")
     # wq#1182: inert until a caller passes --fence, so this is safe to auto-add like any
     # other column — unlike wq's lease_owner/fence/attempt, nothing here changes protocol
     # just by existing.
@@ -163,6 +169,19 @@ def cmd_acquire(a):
         print(f"DENIED: '{scope}' held by {r[0]} until {r[1]}Z" + (f" — {r[2]}" if r[2] else ""))
         print("Do NOT touch this subsystem. Coordinate or wait for expiry.")
         sys.exit(1)
+    # wq#1675: slock takes EXCLUSIVE holds only, and a writer is excluded while any wq
+    # read hold is live. Without this a `<name>:ro` ticket and a slock writer would run on
+    # one subsystem at once — the exact overlap the shared mode exists to forbid.
+    readers = [(h, e) for h, e in c.execute(
+        "SELECT holder,expires_at FROM slocks_ro WHERE scope=? AND expires_at >= ?",
+        (scope, t_now)) if h != holder]
+    if readers:
+        c.execute("COMMIT"); c.close()
+        print(f"DENIED: '{scope}' has {len(readers)} live read-only holder(s) (wq#1675): "
+              + ", ".join(f"{h} until {e}Z" for h, e in readers[:4]))
+        print("They are reading this subsystem. Wait for expiry, or coordinate — an\n"
+              "exclusive hold taken now would write under them.")
+        sys.exit(1)
     mine = ticket_for_holder(c, holder, a.note or '')
     my_pri = mine[2] if mine else None
     my_lane = mine[1] if mine else None
@@ -242,17 +261,29 @@ def cmd_extend(a):
 def cmd_who(a):
     c = conn(); c.isolation_level = None
     c.execute("BEGIN IMMEDIATE")
-    c.execute("DELETE FROM slocks WHERE expires_at < ?", (now(),))
+    t_now = now()
+    c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
+    c.execute("DELETE FROM slocks_ro WHERE expires_at < ?", (t_now,))  # wq#1675
     q, args = "SELECT scope,holder,acquired_at,expires_at,note,fence FROM slocks", ()
-    if a.scope: q += " WHERE scope=?"; args = (a.scope.strip().lower(),)
+    rq = "SELECT scope,holder,acquired_at,expires_at,note FROM slocks_ro"
+    if a.scope:
+        q += " WHERE scope=?"; rq += " WHERE scope=?"; args = (a.scope.strip().lower(),)
     rows = c.execute(q + " ORDER BY scope", args).fetchall()
+    ro_rows = c.execute(rq + " ORDER BY scope,holder", args).fetchall()
     c.execute("COMMIT"); c.close()
-    if not rows: print("(no active locks)"); return
+    if not rows and not ro_rows: print("(no active locks)"); return
     c2 = conn()
     for r in rows:
         t = ticket_for_holder(c2, r[1], r[4] or '')
         ctx = f"  wq#{t[0]} [{t[1]}/p{t[2]}/{t[3]}]" if t else "  (no ticket)"
         print(f"{r[0]:<20} {r[1]:<28} acquired {r[2]}Z expires {r[3]}Z FENCE={r[5] or 0}{ctx}"
+              + (f"  # {r[4]}" if r[4] else ""))
+        if t: print(f"{'':<20} {t[4][:76]}")
+    # wq#1675: read holds. Several may share one scope; each still blocks a writer.
+    for r in ro_rows:
+        t = ticket_for_holder(c2, r[1], r[4] or '')
+        ctx = f"  wq#{t[0]} [{t[1]}/p{t[2]}/{t[3]}]" if t else "  (no ticket)"
+        print(f"{r[0] + ':ro':<20} {r[1]:<28} acquired {r[2]}Z expires {r[3]}Z READ-ONLY{ctx}"
               + (f"  # {r[4]}" if r[4] else ""))
         if t: print(f"{'':<20} {t[4][:76]}")
     c2.close()

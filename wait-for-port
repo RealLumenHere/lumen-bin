@@ -1,0 +1,24 @@
+#!/bin/bash
+# wq#1659: ExecStartPre gate for units that depend on a docker container's
+# published port instead of a systemd unit (litellm :4000, lumen-pgvector
+# :5432 — neither is a unit; docker.service Requires= only guarantees the
+# daemon is up, not that the container inside it has finished listening).
+#
+# usage: wait-for-port HOST PORT [TIMEOUT_S]
+set -euo pipefail
+host="${1:?usage: wait-for-port HOST PORT [TIMEOUT_S]}"
+port="${2:?usage: wait-for-port HOST PORT [TIMEOUT_S]}"
+timeout="${3:-30}"
+deadline=$(( $(date +%s) + timeout ))
+
+while true; do
+    if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+        exec 3>&- 2>/dev/null || true
+        exit 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+        echo "wait-for-port: ${host}:${port} not open after ${timeout}s" >&2
+        exit 1
+    fi
+    sleep 1
+done
