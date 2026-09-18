@@ -1,0 +1,59 @@
+#!/bin/bash
+# github-pat-rotate - re-key the fleet with a NEW GitHub PAT, secret never touching argv/history/transcript.
+# Honors wq#524 ONE-HOME: new PAT lives ONLY in /home/lumen/.secrets/github-frank.token (0600, no newline).
+# REMOVES the deprecated GITHUB_TOKEN line from agent/.env (that .env copy is what leaked into the transcript).
+# The resolver ladder (lumen-pr, lumen-github-identity.sh) already prefers .secrets first, so nothing breaks.
+# Run ON lumen. Frank pastes the NEW PAT at the silent prompt. Usage: github-pat-rotate | --prune-baks
+set -euo pipefail
+ENV=/home/lumen/agent/.env
+TOK=/home/lumen/.secrets/github-frank.token
+STAMP=$(date +%Y%m%d_%H%M%S)
+
+if [ "${1:-}" = "--prune-baks" ]; then
+  echo "Pruning agent/.env.bak.* copies that carry the dead secret + old provider keys."
+  n=0
+  for f in "$ENV".bak.*; do
+    [ -e "$f" ] || continue
+    case "$f" in *"_pre_patrotate") echo "  keep (this rotation): $(basename "$f")"; continue;; esac
+    shred -u "$f" 2>/dev/null || rm -f "$f"
+    n=$((n+1))
+  done
+  echo "shredded $n old .env backups. Live secret home: $TOK only."
+  exit 0
+fi
+
+[ -f "$TOK" ] || { echo "no $TOK - expected the one-home secret file"; exit 1; }
+read -rsp "Paste NEW github PAT (input hidden), then Enter: " NEWPAT; echo
+[ -n "$NEWPAT" ] || { echo "empty, aborting"; exit 1; }
+case "$NEWPAT" in ghp_*|github_pat_*) : ;; *) echo "not a PAT prefix, aborting"; exit 1;; esac
+
+# 1. new secret -> the ONE home (keep the dead one one cycle for audit)
+cp "$TOK" "$TOK.bak.${STAMP}_dead_leaked"; chmod 600 "$TOK.bak.${STAMP}_dead_leaked"
+umask 077; printf '%s' "$NEWPAT" > "$TOK"; chmod 600 "$TOK"
+
+# 2. strip the deprecated GITHUB_TOKEN line out of agent/.env (the leaked location)
+if [ -f "$ENV" ] && grep -q '^GITHUB_TOKEN=' "$ENV"; then
+  cp "$ENV" "$ENV.bak.${STAMP}_pre_patrotate"
+  python3 - "$ENV" <<'PY'
+import sys,re
+p=sys.argv[1]; s=open(p).read()
+s=re.sub(r'^GITHUB_TOKEN=.*\n?', '', s, flags=re.M)
+open(p,'w').write(s)
+PY
+  echo "removed deprecated GITHUB_TOKEN from $ENV (now .secrets-only)"
+fi
+unset NEWPAT
+
+# 3. verify against github, print login + scopes, never the secret
+python3 - <<'PY'
+import urllib.request,json
+tok=open('/home/lumen/.secrets/github-frank.token').read().strip()
+r=urllib.request.Request('https://api.github.com/user',headers={'Authorization':'Bearer '+tok,'User-Agent':'lumen'})
+try:
+    resp=urllib.request.urlopen(r,timeout=10); u=json.load(resp)
+    print("VERIFY OK: authenticated as", u.get('login'))
+    print("scopes:", resp.headers.get('x-oauth-scopes','(fine-grained token - not in header)'))
+except Exception as e:
+    print("VERIFY FAILED:", e)
+PY
+echo "Done. New PAT lives ONLY in $TOK. Next: github-pat-rotate --prune-baks"

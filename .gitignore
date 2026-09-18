@@ -13,6 +13,7 @@ __pycache__/
 
 # large downloaded binaries — not source
 /trivy
+/gatus
 
 # stale/superseded drafts, retired scripts, backups-by-suffix not caught above
 *.orig

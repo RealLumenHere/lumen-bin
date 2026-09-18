@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# lumen-wq-health: measure wq collision + stuck-worker symptoms. Read-only, bridge-safe.
+# Flags: dead-holder claims (no live worker), RUNAWAY claims (>3h, the maat-22h class), high churn.
+# Transition-based alerting (no storm); stamp file for the dead-man cron.
+set -uo pipefail
+DB=/home/lumen/agents/work-queue/queue.db
+exec 9>/tmp/lumen-wq-health.lock; flock -n 9 || exit 0
+LOG=/home/lumen/logs/wq-health.log; STAMP=/home/lumen/logs/.wq-health.laststate; mkdir -p /home/lumen/logs
+DEAD=""; LIVE=""
+while IFS='|' read -r id holder; do
+  [ -z "$id" ] && continue
+  if pgrep -f "ticket $id" 2>/dev/null | grep -qv "$$"; then LIVE="$LIVE $id"; else DEAD="$DEAD $id($holder)"; fi
+done < <(sqlite3 "$DB" "select id,coalesce(claimed_by,'?') from tasks where status='claimed';" 2>/dev/null)
+RUNAWAY=$(sqlite3 "$DB" "select id||'('||cast((unixepoch()-unixepoch(claimed_at))/3600 as int)||'h)' from tasks where status='claimed' and claimed_at is not null and (unixepoch()-unixepoch(claimed_at))>10800;" 2>/dev/null | tr '\n' ' ')
+CHURN=$(sqlite3 "$DB" "select id||'(r='||reopened_count||')' from tasks where reopened_count>=3 and status not in ('done','rejected') order by reopened_count desc limit 5;" 2>/dev/null | tr '\n' ' ')
+STATE="dead=[$DEAD] runaway=[$RUNAWAY] churn=[$CHURN]"
+echo "$(date -u +%FT%TZ) $STATE" >> "$LOG"
+touch /home/lumen/logs/.stamp.wq-health
+if [ "$STATE" != "$(cat "$STAMP" 2>/dev/null)" ] && [ -n "$DEAD$RUNAWAY$CHURN" ]; then
+  /home/lumen/bin/ntfy-send -p high -T "wq health" "dead-holders:${DEAD:-none} | runaway>3h:${RUNAWAY:-none} | churn:${CHURN:-none}" 2>/dev/null || true
+fi
+echo "$STATE" > "$STAMP"
+echo "wq-health: dead=[$DEAD] live=[$LIVE ] runaway=[$RUNAWAY] churn=[$CHURN]"

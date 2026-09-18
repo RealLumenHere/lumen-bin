@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# wq-reopen <id>...: reopen a blocked/stuck ticket for re-dispatch WITHOUT tombstoning its
+# deterministic worker name (do NOT use `wq retire` for this — it poisons fworker-wq<id>).
+set -euo pipefail; DB=/home/lumen/agents/work-queue/queue.db
+for id in "$@"; do
+  for p in $(pgrep -f "ticket $id" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+  sqlite3 "$DB" "DELETE FROM retired_sessions WHERE base_name='fworker-wq$id' OR session_id LIKE 'fworker-wq$id%';"
+  sqlite3 "$DB" "UPDATE tasks SET status='open',claimed_by=NULL,claimed_at=NULL,block_reason=NULL WHERE id=$id;"
+  echo "wq#$id reopened (claim cleared, no tombstone)"
+done
