@@ -1187,7 +1187,11 @@ def _liveness_creation_check(title, detail, lane, frank_gated, force=False, verb
     exists. FOREMAN_LIVENESS_CLEAR=0 -> warn-only (the existing writes-disabled knob);
     =warn -> NO_TAG itself is warn-only (the NEW 7-day mandatory-tag rollout knob).
     --force files it anyway, verdict printed. Returns the (possibly Liveness:/[NO-PROBE:
-    -augmented) detail text; callers persist it (add: before INSERT; block/decide: UPDATE)."""
+    -augmented) detail text; callers persist it (add: before INSERT; block/decide: UPDATE).
+    fatal=False (wq#1998, cmd_block's only caller) downgrades the refusal to a warning:
+    sys.exit(6) here returns before cmd_block reaches _finish(a, 'blocked'), so a refused
+    block leaves the row claimed until its lease expires, which is strictly worse than an
+    untagged block the age alarm can still find. A retreat must always land."""
     detail = detail or ""
     if liveness:
         detail = detail.rstrip("\n") + "\nLiveness: " + liveness
@@ -1224,14 +1228,10 @@ def _liveness_creation_check(title, detail, lane, frank_gated, force=False, verb
         warn(f"liveness {verdict} overridden ({'--force' if force else 'FOREMAN_LIVENESS_CLEAR=0'}): {msg}")
         return detail
     if not fatal:
-        # wq#1998: advisory at block — refusing here returns before cmd_block reaches
-        # _finish(a, 'blocked'), so the refusal strands the row in 'claimed' under a
-        # caller that has already given up. A retreat must always land; what an untagged
-        # block forfeits is auto-clearing, and age_alarm() files an aq row for exactly
-        # that shape after 7 days. No [NO-PROBE: ...] stamp on purpose: that marker is
-        # what age_alarm() skips on.
-        warn(f"liveness {verdict} NOT enforced at {verb} — recorded anyway, because "
-             f"refusing it would leave the ticket 'claimed' (wq#1998): {msg}")
+        # wq#1998: advisory at `block` — warn and file. Do NOT stamp [NO-PROBE: ...] here:
+        # that marker is exactly what liveness_clear.age_alarm() skips on, so stamping it
+        # would silence the 7-day stale-gate alarm for the untagged blocks it exists to catch.
+        warn(f"liveness {verdict} at {verb}: {msg} (advisory — NOT enforced at block, wq#1998)")
         return detail
     eprint(f"REFUSED: wq#1478/wq#1676 liveness gate — {verb} not done. {msg}")
     eprint("  A Frank-gate needs a machine-checkable premise: --liveness \"<probe>(...)\", or")
@@ -2672,16 +2672,14 @@ def cmd_block(a):
         pre_owner_ok = owner_ok(c, caller, claimed_by, "block", a.id)
         c.close()
         if fence_ok and pre_owner_ok:
-            # wq#1998: advisory at block (fatal=False) — a refused block leaves the row
-            # 'claimed' until its lease expires, which is strictly worse than an untagged
-            # block the age alarm can still find. The reason rides along in the derivation
-            # text because it is the line that says what the ticket waits on, and
-            # derive_probe() only ever read title+detail.
-            new_detail = _liveness_creation_check(f"{title or ''}\n{a.reason or ''}", detail,
-                                                  lane, True, verb="block", fatal=False,
+            # wq#1998: fatal=False. The gate is advisory HERE and nowhere else — a refused
+            # block returns before _finish(a, 'blocked') below and strands the row 'claimed'
+            # under a caller that has already given up. A retreat must always land.
+            new_detail = _liveness_creation_check(title, detail, lane, True, verb="block",
                                                   liveness=getattr(a, "liveness", None),
                                                   no_probe=getattr(a, "no_probe", None),
-                                                  accept_probe=getattr(a, "accept_probe", False))
+                                                  accept_probe=getattr(a, "accept_probe", False),
+                                                  fatal=False)
             if new_detail != (detail or ""):
                 c2 = conn(); c2.isolation_level = None; c2.execute("BEGIN IMMEDIATE")
                 c2.execute("UPDATE tasks SET detail=? WHERE id=?", (new_detail, a.id))
