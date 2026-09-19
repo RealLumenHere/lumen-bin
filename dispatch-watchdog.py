@@ -96,6 +96,17 @@ def assess():
     if crash: return (True, "dispatch pass crashing")
     return (False, "empty runnable queue (nothing sandboxed workers can run)")
 
+def _cause():
+    """wq#1694: name the cause on the page. Fail-open, never raises."""
+    try:
+        import importlib.util
+        p = "/home/lumen/sentinel/probes/credential_expiry.py"
+        spec = importlib.util.spec_from_file_location("_wq1694_ce", p)
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        return m, m.cause_line()
+    except Exception:
+        return None, ""
+
 def recover(reason):
     steps = []
     # 1) clear LAUNCH_FAILURE loopers (they burn all slots)
@@ -140,7 +151,10 @@ def main():
     save_state(st)
     if not should_page:
         return
-    body = f"DISPATCH STALLED: {reason}\nRecovery ladder:\n- " + "\n- ".join(steps) + \
+    ce, cause = _cause()
+    if cause and not ok and ce is not None and ce.attach_symptom("dispatch-watchdog", f"{reason}; recovery failed"):
+        return  # wq#1694 item 4: the credential alarm already owns this incident
+    body = (cause + "\n" if cause else "") + f"DISPATCH STALLED: {reason}\nRecovery ladder:\n- " + "\n- ".join(steps) + \
            f"\nResult: {'RECOVERED (spawned=%d, workers=%d)'%(spawned,w) if ok else 'RECOVERY FAILED — needs a human'}"
     if ok:
         ntfy("[DISPATCH] auto-recovered", body, prio="default", topic="lumen-fleet")
