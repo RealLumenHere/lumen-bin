@@ -10,9 +10,12 @@ Bundle verdict:
   ABSENT   none reached the box, not even by name
   PARTIAL  mix: at least one file absent by name
   NOTHING  bundle ships no installable files (docs/diffs only) -> needs a human look
-HEURISTIC, TRIAGE ONLY: a file installed under a different name (trivy -> lumen-trivy-weekly)
+AUTHORITATIVE for bundles whose install.sh carries the --verify handler
+(ops/VERIFY_CONTRACT.md): VERIFIED / VERIFY_FAIL / VERIFY_ERR come from the bundle
+itself, and only these can open aq rows (--aq; auto-resolved on VERIFIED).
+HEURISTIC, TRIAGE ONLY, for every other bundle: a file installed under a different name (trivy -> lumen-trivy-weekly)
 or merged into another module reads ABSENT. Truth needs the per-bundle install.sh --verify
-contract (wq#1696 item 2). Do not wire --aq to a timer until bundles carry --verify.
+contract (wq#1696 item 2). Heuristic verdicts never reach aq.
 Exit 0 always; --json for machine output; --aq opens one keyed aq row per ABSENT/PARTIAL
 bundle older than 24h (key ops-drift:<bundle>).
 """
@@ -69,12 +72,38 @@ def index_roots():
     return idx
 
 
+def has_verify(bd):
+    """Contract marker (ops/VERIFY_CONTRACT.md). Without it --verify is NEVER run:
+    a script that does not know the flag would ignore it and install."""
+    try:
+        head = open(os.path.join(bd, "install.sh")).read(20000)
+    except OSError:
+        return False
+    return ("= --verify ]" in head) or ("--verify)" in head)
+
+
+def run_verify(bd):
+    try:
+        p = subprocess.run(["bash", os.path.join(bd, "install.sh"), "--verify"], capture_output=True,
+                           text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return "VERIFY_ERR", ["timeout"]
+    lines = [l for l in (p.stdout or "").splitlines() if l.startswith(("MISS", "ERR"))]
+    return {0: "VERIFIED", 1: "VERIFY_FAIL"}.get(p.returncode, "VERIFY_ERR"), lines
+
+
 def main():
     idx = index_roots()
     out = []
     for b in sorted(os.listdir(OPS)):
         bd = os.path.join(OPS, b)
         if not (b.startswith("wq") and os.path.isdir(bd)):
+            continue
+        age_h = (time.time() - os.path.getmtime(bd)) / 3600
+        if has_verify(bd):
+            v, lines = run_verify(bd)
+            out.append({"bundle": b, "verdict": v, "authoritative": True, "files": 0, "live": 0,
+                        "missing": lines, "drifted": [], "age_h": round(age_h, 1)})
             continue
         files = []
         for dp, dns, fns in os.walk(bd):
@@ -86,8 +115,7 @@ def main():
         miss = [os.path.relpath(f, bd) for f in missf if _norm(os.path.basename(f)) not in NAMES]
         v = ("NOTHING" if not files else "LIVE" if not missf else
              "DRIFTED" if not miss else "ABSENT" if not hit and not drift else "PARTIAL")
-        age_h = (time.time() - os.path.getmtime(bd)) / 3600
-        out.append({"bundle": b, "verdict": v, "files": len(files), "live": len(hit),
+        out.append({"bundle": b, "verdict": v, "authoritative": False, "files": len(files), "live": len(hit),
                     "missing": miss, "drifted": drift, "age_h": round(age_h, 1)})
     if "--json" in sys.argv:
         print(json.dumps(out, indent=1))
@@ -101,12 +129,23 @@ def main():
             c[r["verdict"]] = c.get(r["verdict"], 0) + 1
         print("summary:", c)
     if "--aq" in sys.argv:
+        # Only authoritative (--verify) results alert. Heuristic verdicts never do.
+        sys.path.insert(0, "/home/lumen/agents/alert-queue")
+        import aq
         for r in out:
-            if r["verdict"] in ("ABSENT", "PARTIAL") and r["age_h"] > 24:
-                subprocess.run(["aq", "add", "ops-deploy-drift", f"ops-drift:{r['bundle']}",
-                                f"ops bundle not live: {r['bundle']}",
-                                f"{r['verdict']} {r['live']}/{r['files']} missing={r['missing'][:6]} (wq#1696)"],
-                               check=False)
+            if not r.get("authoritative"):
+                continue
+            key = f"ops-drift:{r['bundle']}"
+            if r["verdict"] == "VERIFY_FAIL" and r["age_h"] > 24:
+                aq.ingest(source="ops-deploy-drift", key=key, title=f"ops bundle not live: {r['bundle']}",
+                          message=f"install.sh --verify FAIL: {'; '.join(r['missing'][:8])} "
+                                  f"(fix: run the bundle's install.sh, or retire the bundle; wq#1696)")
+            elif r["verdict"] == "VERIFIED":
+                c = aq.db()
+                c.execute("UPDATE alerts SET status='resolved', note='auto-cleared: --verify OK', "
+                          "resolved_ts=? WHERE source='ops-deploy-drift' AND key=? AND status='open'",
+                          (aq.now(), key))
+                c.commit(); c.close()
 
 
 if __name__ == "__main__":
