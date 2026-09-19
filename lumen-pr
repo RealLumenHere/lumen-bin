@@ -500,7 +500,7 @@ ff_primary_after_land() {
 # Paths arrive as an ARGUMENT, never on stdin: a function on the right of a pipe runs in
 # a subshell, so `die` inside it would exit that subshell and the land would carry on.
 dirty_target_guard() {
-  local mode="$1" label="$2" paths="$3" primary sorted uncommitted unpushed hits n
+  local mode="$1" label="$2" paths="$3" head_sha="${4:-}" primary sorted uncommitted unpushed hits n
   [ -n "$paths" ] || return 0
   if ! primary=$(primary_worktree); then
     note "WARNING: cannot resolve the primary work tree of $SLUG — dirty-target guard (wq#771) SKIPPED" >&2
@@ -509,6 +509,34 @@ dirty_target_guard() {
   sorted=$(printf '%s\n' "$paths" | grep -v '^$' | LC_ALL=C sort -u)
   uncommitted=$(LC_ALL=C comm -12 <(printf '%s\n' "$sorted") <(tree_uncommitted "$primary"))
   unpushed=$(LC_ALL=C comm -12 <(printf '%s\n' "$sorted") <(tree_unpushed "$primary"))
+
+  # wq#1474: "unpushed" only means the primary tree is ahead of origin on this path —
+  # it does NOT mean the PR being landed diverges from that unpushed content. When the
+  # PR head carries the byte-identical blob for a path (e.g. it IS the push of that same
+  # unpushed commit, possibly rebased — rebasing changes the COMMIT sha but not a file's
+  # BLOB sha), landing supersedes nothing there. Narrow, content-scoped, provable: only
+  # ever drops entries from the unpushed set, never uncommitted (no commit to diff
+  # against there), and only when both blobs are actually resolvable and equal — any
+  # failure to resolve either side leaves the path a hit (fails closed, not open).
+  if [ -n "$head_sha" ] && [ -n "$unpushed" ] \
+      && git -C "$REPO_PATH" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+    local path b_primary b_pr still_unpushed=""
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      b_primary=$(git -C "$primary" rev-parse -q --verify "${DEFAULT_BRANCH}:${path}" 2>/dev/null) || b_primary=""
+      b_pr=$(git -C "$REPO_PATH" rev-parse -q --verify "${head_sha}:${path}" 2>/dev/null) || b_pr=""
+      if [ -n "$b_primary" ] && [ "$b_primary" = "$b_pr" ]; then
+        note "wq#1474: $path unpushed in $primary but blob-identical to PR head $head_sha — not a real collision, dropping"
+      else
+        still_unpushed="${still_unpushed}${path}
+"
+      fi
+    done <<EOF_UNPUSHED
+$unpushed
+EOF_UNPUSHED
+    unpushed=$(printf '%s' "$still_unpushed" | grep -v '^$' | LC_ALL=C sort -u)
+  fi
+
   hits=$(printf '%s\n%s\n' "$uncommitted" "$unpushed" | grep -v '^$' | LC_ALL=C sort -u)
   [ -n "$hits" ] || return 0
   n=$(printf '%s\n' "$hits" | grep -c .)
@@ -970,7 +998,7 @@ cmd_land() {
   # read, so refusing here costs nothing and — unlike refusing after a ten-minute check
   # poll — does not park a shared lock behind a decision a human has to make anyway.
   local pr_files; pr_files=$(pr_changed_files "$pr" "$head_sha")
-  dirty_target_guard refuse "PR #$pr" "$pr_files"
+  dirty_target_guard refuse "PR #$pr" "$pr_files" "$head_sha"
 
   # Wait for checks. A repo with no CI yet has nothing to wait for; say so loudly
   # rather than silently treating 'no checks' as 'green'.
