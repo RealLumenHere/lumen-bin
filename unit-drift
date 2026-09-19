@@ -9,7 +9,8 @@ enable-state changes) and exits 1 on drift. It never applies or restarts.
   unit-drift check [--digest]  read-only diff; exit 1 on drift;
                                --digest emits an info-class ntfy on drift;
                                also lints for dangling After/Wants/Requires
-                               targets (wq#1659)
+                               targets (wq#1659) and the guard exit-code
+                               contract (wq#1657 GEL1/GEL2 via guard_exit_lint.py)
   unit-drift apply --dry-run   show disk<-baseline plan (manual, no write)
   unit-drift show-baseline     list tracked files in the baseline
 
@@ -165,6 +166,15 @@ def dangling_target_lint():
                     out.append("%s: %s=%s does not load" % (name, kind, target))
     return out
 
+def guard_lint():
+    """wq#1657 guard exit-code contract lint. Fail-open: no module, no lint."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import guard_exit_lint
+        return guard_exit_lint.lint_dir(SYS, read=read_bytes)
+    except Exception:
+        return []
+
 def _diff(kind, base, cur, known_rm=None):
     d = []
     for n in sorted(set(cur) - set(base)):
@@ -184,20 +194,22 @@ def cmd_check(digest=False):
     orphans = sorted({rel.split("/")[0] for rel in cur["dropins"]
                       if not base_unit_exists(rel.split("/")[0][:-2])})
     dangling = dangling_target_lint()
+    lint = guard_lint()
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     counts = "%d units, %d drop-ins, %d enable-links" % (
         len(cur["units"]), len(cur["dropins"]), len(cur["enable"]))
-    if not drift and not dangling:
+    if not drift and not dangling and not lint:
         print("[%s] unit-drift: CLEAN (%s)" % (ts, counts))
         if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
         return 0
-    print("[%s] unit-drift: DRIFT — %d change(s) vs git baseline, %d dangling target(s)"
-          % (ts, len(drift), len(dangling)))
+    print("[%s] unit-drift: DRIFT — %d change(s) vs git baseline, %d dangling target(s), %d guard-lint violation(s)"
+          % (ts, len(drift), len(dangling), len(lint)))
     for kind, name in drift: print("  %-16s %s" % (kind, name))
     for v in dangling: print("  %-16s %s" % ("DANGLING-TARGET", v))
+    for v in lint: print("  %-16s %s" % ("GUARD-LINT", v))
     if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
     if digest:
-        items = [k + " " + n for k, n in drift] + dangling
+        items = [k + " " + n for k, n in drift] + dangling + [v.split(":")[0] for v in lint]
         summ = "; ".join(items[:12])
         if len(items) > 12: summ += "; +%d more" % (len(items) - 12)
         subprocess.run([NTFY, "-t", TOPIC, "-p", "low", "-T",
