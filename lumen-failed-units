@@ -47,11 +47,21 @@ NEWLY=$(comm -13 <(printf '%s\n' "$PREV" | grep -v '^$' | sort -u) \
 CLEARED=$(comm -23 <(printf '%s\n' "$PREV" | grep -v '^$' | sort -u) \
                    <(printf '%s\n' "$NOW"  | grep -v '^$' | sort -u))
 
-notify() { # $1=priority $2=title $3=message
+notify() { # $1=priority $2=title $3=message [$4=aq-source, default failed-unit]
   [[ -x $NTFY ]] && "$NTFY" -t lumen-alerts -p "$1" -T "$2" --quiet "$3" >/dev/null 2>&1
   # aq CLI: aq add <source> <key> <title> [msg] -- dedups on (source,key).
-  [[ -x $AQ   ]] && "$AQ" add failed-unit "$2" "$2" "$3" >/dev/null 2>&1
+  [[ -x $AQ   ]] && "$AQ" add "${4:-failed-unit}" "$2" "$2" "$3" >/dev/null 2>&1
   return 0
+}
+
+# wq#1657 guard exit-code contract: a unit tagged X-Lumen-Guard=finding-exit
+# (unit file or drop-in), or listed in guard-finding-exit.list, that exited 1
+# FIRED a finding -- it did not crash. Info, not urgent.
+FINDING_LIST=/home/lumen/bin/guard-finding-exit.list
+is_finding_exit() { # $1=unit
+  systemctl cat "$1" 2>/dev/null | grep -qE '^[[:space:]]*X-Lumen-Guard[[:space:]]*=[[:space:]]*finding-exit[[:space:]]*$' && return 0
+  [[ -r $FINDING_LIST ]] && grep -qxF "$1" "$FINDING_LIST" && return 0
+  return 1
 }
 
 for u in $NEWLY; do
@@ -59,7 +69,11 @@ for u in $NEWLY; do
   REASON=$(systemctl show "$u" -p Result --value 2>/dev/null)
   CODE=$(systemctl show "$u" -p ExecMainStatus --value 2>/dev/null)
   TAIL=$(journalctl -u "$u" --no-pager -n 3 -o cat 2>/dev/null | tr '\n' ' ' | cut -c1-300)
-  notify high "Failed unit: $u" "result=$REASON exit=$CODE :: $TAIL"
+  if [[ $REASON == exit-code && $CODE == 1 ]] && is_finding_exit "$u"; then
+    notify low "Guard fired: $u" "finding-exit guard reported (exit 1) :: $TAIL" guard-fired
+  else
+    notify high "Failed unit: $u" "result=$REASON exit=$CODE :: $TAIL"
+  fi
 done
 
 for u in $CLEARED; do

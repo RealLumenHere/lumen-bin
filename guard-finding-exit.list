@@ -1,0 +1,15 @@
+# guard-finding-exit.list (wq#1657) — units whose exit 1 means "finding", not
+# "crash". Bridge until each unit file carries X-Lumen-Guard=finding-exit (the
+# tag is authoritative; lumen-failed-units checks tag first, then this list).
+# One unit name per line, exact match. Remove entries as units are tagged or
+# migrated to exit-0 (Mode A) per ops/wq1657-guard-exit-convention/DESIGN.md.
+unit-drift.service
+wq-drift-guard.service
+primary-tree-guard.service
+lumen-repo-sweep.service
+lumen-pat-scan.service
+lumen-dispatch-lint.service
+lumen-retirement-audit.service
+lumen-budget-alert.service
+git-guard-sentinel.service
+repo-visibility-sentinel.service
