@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# S4 PRE-REBOOT GATE v2 — exits 0 only if EVERY check passes.
+# overnight_boot_gate.sh — S4 pre-reboot safety gate (v2). Run by hand (or by whoever is
+# about to reboot a node) before a planned reboot: checks dpkg isn't mid-operation, the
+# current kernel has a matching initramfs, /boot has >50MB free, fstab verifies, netplan
+# regenerates cleanly, the bootloader (grub or systemd-boot) parses, ssh is enabled, and
+# there's no active apt op or shutdown-blocking inhibitor. Prints PASS/FAIL per check and
+# a final verdict; exits 1 on any failure. No systemd unit calls it — standalone manual gate.
+# Usage: bash overnight_boot_gate.sh   (run ON the target node — checks its own /boot and /)
 PW="${FLEET_PW:-$(cat /home/lumen/.fleet_pw 2>/dev/null)}"
 s() { echo "$PW" | sudo -S "$@" 2>/dev/null; }
 fail=0
