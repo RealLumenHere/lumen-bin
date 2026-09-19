@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""STAGED tier-1 variant of dc-enforce-config.py — FRANK-GATED, not live.
+"""Enforce Desktop Commander canonical config on every gateway start — LIVE
+tier-1 enforcer (activated 2026-07-17, wq#1585 corrected this docstring which
+had drifted: it previously described this file as a staged, not-yet-activated
+draft, but it has been the live config since activation and is wired as
+ExecStartPre of desktop-commander-mcp.service). Idempotent; preserves
+clientId/usageStats if present; forces the three keys below plus a curated
+blockedCommands list.
 
-Difference from the live enforcer: FORCE["blockedCommands"] carries the
-irreversible-op blocklist instead of []. Everything else identical
-(idempotent, preserves clientId/usageStats, kills onboarding reset).
-
-Rationale: the live enforcer exists to defeat DC v0.2.40's onboarding reset,
-which clobbers blockedCommands back to a stock 34-cmd list. If we want a
-CURATED blocklist to survive that same reset, it has to live HERE — otherwise
-the reset wipes it. So enforcing tier-1 = swapping this FORCE dict in.
+blockedCommands = irreversible / unrecoverable-data / host-availability ops
+only (see BLOCKED below) — this replaced the earlier zero-restrictions config
+from Frank's 2026-06-26 directive, preserved for reference in
+dc-enforce-config.py.bak.20260717_001558_pre_tier1.
 
 Matching semantics (verified from command-manager.js 2026-07-16): DC blocks on
 basename(argv0), lowercased, per chained segment, after stripping env-vars and
@@ -16,12 +18,12 @@ leading path. So "dd" blocks /bin/dd, "sudo dd", "a | dd", "$(dd ..)", "X=1 dd".
 It does NOT match subcommands/args — this is why the list is destructive
 BINARIES only, never "docker" (would kill all docker) or "rm" (would kill all rm).
 
-TO ACTIVATE (Frank-gated):
-  cp /home/lumen/bin/dc-enforce-config.py /home/lumen/bin/dc-enforce-config.py.bak.$(date +%Y%m%d_%H%M%S)
-  cp /home/lumen/bin/dc-enforce-config.py.tier1-staged /home/lumen/bin/dc-enforce-config.py
+TO ROLLBACK to zero restrictions:
+  cp /home/lumen/bin/dc-enforce-config.py.bak.20260717_001558_pre_tier1 /home/lumen/bin/dc-enforce-config.py
   sudo systemctl restart desktop-commander-mcp     # <- reconnects the mcpw path; Frank present
-TO ROLLBACK:
-  cp /home/lumen/bin/dc-enforce-config.py.bak.<ts> /home/lumen/bin/dc-enforce-config.py
+TO CHANGE the blocklist:
+  cp /home/lumen/bin/dc-enforce-config.py /home/lumen/bin/dc-enforce-config.py.bak.$(date +%Y%m%d_%H%M%S)
+  <edit BLOCKED below>
   sudo systemctl restart desktop-commander-mcp
 """
 import json
