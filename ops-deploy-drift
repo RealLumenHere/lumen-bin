@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""ops-deploy-drift (wq#1696 item 2+4): which foreman/ops bundles never reached the box.
+
+Read-only. For every shippable file in /home/lumen/foreman/ops/wq*/ (skips docs, tests,
+diffs, install.sh itself), look for a byte-identical copy under the deploy roots.
+Bundle verdict:
+  LIVE     every shippable file has a byte-identical copy on the box
+  PARTIAL  some do
+  DRIFTED  every non-matching file exists on the box by name but differs (deployed, later edited)
+  ABSENT   none reached the box, not even by name
+  PARTIAL  mix: at least one file absent by name
+  NOTHING  bundle ships no installable files (docs/diffs only) -> needs a human look
+HEURISTIC, TRIAGE ONLY: a file installed under a different name (trivy -> lumen-trivy-weekly)
+or merged into another module reads ABSENT. Truth needs the per-bundle install.sh --verify
+contract (wq#1696 item 2). Do not wire --aq to a timer until bundles carry --verify.
+Exit 0 always; --json for machine output; --aq opens one keyed aq row per ABSENT/PARTIAL
+bundle older than 24h (key ops-drift:<bundle>).
+"""
+import hashlib, json, os, subprocess, sys, time
+
+OPS = "/home/lumen/foreman/ops"
+ROOTS = ["/home/lumen/bin", "/home/lumen/minerva", "/home/lumen/agents", "/home/lumen/foreman",
+         "/home/lumen/autonomy", "/etc/systemd/system", "/home/lumen/.config/systemd/user", "/etc/lumen",
+         "/home/lumen/agent", "/usr/local/bin", "/home/lumen/services", "/home/lumen/maint",
+         "/home/lumen/fleet-units"]
+SKIP_DIRS = {"__pycache__", ".git", "node_modules", "tests", "test", "_runs", "ops", ".pytest_cache", "worktrees"}
+RUNNERS = {"install.sh", "uninstall.sh", "rollback.sh", "Makefile", "apply.sh", "deploy.sh", "verify.sh", "loadtest.sh", ".gitignore"}
+ONESHOT = ("backfill_", "reopen_", "sweep_", "quarantine_", "migrate_", "remove-units", "deploy-", "verify-", "verify_", "ensure_", "apply_", "retire_", "install-", "rollout-", "measure_")
+DOC_EXT = {".md", ".txt", ".diff", ".patch", ".log", ".example", ".template", ".tsv"}
+MAX = 5 * 1024 * 1024
+
+
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def shippable(name):
+    if name in RUNNERS or name.startswith(ONESHOT):
+        return False
+    if name.startswith("test_") or name.endswith("_test.py") or ".bak" in name:
+        return False
+    return os.path.splitext(name)[1] not in DOC_EXT
+
+
+NAMES = set()
+
+
+def _norm(n):
+    return n.replace("-", "_").rsplit(".py", 1)[0].lower()
+
+
+def index_roots():
+    idx = set()
+    for r in ROOTS:
+        for dp, dns, fns in os.walk(r, onerror=lambda e: None):
+            dns[:] = [d for d in dns if d not in SKIP_DIRS]
+            for fn in fns:
+                p = os.path.join(dp, fn)
+                try:
+                    if os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= MAX:
+                        idx.add(sha(p))
+                        NAMES.add(_norm(fn))
+                except OSError:
+                    pass
+    return idx
+
+
+def main():
+    idx = index_roots()
+    out = []
+    for b in sorted(os.listdir(OPS)):
+        bd = os.path.join(OPS, b)
+        if not (b.startswith("wq") and os.path.isdir(bd)):
+            continue
+        files = []
+        for dp, dns, fns in os.walk(bd):
+            dns[:] = [d for d in dns if d not in SKIP_DIRS]
+            files += [os.path.join(dp, f) for f in fns if shippable(f)]
+        hit = [f for f in files if os.path.getsize(f) <= MAX and sha(f) in idx]
+        missf = [f for f in files if f not in hit]
+        drift = [os.path.relpath(f, bd) for f in missf if _norm(os.path.basename(f)) in NAMES]
+        miss = [os.path.relpath(f, bd) for f in missf if _norm(os.path.basename(f)) not in NAMES]
+        v = ("NOTHING" if not files else "LIVE" if not missf else
+             "DRIFTED" if not miss else "ABSENT" if not hit and not drift else "PARTIAL")
+        age_h = (time.time() - os.path.getmtime(bd)) / 3600
+        out.append({"bundle": b, "verdict": v, "files": len(files), "live": len(hit),
+                    "missing": miss, "drifted": drift, "age_h": round(age_h, 1)})
+    if "--json" in sys.argv:
+        print(json.dumps(out, indent=1))
+    else:
+        for r in out:
+            m = ("  absent: " + ", ".join(r["missing"][:4])) if r["missing"] else ""
+            m += ("  drifted: " + ", ".join(r["drifted"][:3])) if r["drifted"] else ""
+            print(f"{r['verdict']:8} {r['live']}/{r['files']:<3} {r['bundle']}{m}")
+        c = {}
+        for r in out:
+            c[r["verdict"]] = c.get(r["verdict"], 0) + 1
+        print("summary:", c)
+    if "--aq" in sys.argv:
+        for r in out:
+            if r["verdict"] in ("ABSENT", "PARTIAL") and r["age_h"] > 24:
+                subprocess.run(["aq", "add", "ops-deploy-drift", f"ops-drift:{r['bundle']}",
+                                f"ops bundle not live: {r['bundle']}",
+                                f"{r['verdict']} {r['live']}/{r['files']} missing={r['missing'][:6]} (wq#1696)"],
+                               check=False)
+
+
+if __name__ == "__main__":
+    main()
