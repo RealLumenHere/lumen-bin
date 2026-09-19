@@ -381,6 +381,51 @@ check("D4 dirtycheck also catches an un-pushed commit, not just uncommitted diff
       rc != 0 and "config.json" in out and "wq#792" in out, f"rc={rc} out={out[-200:]!r}")
 
 # ---------------------------------------------------------------------------
+print("\nE. wq#1121 — the branch CONTAINS the un-pushed commit, so landing supersedes nothing")
+
+# D1's repo with one thing changed: the branch is cut from the target tree's main instead of
+# from origin/main, so it carries the local-only commit forward. wq#1108 died here — the guard
+# refused the very PR its own refusal text asks for ("land it as its own PR, then this").
+p10, _ = forge_repo("superset")
+open(os.path.join(p10, "config.json"), "w").write('{"lanes": {"build": {"enabled": true}}}\n')
+git(p10, "add -- config.json")
+git(p10, "commit -qm 'feat(probe): local-only commit never pushed'")
+w10 = os.path.join(TMP, "superset-wt2")
+git(p10, f"worktree add -q -b fix/superset {w10} main")
+sha10 = branch_commit(w10, "config.json",
+                      '{"lanes": {"build": {"enabled": true}}, "cloud_ceiling": 5}\n')
+PR["head"] = {"sha": sha10, "ref": "fix/superset"}
+FILES[:] = ["config.json"]
+rc, out = land(w10)
+check("E1 land PROCEEDS when the branch is a superset of the target tree, and says why",
+      rc == 0 and merged_yet() and "wq#1121" in out and "superset of the target tree" in out,
+      f"rc={rc} out={out[-300:]!r}")
+
+# The carve-out is about COMMITS. Uncommitted work in the target tree is in no commit, so no
+# ancestry vouches for it and the refusal must survive even on a superset branch.
+p11, _ = forge_repo("superset-dirty")
+open(os.path.join(p11, "config.json"), "w").write('{"lanes": {"build": {"enabled": true}}}\n')
+git(p11, "add -- config.json")
+git(p11, "commit -qm 'feat(probe): local-only commit never pushed'")
+w11 = os.path.join(TMP, "superset-dirty-wt2")
+git(p11, f"worktree add -q -b fix/superset {w11} main")
+sha11 = branch_commit(w11, "config.json",
+                      '{"lanes": {"build": {"enabled": true}}, "cloud_ceiling": 5}\n')
+open(os.path.join(p11, "config.json"), "a").write('// operator is mid-edit\n')
+PR["head"] = {"sha": sha11, "ref": "fix/superset"}
+rc, out = land(w11)
+check("E2 a superset branch still refuses over UNCOMMITTED work in the target tree",
+      rc != 0 and not merged_yet() and "uncommitted there" in out and "refusing to land" in out,
+      f"rc={rc} out={out[-300:]!r}")
+
+HITS.clear()
+rc, out = sh(f"{LPR} land {w11} 1 --allow-dirty", env=env())
+check("E3 land --allow-dirty parses (no 'unknown flag') and rescues nothing (wq#1121/wq#1282)",
+      rc != 0 and not merged_yet() and "unknown flag" not in out
+      and "does NOTHING" in out and "refusing to land" in out,
+      f"rc={rc} out={out[-300:]!r}")
+
+# ---------------------------------------------------------------------------
 print("\nC. REGRESSION GUARDS — behaviour the change must not move")
 
 src = open(LPR).read()

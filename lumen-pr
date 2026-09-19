@@ -10,10 +10,10 @@
 #   lumen-pr start  <repo-path> <type>/<slug> [--worktree|--primary|--adopt]
 #   lumen-pr commit <repo-path> "<conventional subject>" [--refs wq#N] [--body-file F]
 #   lumen-pr open   <repo-path> --title T --body-file F [--draft] [--allow-second-person]
-#   lumen-pr land   <repo-path> <pr-number> [--timeout SEC] [--merge]
+#   lumen-pr land   <repo-path> <pr-number> [--timeout SEC] [--merge] [--allow-dirty]
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
-#   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>...  # wq#771/wq#792 target-tree guard
+#   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] [--head REV] <path>...  # wq#771/wq#792 guard
 #   lumen-pr ffprimary <repo-path>         # wq#1536: ff the primary tree to origin/main, or say why not
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
@@ -34,6 +34,14 @@
 # rewriting tracked runtime state — and once that state moved under gitignored runtime/
 # dirs, every remaining trip of the guard is a true positive: real work about to be
 # silently superseded. Setting the variable now fails loudly rather than landing.
+#
+# wq#1121: that is still true, and `land --allow-dirty` is therefore accepted-and-inert —
+# it says once that no override exists, then lands or refuses on the guard's own verdict.
+# What DID need fixing is the guard's reach: it counted an un-pushed commit on the target
+# tree as a collision even when the branch being landed already CONTAINED that commit, so
+# the PR that carried the un-pushed work — the guard's own prescribed fix — was the one
+# thing it refused. dirty_target_guard now clears the un-pushed set on that ancestry, and
+# ff_primary_after_land re-points a target tree whose local commits are already on origin.
 set -uo pipefail
 
 BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
@@ -466,6 +474,21 @@ ff_primary_after_land() {
     || { note "primary $tree NOT fast-forwarded: no origin/$DEFAULT_BRANCH ref (never fetched?)"; return 1; }
   ahead=$(git -C "$tree" rev-list --count "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null || echo 0)
   if [ "${ahead:-0}" -gt 0 ]; then
+    # wq#1121: "ahead" is not always divergence. The land that wq#1121 unblocks squashes the
+    # tree's own un-pushed commits onto origin, which leaves them ahead by COMMIT and identical
+    # by CONTENT — and without this the tree stays permanently diverged, so every later land
+    # warns about work that is already on origin. Trees equal is the proof (the same
+    # content-not-commit standard wq#1474 uses in the guard); re-pointing then changes no file.
+    # --keep, not --hard: with equal trees no tracked file differs, so uncommitted work
+    # survives, and if git disagrees it refuses and we fall through to the refusal below.
+    local ltree rtree
+    ltree=$(git -C "$tree" rev-parse -q --verify "$DEFAULT_BRANCH^{tree}" 2>/dev/null) || ltree=""
+    rtree=$(git -C "$tree" rev-parse -q --verify "origin/$DEFAULT_BRANCH^{tree}" 2>/dev/null) || rtree=""
+    if [ -n "$ltree" ] && [ "$ltree" = "$rtree" ] \
+       && err=$(git -C "$tree" reset --keep "origin/$DEFAULT_BRANCH" 2>&1); then
+      note "primary $tree re-pointed to origin/$DEFAULT_BRANCH ($(git -C "$tree" rev-parse --short HEAD)): its $ahead local commit(s) are already on origin by content (identical tree) — no file changed"
+      return 0
+    fi
     note "primary $tree NOT fast-forwarded: local $DEFAULT_BRANCH has $ahead commit(s) origin does not (diverged, wq#792):"
     git -C "$tree" log --oneline "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null | sed 's/^/    /'
     note "  push them (git -C $tree push origin $DEFAULT_BRANCH) or land them as their own PR, then: lumen-pr ffprimary $tree"
@@ -509,6 +532,29 @@ dirty_target_guard() {
   sorted=$(printf '%s\n' "$paths" | grep -v '^$' | LC_ALL=C sort -u)
   uncommitted=$(LC_ALL=C comm -12 <(printf '%s\n' "$sorted") <(tree_uncommitted "$primary"))
   unpushed=$(LC_ALL=C comm -12 <(printf '%s\n' "$sorted") <(tree_unpushed "$primary"))
+
+  # wq#1121: an un-pushed commit on the target tree is only a hazard when the merge lands a
+  # version of those paths that never saw it. When the target tree's $DEFAULT_BRANCH tip is an
+  # ANCESTOR of the PR head, the branch CONTAINS those commits — it is a strict superset of the
+  # target tree — so the squash carries them to origin instead of superseding them. That is
+  # exactly what the refusal below tells the operator to do ("land it as its own PR, then
+  # this"), and until now the guard refused that very PR: wq#1108 could not close a branch that
+  # was foreman main 035bedb plus one commit. Whole-set, not per-path, because ancestry is one
+  # statement about every commit in the range. Never touches $uncommitted: work in no commit
+  # cannot be vouched for by any ancestry. Fails closed — an unresolvable tip or head, or a
+  # non-zero merge-base, leaves every hit standing.
+  if [ -n "$head_sha" ] && [ -n "$unpushed" ]; then
+    local primary_tip dropped
+    primary_tip=$(git -C "$primary" rev-parse -q --verify "refs/heads/$DEFAULT_BRANCH^{commit}" 2>/dev/null) || primary_tip=""
+    if [ -n "$primary_tip" ] \
+       && git -C "$REPO_PATH" cat-file -e "${head_sha}^{commit}" 2>/dev/null \
+       && git -C "$REPO_PATH" cat-file -e "${primary_tip}^{commit}" 2>/dev/null \
+       && git -C "$REPO_PATH" merge-base --is-ancestor "$primary_tip" "$head_sha" 2>/dev/null; then
+      dropped=$(printf '%s\n' "$unpushed" | grep -c .)
+      note "wq#1121: $primary $DEFAULT_BRANCH ($(git -C "$REPO_PATH" rev-parse --short "$primary_tip")) is an ancestor of ${label} head ${head_sha} — the branch is a superset of the target tree, so landing supersedes nothing; dropping $dropped un-pushed path(s)"
+      unpushed=""
+    fi
+  fi
 
   # wq#1474: "unpushed" only means the primary tree is ahead of origin on this path —
   # it does NOT mean the PR being landed diverges from that unpushed content. When the
@@ -587,8 +633,11 @@ EOF_UNPUSHED
         rm -- $primary/<path>                                       # untracked
         git -C $primary reset --hard origin/$DEFAULT_BRANCH          # discard un-pushed commit(s) — destructive
 
-      There is no override (LUMEN_PR_ALLOW_DIRTY retired, wq#1282). Runtime state that used
-      to trip this guard now lives under gitignored runtime/ dirs, so a hit here is real work."
+      There is no override (LUMEN_PR_ALLOW_DIRTY retired, wq#1282; land --allow-dirty is
+      accepted but inert, wq#1121). Runtime state that used to trip this guard now lives under
+      gitignored runtime/ dirs, so a hit here is real work. The one automatic clearance is
+      wq#1121: if this branch already CONTAINS the target tree's un-pushed commits, the guard
+      drops them itself — reaching this message means it does not, or the hit is uncommitted."
 }
 
 # The paths a PR touches. Resolved LOCALLY where possible: merge-base(origin/default, head)
@@ -977,6 +1026,20 @@ cmd_land() {
     case "$1" in
       --timeout) timeout="${2:-600}"; shift 2 ;;
       --merge) merge_method=merge; shift ;;
+      # wq#1121: recognised and deliberately inert. A headless worker that trips the wq#771
+      # guard is told to use an override; the env one (LUMEN_PR_ALLOW_DIRTY) was retired by
+      # wq#1282 AND is unreachable anyway, because the worker allowlist matches the bare
+      # `/home/lumen/bin/lumen-pr` prefix and an `VAR=1 lumen-pr ...` line does not start
+      # with it. So the worker reached for --allow-dirty and got `unknown flag`: a dead end
+      # at both doors. Accepting it here costs nothing, says once that no override exists,
+      # and stops a land that would have passed anyway from dying in argument parsing.
+      --allow-dirty)
+        note "WARNING: --allow-dirty is accepted but does NOTHING (wq#1121). The wq#771/wq#792" >&2
+        note "  target-tree guard has had no override since wq#1282 — a trip is real work about to" >&2
+        note "  be superseded, and the refusal prints the exact commands that resolve it. If this" >&2
+        note "  branch already CONTAINS the target tree's un-pushed commits, the guard clears" >&2
+        note "  itself and this land proceeds with no flag at all." >&2
+        shift ;;
       *) die "unknown flag for land: $1" ;;
     esac
   done
@@ -1193,18 +1256,28 @@ cmd_check() {
 
 cmd_dirtycheck() {
   need_repo "${1:-}"; shift 2>/dev/null || true
-  local mode=refuse paths="" n
+  local mode=refuse paths="" n head="" head_sha=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --mode) mode="${2:-}"; shift 2 ;;
+      # wq#1121: the head the paths would land as. `land` has always passed it (it is what
+      # the wq#1474 blob check and the wq#1121 ancestry check read), but dirtycheck could
+      # not, so the only way to exercise either narrowing was to drive a real merge against
+      # a real forge. With --head the whole guard is checkable offline, by the test gate and
+      # by an agent that wants to know whether its branch will land before it asks.
+      --head) head="${2:-}"; shift 2 ;;
       -)      paths="$paths$(cat)"$'\n'; shift ;;
       *)      paths="$paths$1"$'\n'; shift ;;
     esac
   done
   case "$mode" in refuse|warn) : ;; *) die "unknown --mode '$mode' (refuse|warn)" ;; esac
-  [ -n "${paths//[$'\n']/}" ] || die "usage: lumen-pr dirtycheck <repo-path> [--mode refuse|warn] <path>... | -"
+  if [ -n "$head" ]; then
+    head_sha=$(git -C "$REPO_PATH" rev-parse -q --verify "${head}^{commit}" 2>/dev/null) \
+      || die "--head '$head' does not resolve to a commit in $REPO_PATH"
+  fi
+  [ -n "${paths//[$'\n']/}" ] || die "usage: lumen-pr dirtycheck <repo-path> [--mode refuse|warn] [--head REV] <path>... | -"
   n=$(printf '%s' "$paths" | grep -c .)
-  dirty_target_guard "$mode" "path list" "$paths" || return 1
+  dirty_target_guard "$mode" "path list" "$paths" "$head_sha" || return 1
   note "clean: none of the $n path(s) given is uncommitted or in an un-pushed commit in $(primary_worktree)"
 }
 
