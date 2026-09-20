@@ -97,7 +97,7 @@ on each other's in-flight claims. Nothing at this chokepoint can separate them (
 docstring works through why no per-instance signal exists) — the orch lease is what covers it,
 and only for callers that take one. Boot-time registration is what closes the rest, and it lives
 outside wq: see ops/wq1116-orch-collision-guard/README.md in claude-foreman."""
-import sqlite3, sys, os, argparse, datetime, socket, re, secrets, json
+import sqlite3, sys, os, argparse, datetime, socket, re, secrets, json, ast, subprocess
 DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
 DEFAULT_TTL_MIN = 240
 def _envint(name, default):
@@ -191,6 +191,70 @@ def configured_lanes():
         return set(cfg.get("lanes", {}).keys())
     except (OSError, ValueError):
         return None
+# wq#2139 (wq#2127, DISPATCH_FIX_RESEARCH §1.4): 12 open tickets (auto x11, simpill x1) sat in
+# lanes that are enabled for dispatch but have no LANE_REPO row, so the dispatcher skipped them
+# as lane_unmapped on every pass forever. Refuse at creation time instead. Policy is read the
+# way the dispatcher reads it — COMMITTED at git HEAD, never the working tree (wq#772).
+FOREMAN_ROUTER_PY = os.environ.get("WQ_FOREMAN_ROUTER",
+                                   "/home/lumen/foreman/orchestrator/router.py")
+FOREMAN_DISPATCHER_PY = os.environ.get("WQ_FOREMAN_DISPATCHER",
+                                       "/home/lumen/foreman/dispatcher/foreman_dispatcher.py")
+_REPO_TAG_RE = re.compile(r"(?:needs:)?repo\(\s*[^)\s][^)]*\)")
+def _git_head_text(path):
+    """`path` as committed at HEAD of its containing repo. Raises on any failure."""
+    path = os.path.abspath(path)
+    repo_dir = os.path.dirname(path)
+    top = subprocess.run(["git", "-C", repo_dir, "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+    return subprocess.run(["git", "-C", repo_dir, "show", f"HEAD:{os.path.relpath(path, top)}"],
+                          capture_output=True, text=True, timeout=10, check=True).stdout
+def _committed_assign(path, name):
+    """The value node of the module-level `name = ...` in `path` at git HEAD (no import: the
+    router/dispatcher modules have import-time side effects)."""
+    for node in ast.parse(_git_head_text(path)).body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return node.value
+    raise ValueError(f"{name} not found in {path}")
+def unmapped_dispatch_lanes():
+    """wq#2139: (lanes enabled for dispatch with no LANE_REPO row, human lanes). None means a
+    foreman file could not be read or parsed — callers must fail OPEN (wq#912 precedent)."""
+    try:
+        cfg = json.loads(_git_head_text(DISPATCHER_CONFIG))
+        enabled = {ln for ln, p in cfg["lanes"].items()
+                   if isinstance(p, dict) and p.get("enabled") is True}
+        mapped = {ast.literal_eval(k) for k in _committed_assign(FOREMAN_ROUTER_PY, "LANE_REPO").keys}
+        human = set(ast.literal_eval(_committed_assign(FOREMAN_DISPATCHER_PY, "HUMAN_LANES")))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, SyntaxError,
+            subprocess.SubprocessError) as e:
+        eprint(f"WARNING (wq#2139): dispatch-lane repo check skipped, foreman policy unreadable: "
+               f"{type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
+        return None
+    return enabled - mapped - human, human
+_UNMAPPED_FORCE_NOTE = ("[--force wq#2139] filed in lane {lane!r} with no LANE_REPO row and no needs "
+                        "repo(...) tag: the dispatcher will skip this as lane_unmapped until re-laned or tagged")
+def check_lane_has_repo(lane, needs, detail, force):
+    """wq#2139: refuse `lane` when the dispatcher can never land it (enabled, no LANE_REPO row,
+    human lanes exempt) unless the ticket carries a needs repo(...) tag — in --needs or in the
+    detail's `Needs:` line, the same two places the router reads. Returns True when --force
+    overrode a refusal (caller records it in the ticket notes)."""
+    if not lane:
+        return False
+    res = unmapped_dispatch_lanes()
+    if res is None or lane not in res[0]:
+        return False
+    text = (needs or "") + "\n" + "\n".join(
+        m for m in re.findall(r"^Needs:\s*(.+)$", detail or "", re.M))
+    if _REPO_TAG_RE.search(text):
+        return False
+    if force:
+        warn(f"--force: lane {lane!r} has no LANE_REPO row and the ticket has no needs repo(...) tag")
+        return True
+    print(f"REFUSED: lane {lane!r} is enabled for dispatch but has no LANE_REPO row in the foreman "
+          f"router — the dispatcher would skip this ticket as lane_unmapped forever (wq#2139).")
+    print("Ways out: pick a mapped lane (e.g. build, ops, research, fleet), or pass a repo tag: "
+          "--needs 'repo(/abs/path/to/repo)'. --force overrides, on the record in the ticket notes.")
+    sys.exit(1)
 FOREMAN_MODELS_YAML = os.environ.get("FOREMAN_MODELS_YAML",
                                      "/home/lumen/foreman/research/models.yaml")
 def known_models():
@@ -1332,6 +1396,9 @@ def cmd_add(a):
               f"Exempt (deliberately unlisted): {', '.join(sorted(LANE_EXEMPT))}\n"
               f"Use an existing lane, add one to dispatcher/config.json first, or --force to override.")
         sys.exit(1)
+    # wq#2139: refuse an enabled lane the dispatcher can never land (no LANE_REPO row) unless
+    # the ticket carries a needs repo(...) tag. Fail-open on unreadable foreman policy.
+    force_unmapped = check_lane_has_repo(a.lane, getattr(a, "needs", None), a.detail, a.force)
     # wq#1368: refuse an archetype with no routing row — the dispatcher would never be
     # able to route this ticket (it used to crash the whole pass on this exact shape;
     # the dispatcher is now hardened too, but a ticket that can never route is still a
@@ -1371,6 +1438,9 @@ def cmd_add(a):
                model, effort, (a.archetype or None), init_status, gate_type))
     if needs_val is not None:
         c.execute("UPDATE tasks SET needs=? WHERE id=last_insert_rowid()", (needs_val.strip(),))
+    if force_unmapped:
+        c.execute("UPDATE tasks SET notes=? WHERE id=last_insert_rowid()",
+                  (f"[{now()}] {_UNMAPPED_FORCE_NOTE.format(lane=a.lane)}",))
     deliverable = (getattr(a, "deliverable", None) or "").strip()
     if deliverable:
         c.execute("UPDATE tasks SET deliverable=? WHERE id=last_insert_rowid()", (deliverable,))
@@ -2953,6 +3023,15 @@ def cmd_edit(a):
             print(f"REFUSED: archetype {a.archetype!r} has no routing row in models.yaml "
                   f"(wq#1368). Known archetypes: {', '.join(sorted(archs))}")
             c.close(); sys.exit(1)
+    # wq#2139: same LANE_REPO check as cmd_add when the lane changes; the tag may already be on
+    # the ticket, so judge the EFFECTIVE needs/detail (edited value, else stored).
+    force_unmapped = False
+    if a.lane is not None:
+        cur = c.execute(f"SELECT detail,{'needs' if needs_ready(c) else 'NULL'} FROM tasks WHERE id=?",
+                        (a.id,)).fetchone() or ("", "")
+        force_unmapped = check_lane_has_repo(
+            a.lane, needs_val if needs_val is not None else cur[1],
+            a.detail if a.detail is not None else cur[0], a.force)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
@@ -2971,6 +3050,10 @@ def cmd_edit(a):
     if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype/--gate-type/--needs"); c.close(); return
     vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
     reopened = bump_reopened(c, a.id) if is_reopen(prev_status, a.status) else 0
+    if force_unmapped:
+        prev = c.execute("SELECT notes FROM tasks WHERE id=?", (a.id,)).fetchone()[0] or ""
+        c.execute("UPDATE tasks SET notes=? WHERE id=?",
+                  ((prev + "\n" if prev else "") + f"[{now()}] " + _UNMAPPED_FORCE_NOTE.format(lane=a.lane), a.id))
     c.commit()
     print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}{_reopen_tag(reopened)}"); c.close()
 def cmd_retire(a):
@@ -3210,7 +3293,7 @@ s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, a
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.add_argument("--json",action="store_true",help="wq#1277: emit the row as a single JSON object — safe for multi-line detail fields; plain text truncates/mis-parses embedded newlines"); s.set_defaults(f=cmd_show)
-s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.add_argument("--force",action="store_true",help="wq#2139: file the lane even with no LANE_REPO row and no needs repo(...) tag (noted on the ticket)"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("note",help="wq#1331: APPEND one timestamped line to notes (never overwrites)"); s.add_argument("id",type=int); s.add_argument("text"); s.set_defaults(f=cmd_note)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: required to retire a fworker-wq<id> per-ticket identity — confirms you mean to permanently poison future spawns of that ticket, not just clear a stale claim (use `wq release --dead-worker` for that instead)"); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
