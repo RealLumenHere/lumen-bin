@@ -1,10 +1,32 @@
 #!/bin/bash
 # systemd-onfailure-ntfy <unit> (wq#392): fired by ntfy-onfailure@<unit>.service
 # OnFailure hook. Sends an URGENT ntfy with the unit's last state + tail.
+#
+# wq#1625/wq#1657: this hook predates the guard exit-code contract (wq#1657/1679)
+# and fires unconditionally on every OnFailure=, with no idea that a unit tagged
+# X-Lumen-Guard=finding-exit exiting 1 is a REPORTED FINDING, not a crash.
+# lumen-failed-units (the wq#1657 sweep, runs every 5min) already classifies that
+# case correctly as "Guard fired" at low priority via aq source=guard-fired --
+# so an unconditional urgent page here duplicates it at the wrong priority and
+# re-teaches everyone to ignore "systemd: X failed" pages, exactly the failure
+# mode lumen-failed-units' own design doc (wq#1657) was written to stop.
+# Skip ONLY the expected finding signal (Result=exit-code, ExecMainStatus=1) for
+# a tagged unit; anything else (segfault, timeout, oom-kill, exit 2+) on the same
+# unit is a real crash of the guard itself and still pages urgent as before.
 U="${1:?unit required}"
+FINDING_LIST=/home/lumen/bin/guard-finding-exit.list
+is_finding_exit() { # $1=unit
+  systemctl cat "$1" 2>/dev/null | grep -qE '^[[:space:]]*X-Lumen-Guard[[:space:]]*=[[:space:]]*finding-exit[[:space:]]*$' && return 0
+  [[ -r $FINDING_LIST ]] && grep -qxF "$1" "$FINDING_LIST" && return 0
+  return 1
+}
 NTFY="${NTFY_ONFAIL_URL:-http://localhost:8080/lumen-alerts}"
 RES=$(systemctl show "$U" -p Result --value 2>/dev/null)
 NR=$(systemctl show "$U" -p NRestarts --value 2>/dev/null)
+CODE=$(systemctl show "$U" -p ExecMainStatus --value 2>/dev/null)
+if [[ $RES == exit-code && $CODE == 1 ]] && is_finding_exit "$U"; then
+  exit 0   # lumen-failed-units already covers this at "low" priority within 5min
+fi
 TAIL=$(journalctl -u "$U" -n 6 --no-pager -o cat 2>/dev/null | tr '\n' ' ' | tail -c 300)
 MSG="🔴 $U FAILED (result=$RES restarts=$NR) — $TAIL"
 curl -s -m 8 -d "$MSG" -H "Title: systemd: $U failed" -H "Priority: urgent" -H "Tags: rotating_light" "$NTFY" >/dev/null 2>&1
