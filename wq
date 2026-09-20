@@ -199,7 +199,7 @@ FOREMAN_ROUTER_PY = os.environ.get("WQ_FOREMAN_ROUTER",
                                    "/home/lumen/foreman/orchestrator/router.py")
 FOREMAN_DISPATCHER_PY = os.environ.get("WQ_FOREMAN_DISPATCHER",
                                        "/home/lumen/foreman/dispatcher/foreman_dispatcher.py")
-_REPO_TAG_RE = re.compile(r"(?:needs:)?repo\(\s*[^)\s][^)]*\)")
+_REPO_TAG_RE = re.compile(r"(?:needs:)?repo\(\s*([^)\s][^)]*?)\s*\)")
 def _git_head_text(path):
     """`path` as committed at HEAD of its containing repo. Raises on any failure."""
     path = os.path.abspath(path)
@@ -216,53 +216,92 @@ def _committed_assign(path, name):
                 isinstance(t, ast.Name) and t.id == name for t in node.targets):
             return node.value
     raise ValueError(f"{name} not found in {path}")
+def _static_str(path, node):
+    """A router string constant without importing it: a literal, a module-level name bound to
+    one, or os.environ.get(KEY, "default") (the default is what an unset env resolves to)."""
+    if isinstance(node, ast.Name):
+        node = _committed_assign(path, node.id)
+    if isinstance(node, ast.Call) and len(node.args) == 2:
+        node = node.args[1]
+    return ast.literal_eval(node)
+# wq#2144: repo_sweep.managed_repos() = LANE_REPO values + EXTRA_REPOS, read from git HEAD.
+FOREMAN_REPO_SWEEP_PY = os.environ.get("WQ_FOREMAN_REPO_SWEEP",
+                                       "/home/lumen/foreman/harness/repo_sweep.py")
+_SWEEP_TITLE_PREFIX = "[repo-sweep] "
+_SWEEP_DETAIL_RE = re.compile(r"^Automated sweep detected \S+ in (\S+)\.")
 def unmapped_dispatch_lanes():
-    """wq#2139: (lanes enabled for dispatch with no LANE_REPO row, human lanes). None means a
-    foreman file could not be read or parsed — callers must fail OPEN (wq#912 precedent)."""
+    """wq#2139: (lanes enabled for dispatch with no LANE_REPO row, human lanes, the one lane the
+    dispatcher resolves off the ticket itself, managed repos). None means a foreman file could
+    not be read or parsed — callers must fail OPEN (wq#912 precedent)."""
     try:
         cfg = json.loads(_git_head_text(DISPATCHER_CONFIG))
         enabled = {ln for ln, p in cfg["lanes"].items()
                    if isinstance(p, dict) and p.get("enabled") is True}
-        mapped = {ast.literal_eval(k) for k in _committed_assign(FOREMAN_ROUTER_PY, "LANE_REPO").keys}
+        lane_repo = _committed_assign(FOREMAN_ROUTER_PY, "LANE_REPO")
+        mapped = {ast.literal_eval(k) for k in lane_repo.keys}
         human = set(ast.literal_eval(_committed_assign(FOREMAN_DISPATCHER_PY, "HUMAN_LANES")))
+        hint_lane = ast.literal_eval(_committed_assign(FOREMAN_DISPATCHER_PY, "REPO_HINT_LANE"))
+        managed = {_static_str(FOREMAN_ROUTER_PY, v) for v in lane_repo.values}
+        managed |= set(ast.literal_eval(_committed_assign(FOREMAN_REPO_SWEEP_PY, "EXTRA_REPOS")))
     except (OSError, ValueError, KeyError, TypeError, AttributeError, SyntaxError,
             subprocess.SubprocessError) as e:
         eprint(f"WARNING (wq#2139): dispatch-lane repo check skipped, foreman policy unreadable: "
                f"{type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
         return None
-    return enabled - mapped - human, human
-_UNMAPPED_FORCE_NOTE = ("[{how} wq#2139] filed in lane {lane!r} with no LANE_REPO row and no needs "
-                        "repo(...) tag: the dispatcher will skip this as lane_unmapped until re-laned or tagged")
-def check_lane_has_repo(lane, needs, detail, force):
+    return enabled - mapped - human, human, hint_lane, managed
+_UNMAPPED_FORCE_NOTE = ("[{how} wq#2139] filed in lane {lane!r} with no LANE_REPO row and no repo the "
+                        "dispatcher can resolve: it will skip this as lane_unmapped until re-laned or fixed")
+def _resolvable_repo(title, needs, detail, managed):
+    """wq#2144: the repo the dispatcher's repo_for_ticket resolves for an unmapped-lane ticket,
+    mirroring the two sources it reads: the first needs repo(<path>) tag (--needs, then the
+    detail's first `Needs:` line — router.needs_repo_hint) and a repo-sweep ticket's own
+    title/detail (repo_sweep.repo_hint). Both are honoured only for a managed repo."""
+    line = re.search(r"^Needs:\s*(.+)$", detail or "", re.M)
+    tag = _REPO_TAG_RE.search((needs or "") + "\n" + (line.group(1) if line else ""))
+    if tag and tag.group(1) in managed:
+        return tag.group(1)
+    if (title or "").startswith(_SWEEP_TITLE_PREFIX):
+        sweep = _SWEEP_DETAIL_RE.match(detail or "")
+        if sweep and sweep.group(1) in managed:
+            return sweep.group(1)
+    return None
+def check_lane_has_repo(lane, needs, detail, force, title=None):
     """wq#2139: refuse `lane` when the dispatcher can never land it (enabled, no LANE_REPO row,
-    human lanes exempt) unless the ticket carries a needs repo(...) tag — in --needs or in the
-    detail's `Needs:` line, the same two places the router reads. Returns True when --force
-    overrode a refusal (caller records it in the ticket notes)."""
+    human lanes exempt). wq#2144: only the hint lane ('auto', foreman_dispatcher.REPO_HINT_LANE)
+    can be rescued by the ticket itself — a managed needs repo(...) tag or the repo-sweep
+    title/detail shape; the dispatcher skips every other unmapped lane as lane_unmapped BEFORE it
+    reads the tag. Returns "--force" / "warn-mode" when the ticket is filed anyway (caller records
+    it in the notes)."""
     if not lane:
         return False
     res = unmapped_dispatch_lanes()
     if res is None or lane not in res[0]:
         return False
-    text = (needs or "") + "\n" + "\n".join(
-        m for m in re.findall(r"^Needs:\s*(.+)$", detail or "", re.M))
-    if _REPO_TAG_RE.search(text):
+    if lane == res[2] and _resolvable_repo(title, needs, detail, res[3]):
         return False
     if force:
-        warn(f"--force: lane {lane!r} has no LANE_REPO row and the ticket has no needs repo(...) tag")
+        warn(f"--force: lane {lane!r} has no LANE_REPO row and the dispatcher cannot resolve a repo for it")
         return "--force"
     # wq#2127: the CLI DEFAULT lane ('auto') is itself such a lane and ~3 tickets/day are filed
     # into it by unattended producers (minerva_defer_review, fleet-update-check, sessions). A hard
     # refusal there loses the ticket, which is worse than a ticket that needs re-laning, so the
     # default is warn + note. WQ_LANE_REPO_GUARD=refuse turns the refusal on.
     if os.environ.get("WQ_LANE_REPO_GUARD", "warn") != "refuse":
-        warn(f"lane {lane!r} is enabled for dispatch but has no LANE_REPO row and the ticket has no "
-             f"needs repo(...) tag: the dispatcher will skip it as lane_unmapped until it is re-laned "
-             f"or tagged (wq#2139). Filed anyway; set WQ_LANE_REPO_GUARD=refuse to refuse instead.")
+        warn(f"lane {lane!r} is enabled for dispatch but has no LANE_REPO row and the dispatcher cannot "
+             f"resolve a repo for this ticket: it will skip it as lane_unmapped until it is re-laned "
+             f"or fixed (wq#2139). Filed anyway; set WQ_LANE_REPO_GUARD=refuse to refuse instead.")
         return "warn-mode"
     print(f"REFUSED: lane {lane!r} is enabled for dispatch but has no LANE_REPO row in the foreman "
           f"router — the dispatcher would skip this ticket as lane_unmapped forever (wq#2139).")
-    print("Ways out: pick a mapped lane (e.g. build, ops, research, fleet), or pass a repo tag: "
-          "--needs 'repo(/abs/path/to/repo)'. --force overrides, on the record in the ticket notes.")
+    if lane == res[2]:
+        print(f"Ways out: pick a mapped lane (e.g. build, ops, research, fleet), or give lane {lane!r} a "
+              f"repo it can resolve: --needs 'repo(<managed repo path>)' (the path must be in "
+              f"repo_sweep.managed_repos()). --force overrides, on the record in the ticket notes.")
+    else:
+        print("Ways out: pick a mapped lane (e.g. build, ops, research, fleet) or add a LANE_REPO row "
+              "for it in foreman orchestrator/router.py — a needs repo(...) tag does NOT rescue an "
+              "unmapped lane other than 'auto' (wq#2144). --force overrides, on the record in the "
+              "ticket notes.")
     sys.exit(1)
 FOREMAN_MODELS_YAML = os.environ.get("FOREMAN_MODELS_YAML",
                                      "/home/lumen/foreman/research/models.yaml")
@@ -1407,7 +1446,8 @@ def cmd_add(a):
         sys.exit(1)
     # wq#2139: refuse an enabled lane the dispatcher can never land (no LANE_REPO row) unless
     # the ticket carries a needs repo(...) tag. Fail-open on unreadable foreman policy.
-    force_unmapped = check_lane_has_repo(a.lane, getattr(a, "needs", None), a.detail, a.force)
+    force_unmapped = check_lane_has_repo(a.lane, getattr(a, "needs", None), a.detail, a.force,
+                                         a.title)
     # wq#1368: refuse an archetype with no routing row — the dispatcher would never be
     # able to route this ticket (it used to crash the whole pass on this exact shape;
     # the dispatcher is now hardened too, but a ticket that can never route is still a
@@ -3036,11 +3076,12 @@ def cmd_edit(a):
     # the ticket, so judge the EFFECTIVE needs/detail (edited value, else stored).
     force_unmapped = False
     if a.lane is not None:
-        cur = c.execute(f"SELECT detail,{'needs' if needs_ready(c) else 'NULL'} FROM tasks WHERE id=?",
-                        (a.id,)).fetchone() or ("", "")
+        cur = c.execute(f"SELECT detail,{'needs' if needs_ready(c) else 'NULL'},title FROM tasks "
+                        f"WHERE id=?", (a.id,)).fetchone() or ("", "", "")
         force_unmapped = check_lane_has_repo(
             a.lane, needs_val if needs_val is not None else cur[1],
-            a.detail if a.detail is not None else cur[0], a.force)
+            a.detail if a.detail is not None else cur[0], a.force,
+            a.title if a.title is not None else cur[2])
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
