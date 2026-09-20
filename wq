@@ -231,7 +231,7 @@ def unmapped_dispatch_lanes():
                f"{type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
         return None
     return enabled - mapped - human, human
-_UNMAPPED_FORCE_NOTE = ("[--force wq#2139] filed in lane {lane!r} with no LANE_REPO row and no needs "
+_UNMAPPED_FORCE_NOTE = ("[{how} wq#2139] filed in lane {lane!r} with no LANE_REPO row and no needs "
                         "repo(...) tag: the dispatcher will skip this as lane_unmapped until re-laned or tagged")
 def check_lane_has_repo(lane, needs, detail, force):
     """wq#2139: refuse `lane` when the dispatcher can never land it (enabled, no LANE_REPO row,
@@ -249,7 +249,16 @@ def check_lane_has_repo(lane, needs, detail, force):
         return False
     if force:
         warn(f"--force: lane {lane!r} has no LANE_REPO row and the ticket has no needs repo(...) tag")
-        return True
+        return "--force"
+    # wq#2127: the CLI DEFAULT lane ('auto') is itself such a lane and ~3 tickets/day are filed
+    # into it by unattended producers (minerva_defer_review, fleet-update-check, sessions). A hard
+    # refusal there loses the ticket, which is worse than a ticket that needs re-laning, so the
+    # default is warn + note. WQ_LANE_REPO_GUARD=refuse turns the refusal on.
+    if os.environ.get("WQ_LANE_REPO_GUARD", "warn") != "refuse":
+        warn(f"lane {lane!r} is enabled for dispatch but has no LANE_REPO row and the ticket has no "
+             f"needs repo(...) tag: the dispatcher will skip it as lane_unmapped until it is re-laned "
+             f"or tagged (wq#2139). Filed anyway; set WQ_LANE_REPO_GUARD=refuse to refuse instead.")
+        return "warn-mode"
     print(f"REFUSED: lane {lane!r} is enabled for dispatch but has no LANE_REPO row in the foreman "
           f"router — the dispatcher would skip this ticket as lane_unmapped forever (wq#2139).")
     print("Ways out: pick a mapped lane (e.g. build, ops, research, fleet), or pass a repo tag: "
@@ -1440,7 +1449,7 @@ def cmd_add(a):
         c.execute("UPDATE tasks SET needs=? WHERE id=last_insert_rowid()", (needs_val.strip(),))
     if force_unmapped:
         c.execute("UPDATE tasks SET notes=? WHERE id=last_insert_rowid()",
-                  (f"[{now()}] {_UNMAPPED_FORCE_NOTE.format(lane=a.lane)}",))
+                  (f"[{now()}] {_UNMAPPED_FORCE_NOTE.format(lane=a.lane, how=force_unmapped)}",))
     deliverable = (getattr(a, "deliverable", None) or "").strip()
     if deliverable:
         c.execute("UPDATE tasks SET deliverable=? WHERE id=last_insert_rowid()", (deliverable,))
@@ -3053,7 +3062,7 @@ def cmd_edit(a):
     if force_unmapped:
         prev = c.execute("SELECT notes FROM tasks WHERE id=?", (a.id,)).fetchone()[0] or ""
         c.execute("UPDATE tasks SET notes=? WHERE id=?",
-                  ((prev + "\n" if prev else "") + f"[{now()}] " + _UNMAPPED_FORCE_NOTE.format(lane=a.lane), a.id))
+                  ((prev + "\n" if prev else "") + f"[{now()}] " + _UNMAPPED_FORCE_NOTE.format(lane=a.lane, how=force_unmapped), a.id))
     c.commit()
     print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}{_reopen_tag(reopened)}"); c.close()
 def cmd_retire(a):

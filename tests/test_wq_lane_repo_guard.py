@@ -48,6 +48,7 @@ def make_env(tmp_path, repo=None):
     env = dict(os.environ)
     env["WQ_DB"] = str(tmp_path / "scratch_wq.db")
     env["WQ_AGENT"] = "test-lane-repo-agent"
+    env["WQ_LANE_REPO_GUARD"] = "refuse"   # the refusal path is what this suite pins; default is warn
     env["WQ_DISPATCHER_CONFIG"] = str(repo / "dispatcher" / "config.json")
     env["WQ_FOREMAN_ROUTER"] = str(repo / "orchestrator" / "router.py")
     env["WQ_FOREMAN_DISPATCHER"] = str(repo / "dispatcher" / "foreman_dispatcher.py")
@@ -160,3 +161,16 @@ def test_edit_lane_guarded(tmp_path):
     p3 = wq(env, "edit", str(t3), "--lane", "auto", "--force")
     assert p3.returncode == 0
     assert "--force wq#2139" in show(env, t3)["notes"]
+
+
+def test_default_mode_warns_and_files_the_ticket(tmp_path):
+    """wq#2127: without WQ_LANE_REPO_GUARD=refuse an unmapped enabled lane is filed with a warning
+    and a note, because the CLI default lane is one and unattended producers must not lose tickets."""
+    env = make_env(tmp_path)
+    env.pop("WQ_LANE_REPO_GUARD")
+    wq(env, "list")
+    migrate(env)
+    p = add(env, "simpill", "default mode files it")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "added task" in p.stdout
+    assert "lane_unmapped" in p.stderr
