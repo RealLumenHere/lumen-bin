@@ -22,7 +22,11 @@ CONFIG = {"lanes": {
     "off": {"enabled": False},
 }}
 ROUTER = 'FOREMAN_ROOT = "/f"\nLANE_REPO = {\n    "build": FOREMAN_ROOT,\n    "pokemon": "/p",  # c\n}\n'
-DISPATCHER = 'HUMAN_LANES = {"user", "frank-re"}\n'
+DISPATCHER = 'REPO_HINT_LANE = "auto"\nHUMAN_LANES = {"user", "frank-re"}\n'
+REPO_SWEEP = 'EXTRA_REPOS = [\n    "/home/lumen/bin",\n]\n'
+# managed repos in this scratch policy: LANE_REPO values ("/f" via FOREMAN_ROOT, "/p") + EXTRA_REPOS
+SWEEP_TITLE = "[repo-sweep] /f diverged"
+SWEEP_DETAIL = "Automated sweep detected DIVERGED in /f.\nAuto-escalated by aq_escalate."
 
 
 def git(repo, *args):
@@ -34,6 +38,8 @@ def make_foreman(tmp_path):
     repo = tmp_path / "foreman"
     (repo / "dispatcher").mkdir(parents=True)
     (repo / "orchestrator").mkdir()
+    (repo / "harness").mkdir()
+    (repo / "harness" / "repo_sweep.py").write_text(REPO_SWEEP)
     (repo / "dispatcher" / "config.json").write_text(json.dumps(CONFIG))
     (repo / "dispatcher" / "foreman_dispatcher.py").write_text(DISPATCHER)
     (repo / "orchestrator" / "router.py").write_text(ROUTER)
@@ -51,6 +57,7 @@ def make_env(tmp_path, repo=None):
     env["WQ_DISPATCHER_CONFIG"] = str(repo / "dispatcher" / "config.json")
     env["WQ_FOREMAN_ROUTER"] = str(repo / "orchestrator" / "router.py")
     env["WQ_FOREMAN_DISPATCHER"] = str(repo / "dispatcher" / "foreman_dispatcher.py")
+    env["WQ_FOREMAN_REPO_SWEEP"] = str(repo / "harness" / "repo_sweep.py")
     return env
 
 
@@ -89,12 +96,50 @@ def test_needs_repo_tag_accepted(tmp_path):
     env = make_env(tmp_path)
     wq(env, "list")
     migrate(env)
-    p = add(env, "simpill", "tagged", "--needs", "repo(/home/lumen/questfree)")
+    p = add(env, "auto", "tagged", "--needs", "repo(/p)")
     assert p.returncode == 0, p.stdout + p.stderr
-    p2 = add(env, "simpill", "tagged in detail", "--detail", "body\nNeeds: repo(/home/lumen/kb)")
+    p2 = add(env, "auto", "tagged in detail", "--detail", "body\nNeeds: repo(/home/lumen/bin)")
     assert p2.returncode == 0, p2.stdout + p2.stderr
-    p3 = add(env, "simpill", "wrong tag", "--needs", "dir(/home/lumen/kb)")
+    p3 = add(env, "auto", "wrong tag", "--needs", "dir(/p)")
     assert p3.returncode == 1 and "REFUSED" in p3.stdout
+
+
+def test_repo_sweep_shape_accepted_into_auto(tmp_path):
+    """wq#2144: aq_escalate files repo-sweep escalations as `wq add --lane auto` with no --needs;
+    the dispatcher resolves them through repo_sweep.repo_hint, so the guard must let them in."""
+    env = make_env(tmp_path)
+    p = add(env, "auto", SWEEP_TITLE, "--detail", SWEEP_DETAIL)
+    assert p.returncode == 0, p.stdout + p.stderr
+    # the same shape with a repo repo_sweep does not manage is not resolvable, so still refused
+    for title, detail in ((SWEEP_TITLE + " 2", SWEEP_DETAIL.replace("/f.", "/elsewhere.")),
+                          ("plain title", SWEEP_DETAIL),
+                          (SWEEP_TITLE + " 3", "Some other prose.\n" + SWEEP_DETAIL)):
+        p = add(env, "auto", title, "--detail", detail)
+        assert p.returncode == 1 and "REFUSED" in p.stdout, (title, p.stdout + p.stderr)
+
+
+def test_needs_tag_does_not_rescue_unmapped_non_auto_lane(tmp_path):
+    """wq#2144: the dispatcher skips lane_unmapped for every lane but 'auto' before it reads the
+    needs tag, so a tag (even a managed path) or the repo-sweep shape must not admit simpill."""
+    env = make_env(tmp_path)
+    wq(env, "list")
+    migrate(env)
+    for extra in (("--needs", "repo(/p)"), ("--detail", "body\nNeeds: repo(/f)"),
+                  ("--detail", SWEEP_DETAIL)):
+        p = add(env, "simpill", SWEEP_TITLE + " s", *extra)
+        assert p.returncode == 1, (extra, p.stdout + p.stderr)
+        assert "REFUSED" in p.stdout and "LANE_REPO" in p.stdout and "'simpill'" in p.stdout
+    assert "does NOT rescue" in p.stdout
+
+
+def test_unmanaged_needs_path_refused_into_auto(tmp_path):
+    """wq#2144: router.needs_repo_hint ignores a path outside repo_sweep.managed_repos()."""
+    env = make_env(tmp_path)
+    wq(env, "list")
+    migrate(env)
+    p = add(env, "auto", "unmanaged tag", "--needs", "repo(/home/lumen/questfree)")
+    assert p.returncode == 1 and "REFUSED" in p.stdout, p.stdout + p.stderr
+    assert "managed_repos" in p.stdout
 
 
 def test_mapped_disabled_and_human_lanes_accepted(tmp_path):
@@ -148,11 +193,15 @@ def test_edit_lane_guarded(tmp_path):
     p = wq(env, "edit", str(tid), "--lane", "simpill")
     assert p.returncode == 1 and "REFUSED" in p.stdout
     assert show(env, tid)["lane"] == "build"
-    # an existing repo tag on the ticket satisfies the check
-    assert wq(env, "edit", str(tid), "--needs", "repo(/home/lumen/kb)").returncode == 0
-    assert wq(env, "edit", str(tid), "--lane", "simpill").returncode == 0
+    # an existing managed repo tag rescues only the hint lane (wq#2144), never simpill
+    assert wq(env, "edit", str(tid), "--needs", "repo(/p)").returncode == 0
+    assert wq(env, "edit", str(tid), "--lane", "simpill").returncode == 1
+    assert wq(env, "edit", str(tid), "--lane", "auto").returncode == 0
     # edits that do not touch the lane never trip it, even on an unmapped lane
     assert wq(env, "edit", str(tid), "--pri", "1").returncode == 0
+    # the repo-sweep shape (title + detail already on the ticket) also satisfies an edit into auto
+    ts = tid_of(add(env, "build", SWEEP_TITLE + " edit", "--detail", SWEEP_DETAIL))
+    assert wq(env, "edit", str(ts), "--lane", "auto").returncode == 0
     # human lane exempt; --force on record
     t2 = tid_of(add(env, "build", "second"))
     assert wq(env, "edit", str(t2), "--lane", "user").returncode == 0
