@@ -187,7 +187,12 @@ def guard_blocked(facts):
     docstring for why the literal-string guard in the policy doc is insufficient
     against real fleet data."""
     hold = (facts.get("remediation_hold") or "").strip().lower()
-    if hold and hold not in ("off", "clear", "none", ""):
+    # wq#2156: real fleet values are prose ("off - cleared 2026-09-18: isis is the
+    # WARM standby ..."), not bare tokens. Judge only the leading word, otherwise a
+    # cleared hold reads as active and silently disables auto-recovery. An unknown
+    # leading word still blocks (fail-safe toward holding).
+    first_word = re.split(r"[^a-z_]+", hold, 1)[0] if hold else ""
+    if hold and first_word not in ("off", "clear", "cleared", "none"):
         return True, f"remediation_hold={facts['remediation_hold']!r}"
     status = (facts.get("status") or "").lower()
     for kw in HOLD_KEYWORDS:
@@ -435,6 +440,18 @@ def selftest():
 
     chk("remediation_hold=on blocks", guard_blocked({"remediation_hold": "on — bench work"})[0], True)
     chk("remediation_hold=off does not block", guard_blocked({"remediation_hold": "off"})[0], False)
+    # wq#2156 regression: isis's real fact value — a cleared hold with prose after
+    # the leading 'off' — must NOT read as an active hold.
+    chk("prose 'off - cleared ...' does not block",
+        guard_blocked({"remediation_hold":
+                       "off - cleared 2026-09-18: isis is the WARM standby LLM by "
+                       "design, MUST stay on+ready to serve the fleet"})[0], False)
+    chk("prose 'cleared 2026-09-18 ...' does not block",
+        guard_blocked({"remediation_hold": "cleared 2026-09-18 after bench work"})[0], False)
+    chk("'offline for bench work' still blocks (off != offline)",
+        guard_blocked({"remediation_hold": "offline for bench work"})[0], True)
+    chk("prose 'on — bench work' still blocks",
+        guard_blocked({"remediation_hold": "on — bench work"})[0], True)
     chk("prose maintenance status blocks",
         guard_blocked({"status": "offline — planned maintenance, Frank at bench"})[0], True)
     chk("prose parked status blocks",
