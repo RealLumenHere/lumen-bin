@@ -14,7 +14,7 @@
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
 #   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] [--head REV] <path>...  # wq#771/wq#792 guard
-#   lumen-pr ffprimary <repo-path>         # wq#1536: ff the primary tree to origin/main, or say why not
+#   lumen-pr ffprimary <repo-path> [--head REV]  # wq#1536: ff the primary tree to origin/main, or say why not
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
 # trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
@@ -418,7 +418,48 @@ tree_unpushed() { # tree_unpushed <tree>
     "origin/$DEFAULT_BRANCH...$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u
 }
 
-# ff_primary_after_land <tree>  (wq#1536)
+# landed_carries_unpushed <tree> <landed-head>  (wq#2099)
+# Did the head that just landed CONTAIN <tree>'s un-pushed commits, and did that content actually
+# reach origin? Ancestry answers the first half: a tip that is an ancestor of the head means the
+# branch is a strict superset of the tree, the same statement dirty_target_guard clears the guard
+# on. It does NOT answer the second — a squash leaves no commit of the head on origin to look for,
+# so ancestry alone would re-point on a merge that never happened. The blob comparison is the
+# arrival proof: every path those commits touch reads the same on origin as on the landed head.
+# Both halves, or nothing: an unresolvable ref, a path origin does not match, or no head at all
+# leaves the tree diverged, which is the safe verdict the wq#792 refusal exists to give.
+landed_carries_unpushed() {
+  local t="$1" landed="$2" tip path b_head b_origin
+  [ -n "$landed" ] || return 1
+  git -C "$t" cat-file -e "${landed}^{commit}" 2>/dev/null || return 1
+  tip=$(git -C "$t" rev-parse -q --verify "refs/heads/$DEFAULT_BRANCH^{commit}" 2>/dev/null) || return 1
+  [ -n "$tip" ] || return 1
+  git -C "$t" merge-base --is-ancestor "$tip" "$landed" 2>/dev/null || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    b_head=$(git -C "$t" rev-parse -q --verify "${landed}:${path}" 2>/dev/null) || b_head=""
+    b_origin=$(git -C "$t" rev-parse -q --verify "origin/$DEFAULT_BRANCH:${path}" 2>/dev/null) || b_origin=""
+    [ "$b_head" = "$b_origin" ] || return 1
+  done <<EOF_LANDED_PATHS
+$(tree_unpushed "$t")
+EOF_LANDED_PATHS
+  return 0
+}
+
+# unpushed_are_upstream_equivalent <tree>  (wq#2099)
+# Is every un-pushed commit already on origin as a patch? `git cherry` compares PATCH-IDs, so a
+# commit that reached origin by rebase or cherry-pick — new sha, same diff — counts as present,
+# and a '+' line (not upstream) means the tree is genuinely diverged. This is the only proof
+# available to a bare `ffprimary` that was told no landed head. A squash merge is NOT this shape:
+# the squash's patch is the whole branch, not any single commit, so it needs the superset proof.
+unpushed_are_upstream_equivalent() {
+  local t="$1" out
+  out=$(git -C "$t" cherry "origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | grep -q '^+' && return 1
+  return 0
+}
+
+# ff_primary_after_land <tree> [landed-head]  (wq#1536)
 # Bring <tree>'s $DEFAULT_BRANCH up to origin/$DEFAULT_BRANCH by fast-forward, or say EXACTLY
 # why not, with the one command that fixes it. Before this, a --worktree land returned right
 # after the merge and never touched the primary at all: /home/lumen/fleet/inventory (PR #6)
@@ -431,7 +472,7 @@ tree_unpushed() { # tree_unpushed <tree>
 # shared, and parking it elsewhere is someone's deliberate act. Returns 0 on ff or already
 # current, 1 otherwise; callers in land treat 1 as "merged, primary needs a hand", not a die.
 ff_primary_after_land() {
-  local tree="$1" cur p f ahead behind incoming overlap n err
+  local tree="$1" landed="${2:-}" cur p f ahead behind incoming overlap n err
   [ -d "$tree" ] || { note "primary $tree NOT fast-forwarded: directory does not exist"; return 1; }
   git -C "$tree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || { note "primary $tree NOT fast-forwarded: not a git work tree"; return 1; }
@@ -475,19 +516,50 @@ ff_primary_after_land() {
   ahead=$(git -C "$tree" rev-list --count "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null || echo 0)
   if [ "${ahead:-0}" -gt 0 ]; then
     # wq#1121: "ahead" is not always divergence. The land that wq#1121 unblocks squashes the
-    # tree's own un-pushed commits onto origin, which leaves them ahead by COMMIT and identical
-    # by CONTENT — and without this the tree stays permanently diverged, so every later land
-    # warns about work that is already on origin. Trees equal is the proof (the same
-    # content-not-commit standard wq#1474 uses in the guard); re-pointing then changes no file.
-    # --keep, not --hard: with equal trees no tracked file differs, so uncommitted work
-    # survives, and if git disagrees it refuses and we fall through to the refusal below.
-    local ltree rtree
+    # tree's own un-pushed commits onto origin, which leaves them ahead by COMMIT while their
+    # content is already there — and without a re-point the tree stays permanently diverged, so
+    # every later land warns about work that is already on origin AND the wq#771 guard refuses the
+    # next PR that touches those paths as un-pushed (wq#2099: that refusal is the loop wq#1121 was
+    # supposed to end). Three proofs, cheapest first, each content-not-commit (the standard wq#1474
+    # uses in the guard) and each failing closed to the wq#792 refusal below:
+    #   equal trees — the branch added nothing to the local commits (the only wq#1121 case)
+    #   superset    — the tree's tip is an ancestor of the head that JUST landed AND origin now
+    #                 carries that head's blob on every path those commits touch. wq#1121 claimed
+    #                 the trees would be identical after such a land; they are not when the branch
+    #                 re-edited a path the local commit touched, which is wq#1108's own shape
+    #   patch-id    — git cherry finds every local commit upstream-equivalent (a rebase or
+    #                 cherry-pick land, and the only proof a bare `ffprimary` has with no head)
+    local ltree rtree proof=""
     ltree=$(git -C "$tree" rev-parse -q --verify "$DEFAULT_BRANCH^{tree}" 2>/dev/null) || ltree=""
     rtree=$(git -C "$tree" rev-parse -q --verify "origin/$DEFAULT_BRANCH^{tree}" 2>/dev/null) || rtree=""
-    if [ -n "$ltree" ] && [ "$ltree" = "$rtree" ] \
-       && err=$(git -C "$tree" reset --keep "origin/$DEFAULT_BRANCH" 2>&1); then
-      note "primary $tree re-pointed to origin/$DEFAULT_BRANCH ($(git -C "$tree" rev-parse --short HEAD)): its $ahead local commit(s) are already on origin by content (identical tree) — no file changed"
-      return 0
+    if [ -n "$ltree" ] && [ "$ltree" = "$rtree" ]; then
+      proof="already on origin by content (identical tree) — no file changed"
+    elif landed_carries_unpushed "$tree" "$landed"; then
+      proof="carried to origin by the head that just landed ($(git -C "$tree" rev-parse --short "$landed" 2>/dev/null)), which contains every one of them (wq#2099)"
+    elif unpushed_are_upstream_equivalent "$tree"; then
+      proof="already on origin by patch: git cherry finds every one upstream-equivalent (wq#2099)"
+    fi
+    if [ -n "$proof" ]; then
+      # Never move a tree whose uncommitted work overlaps the move. Under the equal-tree proof no
+      # tracked file differs, so nothing could; the two wq#2099 proofs DO rewrite files, and while
+      # `reset --keep` refuses such an overlap itself, checking first names the paths instead of
+      # echoing git. --keep, not --hard, still: uncommitted work outside the overlap survives.
+      incoming=$(git -C "$tree" -c core.quotePath=false diff --name-only \
+                   "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u)
+      overlap=$(LC_ALL=C comm -12 <(printf '%s\n' "$incoming") <(tree_uncommitted "$tree"))
+      if [ -n "$overlap" ]; then
+        n=$(printf '%s\n' "$overlap" | grep -c .)
+        note "primary $tree NOT re-pointed: its $ahead local commit(s) are $proof, but $n uncommitted path(s) there overlap the re-point:"
+        printf '%s\n' "$overlap" | sed 's/^/    /'
+        note "  commit or discard them (git -C $tree status --short), then: lumen-pr ffprimary $tree"
+        return 1
+      fi
+      if err=$(git -C "$tree" reset --keep "origin/$DEFAULT_BRANCH" 2>&1); then
+        note "primary $tree re-pointed to origin/$DEFAULT_BRANCH ($(git -C "$tree" rev-parse --short HEAD)): its $ahead local commit(s) are $proof"
+        return 0
+      fi
+      note "primary $tree NOT re-pointed: git reset --keep origin/$DEFAULT_BRANCH refused:"
+      printf '%s\n' "${err:-(git printed nothing)}" | sed 's/^/    /'
     fi
     note "primary $tree NOT fast-forwarded: local $DEFAULT_BRANCH has $ahead commit(s) origin does not (diverged, wq#792):"
     git -C "$tree" log --oneline "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null | sed 's/^/    /'
@@ -1208,7 +1280,7 @@ cmd_land() {
     # the shared refs; now catch the primary tree up (or print exactly why it cannot be).
     local primary
     if primary=$(primary_worktree); then
-      ff_primary_after_land "$primary" || true
+      ff_primary_after_land "$primary" "$head_sha" || true
     else
       note "WARNING: cannot resolve the primary work tree of $SLUG — it was NOT fast-forwarded"
     fi
@@ -1220,7 +1292,7 @@ cmd_land() {
     git -C "$REPO_PATH" checkout -q "$DEFAULT_BRANCH" || die "merged, but could not switch back to $DEFAULT_BRANCH — do it by hand"
   fi
   # wq#1536: same function as the linked-worktree path — no more 2>/dev/null guesswork.
-  ff_primary_after_land "$REPO_PATH" || true
+  ff_primary_after_land "$REPO_PATH" "$head_sha" || true
   git -C "$REPO_PATH" branch -q -d "$head_ref" 2>/dev/null \
     && note "deleted local branch $head_ref" \
     || note "local branch $head_ref kept (not fully merged locally, or already gone)"
@@ -1287,11 +1359,24 @@ cmd_dirtycheck() {
 # can drive the REAL function against a throwaway repo instead of a re-implementation.
 # Local only: fetches, then ff-only on the primary. No forge write, so no scope fence.
 cmd_ffprimary() {
-  need_repo "${1:-}"
-  local primary
+  need_repo "${1:-}"; shift 2>/dev/null || true
+  local primary head="" head_sha=""
+  # wq#2099: --head is the head that was just landed, and it is what the superset proof reads.
+  # `land` passes it from the merge it just performed; here it makes that path drivable by hand
+  # (a land whose ff was interrupted) and by the test gate, exactly as dirtycheck --head does.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="${2:-}"; shift 2 ;;
+      *)      die "unknown flag '$1' (usage: lumen-pr ffprimary <repo-path> [--head REV])" ;;
+    esac
+  done
+  if [ -n "$head" ]; then
+    head_sha=$(git -C "$REPO_PATH" rev-parse -q --verify "${head}^{commit}" 2>/dev/null) \
+      || die "--head '$head' does not resolve to a commit in $REPO_PATH"
+  fi
   git -C "$REPO_PATH" fetch -q origin || die "fetch from origin failed in $REPO_PATH"
   primary=$(primary_worktree) || die "cannot resolve the primary work tree of $SLUG"
-  ff_primary_after_land "$primary"
+  ff_primary_after_land "$primary" "$head_sha"
 }
 
 case "${1:-}" in

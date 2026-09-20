@@ -53,7 +53,8 @@ if printf '%s\n' "$STAGED" | grep -qx 'lumen-pr'; then
   ln -s "$REPO_ROOT/lumen-github-identity.sh" "$STAGED_PR_DIR/lumen-github-identity.sh"
   if ! bash -n "$STAGED_PR_DIR/lumen-pr" || \
      ! LUMEN_PR_BIN="$STAGED_PR_DIR/lumen-pr" python3 -m pytest \
-        "$REPO_ROOT/tests/test_lumen_pr_ff_primary.py" -q; then
+        "$REPO_ROOT/tests/test_lumen_pr_ff_primary.py" \
+        "$REPO_ROOT/tests/test_lumen_pr_dirty_guard.py" -q; then
     echo "pre-commit(wq#1536): staged lumen-pr fails its regression suite. Refusing." >&2
     exit 1
   fi

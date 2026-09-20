@@ -51,9 +51,21 @@ def dirtycheck(repo, *args, timeout=60):
                           env=GIT_ENV, capture_output=True, text=True, timeout=timeout)
 
 
-def ffprimary(repo, timeout=60):
-    return subprocess.run([LUMEN_PR, "ffprimary", str(repo)],
+def ffprimary(repo, *args, timeout=60):
+    return subprocess.run([LUMEN_PR, "ffprimary", str(repo), *args],
                           env=GIT_ENV, capture_output=True, text=True, timeout=timeout)
+
+
+def squash_onto_origin(primary, head, msg="squashed"):
+    """Land <head>'s TREE as one new commit on origin/main, the way a forge squash-merge does.
+
+    commit-tree, not a local merge: the point is that origin gets a commit that carries the
+    branch's content and none of its shas, so nothing on the primary tree is an ancestor of it.
+    """
+    base = git(primary, "rev-parse", "origin/main").stdout.strip()
+    sha = git(primary, "commit-tree", f"{head}^{{tree}}", "-p", base, "-m", msg).stdout.strip()
+    git(primary, "push", "-q", "origin", f"{sha}:main")
+    return sha
 
 
 def ahead(primary):
@@ -189,6 +201,125 @@ def test_ffprimary_still_refuses_when_the_local_commit_differs_in_content(repo, 
     assert "diverged, wq#792" in r.stdout
     assert "re-pointed" not in r.stdout
     assert (primary / "f").read_text() == "b\n"
+
+
+# --- wq#2099: the superset land, whose trees are NOT identical ----------------
+
+def test_ffprimary_repoints_after_a_superset_land_that_re_edited_the_path(repo, tmp_path):
+    """wq#1108's shape end to end: primary main = origin + T, branch = main + C, squash = T+C.
+
+    wq#1121 cleared the guard for this branch but left the primary diverged forever: its proof
+    was "identical tree", and C re-edited the very file T touched, so the trees differ. The tree
+    then stayed 1 ahead and the wq#771 guard refused the NEXT PR on that path as un-pushed —
+    the same refusal wq#1121 existed to end, one land later.
+    """
+    _, primary = repo
+    commit(primary, "b\n")                      # T: un-pushed on the target tree
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/x", "main")
+    head = commit(wt, "c\n")                    # C: the branch re-edits the same path
+    squash_onto_origin(primary, head)           # the forge's squash of T+C
+    assert ahead(primary) == 1
+
+    r = ffprimary(primary, "--head", head)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "re-pointed to origin/main" in r.stdout
+    assert "wq#2099" in r.stdout
+    assert ahead(primary) == 0
+    assert (primary / "f").read_text() == "c\n"
+
+    # ...and the next PR from origin/main touching f is no longer a collision.
+    nxt = tmp_path / "next"
+    git(primary, "worktree", "add", "-q", str(nxt), "-b", "fix/next", "origin/main")
+    nxt_head = commit(nxt, "d\n")
+    r = dirtycheck(nxt, "--mode", "refuse", "--head", nxt_head, "f")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "TARGET TREE HAS WORK" not in r.stderr
+
+
+def test_superset_repoint_refuses_when_uncommitted_work_overlaps(repo, tmp_path):
+    """The re-point rewrites files here, unlike the identical-tree one. Overlap outranks it."""
+    _, primary = repo
+    commit(primary, "b\n")
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/x", "main")
+    head = commit(wt, "c\n")
+    squash_onto_origin(primary, head)
+    (primary / "f").write_text("b+mine\n")      # uncommitted, on the path being rewritten
+    r = ffprimary(primary, "--head", head)
+    assert r.returncode == 1
+    assert "NOT re-pointed" in r.stdout
+    assert "uncommitted path(s) there overlap" in r.stdout
+    assert (primary / "f").read_text() == "b+mine\n"
+    assert ahead(primary) == 1
+
+
+def test_superset_repoint_keeps_uncommitted_work_it_does_not_touch(repo, tmp_path):
+    """--keep semantics survive the wider proof: only the overlapping case is refused."""
+    _, primary = repo
+    commit(primary, "b\n")
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/x", "main")
+    head = commit(wt, "c\n")
+    squash_onto_origin(primary, head)
+    (primary / "scratch").write_text("mine\n")  # untracked, unrelated path
+    r = ffprimary(primary, "--head", head)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (primary / "scratch").read_text() == "mine\n"
+    assert ahead(primary) == 0
+
+
+def test_a_head_that_does_not_contain_the_local_commit_still_refuses(repo, tmp_path):
+    """Ancestry is the whole claim. A branch off origin/main never carried T, so T is at risk."""
+    _, primary = repo
+    commit(primary, "b\n")                      # T, on nobody's branch
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/y", "origin/main")
+    head = commit(wt, "c\n")
+    squash_onto_origin(primary, head)
+    r = ffprimary(primary, "--head", head)
+    assert r.returncode == 1
+    assert "diverged, wq#792" in r.stdout
+    assert "re-pointed" not in r.stdout
+    assert (primary / "f").read_text() == "b\n"
+
+
+def test_a_head_that_never_reached_origin_still_refuses(repo, tmp_path):
+    """Containment is not arrival: with no squash pushed, origin has none of T's content."""
+    _, primary = repo
+    commit(primary, "b\n")
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/x", "main")
+    head = commit(wt, "c\n")                    # landed nowhere
+    r = ffprimary(primary, "--head", head)
+    assert r.returncode == 1
+    assert "diverged, wq#792" in r.stdout
+    assert ahead(primary) == 1
+
+
+def test_ffprimary_repoints_when_every_local_commit_is_upstream_equivalent(repo, tmp_path):
+    """No head to go on: a cherry-picked/rebased land is provable by patch-id alone."""
+    _, primary = repo
+    local = commit(primary, "b\n")              # T
+    other = tmp_path / "other"
+    git(primary, "worktree", "add", "-q", str(other), "-b", "elsewhere", "origin/main")
+    git(other, "cherry-pick", "-x", local)      # T' — same patch, new sha (-x keeps them apart)
+    commit(other, "x\n", path="g", msg="unrelated")   # ...and origin moves on, so trees differ
+    git(other, "push", "-q", "origin", "HEAD:main")
+    r = ffprimary(primary)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "upstream-equivalent" in r.stdout
+    assert ahead(primary) == 0
+    assert (primary / "f").read_text() == "b\n"
+    assert (primary / "g").read_text() == "x\n"
+
+
+def test_ffprimary_rejects_an_unresolvable_head(repo):
+    """Same door as dirtycheck --head: a typo must not read as 'no head given'."""
+    _, primary = repo
+    r = ffprimary(primary, "--head", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+    assert r.returncode == 1
+    assert "does not resolve to a commit" in r.stderr
 
 
 # --- the flag ----------------------------------------------------------------
