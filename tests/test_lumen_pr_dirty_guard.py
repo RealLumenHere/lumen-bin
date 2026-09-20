@@ -347,3 +347,123 @@ def test_land_still_rejects_a_genuinely_unknown_flag(repo):
                        env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 1
     assert "unknown flag for land: --yolo" in r.stderr
+
+
+# --- wq#1490: uncommitted work that is byte-identical to what lands --------------
+
+def test_uncommitted_path_identical_to_head_is_not_a_collision(repo, tmp_path):
+    """lumen-bin PR#75's shape: a script patched in place in the primary, and the PR carries
+    exactly those bytes. Landing changes nothing on disk, so there is nothing to supersede."""
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/x", "origin/main")
+    head = commit(wt, "c\n")
+    (primary / "f").write_text("c\n")            # uncommitted, same bytes as the PR head
+    r = dirtycheck(wt, "--mode", "refuse", "--head", head, "f")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "wq#1490" in r.stdout
+    assert "clean: none of the 1 path(s)" in r.stdout
+    assert "TARGET TREE HAS WORK" not in r.stderr
+
+
+def test_uncommitted_path_that_differs_from_head_still_refuses(repo, tmp_path):
+    """The wq#771 hazard itself: live bytes the PR does not carry would be superseded."""
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/y", "origin/main")
+    head = commit(wt, "c\n")
+    (primary / "f").write_text("c-but-different\n")
+    r = dirtycheck(wt, "--mode", "refuse", "--head", head, "f")
+    assert r.returncode == 1
+    assert "uncommitted there" in r.stderr
+    assert "TARGET TREE HAS WORK ORIGIN DOES NOT" in r.stderr
+    assert "wq#1490" not in r.stdout
+
+
+def test_uncommitted_identical_path_without_head_is_still_a_hit(repo, tmp_path):
+    """No head, no blob to compare against: the pre-wq#1490 verdict stands (fails closed)."""
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/z", "origin/main")
+    commit(wt, "c\n")
+    (primary / "f").write_text("c\n")
+    r = dirtycheck(wt, "--mode", "refuse", "f")
+    assert r.returncode == 1
+    assert "TARGET TREE HAS WORK ORIGIN DOES NOT" in r.stderr
+
+
+def test_untracked_file_identical_to_head_is_not_a_collision(repo, tmp_path):
+    """An untracked file the PR adds with the same bytes is the same non-collision."""
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/u", "origin/main")
+    head = commit(wt, "new\n", path="g")
+    (primary / "g").write_text("new\n")          # untracked in the primary
+    r = dirtycheck(wt, "--mode", "refuse", "--head", head, "g")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "wq#1490" in r.stdout
+
+
+def test_symlink_never_reads_as_identical(repo, tmp_path):
+    """A symlink's blob is its target text; a regular file with the same text is not it."""
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/s", "origin/main")
+    head = commit(wt, "f", path="g")             # PR adds a regular file g containing "f"
+    (primary / "g").symlink_to("f")              # primary has g as a symlink to f
+    r = dirtycheck(wt, "--mode", "refuse", "--head", head, "g")
+    assert r.returncode == 1
+    assert "TARGET TREE HAS WORK ORIGIN DOES NOT" in r.stderr
+
+
+def test_ffprimary_fast_forwards_over_an_identical_uncommitted_overlap(repo, tmp_path):
+    """After the guard lets that PR land, the ff must not refuse for the same non-reason:
+    the live file is already the incoming blob, so stage it and fast-forward — no byte moves."""
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/ff", "origin/main")
+    commit(wt, "c\n")
+    git(wt, "push", "-q", "origin", "HEAD:main")
+    (primary / "f").write_text("c\n")            # patched in place, identical to what landed
+    (primary / "other").write_text("mine\n")     # unrelated untracked work must survive
+    r = ffprimary(primary)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "wq#1490" in r.stdout
+    assert "fast-forwarded 1 commit(s)" in r.stdout
+    assert (primary / "f").read_text() == "c\n"
+    assert (primary / "other").read_text() == "mine\n"
+    assert git(primary, "status", "--porcelain", "--", "f").stdout == ""
+    assert git(primary, "rev-parse", "main").stdout == git(primary, "rev-parse", "origin/main").stdout
+
+
+def test_ffprimary_still_refuses_a_divergent_uncommitted_overlap(repo, tmp_path):
+    _, primary = repo
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/ff2", "origin/main")
+    commit(wt, "c\n")
+    git(wt, "push", "-q", "origin", "HEAD:main")
+    (primary / "f").write_text("c-but-different\n")
+    r = ffprimary(primary)
+    assert r.returncode == 1
+    assert "uncommitted path(s) there overlap" in r.stdout
+    assert "wq#1490" not in r.stdout
+    assert (primary / "f").read_text() == "c-but-different\n"
+
+
+def test_superset_repoint_stages_an_identical_uncommitted_overlap(repo, tmp_path):
+    """Same narrowing on the wq#2099 re-point path: T un-pushed, branch T+C squashed onto
+    origin, and the primary's live f already holds C's bytes."""
+    _, primary = repo
+    commit(primary, "b\n")                      # T
+    wt = tmp_path / "wt"
+    git(primary, "worktree", "add", "-q", str(wt), "-b", "fix/sup", "main")
+    head = commit(wt, "c\n")                    # C
+    squash_onto_origin(primary, head)
+    (primary / "f").write_text("c\n")           # live bytes already C's
+    r = ffprimary(primary, "--head", head)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "wq#1490" in r.stdout
+    assert "re-pointed to origin/main" in r.stdout
+    assert ahead(primary) == 0
+    assert (primary / "f").read_text() == "c\n"
+    assert git(primary, "status", "--porcelain", "--", "f").stdout == ""

@@ -418,6 +418,58 @@ tree_unpushed() { # tree_unpushed <tree>
     "origin/$DEFAULT_BRANCH...$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u
 }
 
+# live_blob <tree> <path>  (wq#1490)
+# The blob sha the working-tree file at <path> would be stored as, or nothing. This is the
+# content half of the wq#771 question for UNCOMMITTED work: the guard's job is to keep live
+# bytes from being silently superseded, so live bytes that already equal what is about to
+# land are not at risk. Regular files only — a symlink hashes as its target text and a
+# directory has no blob — and no output means "not provable", never "equal".
+live_blob() {
+  local f="$1/$2"
+  { [ -f "$f" ] && [ ! -L "$f" ]; } || return 0
+  git -C "$1" hash-object -- "$f" 2>/dev/null
+}
+
+# stage_identical_overlap <tree> <ref> <newline-separated paths>  (wq#1490)
+# Of the uncommitted <paths> that an ff/re-point to <ref> would touch, stage every one whose
+# live bytes already equal <ref>'s blob, and print the rest. A tree whose index matches the
+# incoming entry is a clean two-way merge ("keep index") for both `merge --ff-only` and
+# `reset --keep`, and staging changes no byte on disk — the file the fleet runs is the file
+# it ran a second ago, now with HEAD agreeing. Anything not provably identical stays in the
+# overlap and keeps its refusal.
+stage_identical_overlap() {
+  local t="$1" ref="$2" paths="$3" path b_live b_ref rest=""
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    b_live=$(live_blob "$t" "$path")
+    b_ref=$(git -C "$t" rev-parse -q --verify "${ref}:${path}" 2>/dev/null) || b_ref=""
+    if [ -n "$b_live" ] && [ -n "$b_ref" ] && [ "$b_live" = "$b_ref" ] \
+       && git -C "$t" add -- "$path" 2>/dev/null; then
+      :
+    else
+      rest="${rest}${path}
+"
+    fi
+  done <<EOF_OVERLAP
+$paths
+EOF_OVERLAP
+  printf '%s' "$rest" | grep -v '^$' | LC_ALL=C sort -u
+}
+
+# drop_identical_overlap <tree>  (wq#1490)
+# Narrows the caller's $overlap (bash scoping: the caller's local) to the paths that are NOT
+# byte-identical to origin/$DEFAULT_BRANCH, staging the identical ones, and says which. The
+# note is printed here, not inside stage_identical_overlap, because that runs under $(...)
+# and anything it printed would be read back as a path.
+drop_identical_overlap() {
+  local t="$1" rest staged
+  [ -n "$overlap" ] || return 0
+  rest=$(stage_identical_overlap "$t" "origin/$DEFAULT_BRANCH" "$overlap")
+  staged=$(LC_ALL=C comm -23 <(printf '%s\n' "$overlap") <(printf '%s\n' "$rest") | grep -v '^$' | tr '\n' ' ')
+  [ -z "$staged" ] || note "wq#1490: uncommitted in $t but already byte-identical to origin/$DEFAULT_BRANCH — staged, no file changed: $staged"
+  overlap="$rest"
+}
+
 # landed_carries_unpushed <tree> <landed-head>  (wq#2099)
 # Did the head that just landed CONTAIN <tree>'s un-pushed commits, and did that content actually
 # reach origin? Ancestry answers the first half: a tip that is an ancestor of the head means the
@@ -547,6 +599,7 @@ ff_primary_after_land() {
       incoming=$(git -C "$tree" -c core.quotePath=false diff --name-only \
                    "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u)
       overlap=$(LC_ALL=C comm -12 <(printf '%s\n' "$incoming") <(tree_uncommitted "$tree"))
+      drop_identical_overlap "$tree"
       if [ -n "$overlap" ]; then
         n=$(printf '%s\n' "$overlap" | grep -c .)
         note "primary $tree NOT re-pointed: its $ahead local commit(s) are $proof, but $n uncommitted path(s) there overlap the re-point:"
@@ -574,6 +627,10 @@ ff_primary_after_land() {
   incoming=$(git -C "$tree" -c core.quotePath=false diff --name-only \
                "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null | LC_ALL=C sort -u)
   overlap=$(LC_ALL=C comm -12 <(printf '%s\n' "$incoming") <(tree_uncommitted "$tree"))
+  # wq#1490: an uncommitted path whose live bytes ARE the incoming blob is not in the way —
+  # the guard just let that PR land on exactly that proof, and refusing the ff here would
+  # leave the primary behind for the same non-reason.
+  drop_identical_overlap "$tree"
   if [ -n "$overlap" ]; then
     n=$(printf '%s\n' "$overlap" | grep -c .)
     note "primary $tree NOT fast-forwarded: $n uncommitted path(s) there overlap the $behind incoming commit(s):"
@@ -653,6 +710,34 @@ dirty_target_guard() {
 $unpushed
 EOF_UNPUSHED
     unpushed=$(printf '%s' "$still_unpushed" | grep -v '^$' | LC_ALL=C sort -u)
+  fi
+
+  # wq#1490: the same content test for UNCOMMITTED paths, by live bytes instead of a commit.
+  # lumen-bin PR#75 was refused on 2026-09-08 because two scripts had been patched in place
+  # in /home/lumen/bin (a wq#1454 orchestrator apply) and the PR carried that identical
+  # content: "work origin does not have" was literally true and operationally empty, since
+  # landing would have changed nothing on disk. wq#1474 could not cover it — it compares the
+  # tree's COMMITTED blob, and this work is in no commit — so hash the working-tree file
+  # itself (live_blob) against the PR head's blob. Same discipline: both sides resolvable and
+  # equal or the path stays a hit. A staged-but-different index, a symlink, or a deleted
+  # file all fail closed.
+  if [ -n "$head_sha" ] && [ -n "$uncommitted" ] \
+      && git -C "$REPO_PATH" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+    local path b_pr b_live still_uncommitted=""
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      b_live=$(live_blob "$primary" "$path")
+      b_pr=$(git -C "$REPO_PATH" rev-parse -q --verify "${head_sha}:${path}" 2>/dev/null) || b_pr=""
+      if [ -n "$b_live" ] && [ -n "$b_pr" ] && [ "$b_live" = "$b_pr" ]; then
+        note "wq#1490: $path uncommitted in $primary but its live bytes are PR head $head_sha's blob — landing changes nothing there, dropping"
+      else
+        still_uncommitted="${still_uncommitted}${path}
+"
+      fi
+    done <<EOF_UNCOMMITTED
+$uncommitted
+EOF_UNCOMMITTED
+    uncommitted=$(printf '%s' "$still_uncommitted" | grep -v '^$' | LC_ALL=C sort -u)
   fi
 
   hits=$(printf '%s\n%s\n' "$uncommitted" "$unpushed" | grep -v '^$' | LC_ALL=C sort -u)
