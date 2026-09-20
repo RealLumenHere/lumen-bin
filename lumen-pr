@@ -10,6 +10,7 @@
 #   lumen-pr start  <repo-path> <type>/<slug> [--worktree|--primary|--adopt]
 #   lumen-pr commit <repo-path> "<conventional subject>" [--refs wq#N] [--body-file F]
 #   lumen-pr open   <repo-path> --title T --body-file F [--draft] [--allow-second-person]
+#   lumen-pr comment <repo-path> <pr-number> --body-file F   # wq#2273: via broker pr-comment
 #   lumen-pr land   <repo-path> <pr-number> [--timeout SEC] [--merge] [--allow-dirty]
 #   lumen-pr check  <repo-path>            # what state am I in?
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
@@ -24,10 +25,14 @@
 # A rule a careful agent cannot execute reliably is a broken rule, not a discipline problem.
 #
 # Every subcommand is idempotent and exits non-zero with a readable reason.
-# Token: resolved per-repo by lumen-github-identity.sh (wq#525) — identity-map entry,
-# then /home/lumen/.secrets/github-frank.token, then the deprecated GITHUB_TOKEN in
-# /home/lumen/agent/.env (wq#524). Gitea repos take the same ladder from
-# /home/lumen/.secrets/gitea-lumen.token. Never printed, never committed.
+# Credentials: NONE (wq#2273, token-engine T4). This tool never reads a token
+# file and never builds an Authorization header. Every forge API call is a
+# broker verb (pr-open/pr-update/pr-comment/pr-view/pr-checks/pr-files/
+# pr-list/pr-merge) over the token-engine socket; the daemon (uid tokeneng)
+# picks the forge, base URL and token per repo slug and answers with scalars
+# only — a PR number and url, never a credential. Titles and bodies travel as
+# file paths, never argv, so nothing lands in /proc/*/cmdline. `git push`
+# still authenticates via git's own credential path until T1 (wq#2271).
 #
 # wq#1282 (ISSUE-LOG #23): LUMEN_PR_ALLOW_DIRTY is RETIRED. The wq#771 target-tree guard
 # has no override. It was added for a false-block that no longer exists — the daemons
@@ -45,8 +50,6 @@
 set -uo pipefail
 
 BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
-# shellcheck source=lumen-github-identity.sh
-. "$BIN_DIR/lumen-github-identity.sh" || { echo "lumen-pr: cannot load lumen-github-identity.sh" >&2; exit 1; }
 
 # Overridable for the same reason LUMEN_PR_SLOCK is: verifying the worktree guard requires
 # CREATING worktrees, and doing that under the live root would leave test debris in the one
@@ -74,37 +77,97 @@ note() { printf 'lumen-pr: %s\n' "$*"; }
 # Never let a token reach stdout/stderr, whatever a remote hands back.
 redact() { sed -E 's#(gh[pousr]_[A-Za-z0-9]{6})[A-Za-z0-9_]*#\1REDACTED#g; s#https://[^@/]*@#https://REDACTED@#g'; }
 
-load_token() {
-  # SLUG is set by need_repo, which every caller of load_token runs first.
-  # wq#557: a Gitea repo needs the GITEA_TOKEN, not a github.com PAT. The variable stays
-  # named GITHUB_TOKEN downstream so api() has one contract; only the SOURCE differs.
-  if [ "${FORGE:-github}" = gitea ]; then
-    # wq#524: same ladder as the github side — .secrets first, agent/.env as the
-    # deprecated fallback. This used to `. /home/lumen/agent/.env`, which dragged
-    # EVERY key in that file (model providers, n8n, ghost, webapp creds) into this
-    # shell and into the environment of every git/curl/jq child it spawns, purely
-    # to read one variable. Extract the one line instead; never source the file.
-    local gitea_file=${GITEA_TOKEN_FILE:-/home/lumen/.secrets/gitea-lumen.token}
-    local gt=""
-    if [ -r "$gitea_file" ]; then
-      gt=$(tr -d '\n\r' < "$gitea_file")
-      [ -n "$gt" ] && TOKEN_SOURCE="$gitea_file"
-    fi
-    if [ -z "$gt" ] && [ -r /home/lumen/agent/.env ]; then
-      gt=$(grep -m1 -E '^GITEA_TOKEN=' /home/lumen/agent/.env | cut -d= -f2- | tr -d '"'\''' | tr -d ' \r')
-      if [ -n "$gt" ]; then
-        TOKEN_SOURCE="/home/lumen/agent/.env (GITEA_TOKEN)"
-        note "DEPRECATED token source $TOKEN_SOURCE — fold it into $gitea_file (mode 600)" >&2
-      fi
-    fi
-    [ -n "$gt" ] || die "no Gitea token for $SLUG on $FORGE_HOST — looked in $gitea_file then /home/lumen/agent/.env (GITEA_TOKEN).
-      This repo is on a Gitea forge, so a github.com PAT will not authenticate it."
-    GITHUB_TOKEN="$gt"
-    note "authenticating to $SLUG on $FORGE_HOST (gitea) via $TOKEN_SOURCE"
-    return 0
+# --- token-engine broker (wq#2273, T4) --------------------------------------
+# Every forge API call goes through the token-engine daemon; this process holds
+# no token at any point. The grant is self-attested (the T2 trust model — the
+# broker's enforced value today is the audit line per call, scalar-only
+# responses, and the daemon-side forge/token pinning), minted per invocation
+# with a short TTL, scoped to exactly this repo's node, and removed on exit.
+# It lives under the events tree because the daemon's PrivateTmp hides /tmp,
+# and events/ carries a default ACL tokeneng can read through (gate_replay.sh
+# established the pattern).
+TE_CLIENT=${LUMEN_PR_TE_CLIENT:-/usr/local/lib/token-engine/te_client.py}
+TE_GRANT_DIR=${LUMEN_PR_TE_GRANT_DIR:-/home/lumen/foreman/events}
+TE_TICKET="" TE_WORKER="" TE_GRANT_FILE="" TE_GRANT_SHA="" TE_GRANT_SLUG=""
+TE_CLEANUP_DIR=""
+BROKER_RESULT='{}' BROKER_RULE="" BROKER_REASON=""
+
+cleanup_on_exit() {
+  gitlock_release
+  [ -n "$TE_CLEANUP_DIR" ] && rm -rf "$TE_CLEANUP_DIR"
+}
+
+te_identity() {
+  # Ticket id for the audit line: the fworker convention (WQ_AGENT=fworker-wqN)
+  # when present, an explicit adhoc marker otherwise — never a guess.
+  case "${WQ_AGENT:-}" in
+    fworker-wq[0-9]*) TE_TICKET="wq${WQ_AGENT#fworker-wq}" ;;
+    *)                TE_TICKET="adhoc-lumen-pr" ;;
+  esac
+  TE_WORKER=$(printf '%s' "${WQ_AGENT:-lumen-pr-$$}" | tr -cd 'A-Za-z0-9._-')
+  [ -n "$TE_WORKER" ] || TE_WORKER="lumen-pr-$$"
+}
+
+te_grant() { # mint (once per SLUG per process) the per-repo grant
+  [ -n "$TE_GRANT_FILE" ] && [ "$TE_GRANT_SLUG" = "$SLUG" ] && return 0
+  te_identity
+  local dir exp
+  dir=$(mktemp -d -p "$TE_GRANT_DIR" te-pr.XXXXXX) || die "cannot create grant dir under $TE_GRANT_DIR"
+  chmod 755 "$dir"
+  exp=$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)
+  jq -n --arg t "$TE_TICKET" --arg e "$exp" --arg n "repo:$SLUG" \
+    '{ticket:$t, expires:$e, grants:[{kind:"pr_read",node:$n},{kind:"pr_write",node:$n},{kind:"pr_comment",node:$n}]}' \
+    > "$dir/grant.json" || die "cannot write broker grant"
+  chmod 644 "$dir/grant.json"
+  TE_GRANT_FILE="$dir/grant.json"
+  TE_GRANT_SHA=$(sha256sum "$TE_GRANT_FILE" | awk '{print $1}')
+  TE_GRANT_SLUG="$SLUG"
+  TE_CLEANUP_DIR="$dir"
+  trap cleanup_on_exit EXIT INT TERM
+  note "broker: $SLUG via $TE_CLIENT (ticket $TE_TICKET, worker $TE_WORKER)"
+}
+
+te_stage() { # te_stage <src-file> — copy where uid tokeneng can read; prints path
+  local dst
+  dst=$(mktemp -p "$TE_CLEANUP_DIR" stage.XXXXXX) || return 1
+  cat "$1" > "$dst" || return 1
+  chmod 644 "$dst"
+  printf '%s\n' "$dst"
+}
+
+te_stage_text() { # te_stage_text <string>
+  local dst
+  dst=$(mktemp -p "$TE_CLEANUP_DIR" stage.XXXXXX) || return 1
+  printf '%s\n' "$1" > "$dst"
+  chmod 644 "$dst"
+  printf '%s\n' "$dst"
+}
+
+broker() { # broker <verb> [argv-after-repo]... — response fields into BROKER_*
+  local verb="$1"; shift
+  te_grant
+  local out rc
+  out=$(python3 "$TE_CLIENT" --verb "$verb" --ticket "$TE_TICKET" --worker "$TE_WORKER" \
+        --grant-file "$TE_GRANT_FILE" --grant-sha "$TE_GRANT_SHA" \
+        --argv "$SLUG" "$@" 2>&1)
+  rc=$?
+  BROKER_RESULT=$(printf '%s' "$out" | jq -c '.result // {}' 2>/dev/null) || BROKER_RESULT='{}'
+  BROKER_RULE=$(printf '%s' "$out" | jq -r '.rule // ""' 2>/dev/null)
+  BROKER_REASON=$(printf '%s' "$out" | jq -r '.reason // ""' 2>/dev/null)
+  if [ -z "$BROKER_RULE" ]; then
+    # not a broker frame at all — socket down, client missing, python error
+    BROKER_RULE="client_error"
+    BROKER_REASON=$(printf '%s' "$out" | head -c 300)
   fi
-  resolve_github_token "${SLUG:-}" || die "no usable GitHub token for ${SLUG:-this repo}"
-  note "authenticating to $SLUG via $TOKEN_SOURCE"
+  return $rc
+}
+
+rget() { printf '%s' "$BROKER_RESULT" | jq -r "$1"; }
+
+broker_fail() { # broker_fail <what>
+  printf 'lumen-pr: %s failed via broker [%s]: %s\n' \
+    "$1" "$BROKER_RULE" "$BROKER_REASON" | redact >&2
+  exit 1
 }
 
 # --- git lock (wq#532a) -----------------------------------------------------
@@ -145,7 +208,9 @@ gitlock_acquire() { # gitlock_acquire <scope> <note>
       Wait and re-run; never force it, and never work around it."
   fi
   GITLOCK_SCOPE="$scope"; GITLOCK_TAKEN=1
-  trap gitlock_release EXIT INT TERM
+  # cleanup_on_exit = gitlock_release + broker grant removal (wq#2273); one
+  # trap slot, so the two cleanups share a function instead of clobbering.
+  trap cleanup_on_exit EXIT INT TERM
 }
 
 gitlock_release() {
@@ -246,52 +311,6 @@ need_repo() {
       A fence that fails open is not a fence (wq#546). Restore lumen-repo-scope."
     fi
   fi
-}
-
-api() { # api <method> <path> [json-body]  — path is forge-relative, e.g. /repos/o/r/pulls
-  local method="$1" path="$2" body="${3:-}" out code
-  # wq#557: base URL and auth scheme come from the forge detected in need_repo. GitHub uses
-  # a Bearer token against api.github.com; Gitea uses `token <t>` against <host>/api/v1.
-  # Verified against the live instance (Gitea 1.26.4) rather than from memory.
-  local base auth
-  if [ "${FORGE:-github}" = gitea ]; then
-    base="${GITEA_URL:-${FORGE_BASE_URL:-http://$FORGE_HOST}}/api/v1"
-    auth="Authorization: token $GITHUB_TOKEN"
-  else
-    base="https://api.github.com"
-    auth="Authorization: Bearer $GITHUB_TOKEN"
-  fi
-  if [ -n "$body" ]; then
-    # wq#557: Content-Type is NOT optional. `curl -d` defaults to
-    # application/x-www-form-urlencoded; GitHub tolerates that and parses the JSON body
-    # anyway, so this was invisible for as long as github.com was the only forge. Gitea's
-    # binding.JSON does NOT: it binds the body as FORM data, every field comes back empty,
-    # and it answers "422 [Head]: Required" — an error that reads like a missing argument
-    # rather than a wrong header. Proved by controlled experiment: identical request, the
-    # header the only difference, 422 -> 201.
-    out=$(curl -sS -w '\n%{http_code}' -X "$method" \
-      -H "$auth" \
-      -H 'Accept: application/json' \
-      -H 'Content-Type: application/json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      -d "$body" "$base$path" 2>&1)
-  else
-    out=$(curl -sS -w '\n%{http_code}' -X "$method" \
-      -H "$auth" \
-      -H 'Accept: application/json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      "$base$path" 2>&1)
-  fi
-  code=$(printf '%s' "$out" | tail -n1)
-  API_BODY=$(printf '%s' "$out" | sed '$d')
-  API_CODE="$code"
-  case "$code" in 2*) return 0 ;; *) return 1 ;; esac
-}
-
-api_fail() { # api_fail <what>
-  printf 'lumen-pr: %s failed (HTTP %s): %s\n' "$1" "$API_CODE" \
-    "$(printf '%s' "$API_BODY" | jq -r '.message // "no message"' 2>/dev/null | redact)" >&2
-  exit 1
 }
 
 # --- lint helpers -----------------------------------------------------------
@@ -802,7 +821,7 @@ EOF_UNCOMMITTED
 # capped the way GitHub's /pulls/N/files is (30 per page, 300 files hard cap). The forge is
 # the fallback for landing a PR whose head this clone has never fetched.
 pr_changed_files() { # pr_changed_files <pr-number> <head-sha>
-  local pr="$1" sha="$2" base page=1 chunk n
+  local pr="$1" sha="$2" base
   if ! git -C "$REPO_PATH" cat-file -e "${sha}^{commit}" 2>/dev/null; then
     git -C "$REPO_PATH" fetch -q origin 2>/dev/null || true
   fi
@@ -817,20 +836,16 @@ pr_changed_files() { # pr_changed_files <pr-number> <head-sha>
       return 0
     fi
   fi
-  while [ "$page" -le 5 ]; do
-    if ! api GET "/repos/$SLUG/pulls/$pr/files?per_page=100&page=$page"; then
-      note "WARNING: could not list PR #$pr files (HTTP $API_CODE) — the wq#771 guard is running on an INCOMPLETE file list" >&2
-      return 0
-    fi
-    # previous_filename too: a rename lands a DELETE of the old path, which clobbers an
-    # uncommitted edit there just as thoroughly as a modification would.
-    chunk=$(printf '%s' "$API_BODY" | jq -r '.[]? | (.filename // empty), (.previous_filename // empty)' 2>/dev/null)
-    n=$(printf '%s' "$API_BODY" | jq -r '.[]? | .filename // empty' 2>/dev/null | grep -c .)
-    [ -n "$chunk" ] && printf '%s\n' "$chunk"
-    [ "${n:-0}" -lt 100 ] && return 0
-    page=$((page + 1))
-  done
-  note "WARNING: PR #$pr changes more than 500 files — the wq#771 guard checked the first 500" >&2
+  # wq#2273: the forge fallback is the broker's pr-files verb — previous_filename
+  # included daemon-side (a rename lands a DELETE of the old path, wq#864).
+  if ! broker pr-files "$pr"; then
+    note "WARNING: could not list PR #$pr files via broker [$BROKER_RULE] — the wq#771 guard is running on an INCOMPLETE file list" >&2
+    return 0
+  fi
+  rget '.files' | grep -v '^$'
+  [ "$(rget '.complete')" = true ] || \
+    note "WARNING: PR #$pr changes more than 500 files — the wq#771 guard checked the first 500" >&2
+  return 0
 }
 
 # start knows no file set (nothing is written yet), so the useful thing to say is WHICH
@@ -1086,42 +1101,56 @@ cmd_open() {
   git -C "$REPO_PATH" rev-parse --verify -q "origin/$DEFAULT_BRANCH" >/dev/null || git -C "$REPO_PATH" fetch -q origin
   [ -n "$(git -C "$REPO_PATH" log --oneline "origin/$DEFAULT_BRANCH..$branch" 2>/dev/null)" ] || \
     die "branch '$branch' has no commits ahead of origin/$DEFAULT_BRANCH — nothing to review"
-  load_token
-
-  local existing
-  # wq#557: GITEA IGNORES THE head= FILTER. Verified directly — a deliberately
-  # non-matching `head=lumen:no-such-branch` still returns the full open list. Trusting it
-  # would make this dedup match ANY open PR, so opening a PR for branch B while an
-  # unrelated PR A was open would silently PATCH A's title and body onto someone else's
-  # review. Filter client-side on head.ref instead; harmless on GitHub, where the server
-  # has already narrowed the list.
-  if api GET "/repos/$SLUG/pulls?head=${SLUG%%/*}:$branch&state=open"; then
-    existing=$(printf '%s' "$API_BODY" | jq -r --arg b "$branch" \
-      'map(select(.head.ref == $b)) | .[0].number // empty')
-  fi
 
   git -C "$REPO_PATH" push -q -u origin "$branch" 2>&1 | redact || die "push of $branch failed"
   note "pushed $branch"
 
-  if [ -n "${existing:-}" ]; then
-    note "PR #$existing already open for $branch — updating title/body"
-    local payload; payload=$(jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b}')
-    api PATCH "/repos/$SLUG/pulls/$existing" "$payload" || api_fail "PR update"
-    printf '%s\n' "$(printf '%s' "$API_BODY" | jq -r '.html_url')"
-    PR_NUMBER="$existing"; return 0
+  # wq#2273: find-or-create-or-update is the DAEMON's pr-open, including the
+  # wq#557 dedup (Gitea ignores the head= filter, so the daemon matches on
+  # head.ref client-side — an open PR for a different branch is never patched).
+  # Title and body go as staged file paths, never argv.
+  te_grant
+  local title_f body_f draft_arg=nodraft
+  title_f=$(te_stage_text "$title") || die "cannot stage PR title for the broker"
+  body_f=$(te_stage "$body_file") || die "cannot stage PR body for the broker"
+  [ "$draft" = true ] && draft_arg=draft
+  broker pr-open "$branch" "$DEFAULT_BRANCH" "$title_f" "$body_f" "$draft_arg" \
+    || broker_fail "PR open"
+  PR_NUMBER=$(rget '.number')
+  if [ "$(rget '.action')" = updated ]; then
+    note "PR #$PR_NUMBER already open for $branch — updated title/body"
+  else
+    note "opened PR #$PR_NUMBER"
   fi
+  rget '.url'
+}
 
-  local payload
-  payload=$(jq -n --arg t "$title" --arg b "$body" --arg h "$branch" --arg base "$DEFAULT_BRANCH" \
-    --argjson d "$draft" '{title:$t, body:$b, head:$h, base:$base, draft:$d}')
-  api POST "/repos/$SLUG/pulls" "$payload" || api_fail "PR create"
-  PR_NUMBER=$(printf '%s' "$API_BODY" | jq -r '.number')
-  note "opened PR #$PR_NUMBER"
-  printf '%s\n' "$(printf '%s' "$API_BODY" | jq -r '.html_url')"
+# wq#2273: PR comments through the broker's pr-comment verb (grant kind
+# pr_comment). Body as a staged file path, same as open.
+cmd_comment() {
+  need_repo "${1:-}"; shift
+  local pr="" body_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body-file) body_file="${2:-}"; shift 2 ;;
+      --allow-second-person) ALLOW_SECOND_PERSON=1; shift ;;
+      -*) die "unknown flag for comment: $1" ;;
+      *) [ -z "$pr" ] || die "unexpected argument '$1'"; pr="$1"; shift ;;
+    esac
+  done
+  [ -n "$pr" ] || die "usage: lumen-pr comment <repo-path> <pr-number> --body-file F"
+  [ -n "$body_file" ] && [ -r "$body_file" ] || die "missing or unreadable --body-file"
+  lint_second_person "$(cat "$body_file")" "PR comment"
+  te_grant
+  local staged
+  staged=$(te_stage "$body_file") || die "cannot stage comment body for the broker"
+  broker pr-comment "$pr" "$staged" || broker_fail "PR comment"
+  note "commented on PR #$pr (comment id $(rget '.id'))"
+  rget '.url'
 }
 
 # wq#563: forge-aware pre-merge mergeability guard. Reads the PR body already in
-# $API_BODY (cmd_land re-fetches immediately before merging) and either dies, warns, or
+# the pr-view result (cmd_land re-fetches immediately before merging) and either dies, warns, or
 # stays silent.
 #
 # THE DEFECT: this used to switch on .mergeable_state unconditionally. That is a GITHUB
@@ -1146,9 +1175,10 @@ cmd_open() {
 # latency to the lock-held window — the exact cost wq#532a was filed about — to fix a race
 # never observed. If an unknown is ever seen in the wild, revisit with that evidence.
 mergeability_guard() {
+  # Reads the pr-view result the caller just fetched into BROKER_RESULT (wq#2273).
   local pr="$1" ms mf
-  ms=$(printf '%s' "$API_BODY" | jq -r '.mergeable_state // "null"')
-  mf=$(printf '%s' "$API_BODY" | jq -r 'if has("mergeable") and .mergeable != null then (.mergeable|tostring) else "null" end')
+  ms=$(rget '.mergeable_state // "null"')
+  mf=$(rget 'if .mergeable == null then "null" else (.mergeable|tostring) end')
 
   if [ "${FORGE:-github}" = gitea ]; then
     case "$mf" in
@@ -1201,15 +1231,13 @@ cmd_land() {
     esac
   done
   [ -n "$pr" ] || die "usage: lumen-pr land <repo-path> <pr-number>"
-  load_token
-  api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR fetch"
+  broker pr-view "$pr" || broker_fail "PR fetch"
   local state merged head_sha head_ref draft
-  state=$(printf '%s' "$API_BODY" | jq -r '.state')
-  merged=$(printf '%s' "$API_BODY" | jq -r '.merged')
-  draft=$(printf '%s' "$API_BODY" | jq -r '.draft')
-  head_sha=$(printf '%s' "$API_BODY" | jq -r '.head.sha')
-  head_ref=$(printf '%s' "$API_BODY" | jq -r '.head.ref')
-  local title; title=$(printf '%s' "$API_BODY" | jq -r '.title')
+  state=$(rget '.state')
+  merged=$(rget '.merged')
+  draft=$(rget '.draft')
+  head_sha=$(rget '.head_sha')
+  head_ref=$(rget '.head_ref')
   if [ "$merged" = true ]; then note "PR #$pr is already merged — nothing to do"; return 0; fi
   [ "$state" = open ] || die "PR #$pr is '$state', not open"
   [ "$draft" = true ] && die "PR #$pr is a draft — mark it ready before landing (§5)"
@@ -1222,55 +1250,32 @@ cmd_land() {
 
   # Wait for checks. A repo with no CI yet has nothing to wait for; say so loudly
   # rather than silently treating 'no checks' as 'green'.
-  local waited=0 conclusion total
+  local waited=0 total
   while :; do
-    # wq#557: Gitea has NO check-runs endpoint — verified 404 against the live instance,
-    # and absent from its swagger. Its equivalent is commit STATUSES, with a different
-    # shape: a flat array of {status, context, target_url} where status is
-    # pending|success|error|failure|warning. Normalise both into total/pending/failed so
-    # the policy below (never merge red, say so loudly when there is no CI at all) is
-    # written once and means the same thing on both forges.
+    # wq#2273: the forge split lives in the daemon's pr-checks now — Gitea has
+    # no check-runs endpoint (wq#557: commit statuses instead) and reports a
+    # never-ran queue cancellation as status=failure (wq#986: an infra gap, not
+    # a failing check). The daemon normalises both into
+    # total/pending/failed/cancelled plus pre-formatted detail lines, so the
+    # policy here (never merge red, say so loudly when there is no CI at all)
+    # is written once and means the same thing on both forges.
     local pending failed cancelled
-    if [ "${FORGE:-github}" = gitea ]; then
-      api GET "/repos/$SLUG/commits/$head_sha/statuses" || api_fail "commit statuses fetch"
-      total=$(printf '%s' "$API_BODY" | jq -r 'length')
-      pending=$(printf '%s' "$API_BODY" | jq -r '[.[] | select(.status == "pending")] | length')
-      # wq#986: Gitea's commit-status API has no "cancelled" state (verified against its
-      # swagger — status is only pending|success|error|failure|warning), so a workflow run
-      # that never got a runner and was cancelled by Gitea's own queue timeout reports as
-      # status=failure with description "Has been cancelled". That is an INFRA gap (zero
-      # runners registered), not evidence the code is broken, but the old check treated it
-      # identically to a real test failure and refused every PR on the repo (wq#984 worked
-      # around it with a direct-API merge). Split failure/error entries on the description
-      # instead of conflating them: a genuine failure still blocks; a cancelled-unrun one is
-      # reported and does not.
-      failed=$(printf '%s' "$API_BODY" | jq -r '[.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i") | not))] | length')
-      cancelled=$(printf '%s' "$API_BODY" | jq -r '[.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i")))] | length')
-      if [ "$total" = 0 ]; then
-        note "NO CI CHECKS configured on this repo (§8 not yet satisfied) — landing on review alone"
-        break
-      fi
-      if [ "$cancelled" -gt 0 ]; then
-        printf '%s' "$API_BODY" | jq -r '.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i"))) | "  CANCELLED (not a failure, wq#986): \(.context) -> \(.description)  \(.target_url)"' >&2
-        note "WARNING: $cancelled check(s) never ran (cancelled — most likely no runner registered for this repo). Not treated as a failing check. If this hides a real problem, check the run at $FORGE_BASE_URL/$SLUG/actions."
-      fi
-      if [ "$failed" -gt 0 ]; then
-        printf '%s' "$API_BODY" | jq -r '.[] | select((.status == "error" or .status == "failure") and ((.description // "") | test("cancel"; "i") | not)) | "  FAILED: \(.context) -> \(.status)  \(.target_url)"' >&2
-        die "PR #$pr has failing checks — fix them, do not merge red (§5)"
-      fi
-    else
-    api GET "/repos/$SLUG/commits/$head_sha/check-runs" || api_fail "check-runs fetch"
-    total=$(printf '%s' "$API_BODY" | jq -r '.total_count')
+    broker pr-checks "$head_sha" || broker_fail "checks fetch"
+    total=$(rget '.total')
+    pending=$(rget '.pending')
+    failed=$(rget '.failed')
+    cancelled=$(rget '.cancelled')
     if [ "$total" = 0 ]; then
       note "NO CI CHECKS configured on this repo (§8 not yet satisfied) — landing on review alone"
       break
     fi
-    pending=$(printf '%s' "$API_BODY" | jq -r '[.check_runs[] | select(.status != "completed")] | length')
-    failed=$(printf '%s' "$API_BODY" | jq -r '[.check_runs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length')
-    if [ "$failed" -gt 0 ]; then
-      printf '%s' "$API_BODY" | jq -r '.check_runs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped") | "  FAILED: \(.name) -> \(.conclusion)  \(.html_url)"' >&2
-      die "PR #$pr has failing checks — fix them, do not merge red (§5)"
+    if [ "$cancelled" -gt 0 ]; then
+      rget '.cancelled_detail' >&2
+      note "WARNING: $cancelled check(s) never ran (cancelled — most likely no runner registered for this repo). Not treated as a failing check. If this hides a real problem, check the run at $FORGE_BASE_URL/$SLUG/actions."
     fi
+    if [ "$failed" -gt 0 ]; then
+      rget '.failed_detail' >&2
+      die "PR #$pr has failing checks — fix them, do not merge red (§5)"
     fi
     if [ "$pending" = 0 ]; then
       if [ "${cancelled:-0}" -gt 0 ]; then
@@ -1291,7 +1296,7 @@ cmd_land() {
   # genuinely shared state.
   gitlock_acquire "$(gitlock_scope)" "lumen-pr land $SLUG #$pr"
 
-  api GET "/repos/$SLUG/pulls/$pr" || api_fail "PR re-fetch"
+  broker pr-view "$pr" || broker_fail "PR re-fetch"
   mergeability_guard "$pr"
 
   # wq#657: merge_method is 'squash' (default) or 'merge' (--merge flag). Squash
@@ -1307,43 +1312,16 @@ cmd_land() {
   #
   # Merge: the merge commit carries the PR title + footers. Individual branch
   # commits keep their own messages intact — that is the whole point.
-  local footers
-  if api GET "/repos/$SLUG/pulls/$pr/commits"; then
-    footers=$(printf '%s' "$API_BODY" \
-      | jq -r '.[].commit.message' \
-      | grep -E '^(Refs|Assisted-by|Generated-by|BREAKING CHANGE|Co-authored-by):' \
-      | grep -v 'Co-authored-by:.*[Cc]laude' \
-      | awk '!seen[$0]++')
-  fi
-  [ -n "${footers:-}" ] || footers="$FOOTER_ASSIST"
-  # wq#557: the merge call itself diverges. GitHub: PUT .../merge with
-  # {merge_method, commit_title, commit_message, sha}. Gitea 1.26.4: POST .../merge with
-  # {do:<method>, MergeTitleField, MergeMessageField, head_commit_id} — different VERB,
-  # different field names, and `do` is required. Both verified from the live swagger, not
-  # from memory. The §3 footers must survive on either forge.
-  local payload
-  if [ "${FORGE:-github}" = gitea ]; then
-    payload=$(jq -n --arg do "$merge_method" --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
-      '{do:$do, merge_title_field:$t, merge_message_field:$m, head_commit_id:$s, delete_branch_after_merge:true}')
-    api POST "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "$merge_method merge"
-    note "merged PR #$pr ($merge_method) on $FORGE_HOST"
-  else
-    payload=$(jq -n --arg mm "$merge_method" --arg t "$title" --arg m "$footers" --arg s "$head_sha" \
-      '{merge_method:$mm, commit_title:$t, commit_message:$m, sha:$s}')
-    api PUT "/repos/$SLUG/pulls/$pr/merge" "$payload" || api_fail "$merge_method merge"
-    note "merged PR #$pr as $(printf '%s' "$API_BODY" | jq -r '.sha' | cut -c1-10) ($merge_method)"
-  fi
-
-  # wq#557: Gitea exposes NO DELETE on /git/refs — GET only, confirmed in its swagger. The
-  # branch is removed by delete_branch_after_merge in the merge payload above instead, so
-  # attempting the GitHub call here would produce a guaranteed 404 and a misleading
-  # "already gone" note on every single Gitea land.
-  if [ "${FORGE:-github}" = gitea ]; then
-    note "remote branch $head_ref removal requested via delete_branch_after_merge"
-  elif api DELETE "/repos/$SLUG/git/refs/heads/$head_ref"; then
+  # wq#2273: title, §3 footers (from the branch commits, deduped — GitHub's
+  # default squash body would drop Refs:/Assisted-by: off main), the per-forge
+  # merge call (wq#557: GitHub PUT vs Gitea POST-with-`do`) and the head-branch
+  # removal all live in the daemon's pr-merge verb now.
+  broker pr-merge "$pr" "$merge_method" || broker_fail "$merge_method merge"
+  note "merged PR #$pr as $(rget '.sha' | cut -c1-10) ($merge_method) on $FORGE_HOST"
+  if [ "$(rget '.branch_deleted')" = true ]; then
     note "deleted remote branch $head_ref"
   else
-    note "remote branch $head_ref already gone (delete_branch_on_merge)"
+    note "remote branch $head_ref already gone (or removal requested via delete_branch_after_merge)"
   fi
 
   # Return the local tree to the default branch and catch it up. In a LINKED
@@ -1382,7 +1360,9 @@ cmd_land() {
     && note "deleted local branch $head_ref" \
     || note "local branch $head_ref kept (not fully merged locally, or already gone)"
   gitlock_release
-  trap - EXIT INT TERM
+  # keep the EXIT trap: the lock is released (idempotent) but the broker grant
+  # (wq#2273) still needs removing when the process ends.
+  trap cleanup_on_exit EXIT
 }
 
 cmd_check() {
@@ -1395,18 +1375,17 @@ cmd_check() {
   if [ "$branch" != "$DEFAULT_BRANCH" ]; then
     printf 'ahead   : %s commit(s) vs origin/%s\n' "$(git -C "$REPO_PATH" rev-list --count "origin/$DEFAULT_BRANCH..$branch" 2>/dev/null || echo '?')" "$DEFAULT_BRANCH"
   fi
-  load_token
-  # wq#557: this used to swallow the failure. `if api GET ...; then print; fi` meant a 404
-  # printed NOTHING AT ALL — the tool reported branch/staged/dirty and simply omitted the
-  # open-PR line, so it looked like a clean run with no open PRs. That silence is how the
-  # Gitea breakage went unnoticed: a tool that reports partial success without saying it is
-  # partial is worse than one that fails.
-  if api GET "/repos/$SLUG/pulls?state=open"; then
-    printf 'open PRs: %s\n' "$(printf '%s' "$API_BODY" | jq -r 'if length==0 then "none" else (.[] | "#\(.number) \(.title) [\(.head.ref)]") end')"
+  # wq#557: this used to swallow the failure. A silent omission of the open-PR
+  # line looked like a clean run with no open PRs, which is how the Gitea
+  # breakage went unnoticed — a tool that reports partial success without
+  # saying it is partial is worse than one that fails. Same rule on the broker
+  # path (wq#2273): a failed pr-list is reported as UNKNOWN, loudly.
+  if broker pr-list; then
+    local prs; prs=$(rget '.prs')
+    printf 'open PRs: %s\n' "${prs:-none}"
   else
-    printf 'open PRs: UNKNOWN — %s API call failed (HTTP %s): %s\n' \
-      "${FORGE:-github}" "$API_CODE" \
-      "$(printf '%s' "$API_BODY" | jq -r '.message // "no message"' 2>/dev/null | redact)" >&2
+    printf 'open PRs: UNKNOWN — broker pr-list failed [%s]: %s\n' \
+      "$BROKER_RULE" "$BROKER_REASON" >&2
     return 1
   fi
 }
@@ -1468,6 +1447,7 @@ case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   commit) shift; cmd_commit "$@" ;;
   open)   shift; cmd_open "$@" ;;
+  comment) shift; cmd_comment "$@" ;;
   land)   shift; cmd_land "$@" ;;
   # wq#546: gitlock and check are READ-ONLY inspections. They still resolve a repo, but
   # refusing to LOOK at an out-of-scope repo would push agents toward raw git, which is the
@@ -1483,5 +1463,5 @@ case "${1:-}" in
   ffprimary) shift; SCOPE_OP=none cmd_ffprimary "$@" ;;
   ''|-h|--help|help)
     sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (start|commit|open|land|check|gitlock|dirtycheck|ffprimary)" ;;
+  *) die "unknown subcommand '$1' (start|commit|open|comment|land|check|gitlock|dirtycheck|ffprimary)" ;;
 esac
