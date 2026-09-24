@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""cred-doc-postcheck - fail while the rotator is still at the keyboard if a doc
+still points at a credential location that a rotation just moved or removed (wq#1619).
+
+A rotation moves a secret and nobody updates the prose: claude_memory.md told every
+booting agent to read GITHUB_TOKEN from agent/.env after that key was gone, so each
+one got Bad credentials and had to rediscover the real path (found in wq#1581).
+
+  cred-doc-postcheck --old STRING [--old STRING ...] [--near STRING] [--scan PATH ...]
+
+  --old   a location or key that is GONE (a path, an env var name). Fixed string, repeatable.
+  --near  only count a line that ALSO contains this string, for a location that still
+          exists for other reasons: `--old GITHUB_TOKEN --near agent/.env`.
+  --scan  file or directory to check instead of the default instruction plane.
+
+Default scan set: /home/lumen/claude_memory.md, /home/lumen/instructions, 
+/home/lumen/minerva/context, /home/lumen/FLEET_MAP.md. Backups (*.bak*), archives,
+approvals/ and drafts/ are skipped.
+
+A line that documents the absence on purpose ("there is no GITHUB_TOKEN in ...") carries
+the marker `cred-postcheck:ok` and is not reported.
+
+Exit 0: no stale reference. 1: stale references printed as file:line. 2: usage.
+Output shows only the text around the match, never the whole line.
+"""
+import argparse
+import os
+import sys
+
+DEFAULT_SCAN = [
+    "/home/lumen/claude_memory.md",
+    "/home/lumen/instructions",
+    "/home/lumen/minerva/context",
+    "/home/lumen/FLEET_MAP.md",
+]
+SKIP_DIRS = {".git", "__pycache__", "approvals", "drafts", "node_modules"}
+SKIP_NAME_PARTS = (".bak", ".orig", "archive", ".pyc")
+MARKER = "cred-postcheck:ok"
+MAX_BYTES = 8 * 1024 * 1024
+CONTEXT = 50
+
+
+def iter_files(paths):
+    for root in paths:
+        if os.path.isfile(root):
+            yield root
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            for name in sorted(filenames):
+                if any(part in name for part in SKIP_NAME_PARTS):
+                    continue
+                yield os.path.join(dirpath, name)
+
+
+def find_stale(paths, old, near=None):
+    hits = []
+    for path in iter_files(paths):
+        try:
+            if os.path.getsize(path) > MAX_BYTES:
+                continue
+            with open(path, encoding="utf-8", errors="strict") as fh:
+                for lineno, line in enumerate(fh, 1):
+                    if MARKER in line or (near and near not in line):
+                        continue
+                    for needle in old:
+                        col = line.find(needle)
+                        if col >= 0:
+                            lo, hi = max(0, col - CONTEXT), col + len(needle) + CONTEXT
+                            hits.append((path, lineno, needle, line[lo:hi].strip()))
+                            break
+        except (UnicodeDecodeError, OSError):
+            continue  # binary or unreadable: not a doc
+    return hits
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--old", action="append", default=[], required=True)
+    ap.add_argument("--near")
+    ap.add_argument("--scan", action="append")
+    args = ap.parse_args(argv)
+    if any(not o.strip() for o in args.old):
+        ap.error("--old must not be empty")
+    scan = args.scan or DEFAULT_SCAN
+    missing = [p for p in scan if not os.path.exists(p)]
+    if missing:
+        print("cred-doc-postcheck: scan path does not exist: " + ", ".join(missing),
+              file=sys.stderr)
+        return 2
+    hits = find_stale(scan, args.old, args.near)
+    if not hits:
+        print(f"cred-doc-postcheck: OK - no doc still points at {', '.join(args.old)}")
+        return 0
+    print(f"cred-doc-postcheck: {len(hits)} STALE REFERENCE(S) to a moved or removed credential location:")
+    for path, lineno, needle, ctx in hits:
+        print(f"  {path}:{lineno}: [{needle}] ...{ctx}...")
+    print("Fix each doc (keep a .bak), or mark a line that documents the absence on purpose "
+          f"with `{MARKER}`. Do not walk away from this rotation with these in place.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

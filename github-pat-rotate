@@ -57,3 +57,7 @@ except Exception as e:
     print("VERIFY FAILED:", e)
 PY
 echo "Done. New PAT lives ONLY in $TOK. Next: github-pat-rotate --prune-baks"
+
+# 4. wq#1619: the location this rotation removed must not survive in a doc. Exit non-zero
+# so the rotator sees it while still at the keyboard.
+/home/lumen/bin/cred-doc-postcheck --old GITHUB_TOKEN --near agent/.env
