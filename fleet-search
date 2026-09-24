@@ -25,7 +25,7 @@ Per-project cache (--project <name>): writes/reads
   /home/lumen/projects/<name>/research/search_cache.jsonl  (query->results, ts)
   and appends discovery to PRIOR_ART.md. Checked first (TTL default 14d).
 """
-import sys, os, json, time, argparse, hashlib, urllib.parse, urllib.request, urllib.error
+import sys, os, re, json, time, argparse, hashlib, urllib.parse, urllib.request, urllib.error
 
 SEARXNG = os.environ.get("FLEET_SEARXNG_BASE", "http://127.0.0.1:8888")
 AGENT_ENV = "/home/lumen/agent/.env"
@@ -36,6 +36,20 @@ HTTP_TIMEOUT = 20
 CHROMIUM_BIN = "/usr/bin/chromium"
 FLARESOLVERR_BASE = os.environ.get("FLEET_FLARESOLVERR_BASE", "http://127.0.0.1:8191")
 RETRY_STATUSES = (403, 429, 503)          # rungs escalate only on these; 404 etc. is a real answer
+
+# wq#2494: a WAF/bot-check interstitial often renders with HTTP 200 (rung 3
+# chromium has no status of its own -- :487 synthesises 200 from exit-0 +
+# non-empty DOM; rungs 1-2 can serve a 200-status block page too), so status
+# alone can't tell "blocked" from "real content". Match the body text instead.
+CHALLENGE_SIGNATURES = (
+    ("cloudflare", re.compile(rb"(?i)(using a security service to protect itself|"
+                               rb"checking your browser before accessing|"
+                               rb"ray id:|cf-chl-|cf_chl_opt|attention required.{0,40}cloudflare)")),
+    ("turnstile", re.compile(rb"(?i)(cf-turnstile|challenges\.cloudflare\.com/turnstile)")),
+    ("datadome", re.compile(rb"(?i)datadome")),
+    ("akamai", re.compile(rb"(?i)(ak_bmsc|akamai.{0,20}bot manager|_abck)")),
+    ("perimeterx", re.compile(rb"(?i)(perimeterx|_px3|px-captcha)")),
+)
 
 
 def _env_token(key):
@@ -510,12 +524,25 @@ def _fetch_flaresolverr(url, timeout=HTTP_TIMEOUT):
     return status, body, solution.get("url", url)
 
 
+def _detect_challenge(body):
+    """Match a fetched body against known WAF/bot-challenge signatures (wq#2494).
+    Returns the challenge name, or None."""
+    for name, pattern in CHALLENGE_SIGNATURES:
+        if pattern.search(body):
+            return name
+    return None
+
+
 def _fetch_ladder(url):
     """Ordered fetch ladder for `url`. Each rung is tried ONLY if the previous one
     came back 403/429/503 — a 404 (or any other real answer) stops the ladder right
-    there. Rungs 2-4 are skipped (not attempted) if their dependency is unavailable,
-    never crash the ladder. Returns (status, body, final_url, tier) — tier says which
-    rung produced the returned result, for measuring which rung actually serves."""
+    there. A rung's body is also checked against known WAF/bot-challenge signatures
+    (wq#2494): a match is synthesised to 403 so a rendered challenge/block page
+    (which a WAF often serves with a 200) is retry-eligible rather than a terminal
+    "success". Rungs 2-4 are skipped (not attempted) if their dependency is
+    unavailable, never crash the ladder. Returns (status, body, final_url, tier,
+    challenge) — tier says which rung produced the returned result, for measuring
+    which rung actually serves; challenge is the matched signature name, or None."""
     rungs = (
         (1, lambda: _get(url)),                 # unchanged Firefox-UA urllib GET
         (2, lambda: _fetch_cffi_chrome(url)),
@@ -527,7 +554,11 @@ def _fetch_ladder(url):
         result = fn()
         if result is None:
             continue                            # rung unavailable — try the next one
-        last = (*result, tier)
+        status, body, final_url = result
+        challenge = _detect_challenge(body) if status not in RETRY_STATUSES and status != 0 else None
+        if challenge:
+            status = 403                        # rendered challenge page -> retry-eligible, not terminal
+        last = (status, body, final_url, tier, challenge)
         if last[0] not in RETRY_STATUSES:
             return last
     return last                                 # rung 1 always returns, so never None
@@ -548,11 +579,14 @@ def _fetch_and_extract(url):
             "://reddit.com", "://old.reddit.com")
         if fetch_url.endswith(".json"):
             fetch_url = fetch_url[:-5]
-    status, body, final, tier = _fetch_ladder(fetch_url)
+    status, body, final, tier, challenge = _fetch_ladder(fetch_url)
     if status == 0:
         return None, {"error": f"fetch failed: {body[:200].decode('utf-8','replace')}",
                       "url": fetch_url, "tier": tier}
     if status in RETRY_STATUSES:
+        if challenge:
+            return None, {"error": f"blocked by {challenge} challenge after ladder exhausted at tier {tier}",
+                          "url": fetch_url, "tier": tier, "challenge": challenge}
         hint = ""
         if is_reddit and status == 403:
             hint = " (reddit blocks datacenter IPs / .json since 2026-05-30; old.reddit HTML needed)"
