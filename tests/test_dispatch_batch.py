@@ -213,3 +213,64 @@ def test_one_spawn_failure_does_not_abort_the_rest_of_the_batch(tmp_path):
     assert f"wq#{bad}: spawn failed" in text
     assert f"wq#{good} OK unit=stub-{good}" in text
     assert "done rc=1" in text
+
+
+# wq#2526: 'dispatch-batch --help' reached default_spawn(), which built a command line
+# from router.py's own `dispatch-cmd --help` usage output and blindly eval'd it — 3
+# occurrences in production (_runs/dispatch, 2026-09-24 23:33-23:35Z). Any non-numeric
+# argv reaches the same eval, since default_spawn() has no idea an id is well-formed.
+# These three tests cover the parent-side reject-before-detach path and the
+# defense-in-depth check inside default_spawn itself.
+
+def run_dispatch_batch_argv(env, *argv):
+    """Like run_dispatch_batch, but passes argv verbatim (not necessarily numeric ids) and
+    runs dispatch-batch directly rather than through `sh -c` — for exercising the
+    parent-side validation that must reject before any detach/log dir is created."""
+    return subprocess.run([DISPATCH_BATCH_BIN, *argv], capture_output=True, text=True,
+                           env=env, timeout=15)
+
+
+def test_help_flag_prints_usage_and_exits_0_without_detaching(tmp_path):
+    env = make_env(tmp_path)
+    for flag in ("-h", "--help"):
+        p = run_dispatch_batch_argv(env, flag)
+        assert p.returncode == 0, f"{flag}: {p.stdout}\n{p.stderr}"
+        assert "usage: dispatch-batch" in p.stderr
+        assert p.stdout == ""
+    assert not (tmp_path / "runs").exists(), "--help must never create the run dir / detach"
+
+
+def test_non_numeric_arg_rejected_before_detach(tmp_path):
+    env = make_env(tmp_path)
+    p = run_dispatch_batch_argv(env, "not-a-number")
+    assert p.returncode == 64, f"{p.stdout}\n{p.stderr}"
+    assert "refusing non-numeric ticket id" in p.stderr
+    assert not (tmp_path / "runs").exists(), "an invalid id must be rejected before detaching"
+
+    # one bad id anywhere in the batch rejects the whole invocation, before any ticket runs
+    p = run_dispatch_batch_argv(env, "123", "--also-bad")
+    assert p.returncode == 64, f"{p.stdout}\n{p.stderr}"
+    assert not (tmp_path / "runs").exists()
+
+
+def test_default_spawn_refuses_to_eval_non_lumen_run_output(tmp_path):
+    # router.py returning rc=0 with usage/help-shaped stdout (argparse's own --help
+    # handling is exactly this shape) must not reach eval just because rc was 0.
+    fake_router = tmp_path / "fake_router.py"
+    fake_router.write_text(
+        "import sys\nprint('echo not-a-lumen-run-invocation')\nsys.exit(0)\n")
+    env = make_env(tmp_path, DISPATCH_BATCH_ROUTER=str(fake_router))
+    tid = add_ticket(env, "dispatch-batch bad router output")
+
+    run_dispatch_batch(env, tid)
+
+    def batch_done():
+        logs = batch_logs(tmp_path)
+        return logs and "done rc=" in logs[-1].read_text()
+
+    assert wait_for(batch_done, timeout_s=10), "detached batch never finished"
+    text = batch_logs(tmp_path)[-1].read_text()
+    assert f"wq#{tid}: spawn failed" in text
+    assert "done rc=1" in text
+    ticket_log = (tmp_path / "runs" / f"{tid}.log").read_text()
+    assert "refusing to eval non-lumen-run output" in ticket_log

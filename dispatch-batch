@@ -25,15 +25,35 @@ RUN_DIR="${DISPATCH_BATCH_RUN_DIR:-$FOREMAN_ROOT/_runs/dispatch}"
 CLAIM_WAIT_S="${DISPATCH_BATCH_CLAIM_WAIT_S:-60}"
 CLAIM_POLL_S="${DISPATCH_BATCH_CLAIM_POLL_S:-3}"
 
-usage() { echo "usage: dispatch-batch TICKET_ID [TICKET_ID ...]" >&2; exit 64; }
+usage() { echo "usage: dispatch-batch TICKET_ID [TICKET_ID ...]" >&2; exit "${1:-64}"; }
+case "${1:-}" in -h|--help) usage 0 ;; esac
 [ $# -ge 1 ] || usage
+# Every arg must be a bare numeric wq id. default_spawn() eval()s router.py output built from the id,
+# so an unvalidated arg (e.g. '--help') reaches eval and spawns a garbage unit. Reject in the parent,
+# before anything detaches.
+for _a in "$@"; do
+  case "$_a" in ''|*[!0-9]*) echo "dispatch-batch: refusing non-numeric ticket id: '$_a'" >&2; usage 64 ;; esac
+done
 
 default_spawn() {
   # $1 = ticket id. Builds the production command line via router.py, runs it, and
   # passes through its stdout — which ends in `UNIT=<name>`, lumen-run's own contract.
-  local id="$1" cmd_line
+  # router.py exiting nonzero is already caught by `|| return 1` below, but a usage/error
+  # path that prints to stdout and exits 0 (e.g. argparse's own --help handling on a
+  # future flag-shaped id) would otherwise reach eval untouched — refuse unless the last
+  # line is actually a lumen-run invocation.
+  local id="$1" cmd_line last_line
   cmd_line=$(python3 "$ROUTER" dispatch-cmd "$id") || return 1
-  eval "$cmd_line"
+  last_line=$(printf '%s\n' "$cmd_line" | tail -1)
+  case "$last_line" in
+    "lumen-run "*)
+      eval "$cmd_line"
+      ;;
+    *)
+      echo "dispatch-batch: refusing to eval non-lumen-run output: $last_line" >&2
+      return 1
+      ;;
+  esac
 }
 
 spawn_ticket() {
