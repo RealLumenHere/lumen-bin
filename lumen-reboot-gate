@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""lumen-reboot-gate — the pre-reboot boot-safety triple-check (wq#1401).
+
+Implements the gate that /home/lumen/instructions/playbooks/maintenance-window.md
+calls "required before ANY reboot", so the maintenance-window scheduler has one
+mechanical answer to "may this node be rebooted" instead of a prose checklist.
+
+THIS TOOL NEVER REBOOTS, POWERS, OR CHANGES ANYTHING. It reads state and reports.
+Exit 0 means every check passed; any other exit means DO NOT REBOOT.
+
+The three checks are the policy's, in its own order:
+
+  1. services-enabled — every service the node needs is `enabled`, not merely
+     active, so it comes back on boot.
+  2. boot-blocking    — no pending config/unit change would block or hang boot.
+     Delegates to overnight_boot_gate.sh, which already covers dpkg mid-operation,
+     initramfs, /boot space, fstab, netplan, bootloader, apt locks and shutdown
+     inhibitors. Not reimplemented here.
+  3. auto-return      — the node actually comes back. This is the one that has no
+     existing implementation and the one the policy is most emphatic about:
+     "NEVER reboot a node whose auto-return is unknown (see thoth/apis lessons)".
+
+On check 3, a smart plug ALONE is deliberately not enough. A plug can cut and
+restore AC, but if the node's BIOS does not power on from AC-restore, cutting AC
+is precisely the unrecoverable move the thoth/apis lessons are about. Frank has no
+console, so "I can cut the power" without "it boots when power returns" is a trap,
+not a recovery path.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+LUMEN_STATE = os.environ.get(
+    "LUMEN_STATE_BIN", "/home/lumen/minerva/lumen_state.py")
+BOOT_GATE = os.environ.get(
+    "BOOT_GATE_BIN", "/home/lumen/bin/overnight_boot_gate.sh")
+
+# plug-ctl's controllable set. p12 is absent there and so is absent here.
+# p13/p14 are Frank's household plugs (riley-pc / parker-pc), explicitly excluded
+# from fleet ops by plug-ctl's own comment — a fleet node must never claim them.
+CONTROLLABLE_PLUGS = {f"p{n}" for n in range(1, 12)}
+
+# Services every fleet node needs back after a reboot to be reachable at all.
+# Without sshd Frank cannot get in; without tailscaled there is no route to it.
+DEFAULT_REQUIRED = ("ssh", "tailscaled")
+
+
+def state_fact(subject, predicate):
+    """Current value of <subject>.<predicate>, or '' when the fact is not recorded."""
+    try:
+        r = subprocess.run([sys.executable, LUMEN_STATE, "current", subject, predicate],
+                           capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    line = r.stdout.strip()
+    if not line:
+        return ""
+    # "  nephthys.auto_boot_verified = yes — carried over ...  (since ...)"
+    _, _, rhs = line.partition("=")
+    return rhs.strip()
+
+
+def ssh(node, cmd, timeout=45):
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", node, cmd],
+        capture_output=True, text=True, timeout=timeout)
+
+
+def check_auto_return(node):
+    """Policy check 3. Fail-closed: unknown auto-return is a REFUSAL, never a warning."""
+    hold = state_fact(node, "remediation_hold")
+    if hold.lower().startswith("on"):
+        return False, f"remediation_hold is on for {node} — actuation is held: {hold[:120]}"
+
+    verified = state_fact(node, "auto_boot_verified")
+    if verified.lower().startswith("yes"):
+        return True, "auto_boot_verified=yes — a full AC-restore cycle was validated end to end"
+
+    bios = state_fact(node, "bios")
+    ac_on = bool(re.search(r"AC-restore\s*=\s*(PowerOn|Last)", bios, re.I))
+    plug_raw = state_fact(node, "power_plug")
+    m = re.match(r"\s*(p\d+)\b", plug_raw, re.I)
+    plug = m.group(1).lower() if m else ""
+    controllable = plug in CONTROLLABLE_PLUGS
+
+    if ac_on and controllable:
+        return True, (f"BIOS AC-restore is on and {plug} is remotely controllable "
+                      f"(plug-ctl {plug} off/on) — power can be cut and the node boots back")
+
+    # Everything below is a refusal. Name the missing half precisely, because
+    # "unknown" is the whole point of the check.
+    if controllable and not ac_on:
+        return False, (
+            f"{node} is on controllable plug {plug}, but no BIOS AC-restore fact proves it "
+            f"powers on when AC returns. Cutting AC to a node that will not come back is the "
+            f"thoth/apis failure. Record <node>.bios AC-restore=PowerOn, or validate a full "
+            f"cycle and record auto_boot_verified=yes.")
+    if ac_on and not controllable:
+        return False, (
+            f"{node} has BIOS AC-restore on, but no controllable plug "
+            f"(power_plug={plug_raw or 'not recorded'!r}), so there is no remote way to "
+            f"force the power cycle if it hangs on the way down.")
+    return False, (
+        f"auto-return for {node} is UNKNOWN — no auto_boot_verified fact, no BIOS AC-restore "
+        f"fact, no controllable plug (power_plug={plug_raw or 'not recorded'!r}). Policy: "
+        f"NEVER reboot a node whose auto-return is unknown.")
+
+
+def check_services_enabled(node, required):
+    """Policy check 1. `enabled`, not `active` — active says nothing about next boot."""
+    missing, notes = [], []
+    for svc in required:
+        r = ssh(node, f"systemctl is-enabled {svc} 2>/dev/null || true")
+        verdict = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        if verdict in ("enabled", "enabled-runtime", "static", "indirect", "alias"):
+            notes.append(f"{svc}={verdict}")
+            continue
+        # ssh is packaged as `ssh` on Debian/Ubuntu and `sshd` elsewhere; accept either.
+        if svc == "ssh":
+            r2 = ssh(node, "systemctl is-enabled sshd 2>/dev/null || true")
+            v2 = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else ""
+            if v2 in ("enabled", "enabled-runtime", "static", "indirect", "alias"):
+                notes.append(f"sshd={v2}")
+                continue
+        missing.append(f"{svc}={verdict or 'not-found'}")
+    if missing:
+        return False, (f"not enabled for next boot: {', '.join(missing)}"
+                       + (f" (ok: {', '.join(notes)})" if notes else ""))
+    return True, f"all required services enabled: {', '.join(notes)}"
+
+
+def check_boot_blocking(node):
+    """Policy check 2, delegated to the existing gate, run ON the target node."""
+    if not os.path.exists(BOOT_GATE):
+        return False, f"boot gate script not found at {BOOT_GATE} — cannot prove boot safety"
+    try:
+        push = subprocess.run(
+            ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+             BOOT_GATE, f"{node}:/tmp/lumen_boot_gate.sh"],
+            capture_output=True, text=True, timeout=60)
+        if push.returncode != 0:
+            return False, f"could not copy the boot gate to {node}: {push.stderr.strip()[:200]}"
+        r = ssh(node, "bash /tmp/lumen_boot_gate.sh; rc=$?; rm -f /tmp/lumen_boot_gate.sh; exit $rc",
+                timeout=180)
+    except subprocess.TimeoutExpired:
+        return False, f"boot gate timed out on {node} — treat as unsafe"
+    tail = [l for l in r.stdout.splitlines() if "FAIL" in l or "VERDICT" in l]
+    if r.returncode == 0:
+        return True, "overnight_boot_gate.sh: ALL-PASS"
+    return False, "overnight_boot_gate.sh reported failures: " + "; ".join(tail[:6])
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Pre-reboot boot-safety triple-check (wq#1401). Read-only; never reboots.")
+    ap.add_argument("node", help="fleet node name, as ssh resolves it")
+    ap.add_argument("--require", action="append", default=[],
+                    help="extra service that must be `enabled` (repeatable)")
+    ap.add_argument("--json", action="store_true", help="machine-readable verdict")
+    ap.add_argument("--skip-remote", action="store_true",
+                    help="run only the state-based auto-return check (no ssh to the node)")
+    args = ap.parse_args()
+
+    required = list(DEFAULT_REQUIRED) + args.require
+    checks = []
+
+    ok3, why3 = check_auto_return(args.node)
+    checks.append(("auto_return", ok3, why3))
+
+    if args.skip_remote:
+        checks.append(("services_enabled", None, "skipped (--skip-remote)"))
+        checks.append(("boot_blocking", None, "skipped (--skip-remote)"))
+    else:
+        ok1, why1 = check_services_enabled(args.node, required)
+        checks.append(("services_enabled", ok1, why1))
+        ok2, why2 = check_boot_blocking(args.node)
+        checks.append(("boot_blocking", ok2, why2))
+
+    # A skipped check is not a passed check: --skip-remote can never yield REBOOT-SAFE.
+    passed = all(ok is True for _, ok, _ in checks)
+    verdict = "REBOOT-SAFE" if passed else "DO-NOT-REBOOT"
+
+    if args.json:
+        print(json.dumps({
+            "node": args.node, "verdict": verdict, "reboot_safe": passed,
+            "checks": [{"name": n, "pass": ok, "detail": d} for n, ok, d in checks],
+        }, indent=2))
+    else:
+        print(f"=== reboot gate: {args.node} ===")
+        for name, ok, detail in checks:
+            mark = "PASS" if ok is True else ("SKIP" if ok is None else "FAIL")
+            print(f"  {mark}  {name}: {detail}")
+        print(f"=== VERDICT: {verdict} ===")
+        if not passed:
+            print("  This gate does not reboot anything. It says whether a reboot would be")
+            print("  recoverable. Fix the FAILs above, or do not reboot this node.")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
