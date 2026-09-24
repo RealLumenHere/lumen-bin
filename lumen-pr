@@ -480,11 +480,74 @@ EOF_OVERLAP
 # byte-identical to origin/$DEFAULT_BRANCH, staging the identical ones, and says which. The
 # note is printed here, not inside stage_identical_overlap, because that runs under $(...)
 # and anything it printed would be read back as a path.
+# unstage_identical <tree>  (wq#2063)
+# stage_identical_overlap() runs `git add` BEFORE ff_primary_after_land has decided whether it
+# can move the tree, so every refusal below used to return 1 with the index already mutated: a
+# path the operator left as a clean untracked file came back as a staged `A ` entry they never
+# created. Follow lumen-pr's own printed remedy and delete that file and the entry becomes `AD`,
+# which then overlaps the ff forever and re-refuses with a message about a path the operator
+# cannot see any more. A refusal must leave the tree exactly as it found it.
+unstage_identical() {
+  local t="$1" path
+  [ -n "$STAGED_IDENTICAL" ] || return 0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    git -C "$t" reset -q HEAD -- "$path" 2>/dev/null || true
+  done <<EOF_UNSTAGE
+$STAGED_IDENTICAL
+EOF_UNSTAGE
+  note "wq#2063: refusal is side-effect-free — unstaged the byte-identical path(s) staged above"
+  STAGED_IDENTICAL=""
+}
+
+# verify_ff_restored <tree> <old_rev>  (wq#2063)
+# A `git merge --ff-only` / `git reset --keep` that returns 0 is NOT proof that every file the
+# move carried is on disk: git updates HEAD and the index, and skips materialising a path whose
+# index entry already matches the target blob. wq#2063 saw a land print "fast-forwarded 1
+# commit(s)" while two of seven new files were absent from the working tree, showing ` D`. A
+# silent success-that-wasn't is worse than the refusal it replaced (same class as wq#771/wq#792,
+# which land's own refusal message already cites), so prove the restore instead of assuming it.
+#
+# Scoped to paths the move itself touched, so an operator's own pre-existing deletion elsewhere
+# is not swept up: a deleted tracked path that overlapped the incoming commits would have been
+# refused above, and one that did not overlap is not in the moved set.
+verify_ff_restored() {
+  local t="$1" old="$2" moved gone missing
+  moved=$(git -C "$t" -c core.quotePath=false diff --name-only "$old" HEAD 2>/dev/null \
+            | LC_ALL=C sort -u)
+  [ -n "$moved" ] || return 0
+  gone=$(git -C "$t" -c core.quotePath=false diff --name-only --diff-filter=D HEAD 2>/dev/null \
+            | LC_ALL=C sort -u)
+  [ -n "$gone" ] || return 0
+  missing=$(LC_ALL=C comm -12 <(printf '%s\n' "$gone") <(printf '%s\n' "$moved") | grep -v '^$')
+  [ -n "$missing" ] || return 0
+  note "wq#2063: the move touched $(printf '%s\n' "$missing" | grep -c .) path(s) that are NOT on disk after it —"
+  printf '%s\n' "$missing" | sed 's/^/    /'
+  note "  git reported success but the working tree is missing them; restoring from HEAD"
+  # shellcheck disable=SC2086
+  if git -C "$t" checkout HEAD -- $(printf '%s ' $missing) 2>/dev/null; then
+    local still
+    still=$(git -C "$t" -c core.quotePath=false diff --name-only --diff-filter=D HEAD 2>/dev/null \
+              | LC_ALL=C sort -u)
+    still=$(LC_ALL=C comm -12 <(printf '%s\n' "$still") <(printf '%s\n' "$moved") | grep -v '^$')
+    if [ -z "$still" ]; then
+      note "wq#2063: restored — every path the move touched now matches HEAD on disk"
+      return 0
+    fi
+  fi
+  note "wq#2063: RESTORE FAILED — these paths are in HEAD but not on disk, fix by hand:"
+  printf '%s\n' "$missing" | sed "s|^|    git -C $t checkout HEAD -- |"
+  return 1
+}
+
 drop_identical_overlap() {
   local t="$1" rest staged
   [ -n "$overlap" ] || return 0
   rest=$(stage_identical_overlap "$t" "origin/$DEFAULT_BRANCH" "$overlap")
-  staged=$(LC_ALL=C comm -23 <(printf '%s\n' "$overlap") <(printf '%s\n' "$rest") | grep -v '^$' | tr '\n' ' ')
+  # wq#2063: stage_identical_overlap runs inside a command substitution, i.e. a subshell, so it
+  # cannot record this itself — the parent shell has to derive it from the set difference.
+  STAGED_IDENTICAL=$(LC_ALL=C comm -23 <(printf '%s\n' "$overlap") <(printf '%s\n' "$rest") | grep -v '^$')
+  staged=$(printf '%s\n' "$STAGED_IDENTICAL" | grep -v '^$' | tr '\n' ' ')
   [ -z "$staged" ] || note "wq#1490: uncommitted in $t but already byte-identical to origin/$DEFAULT_BRANCH — staged, no file changed: $staged"
   overlap="$rest"
 }
@@ -543,6 +606,8 @@ unpushed_are_upstream_equivalent() {
 # shared, and parking it elsewhere is someone's deliberate act. Returns 0 on ff or already
 # current, 1 otherwise; callers in land treat 1 as "merged, primary needs a hand", not a die.
 ff_primary_after_land() {
+  # wq#2063: paths staged by drop_identical_overlap, so a refusal can put them back.
+  STAGED_IDENTICAL=""
   local tree="$1" landed="${2:-}" cur p f ahead behind incoming overlap n err
   [ -d "$tree" ] || { note "primary $tree NOT fast-forwarded: directory does not exist"; return 1; }
   git -C "$tree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -624,9 +689,13 @@ ff_primary_after_land() {
         note "primary $tree NOT re-pointed: its $ahead local commit(s) are $proof, but $n uncommitted path(s) there overlap the re-point:"
         printf '%s\n' "$overlap" | sed 's/^/    /'
         note "  commit or discard them (git -C $tree status --short), then: lumen-pr ffprimary $tree"
+        unstage_identical "$tree"
         return 1
       fi
+      local pre_move
+      pre_move=$(git -C "$tree" rev-parse HEAD 2>/dev/null)
       if err=$(git -C "$tree" reset --keep "origin/$DEFAULT_BRANCH" 2>&1); then
+        verify_ff_restored "$tree" "$pre_move" || return 1
         note "primary $tree re-pointed to origin/$DEFAULT_BRANCH ($(git -C "$tree" rev-parse --short HEAD)): its $ahead local commit(s) are $proof"
         return 0
       fi
@@ -636,6 +705,7 @@ ff_primary_after_land() {
     note "primary $tree NOT fast-forwarded: local $DEFAULT_BRANCH has $ahead commit(s) origin does not (diverged, wq#792):"
     git -C "$tree" log --oneline "origin/$DEFAULT_BRANCH..$DEFAULT_BRANCH" 2>/dev/null | sed 's/^/    /'
     note "  push them (git -C $tree push origin $DEFAULT_BRANCH) or land them as their own PR, then: lumen-pr ffprimary $tree"
+    unstage_identical "$tree"
     return 1
   fi
   behind=$(git -C "$tree" rev-list --count "$DEFAULT_BRANCH..origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)
@@ -655,15 +725,20 @@ ff_primary_after_land() {
     note "primary $tree NOT fast-forwarded: $n uncommitted path(s) there overlap the $behind incoming commit(s):"
     printf '%s\n' "$overlap" | sed 's/^/    /'
     note "  commit or discard them (git -C $tree status --short), then: lumen-pr ffprimary $tree"
+    unstage_identical "$tree"
     return 1
   fi
+  local pre_ff
+  pre_ff=$(git -C "$tree" rev-parse HEAD 2>/dev/null)
   if err=$(git -C "$tree" merge --ff-only "origin/$DEFAULT_BRANCH" -q 2>&1); then
+    verify_ff_restored "$tree" "$pre_ff" || return 1
     note "primary $tree fast-forwarded $behind commit(s) to $(git -C "$tree" rev-parse --short HEAD)"
     return 0
   fi
   note "primary $tree NOT fast-forwarded: git merge --ff-only origin/$DEFAULT_BRANCH failed:"
   printf '%s\n' "${err:-(git printed nothing)}" | sed 's/^/    /'
   note "  fix the cause above, then: lumen-pr ffprimary $tree"
+  unstage_identical "$tree"
   return 1
 }
 
