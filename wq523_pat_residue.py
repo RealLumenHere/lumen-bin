@@ -23,7 +23,14 @@ token literal that is not one of the four canonical homes or a verified false po
 """
 import os, re, sys, json, stat, shutil, hashlib, subprocess, datetime, fnmatch
 
-PAT = re.compile(rb'ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,}')
+# wq#2480: brought to parity with the token-engine broker's MASK_PATTERNS (ghp_/gho_/ghu_/
+# ghs_/ghr_) and read_dir_sweep.py's full union (foreman/harness/read_dir_sweep.py:114-115,
+# wq#2114/PR#897) which additionally covers glpat-. The three scanners disagreed on which
+# prefixes count as a token; this is the redaction tool, so it stays narrow (still only the
+# GH/GL PAT shapes, not read_dir_sweep's general secret classes like sk-/AKIA/slack).
+PAT = re.compile(rb'ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9]{30,}|'
+                  rb'ghs_[A-Za-z0-9]{30,}|ghr_[A-Za-z0-9]{30,}|ghu_[A-Za-z0-9]{30,}|'
+                  rb'glpat-[A-Za-z0-9_-]{20,}')
 APPLY = "--apply" in sys.argv
 TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 # wq#1029: pre-redaction backups used to live at /home/lumen/backups/wq523_pre_redaction_*
