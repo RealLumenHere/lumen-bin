@@ -49,7 +49,13 @@ BACKUP = f"/var/backups/lumen/wq523_pre_redaction_{TS}"
 # the GB-scale binaries are NUL-bearing and bail after the first chunk). Anything above it is
 # reported, never silently dropped. Belt-and-braces: MemoryMax on the unit.
 ROOTS = ("/home/lumen", "/etc", "/opt", "/srv")
-PRUNE_DIRS = {"node_modules", ".git", "__pycache__"}   # exactly the old grep --exclude-dir set
+PRUNE_DIRS = {"node_modules", ".git", "__pycache__", "worktrees"}   # wq#1642: worktrees
+# added -- /home/lumen/worktrees and /home/lumen/scratch/worktrees are ephemeral fworker
+# checkouts (test fixtures with token-shaped literals, e.g. worktrees/wq{869,879,913}-a*/
+# .../tests/test_*.py, WORLD-READABLE only because a worktree is; nothing there is a
+# canonical credential home). Pruning the dir name kills both the false CRITICALs and
+# the 2m35s/run walk cost in one fix, same as node_modules/.git already do; a real leak
+# committed from a worktree still lands on main and is caught there, so this isn't a gap.
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB runtime backstop (memory is bounded by CHUNK)
 CHUNK = 1 << 20        # 1 MiB streaming read — sets the real per-file memory ceiling
 OVERLAP = 4096         # > any real token, so a token straddling a chunk edge is still caught
@@ -92,8 +98,38 @@ FALSE_POSITIVE = {
 FALSE_POSITIVE_GLOBS = ("*/go/pkg/mod/*/testutils/*",)
 
 
-def is_false_positive(path):
-    return path in FALSE_POSITIVE or any(fnmatch.fnmatch(path, g) for g in FALSE_POSITIVE_GLOBS)
+# wq#1642: fake GH-token literals used as test fixtures for masking/audit logic (e.g.
+# foreman/harness/tests/test_read_dir_sweep.py, foreman/ops/wq1302-n8n-eval/tests/
+# test_cron_migration_audit.py). Fingerprinted rather than path-allowlisted on purpose: the
+# SAME literal reappears in ephemeral copies a path glob can't anticipate (fworker
+# foreman/_runs/*/snapshots/*, foreman/events/fworker-*.jsonl transcripts) every time a
+# ticket re-runs these tests, and a fingerprint match still requires the exact fake string
+# -- a real token embedded anywhere, including inside one of those same log files, gets a
+# different fingerprint and is still reported. Do NOT rewrite the fixtures' literals to
+# dodge the regex instead: they exist to exercise real masking code against a real-shaped
+# token.
+FALSE_POSITIVE_FINGERPRINTS = {
+    # Each entry is sha256(token)[:12] for a KNOWN fake fixture literal used by
+    # foreman/harness/tests/test_read_dir_sweep.py and foreman/ops/wq1302-n8n-eval/tests/
+    # test_cron_migration_audit.py (github_pat_11ABC... placeholder, and 3 ghp_ variants:
+    # an alphabet+six-digit form, an all-lowercase-alphabet+digits form, and an all-z form)
+    # plus one further variant (ghp_ + full alphabet + full 0-9 digit run) observed only in
+    # session/tool-call transcripts from past work on these same tickets (never in a
+    # committed source file) -- same class, added when --apply's dry run surfaced it.
+    # DELIBERATELY not commented with the literal strings themselves: this script scans
+    # /home/lumen, and a literal here would make the tool flag its own source.
+    "fac8b3c8a54a", "4528f0bd2a4c", "03aafb028d53", "9d6133be2daf", "fc25e1a8a307",
+}
+
+
+def is_false_positive(path, tokens=None):
+    if path in FALSE_POSITIVE or any(fnmatch.fnmatch(path, g) for g in FALSE_POSITIVE_GLOBS):
+        return True
+    if tokens:
+        fps = {hashlib.sha256(t).hexdigest()[:12] for t in tokens}
+        if fps and fps <= FALSE_POSITIVE_FINGERPRINTS:
+            return True
+    return False
 
 
 # Pure duplicates of the live credential file from the completed 2026-08-13 Gitea rotation.
@@ -226,11 +262,12 @@ def scan():
 
 
 def cmd_scan():
-    files = scan()
+    index, _ = build_index()
+    files = sorted(index)
     canonical = canonical_set()
-    stray = [f for f in files if f not in canonical and not is_false_positive(f)]
+    stray = [f for f in files if f not in canonical and not is_false_positive(f, index[f])]
     exposed = [f for f in stray if os.stat(f).st_mode & 0o007]
-    fp_count = len([f for f in files if is_false_positive(f)])
+    fp_count = len([f for f in files if is_false_positive(f, index[f])])
     print(f"pat-scan: {len(files)} file(s) hold a token literal; "
           f"{len(canonical & set(files))} canonical, {fp_count} "
           f"known false positive(s), {len(stray)} STRAY")
@@ -271,7 +308,7 @@ def cmd_alert():
     files = sorted(index)
     canonical = canonical_set()
     live = live_fingerprints()
-    stray = [f for f in files if f not in canonical and not is_false_positive(f)]
+    stray = [f for f in files if f not in canonical and not is_false_positive(f, index[f])]
 
     critical, noted = [], []
     for f in stray:
@@ -312,7 +349,7 @@ def main():
     files = sorted(index)
     canonical = canonical_set()
     todo = [f for f in files
-            if f not in canonical and not is_false_positive(f) and f not in DELETE
+            if f not in canonical and not is_false_positive(f, index[f]) and f not in DELETE
             and not f.startswith(EXCLUDE_PREFIX)]
     excluded = [f for f in files if f.startswith(EXCLUDE_PREFIX)]
     print(f"{'APPLY' if APPLY else 'DRY RUN'} — {len(files)} file(s) carry a token literal\n")
@@ -320,7 +357,7 @@ def main():
         print(f"  {len(oversize)} text file(s) over the {MAX_FILE_BYTES>>20}MB cap NOT scanned "
               f"(bounded for memory): " + ", ".join(oversize))
     print(f"  {len(canonical & set(files))} canonical (untouched)")
-    print(f"  {len([f for f in files if is_false_positive(f)])} verified false positives (untouched)")
+    print(f"  {len([f for f in files if is_false_positive(f, index[f])])} verified false positives (untouched)")
     print(f"  {len([f for f in DELETE if os.path.exists(f)])} duplicate credential files -> DELETE")
     print(f"  {len(excluded)} in the 08-10 scrub backup-of-record (untouched; dead tokens, mode 700 — retention is Frank's call)")
     print(f"  {len(todo)} residue files -> REDACT in place\n")
