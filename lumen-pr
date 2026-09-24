@@ -157,7 +157,10 @@ broker() { # broker <verb> [argv-after-repo]... — response fields into BROKER_
   if [ -z "$BROKER_RULE" ]; then
     # not a broker frame at all — socket down, client missing, python error
     BROKER_RULE="client_error"
-    BROKER_REASON=$(printf '%s' "$out" | head -c 300)
+    # tail, not head: a python traceback puts the exception on its LAST line, and head -c 300
+    # kept only the frames above it (wq#2475: a PermissionError on /run/token-engine read as
+    # a bare "Traceback ...").
+    BROKER_REASON=$(printf '%s' "$out" | tail -n 3 | head -c 300)
   fi
   return $rc
 }
