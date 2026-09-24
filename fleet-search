@@ -33,6 +33,9 @@ PROJECTS = "/home/lumen/projects"
 CACHE_TTL_DEFAULT = 14 * 86400          # 14 days for volatile web
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 HTTP_TIMEOUT = 20
+CHROMIUM_BIN = "/usr/bin/chromium"
+FLARESOLVERR_BASE = os.environ.get("FLEET_FLARESOLVERR_BASE", "http://127.0.0.1:8191")
+RETRY_STATUSES = (403, 429, 503)          # rungs escalate only on these; 404 etc. is a real answer
 
 
 def _env_token(key):
@@ -131,7 +134,8 @@ def cache_store(project, kind, query, n, results):
         with open(path, "a") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         # append a compact discovery line to PRIOR_ART.md so future agents don't re-search
-        if project and results:
+        # (skipped for non-list results, e.g. a single `read` payload dict)
+        if project and results and isinstance(results, list):
             _append_prior_art(prior, kind, query, results)
     except OSError:
         pass                          # cache is best-effort; never fail the search on it
@@ -445,11 +449,96 @@ def _reddit_comment_tree(html, max_comments=40):
     return out
 
 
+def _fetch_cffi_chrome(url, timeout=HTTP_TIMEOUT):
+    """Rung 2: browser-consistent Chrome request via a TLS-impersonating client.
+    A Firefox UA over stock Python TLS is a fingerprint mismatch any WAF reads
+    instantly; curl_cffi's impersonate=chrome matches TLS + header order + Sec-CH-UA.
+    Returns (status, body, final_url), or None if curl_cffi is not installed."""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return None
+    try:
+        r = cffi_requests.get(url, impersonate="chrome", timeout=timeout)
+        return r.status_code, r.content, str(r.url)
+    except Exception as e:                # network/TLS errors must not crash the ladder
+        return 0, str(e).encode(), url
+
+
+def _fetch_chromium(url, timeout=HTTP_TIMEOUT):
+    """Rung 3: render with headless Chromium and dump the DOM (covers JS-rendered/
+    challenge-interstitial pages rungs 1-2 can't execute). Hands the DOM to the
+    same trafilatura extraction path as a normal fetch.
+    Returns (status, body, final_url), or None if the binary is absent."""
+    if not os.path.exists(CHROMIUM_BIN):
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            [CHROMIUM_BIN, "--headless=new", "--disable-gpu", "--no-sandbox",
+             "--disable-dev-shm-usage", "--dump-dom", url],
+            capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 0, b"chromium render timed out", url
+    except OSError as e:
+        return 0, str(e).encode(), url
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0, (r.stderr or b"chromium produced no DOM")[:200], url
+    return 200, r.stdout, url
+
+
+def _fetch_flaresolverr(url, timeout=HTTP_TIMEOUT):
+    """Rung 4 (optional): hand the URL to a local FlareSolverr instance for a real
+    Turnstile/JS challenge solve (sibling wq#2482). Returns (status, body, final_url),
+    or None if the service is absent/unreachable — a missing rung 4 degrades to
+    ok:false, it never crashes the ladder."""
+    payload = json.dumps({"cmd": "request.get", "url": url,
+                          "maxTimeout": timeout * 1000}).encode()
+    req = urllib.request.Request(
+        FLARESOLVERR_BASE.rstrip("/") + "/v1", data=payload,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+        return None                       # service absent/unreachable, not a crash
+    solution = data.get("solution") or {}
+    status = solution.get("status", 0)
+    if not status:
+        return None
+    body = (solution.get("response") or "").encode("utf-8", "replace")
+    return status, body, solution.get("url", url)
+
+
+def _fetch_ladder(url):
+    """Ordered fetch ladder for `url`. Each rung is tried ONLY if the previous one
+    came back 403/429/503 — a 404 (or any other real answer) stops the ladder right
+    there. Rungs 2-4 are skipped (not attempted) if their dependency is unavailable,
+    never crash the ladder. Returns (status, body, final_url, tier) — tier says which
+    rung produced the returned result, for measuring which rung actually serves."""
+    rungs = (
+        (1, lambda: _get(url)),                 # unchanged Firefox-UA urllib GET
+        (2, lambda: _fetch_cffi_chrome(url)),
+        (3, lambda: _fetch_chromium(url)),
+        (4, lambda: _fetch_flaresolverr(url)),
+    )
+    last = None
+    for tier, fn in rungs:
+        result = fn()
+        if result is None:
+            continue                            # rung unavailable — try the next one
+        last = (*result, tier)
+        if last[0] not in RETRY_STATUSES:
+            return last
+    return last                                 # rung 1 always returns, so never None
+
+
 def _fetch_and_extract(url):
-    """Fetch a URL (old.reddit-aware) and extract content + comments. Fail-soft.
-    Returns (payload_dict, err_dict) — exactly one is non-None.
-      payload = {"content","comments","comment_count","url","http","bytes"}
-      err     = {"error","url",...}  (splat into envelope(..., False, **err))
+    """Fetch a URL (old.reddit-aware) via the tiered fetch ladder and extract
+    content + comments. Fail-soft. Returns (payload_dict, err_dict) — exactly one
+    is non-None.
+      payload = {"content","comments","comment_count","url","http","bytes","tier"}
+      err     = {"error","url","tier",...}  (splat into envelope(..., False, **err))
     Reused by both `cmd_read` and reddit `--deep` so there is ONE crawl/extract path."""
     is_reddit = "reddit.com" in url
     fetch_url = url
@@ -459,14 +548,18 @@ def _fetch_and_extract(url):
             "://reddit.com", "://old.reddit.com")
         if fetch_url.endswith(".json"):
             fetch_url = fetch_url[:-5]
-    status, body, final = _get(fetch_url)
+    status, body, final, tier = _fetch_ladder(fetch_url)
     if status == 0:
-        return None, {"error": f"fetch failed: {body[:200].decode('utf-8','replace')}", "url": fetch_url}
-    if status == 403:
-        hint = " (reddit blocks datacenter IPs / .json since 2026-05-30; old.reddit HTML needed)" if is_reddit else ""
-        return None, {"error": f"http 403 blocked{hint}", "url": fetch_url}
+        return None, {"error": f"fetch failed: {body[:200].decode('utf-8','replace')}",
+                      "url": fetch_url, "tier": tier}
+    if status in RETRY_STATUSES:
+        hint = ""
+        if is_reddit and status == 403:
+            hint = " (reddit blocks datacenter IPs / .json since 2026-05-30; old.reddit HTML needed)"
+        return None, {"error": f"http {status} blocked after ladder exhausted at tier {tier}{hint}",
+                      "url": fetch_url, "tier": tier}
     if status != 200:
-        return None, {"error": f"http {status}", "url": fetch_url}
+        return None, {"error": f"http {status}", "url": fetch_url, "tier": tier}
     html = body.decode("utf-8", "replace")
 
     content, comments = None, []
@@ -485,18 +578,29 @@ def _fetch_and_extract(url):
 
     if not content and not comments:
         return None, {"error": "fetched OK but extracted no content/comments",
-                      "url": fetch_url, "http": status, "bytes": len(body)}
+                      "url": fetch_url, "http": status, "bytes": len(body), "tier": tier}
     return ({"content": content or "", "comments": comments, "comment_count": len(comments),
-             "url": fetch_url, "http": status, "bytes": len(body)}, None)
+             "url": fetch_url, "http": status, "bytes": len(body), "tier": tier}, None)
 
 
 def cmd_read(args):
+    kind = "read"
+    if not args.no_cache:
+        hit = cache_lookup(args.project, kind, args.url, 0, args.ttl)
+        if hit:
+            payload = hit["results"]
+            emit(envelope("read", True,
+                          {"content": payload["content"], "comments": payload["comments"],
+                           "comment_count": payload["comment_count"], "tier": payload.get("tier")},
+                          url=payload["url"], http=payload["http"], bytes=payload["bytes"],
+                          cached=True, cached_at=hit.get("iso")))
     payload, err = _fetch_and_extract(args.url)
     if err:
         emit(envelope("read", False, **err))
+    cache_store(args.project, kind, args.url, 0, payload)
     emit(envelope("read", True,
                   {"content": payload["content"], "comments": payload["comments"],
-                   "comment_count": payload["comment_count"]},
+                   "comment_count": payload["comment_count"], "tier": payload["tier"]},
                   url=payload["url"], http=payload["http"], bytes=payload["bytes"], cached=False))
 
 
