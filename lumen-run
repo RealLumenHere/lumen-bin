@@ -106,7 +106,7 @@ case "$cmd" in
   status)
     unit="${1:?unit required}"
     if systemctl is-active --quiet "$unit"; then echo "RUNNING"; exit 0; fi
-    line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -a 'LUMEN_JOB_EXIT=' | tail -1 || true)
+    line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -aE '^LUMEN_JOB_EXIT=[0-9]+$' | tail -1 || true)
     if [ -n "$line" ]; then
       rc="${line##*LUMEN_JOB_EXIT=}"
       [ "$rc" = "0" ] && echo "DONE:0" || echo "FAILED:${rc}"
@@ -123,7 +123,7 @@ case "$cmd" in
       sleep 3; waited=$((waited+3))
       [ "$waited" -ge "$budget" ] && { echo "TIMEOUT after ${budget}s (still RUNNING)"; exit 124; }
     done
-    line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -a 'LUMEN_JOB_EXIT=' | tail -1 || true)
+    line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -aE '^LUMEN_JOB_EXIT=[0-9]+$' | tail -1 || true)
     rc="${line##*LUMEN_JOB_EXIT=}"; [ -n "$line" ] || rc="?"
     [ "$rc" = "0" ] && echo "DONE:0" || echo "FAILED:${rc}"
     ;;
