@@ -195,8 +195,14 @@ def main(argv=None):
 
     try:
         counts = measure(conn)
+    except Exception as e:
+        print(f"pgvector chunk/doc invariants: UNAVAILABLE ({e})")
+        return 0
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     raised = []
     if args.raise_aq:

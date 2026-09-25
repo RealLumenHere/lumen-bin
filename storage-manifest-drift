@@ -44,6 +44,13 @@ CONNECT_TIMEOUT_S = 6
 SURVEY_TIMEOUT_S = 40
 FLEET_MAP_MAX_LAG_DAYS = 2
 FLEET_MAP_IP_PREDICATES = ("tailscale_ip", "lan_ip")
+# Prefixes of a `status` value that mean the subject is gone, not merely down.
+# OFFLINE/inactive are deliberately absent: a node that is off still belongs on
+# the roster. A retired subject's last IP stays open in the store forever —
+# nothing ever supersedes a fact about hardware that no longer exists — so
+# without this the map is asked to re-adopt dead devices on every run.
+FLEET_MAP_RETIRED_STATUS = ("retired", "removed", "superseded", "decommissioned",
+                            "torn-down")
 
 SPLIT = "@@FINDMNT@@"
 BYID_SPLIT = "@@BYID@@"
@@ -312,15 +319,29 @@ def parse_ts(value):
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
+def retired_subjects(conn):
+    return {subject for subject, value in conn.execute(
+        "select subject, value from state_facts "
+        "where valid_to is null and predicate = 'status'")
+        if str(value or "").strip().lower().startswith(FLEET_MAP_RETIRED_STATUS)}
+
+
 def check_fleet_map(map_path, db_path, max_lag_days=FLEET_MAP_MAX_LAG_DAYS):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    newest = conn.execute(
-        "select max(valid_from) from state_facts where valid_to is null").fetchone()[0]
     marks = ",".join("?" * len(FLEET_MAP_IP_PREDICATES))
+    # Scoped to the predicates this check actually reconciles. Against the whole
+    # store the lag measures unrelated churn (wq#1800: the newest open fact was
+    # `fleet-workstream frank_todo_order`), so the map reads stale forever unless
+    # someone touches it every other day.
+    newest = conn.execute(
+        f"select max(valid_from) from state_facts "
+        f"where valid_to is null and predicate in ({marks})",
+        FLEET_MAP_IP_PREDICATES).fetchone()[0]
     ips = conn.execute(
         f"select subject, predicate, value from state_facts "
         f"where valid_to is null and predicate in ({marks}) order by subject, predicate",
         FLEET_MAP_IP_PREDICATES).fetchall()
+    retired = retired_subjects(conn)
     conn.close()
 
     text = open(map_path, encoding="utf-8", errors="replace").read()
@@ -332,8 +353,10 @@ def check_fleet_map(map_path, db_path, max_lag_days=FLEET_MAP_MAX_LAG_DAYS):
         if lag_days > max_lag_days:
             findings.append({"node": "FLEET_MAP.md", "kind": "fleet_map_stale",
                              "key": "mtime", "declared": mtime.isoformat(timespec="seconds"),
-                             "live": f"store newest fact {newest} ({lag_days}d ahead)"})
+                             "live": f"store newest roster fact {newest} ({lag_days}d ahead)"})
     for subject, predicate, value in ips:
+        if subject in retired:
+            continue
         # Store values carry provenance prose: '192.168.8.211 (enp12s0, Lumen LAN — …)'.
         ip = IP_RE.search(value or "")
         if not ip:

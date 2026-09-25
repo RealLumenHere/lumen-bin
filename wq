@@ -1417,6 +1417,49 @@ def cmd_liveness_close(a):
     print(f"liveness-closed wq#{a.id} ({lane}/{st} -> {to}): {verdict[:160]}")
 # --- end wq#1478 helpers ---
 
+# --- wq#2529 liveness grep-invert lint ---
+def _liveness_grep_invert_line(text):
+    """wq#2529: wq#1975 shipped 'Liveness: git show HEAD:<doc> | grep -qv <needle>' — -v
+    inverts the match, so the probe succeeds as soon as ANY line lacks the needle and can
+    never go false (the ticket could never self-close). Returns the offending Liveness:
+    line, or None. Flags any grep invocation whose short-opt cluster carries 'v' (-v,
+    -qv, -vq, -Ev, ...) or the --invert-match long form; a plain 'v' inside an unrelated
+    long option (e.g. --version) does not count."""
+    for line in (text or "").splitlines():
+        if "Liveness:" not in line:
+            continue
+        tokens = line.split()
+        for i, tok in enumerate(tokens):
+            if tok != "grep" and not tok.endswith("/grep"):
+                continue
+            for nxt in tokens[i + 1:]:
+                if nxt in ("|", ";", "&&"):
+                    break
+                if nxt.startswith("--"):
+                    if nxt == "--invert-match":
+                        return line
+                    continue
+                if nxt.startswith("-") and "v" in nxt[1:]:
+                    return line
+    return None
+
+def _reject_liveness_grep_invert(text):
+    """wq#2529: hard-refuse (no --force) a Liveness: line whose grep uses -v/-qv/-vq —
+    the fix is always grep -q (or grep -c/-L), never grep -v, for a probe that must be
+    able to go both true and false as the underlying condition changes."""
+    bad = _liveness_grep_invert_line(text)
+    if bad is None:
+        return
+    eprint(f"REFUSED: wq#2529 — Liveness: line uses grep -v (inverted match), which is "
+           f"true whenever ANY line lacks the needle and can never go false:")
+    eprint(f"  {bad.strip()}")
+    eprint("  Fix: drop the -v. Use 'grep -q <needle>' if the probe should go true once "
+           "the needle IS present, or restructure with 'grep -qL <needle>' / a negated "
+           "'! grep -q' if it should go true once the needle is ABSENT. grep -v/-qv/-vq "
+           "is never the right shape for a Liveness: probe.")
+    sys.exit(1)
+# --- end wq#2529 helpers ---
+
 def cmd_add(a):
     subs = parse_subs(a.subsystems)
     # wq#1675: validate on the BASE — ':ro'/':rw' is a mode, not new vocabulary.
@@ -1482,6 +1525,10 @@ def cmd_add(a):
     frank_gated = getattr(a, "frank_gated", False)
     gate_type = getattr(a, "gate_type", None) or ("frank_decision" if frank_gated else None)
     init_status = "frank_gated" if frank_gated else "open"
+    # wq#2529: liveness grep-invert lint — refuse before the on-ramp check below ever
+    # gets to persist a probe that can never go false (wq#1975's bug, now a hard gate)
+    _reject_liveness_grep_invert(
+        (a.detail or "") + (("\nLiveness: " + a.liveness) if getattr(a, "liveness", None) else ""))
     # wq#1478: creation gate — a Frank-gate whose premise is already met is not filed;
     # wq#1676: one with no Liveness: line at all is refused unless --no-probe/--accept-probe
     a.detail = _liveness_creation_check(a.title, a.detail, a.lane, frank_gated, force=a.force, verb="add",
@@ -3090,6 +3137,10 @@ def cmd_edit(a):
             a.lane, needs_val if needs_val is not None else cur[1],
             a.detail if a.detail is not None else cur[0], a.force,
             a.title if a.title is not None else cur[2])
+    # wq#2529: liveness grep-invert lint (edit) — same guard as `wq add`, applied to any
+    # --detail that carries (or edits) a Liveness: line
+    if a.detail is not None:
+        _reject_liveness_grep_invert(a.detail)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
@@ -3336,7 +3387,12 @@ FENCE_HELP = ("wq#1158: the fence token `wq claim` printed as FENCE=<n>. Refuses
               "the ticket has been claimed again since — pass it and a resumed session is inert")
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd")
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=int,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_add)
+def _pri(v):
+    "wq: accept both int (2) and pN (p2) priority forms (backward-compat)"
+    v=str(v).strip()
+    if v[:1] in ("p","P"): v=v[1:]
+    return int(v)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=_pri,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.add_argument("--eval",action="store_true",help="wq#1720: with --register, print ONLY 'export WQ_AGENT=...' on stdout (everything else to stderr) — for eval \"$(wq whoami --register <name> --eval)\""); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
@@ -3351,7 +3407,7 @@ s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, a
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.add_argument("--json",action="store_true",help="wq#1277: emit the row as a single JSON object — safe for multi-line detail fields; plain text truncates/mis-parses embedded newlines"); s.set_defaults(f=cmd_show)
-s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=int); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.add_argument("--force",action="store_true",help="wq#2139: file the lane even with no LANE_REPO row and no needs repo(...) tag (noted on the ticket)"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=_pri); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.add_argument("--force",action="store_true",help="wq#2139: file the lane even with no LANE_REPO row and no needs repo(...) tag (noted on the ticket)"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("note",help="wq#1331: APPEND one timestamped line to notes (never overwrites)"); s.add_argument("id",type=int); s.add_argument("text"); s.set_defaults(f=cmd_note)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: required to retire a fworker-wq<id> per-ticket identity — confirms you mean to permanently poison future spawns of that ticket, not just clear a stale claim (use `wq release --dead-worker` for that instead)"); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)

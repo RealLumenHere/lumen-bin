@@ -12,14 +12,17 @@ when `evidence_age > COALESCE(fact.verify_interval_days, registry predicate
 interval, class default)` (status 3d, config 14d, identity 90d). Probes run
 batched per node, never per fact.
 
-Reconciliation contract (§3.2, §3.4), owned here because wq#1608's
-reconfirm-on-match reconciler had not landed at write time:
+Reconciliation contract (§3.2, §3.4): NOT owned here (wq#2053). reconcile()
+reports what a probe saw to lumen_state.report_observation() (wq#1608) and
+lets the real ingest() decide, so every write keeps the store invariants
+(lifecycle-closed gate, canonical predicate, out-of-order guard, memory_audit
+trail):
   match     -> reconfirmed: bump last_confirmed_at, clear contradicted_at.
   mismatch  -> superseded: close the old fact, open a new observed one --
                UNLESS the open fact is `frank_stated`, which is never
                auto-superseded. That case writes a `fact_verifications` row
                with outcome=unknown and files an aq row for a human.
-  error/absent -> unknown. Never mutates the fact (fail-open).
+  error/absent/refused-by-the-gate -> unknown. Never mutates the fact (fail-open).
 
   lumen_verify.py sweep [--db PATH] [--registry PATH] [--dry-run] [--json]
   lumen_verify.py sweep --now ISO8601   # deterministic for tests
@@ -40,6 +43,7 @@ MINERVA_DB = os.environ.get("MINERVA_DB", "/home/lumen/minerva/minerva.db")
 REGISTRY_PATH = os.environ.get(
     "PREDICATE_REGISTRY", "/home/lumen/minerva/verify/registry.yaml"
 )
+MINERVA_DIR = os.environ.get("MINERVA_DIR", "/home/lumen/minerva")
 AQ = "/home/lumen/bin/aq"
 WQ = "/home/lumen/bin/wq"
 
@@ -190,23 +194,60 @@ def probe_tailscale_ip(subject, facts):
             for f in facts}
 
 
+SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+IPV4_RE = re.compile(r"\binet (\d{1,3}(?:\.\d{1,3}){3})/")
+
+
 def probe_fleet_inventory(subject, facts):
-    rc, out, err = run(["fleet-inv", "get", subject, "--json"])
-    if rc != 0:
-        return {(subject, f["predicate"]): (None, f"fleet-inv rc={rc}: {err[:120]}")
-                for f in facts}
-    try:
-        data = json.loads(out)
-    except ValueError as e:
-        return {(subject, f["predicate"]): (None, f"fleet-inv non-json: {e}")
-                for f in facts}
+    """`lan_ip` and `ssh_user`, observed on the node itself (wq#2150).
+
+    This probe used to run `fleet-inv get <subject> --json`, which fleet-inv
+    rejects (rc=2), so every fact came back unknown. The obvious repair -- read
+    `fleet-inv get <subject> network.lan_ip` -- would be worse than the bug:
+    fleet-inv reads network.lan_ip / ssh.user LIVE FROM state_facts (its YAML is
+    only a fallback), so it would hand the store's own value back and every
+    sweep would 'confirm' it, bumping last_confirmed_at with no evidence
+    (MINERVA_STALENESS_REVIEW.md 3.2: a probe must observe, not re-read). So the
+    node is asked instead, and only an observation that matches confirms:
+      lan_ip   the fact value is one of the node's IPv4 addresses (`ip -o -4 addr`)
+      ssh_user a BatchMode login as that user succeeds
+    Anything else, including a mismatch, is unknown: a multi-homed node's other
+    address is not proof the LAN address changed. `power_plug` has no
+    independent observation (plug-ctl labels are dated observations, fleet-inv's
+    plug binding is declared) and is no longer assigned to this probe.
+    """
     result = {}
+    addresses = None
     for f in facts:
-        val = data.get(f["predicate"])
-        result[(subject, f["predicate"])] = (
-            (str(val) if val is not None else None),
-            None if val is not None else f"{f['predicate']} absent from fleet-inv",
-        )
+        key = (subject, f["predicate"])
+        if f["predicate"] == "lan_ip":
+            if addresses is None:
+                argv = ["ip", "-o", "-4", "addr", "show"]
+                rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
+                addresses = (None, f"ssh {subject}: {err[:120] or 'rc=%s' % rc}") if rc != 0 \
+                    else (IPV4_RE.findall(out), None)
+            found, why = addresses
+            if found is None:
+                result[key] = (None, why)
+            elif f["value"] in found:
+                result[key] = (f["value"], None)
+            else:
+                result[key] = (None, f"{f['value']} not among {subject} addresses {found}")
+        elif f["predicate"] == "ssh_user":
+            user = f["value"]
+            if not SSH_USER_RE.fullmatch(user or ""):
+                result[key] = (None, f"value {(user or '')[:40]!r} is not a login name")
+            elif subject == "lumen":
+                rc, out, err = run(["id", "-un"])
+                result[key] = (user, None) if rc == 0 and out.strip() == user else (
+                    None, f"local user is {out.strip() or 'unknown'!r}")
+            else:
+                rc, out, err = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                    "-l", user, subject, "--", "true"])
+                result[key] = (user, None) if rc == 0 else (
+                    None, f"ssh -l {user} {subject}: rc={rc} {err[:100]}")
+        else:
+            result[key] = (None, f"fleet_inventory cannot observe {f['predicate']}")
     return result
 
 
@@ -215,54 +256,131 @@ def _ssh_argv(node, remote_argv):
             node, "--", *remote_argv]
 
 
+UNIT_NAME_RE = re.compile(
+    r"[A-Za-z0-9:_.@\\-]+\.(service|socket|timer|mount|path|target)"
+)
+
+
 def probe_service_state(subject, facts):
+    """A `status` / `*_status` fact holds free text (RESTORED, healthy, ...), not
+    a unit name, so `systemctl is-active <value>` reports "inactive" for a
+    non-unit and the sweep wrote that over the real value (wq#2192). Only a
+    value that IS a unit name is probed, and an active unit confirms the fact
+    (observed == value); anything else is unknown, never a new value.
+    """
     result = {}
     for f in facts:
+        key = (subject, f["predicate"])
         unit = f["value"]
+        if not UNIT_NAME_RE.fullmatch(unit or ""):
+            result[key] = (None, f"value {unit[:40]!r} is not a systemd unit name")
+            continue
         argv = ["systemctl", "is-active", unit]
         rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
         out = out.strip()
         if rc in (255, 99):
-            result[(subject, f["predicate"])] = (None, f"ssh {subject}: {err[:120]}")
-        elif out:
-            result[(subject, f["predicate"])] = (out, None)
+            result[key] = (None, f"ssh {subject}: {err[:120]}")
+        elif out == "active":
+            result[key] = (unit, None)
         else:
-            result[(subject, f["predicate"])] = (None, f"rc={rc} no output")
+            result[key] = (None, f"{unit} is {out or 'unknown'} (rc={rc})")
     return result
 
 
+SIZE_UNITS = {"T": 10**12, "TB": 10**12, "G": 10**9, "GB": 10**9, "M": 10**6, "MB": 10**6}
+SIZE_UNITS_BINARY = {"T": 2**40, "TB": 2**40, "TIB": 2**40, "G": 2**30, "GB": 2**30,
+                     "GIB": 2**30, "M": 2**20, "MB": 2**20, "MIB": 2**20}
+SIZE_TOKEN_RE = re.compile(
+    r"(?:(\d+)\s*[x×]\s*)?(\d+(?:\.\d+)?)\s*(TiB|GiB|MiB|TB|GB|MB|T|G|M)\b", re.I)
+SIZE_TOLERANCE = 0.05
+
+
+def _stated_size_candidates(text):
+    """Byte totals a free-text hardware value could be stating: each size token
+    on its own (`64GB DDR5 (4x16GB)` repeats one total) and all of them summed
+    (`1TB SSD + 1TB HDD`), each as decimal and as binary units."""
+    tokens = []
+    for count, amount, unit in SIZE_TOKEN_RE.findall(text or ""):
+        n = int(count or 1) * float(amount)
+        unit = unit.upper()
+        tokens.append((n * SIZE_UNITS.get(unit, SIZE_UNITS_BINARY[unit]),
+                       n * SIZE_UNITS_BINARY[unit]))
+    if not tokens:
+        return []
+    return [c for pair in tokens for c in pair] + [sum(t[0] for t in tokens),
+                                                    sum(t[1] for t in tokens)]
+
+
+def _size_matches(observed_bytes, stated):
+    return any(abs(observed_bytes - c) <= SIZE_TOLERANCE * c
+               for c in _stated_size_candidates(stated))
+
+
+def _confirm_size(subject, fact, observed_bytes, what):
+    """ram/storage hold free text (`64GB`, `2x 1TB NVMe RAID1`), so a measured
+    total is never the new value (wq#2204): it only confirms a stored value
+    that states a matching size, and anything else is unknown."""
+    key = (subject, fact["predicate"])
+    if not observed_bytes:
+        return {key: (None, f"no {what} observed")}
+    if _size_matches(observed_bytes, fact["value"]):
+        return {key: (fact["value"], None)}
+    return {key: (None, f"stored {fact['value'][:40]!r} does not state the observed "
+                        f"{what} ({observed_bytes} bytes)")}
+
+
+def _dmidecode_bytes(out):
+    """Total installed RAM: every DIMM's `Size:`, not just the first."""
+    total = 0
+    for amount, unit in re.findall(r"^\s*Size:\s*(\d+)\s*(GB|MB)\b", out, re.M):
+        total += int(amount) * SIZE_UNITS_BINARY[unit]
+    return total
+
+
+def _lsblk_bytes(out):
+    """Whole-disk capacity: top-level `disk` devices only, so partitions, loop
+    and optical devices are not counted twice or at all."""
+    devices = json.loads(out).get("blockdevices", [])
+    return sum(int(d.get("size") or 0) for d in devices if d.get("type") == "disk")
+
+
+NODE_STORAGE_OBSERVERS = {
+    "ram": (["dmidecode", "--type", "17"], _dmidecode_bytes, "RAM"),
+    "storage": (["lsblk", "-J", "-b", "-d", "-o", "NAME,SIZE,TYPE"], _lsblk_bytes, "disk"),
+}
+
+
 def probe_node_storage(subject, facts):
-    ram_argv = ["dmidecode", "--type", "17"]
-    lsblk_argv = ["lsblk", "-J"]
-    mdstat_argv = ["cat", "/proc/mdstat"]
     result = {}
     for f in facts:
-        argv = ram_argv if f["predicate"] == "ram" else lsblk_argv
+        key = (subject, f["predicate"])
+        if f["predicate"] not in NODE_STORAGE_OBSERVERS:
+            result[key] = (None, f"node_storage cannot observe {f['predicate']}")
+            continue
+        argv, measure, what = NODE_STORAGE_OBSERVERS[f["predicate"]]
         rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
         if rc != 0:
-            result[(subject, f["predicate"])] = (None, f"ssh {subject}: {err[:120]}")
+            result[key] = (None, f"ssh {subject}: {err[:120]}")
             continue
-        if f["predicate"] == "ram":
-            sizes = re.findall(r"Size:\s*(\d+\s*[GM]B)", out)
-            result[(subject, f["predicate"])] = (
-                (sizes[0].replace(" ", "") if sizes else None),
-                None if sizes else "no Size field in dmidecode",
-            )
-        else:
-            try:
-                blk = json.loads(out)
-                total = sum(int(d.get("size") or 0) for d in blk.get("blockdevices", []))
-                result[(subject, f["predicate"])] = (str(total) if total else None,
-                                                       None if total else "empty lsblk")
-            except ValueError as e:
-                result[(subject, f["predicate"])] = (None, f"lsblk non-json: {e}")
+        try:
+            result.update(_confirm_size(subject, f, measure(out), what))
+        except ValueError as e:
+            result[key] = (None, f"{argv[0]} unparseable: {e}")
     return result
 
 
 def probe_os_kernel(subject, facts):
+    """Only `kernel` (uname -r) is answerable. `uname -s` ("Linux") was once
+    returned for every other predicate and overwrote ollama_version, *_version
+    and os facts (wq#2192); those now come back unknown.
+    """
     result = {}
     for f in facts:
-        argv = ["uname", "-r"] if f["predicate"] == "kernel" else ["uname", "-s"]
+        if f["predicate"] != "kernel":
+            result[(subject, f["predicate"])] = (
+                None, f"os_kernel cannot observe {f['predicate']}")
+            continue
+        argv = ["uname", "-r"]
         rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
         out = out.strip()
         if rc != 0 or not out:
@@ -292,16 +410,38 @@ def probe_plug_map(subject, facts):
     return result
 
 
+def _endpoint_url(subject, fact):
+    value = (fact["value"] or "").strip()
+    if fact["predicate"] == "url":
+        return value if re.fullmatch(r"https?://\S+", value) else None
+    return f"http://{subject}:{value}/" if value.isdigit() else None
+
+
 def probe_endpoint_live(subject, facts):
+    """A url/port fact is the address itself, and an HTTP GET can only say the
+    address answers. The status code ('200') used to be returned as the
+    observation and superseded the stored url/port (wq#2204); a good GET now
+    confirms (observed == value), everything else is unknown.
+    """
     import urllib.request
     result = {}
     for f in facts:
-        url = f["value"] if f["predicate"] == "url" else f"http://{subject}:{f['value']}/"
+        key = (subject, f["predicate"])
+        url = _endpoint_url(subject, f)
+        if url is None:
+            result[key] = (None, f"value {f['value'][:40]!r} is not a probeable "
+                                 f"{f['predicate']}")
+            continue
         try:
             with urllib.request.urlopen(url, timeout=8) as resp:
-                result[(subject, f["predicate"])] = (str(resp.status), None)
+                status = resp.status
         except Exception as e:  # noqa: BLE001 - any transport failure is fail-open
-            result[(subject, f["predicate"])] = (None, f"{type(e).__name__}: {e}")
+            result[key] = (None, f"{type(e).__name__}: {e}")
+            continue
+        if 200 <= status < 400:
+            result[key] = (f["value"], None)
+        else:
+            result[key] = (None, f"GET {url} answered {status}")
     return result
 
 
@@ -347,56 +487,103 @@ def file_conflict(subject, predicate, old_value, observed, probe_id):
     run([AQ, "add", "--source", "lumen-verify", "--severity", "warn", "--message", title])
 
 
-def reconcile(conn, fact, probe_id, observed, error, now):
-    vid = str(uuid.uuid4())
-    ts = now.isoformat(timespec="seconds")
-    if error is not None or observed is None:
-        outcome = "unknown"
-    elif observed == fact["value"]:
-        outcome = "confirmed"
-    elif fact["source_kind"] == FRANK_STATED:
-        outcome = "unknown"
-        file_conflict(fact["subject"], fact["predicate"], fact["value"], observed, probe_id)
-    else:
-        outcome = "superseded"
+def _lumen_state():
+    """lumen_state is imported lazily: probes and --help must not need the store."""
+    if MINERVA_DIR not in sys.path:
+        sys.path.insert(0, MINERVA_DIR)
+    import lumen_state
+    return lumen_state
 
+
+def _log_unknown(conn, fact, probe_id, observed, detail, now):
+    """An 'unknown' outcome mutates no fact, but a fact_verifications row keeps
+    'checked, could not tell' distinct from 'never checked' (§2.3). The store
+    writes its own rows for confirmed / superseded / frank_stated conflicts."""
     conn.execute(
         "INSERT INTO fact_verifications "
         "(id, fact_id, subject, predicate, probe, observed, outcome, ts, detail) "
         "VALUES (?,?,?,?,?,?,?,?,?)",
-        (vid, fact["id"], fact["subject"], fact["predicate"], probe_id,
-         observed, outcome, ts, error),
+        (str(uuid.uuid4()), fact["id"], fact["subject"], fact["predicate"], probe_id,
+         observed, "unknown", now.isoformat(timespec="seconds"), detail),
     )
 
-    if outcome == "confirmed":
+
+def reconcile(conn, fact, probe_id, observed, error, now):
+    """Report `observed` for `fact` to lumen_state.report_observation() and
+    return the outcome: confirmed | superseded | unknown. This function never
+    compares old to new itself (MINERVA_STALENESS_REVIEW.md section 3.2)."""
+    if error is not None or observed is None or not str(observed).strip():
+        _log_unknown(conn, fact, probe_id, observed, error, now)
+        return "unknown"
+
+    ls = _lumen_state()
+    try:
+        res = ls.report_observation(
+            fact["subject"], fact["predicate"], str(observed), probe_id,
+            source_ref=f"verify:{probe_id}", conn=conn)
+    except ls.StateGateError as e:  # gate refused: nothing was written
+        _log_unknown(conn, fact, probe_id, observed,
+                     f"refused by state gate: {type(e).__name__}: {e}", now)
+        return "unknown"
+
+    if res.get("conflict"):  # frank_stated disagrees: ingest logged the row, a human decides
+        file_conflict(fact["subject"], fact["predicate"], res.get("stored"),
+                      observed, probe_id)
+        return "unknown"
+
+    outcome = res.get("outcome")
+    if outcome in ("confirmed", "superseded"):
+        # ingest() carries no probe id onto the row, and lumen_state's staleness view
+        # labels a row with no verify_recipe UNVERIFIABLE however often a probe
+        # confirms it (14 of ~1000 open facts had one). A probe that just observed
+        # the fact owns it, so record that (wq#2150).
         conn.execute(
-            "UPDATE state_facts SET last_confirmed_at=?, contradicted_at=NULL "
-            "WHERE id=?",
-            (ts, fact["id"]),
-        )
-    elif outcome == "superseded":
-        conn.execute(
-            "UPDATE state_facts SET valid_to=? WHERE id=?", (ts, fact["id"])
-        )
-        conn.execute(
-            "INSERT INTO state_facts (subject, predicate, value, valid_from, "
-            "ingested_at, source_ref, source_kind, verify_recipe, fact_class) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (fact["subject"], fact["predicate"], observed, ts, ts,
-             f"verify:{probe_id}", "observed", probe_id, fact["fact_class"]),
-        )
-    return outcome
+            "UPDATE state_facts SET verify_recipe=? WHERE subject=? AND predicate=? "
+            "AND valid_to IS NULL AND verify_recipe IS NULL",
+            (probe_id, res["subject"], res["predicate"]))
+        conn.commit()
+    if outcome in ("confirmed", "superseded"):
+        return outcome
+
+    # no open fact, or ingest filed it as a historical row: the current value did not change
+    _log_unknown(conn, fact, probe_id, observed,
+                 "state store did not apply it as current "
+                 f"(action={res.get('action', outcome)})", now)
+    return "unknown"
 
 
 # ------------------------------------------------------------------- sweep
+
+SSH_PROBES = frozenset({"fleet_inventory", "service_state", "node_storage", "os_kernel"})
+
+
+def closed_subjects(conn):
+    """{subject: lifecycle value} for subjects whose open lifecycle fact closes them."""
+    ls = _lumen_state()
+    reg = ls.registry()
+    return {r["subject"]: r["value"] for r in conn.execute(
+        "SELECT subject, value FROM state_facts WHERE predicate=? AND valid_to IS NULL",
+        (reg["lifecycle"],)) if r["value"] in reg["closing"]}
+
 
 def sweep(conn, registry, now=None, dry_run=False):
     now = now or datetime.now(timezone.utc)
     migrate(conn)
     batches = due_facts(conn, registry, now)
-    counts = {"confirmed": 0, "superseded": 0, "unknown": 0}
+    counts = {"confirmed": 0, "superseded": 0, "unknown": 0, "skipped": 0}
     detail = []
+    closed = closed_subjects(conn)
     for (probe_id, subject), facts in batches.items():
+        if probe_id in SSH_PROBES and subject in closed:
+            # wq#2150: a retired/decommissioned node cannot answer; ssh would only
+            # time out and log an unknown per fact per sweep. Nothing was checked.
+            for f in facts:
+                counts["skipped"] += 1
+                detail.append({"subject": subject, "predicate": f["predicate"],
+                               "probe": probe_id, "value": f["value"], "observed": None,
+                               "outcome": "skipped",
+                               "error": f"{subject} is {closed[subject]}; not probed"})
+            continue
         try:
             observations = PROBES[probe_id](subject, facts)
         except Exception as e:  # noqa: BLE001 - fail-open: a broken probe never supersedes
