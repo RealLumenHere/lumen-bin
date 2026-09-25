@@ -69,6 +69,17 @@ claimed_by_of() {
   "$WQ_BIN" show "$1" 2>/dev/null | sed -n 's/^claimed_by[[:space:]]*:[[:space:]]*//p'
 }
 
+status_of() {
+  "$WQ_BIN" show "$1" 2>/dev/null | sed -n 's/^status[[:space:]]*:[[:space:]]*//p'
+}
+
+unit_failed() {
+  # A worker that loses the claim race (concurrent batch, stale claimed_by) exits nonzero
+  # within ~1s while claimed_by still reads the winner's fworker-wqN name, which used to
+  # log a false OK. systemctl is-failed is 1 for unknown units, so stub units in tests pass.
+  systemctl is-failed --quiet "$1.service" 2>/dev/null
+}
+
 run_batch() {
   mkdir -p "$RUN_DIR"
   local batch_log="$RUN_DIR/batch-$(date +%s)-$$.log"
@@ -79,6 +90,18 @@ run_batch() {
   for id in "$@"; do
     log="$RUN_DIR/$id.log"
     : >"$log"
+    # Pre-spawn gate: never start a worker for a closed or already-claimed ticket. The
+    # worker's own claim guard refuses it anyway, but the batch then reported OK off the
+    # existing claimed_by (2026-09-25, batch 4: done wq#2436 + live wq#2071 re-spawned).
+    local st pre
+    st=$(status_of "$id"); pre=$(claimed_by_of "$id")
+    case "$st" in
+      done|retired)
+        echo "wq#$id SKIP status=$st" | tee -a "$log"; continue ;;
+    esac
+    if [ -n "$pre" ] && [ "$pre" != "None" ]; then
+      echo "wq#$id SKIP already claimed_by=$pre" | tee -a "$log"; continue
+    fi
     if ! out=$(spawn_ticket "$id" 2>>"$log"); then
       echo "wq#$id: spawn failed — see $log" | tee -a "$log"
       overall=1
@@ -101,6 +124,12 @@ run_batch() {
       waited=$((waited + CLAIM_POLL_S))
     done
     if [ -n "$claimed" ] && [ "$claimed" != "None" ]; then
+      sleep "$CLAIM_POLL_S"
+    fi
+    if [ -n "$claimed" ] && [ "$claimed" != "None" ] && unit_failed "$unit"; then
+      echo "wq#$id FAILED unit=$unit exited nonzero (claim lost?) claimed_by=$claimed" | tee -a "$log"
+      overall=1
+    elif [ -n "$claimed" ] && [ "$claimed" != "None" ]; then
       echo "wq#$id OK unit=$unit claimed_by=$claimed" | tee -a "$log"
     else
       echo "wq#$id NOT-CLAIMED unit=$unit after ${CLAIM_WAIT_S}s" | tee -a "$log"
