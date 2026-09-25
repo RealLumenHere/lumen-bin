@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""rotate-github-cred - replace a burned GitHub PAT in ~/.git-credentials, then revoke it.
+
+wq#2514. Twin of rotate-gitea-cred / gitea-rotate-finish for github.com. Never prints a
+token: values are identified by sha256[:12] of the body (prefix stripped), which is the
+same fingerprint mask_replay / mask-hits records use.
+
+  rotate-github-cred --check          dry run: list github.com lines, their fingerprints and
+                                      whether each is live (GET /user). No writes.
+  rotate-github-cred [NEWFILE]        NEWFILE (default ~/.secrets/github-reallumenhere.token.new,
+                                      0600) holds the new PAT. Steps:
+    1. validate new token: /user login == $GH_LOGIN (RealLumenHere), scopes >= repo,workflow
+    2. back up ~/.git-credentials (.bak.<ts>_pre_github_rotate, 0600)
+    3. every github.com line whose token is LIVE and == the old token for that login gets the
+       new token; github.com lines already dead (401) are dropped
+    4. verify new token from the rewritten store
+    5. revoke each replaced old token via POST /credentials/revoke (unauthenticated, 202)
+       and poll until it returns 401 (max 120s)
+    6. new token moves to ~/.secrets/github-reallumenhere.token (0600); NEWFILE removed
+  --no-revoke skips step 5 (old token stays live; say so loudly).
+Idempotent: re-running after success finds no old live token to replace and exits 0.
+"""
+import hashlib, json, os, re, shutil, sys, time, urllib.request, urllib.error
+from datetime import datetime
+
+HOME = "/home/lumen"
+CRED = os.environ.get("GH_ROT_CRED", f"{HOME}/.git-credentials")
+CANON = os.environ.get("GH_ROT_CANON", f"{HOME}/.secrets/github-reallumenhere.token")
+GH_LOGIN = os.environ.get("GH_LOGIN", "RealLumenHere")
+NEED_SCOPES = {"repo", "workflow"}
+LINE_RX = re.compile(r"^(https?://)([^:@/]+):([^@]+)@(github\.com)$")
+PREFIXES = ("github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_")
+
+
+def fp(tok):
+    body = tok
+    for p in PREFIXES:
+        if tok.startswith(p):
+            body = tok[len(p):]
+            break
+    return hashlib.sha256(body.encode()).hexdigest()[:12]
+
+
+def gh_user(tok):
+    req = urllib.request.Request("https://api.github.com/user", headers={
+        "Authorization": "token " + tok, "User-Agent": "lumen-rotate-github-cred",
+        "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            scopes = {s.strip() for s in (r.headers.get("X-OAuth-Scopes") or "").split(",") if s.strip()}
+            return 200, json.load(r).get("login"), scopes
+    except urllib.error.HTTPError as e:
+        return e.code, None, set()
+
+
+def revoke(toks):
+    body = json.dumps({"credentials": toks}).encode()
+    req = urllib.request.Request("https://api.github.com/credentials/revoke", data=body, method="POST",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": "lumen-rotate-github-cred",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def die(msg, rc=1):
+    print("rotate-github-cred: " + msg, file=sys.stderr)
+    sys.exit(rc)
+
+
+def read_store():
+    return open(CRED).read().splitlines()
+
+
+def write_0600(path, text):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, text.encode())
+    os.close(fd)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def survey(lines):
+    """[(idx, user, token, status, login)] for github.com lines; one API call per distinct token."""
+    seen, out = {}, []
+    for i, l in enumerate(lines):
+        m = LINE_RX.match(l)
+        if not m:
+            continue
+        tok = m.group(3)
+        if tok not in seen:
+            seen[tok] = gh_user(tok)
+        st, login, _ = seen[tok]
+        out.append((i, m.group(2), tok, st, login))
+    return out
+
+
+def main(argv):
+    if os.uname().nodename != "lumen":
+        die("run on lumen only", 9)
+    if not os.path.isfile(CRED):
+        die(f"no {CRED}")
+    check = "--check" in argv
+    no_revoke = "--no-revoke" in argv
+    args = [a for a in argv if not a.startswith("--")]
+    newfile = args[0] if args else CANON + ".new"
+    lines = read_store()
+    rows = survey(lines)
+    for i, user, tok, st, login in rows:
+        print(f"  line {i+1}: user={user[:20]} fp={fp(tok)} len={len(tok)} -> HTTP {st} login={login}")
+    if check:
+        return 0
+
+    if not os.path.isfile(newfile):
+        die(f"no new token at {newfile} (write it 0600, hidden: read -rsp ...)")
+    if oct(os.stat(newfile).st_mode)[-3:] != "600":
+        die(f"{newfile} must be mode 600")
+    new = open(newfile).read().strip()
+    if not new.startswith(PREFIXES) or len(new) < 30:
+        die("new token does not look like a GitHub token; nothing changed")
+    st, login, scopes = gh_user(new)
+    if st != 200:
+        die(f"new token rejected (HTTP {st}); nothing changed")
+    if login != GH_LOGIN:
+        die(f"new token authenticates as {login!r}, expected {GH_LOGIN!r}; nothing changed")
+    if new.startswith("ghp_") and not NEED_SCOPES <= scopes:
+        die(f"new token scopes {sorted(scopes)} missing {sorted(NEED_SCOPES - scopes)}; nothing changed")
+    print(f"1) new token OK: login={login} fp={fp(new)} scopes={sorted(scopes) or 'fine-grained'}")
+
+    old = {tok for _, _, tok, st, lg in rows if st == 200 and lg == GH_LOGIN and tok != new}
+    dead = {i for i, _, _, st, _ in rows if st == 401}
+    if not old and not dead:
+        print("   nothing to replace (store already on the new token).")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak = f"{CRED}.bak.{ts}_pre_github_rotate"
+    shutil.copy2(CRED, bak)
+    os.chmod(bak, 0o600)
+    print(f"2) backup {bak}")
+    out, n_rep, n_drop = [], 0, 0
+    for i, l in enumerate(lines):
+        m = LINE_RX.match(l)
+        if m and i in dead:
+            n_drop += 1
+            continue
+        if m and m.group(3) in old:
+            l = m.group(1) + m.group(2) + ":" + new + "@" + m.group(4)
+            n_rep += 1
+        out.append(l)
+    if not any(LINE_RX.match(l) and LINE_RX.match(l).group(3) == new for l in out):
+        out.append(f"https://{GH_LOGIN}:{new}@github.com")
+        n_rep += 1
+    write_0600(CRED, "\n".join(out) + "\n")
+    print(f"3) store rewritten: {n_rep} line(s) -> new token, {n_drop} dead line(s) dropped")
+
+    for l in read_store():
+        m = LINE_RX.match(l)
+        if m and m.group(3) == new:
+            st, lg, _ = gh_user(m.group(3))
+            if st != 200 or lg != GH_LOGIN:
+                die(f"verify FAILED from rewritten store (HTTP {st}); restore with: cp -a {bak} {CRED}")
+            break
+    print("4) verified from rewritten store")
+
+    write_0600(CANON, new + "\n")
+    if os.path.abspath(newfile) != CANON:
+        os.remove(newfile)
+    print(f"6) canonical home {CANON} (0600)")
+
+    if no_revoke or not old:
+        if old:
+            print(f"!! --no-revoke: {len(old)} old token(s) still LIVE: " + ", ".join(fp(t) for t in old))
+        return 0
+    rc = revoke(sorted(old))
+    print(f"5) revoke request -> HTTP {rc}")
+    if rc != 202:
+        die("revoke not accepted; old token(s) still live: " + ", ".join(fp(t) for t in old))
+    deadline = time.time() + 120
+    pending = set(old)
+    while pending and time.time() < deadline:
+        pending = {t for t in pending if gh_user(t)[0] != 401}
+        if pending:
+            time.sleep(10)
+    if pending:
+        die("revoke accepted but still live after 120s: " + ", ".join(fp(t) for t in pending))
+    print("   old token(s) now 401: " + ", ".join(fp(t) for t in old))
+    print("done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
