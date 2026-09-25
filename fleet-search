@@ -172,24 +172,64 @@ def _append_prior_art(prior, kind, query, results):
 
 
 # ---------- SearXNG (web / reddit-discovery) ----------
+# wq#2568: the general-web engines that actually crawl the open web (as opposed to
+# instant-answer engines like wikipedia/wikidata/currency/lingva, which only ever
+# answer a narrow slice of queries). If SearXNG marks every one of these as
+# unresponsive (suspended for rate-limit, CAPTCHA'd, ...), a 200 with results:[] is
+# NOT "no findings" -- it's "the search never happened" and must not read as ok:true
+# (wq#2564: shared egress IP self-rate-limits every general engine at once).
+WEB_SEARCH_ENGINES = {"brave", "duckduckgo", "google cse", "startpage"}
+BRAVE_API_BASE = "https://api.search.brave.com/res/v1/web/search"
+
+
 def searxng_search(query, n=10, engines=None):
-    """Returns (results_list, error_or_None). Fail-soft."""
+    """Returns (results_list, error_or_None, unresponsive_engines). Fail-soft.
+
+    unresponsive_engines is SearXNG's own [[name, reason], ...] list (possibly
+    empty) even on the success path, so callers can tell a clean 200/empty from a
+    200/empty where every engine that could have answered was suspended.
+    """
     params = {"q": query, "format": "json"}
     if engines:
         params["engines"] = ",".join(engines)
     url = SEARXNG + "/search?" + urllib.parse.urlencode(params)
     status, data, err = _get_json(url)
     if status == 0:
-        return None, f"searxng unreachable at {SEARXNG}: {err}"
+        return None, f"searxng unreachable at {SEARXNG}: {err}", []
     if status == 403:
-        return None, "searxng 403 — JSON format not enabled in settings.yml (search.formats must include 'json')"
+        return None, "searxng 403 — JSON format not enabled in settings.yml (search.formats must include 'json')", []
     if status != 200 or data is None:
-        return None, f"searxng http {status}: {err}"
+        return None, f"searxng http {status}: {err}", []
     out = []
     for r in data.get("results", [])[:n]:
         out.append({"title": r.get("title", ""), "url": r.get("url", ""),
                     "snippet": (r.get("content", "") or "")[:400],
                     "engine": r.get("engine", "")})
+    return out, None, data.get("unresponsive_engines", []) or []
+
+
+def brave_api_search(query, n=10, api_key=None):
+    """Keyed fallback for when SearXNG's general engines are all suspended/CAPTCHA'd.
+
+    Returns (results_list_or_None, error_or_None). No key configured is reported
+    as an error, not a crash -- fleet-search still needs to run without one.
+    """
+    api_key = api_key or _env_token("BRAVE_API_KEY")
+    if not api_key:
+        return None, "no BRAVE_API_KEY configured (see wq#2595: mint a Brave Search API key)"
+    url = BRAVE_API_BASE + "?" + urllib.parse.urlencode({"q": query, "count": min(max(n, 1), 20)})
+    status, data, err = _get_json(url, headers={"User-Agent": UA, "Accept": "application/json",
+                                                 "X-Subscription-Token": api_key})
+    if status == 401:
+        return None, "brave api 401 — key invalid/revoked"
+    if status == 429:
+        return None, "brave api 429 — rate limited"
+    if status != 200 or data is None:
+        return None, f"brave api http {status}: {err}"
+    out = []
+    for r in (data.get("web") or {}).get("results", [])[:n]:
+        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
+                    "snippet": (r.get("description", "") or "")[:400], "engine": "brave-api"})
     return out, None
 
 
@@ -200,11 +240,25 @@ def cmd_web(args):
         if hit:
             emit(envelope("searxng", True, {"results": hit["results"]},
                           query=args.query, cached=True, cached_at=hit.get("iso")))
-    results, err = searxng_search(args.query, args.n)
+    results, err, unresponsive = searxng_search(args.query, args.n)
     if err:
         emit(envelope("searxng", False, error=err, query=args.query, cached=False))
+    down = {name for name, _reason in unresponsive}
+    if WEB_SEARCH_ENGINES <= down:
+        fallback, fb_err = brave_api_search(args.query, args.n)
+        if fallback is not None:
+            cache_store(args.project, kind, args.query, args.n, fallback)
+            emit(envelope("brave-api", True, {"results": fallback}, query=args.query,
+                          unresponsive_engines=unresponsive,
+                          note="searxng general engines all suspended/blocked; used keyed Brave API fallback",
+                          cached=False))
+        emit(envelope("searxng", False,
+                      error=f"all general web-search engines suspended/blocked "
+                            f"({', '.join(sorted(down))}); fallback failed: {fb_err}",
+                      query=args.query, unresponsive_engines=unresponsive, cached=False))
     cache_store(args.project, kind, args.query, args.n, results)
-    emit(envelope("searxng", True, {"results": results}, query=args.query, cached=False))
+    emit(envelope("searxng", True, {"results": results}, query=args.query,
+                  unresponsive_engines=unresponsive, cached=False))
 
 
 def cmd_reddit(args):
@@ -216,7 +270,7 @@ def cmd_reddit(args):
         if hit:
             emit(envelope("searxng-reddit", True, {"results": hit["results"], "deep": deep},
                           query=args.query, cached=True, cached_at=hit.get("iso")))
-    results, err = searxng_search(q, args.n)
+    results, err, unresponsive = searxng_search(q, args.n)
     if err:
         emit(envelope("searxng-reddit", False, error=err, query=args.query, cached=False))
     if deep:
