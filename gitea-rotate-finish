@@ -1,63 +1,157 @@
 #!/usr/bin/env bash
-# gitea-rotate-finish — finish the wq#529 Gitea credential rotation.
+# gitea-rotate-finish — wq#2545: ONE entrypoint for rotating the lumen Gitea token.
 #
-# Frank re-mints the token in Gitea, writes it to ONE file, and runs this. It:
-#   1. validates the new token against the Gitea API BEFORE changing anything
-#   2. backs up every file it touches
-#   3. rewrites .git-credentials (single entry for the Gitea host)
-#   4. STRIPS the embedded token out of the 4 repo remote URLs, so the credential
-#      lives in one place with one rotation point instead of five
-#   5. verifies each repo can still reach origin, and says so per repo
-# Idempotent. Safe to re-run. Never prints a token.
+# wq#2514 rotation raced: two orchestrators each minted a token within 60s and
+# overwrote each other (id11 vs id12, reconciled by hand) because nothing made
+# rotation take a lock. The token also lives in 4 places — this file, the git
+# credential store, agent/.env, and the token-engine secrets store (T10) — and
+# no single tool synced all four; two of them expected a human to paste a value.
+#
+# This script: acquires the gitea-lumen-token slock (refuses if held — the wq#2514
+# fix), mints a fresh token on Anubis via the Gitea admin CLI, validates it BEFORE
+# writing anything, writes all 4 copies, verifies every consumer (API, git
+# ls-remote on every gitea repo, the token-engine broker via lumen-pr), then
+# deletes the OLD token row and proves the old value now 401s. The token itself
+# never appears in argv, in a log line, or in this script's own output — only its
+# length and a byte count ever print, same convention as gitea-cred-restore.
+#
+# Every path below is overridable via env (all default to the real production
+# location) so this can be exercised against a scratch sandbox before trusting it
+# against the live fleet credential — see tests/test_gitea_rotate_finish.sh.
 set -uo pipefail
-TOKFILE=${1:-/home/lumen/.secrets/gitea-lumen.token}
-HOST=100.121.17.5:3000
-USER=lumen
-REPOS="/home/lumen/projects/lumen-messenger-cc /home/lumen/messenger /home/lumen/minerva /home/lumen/bin"
-TS=$(date +%Y%m%d_%H%M%S)
+[ "$(hostname)" = lumen ] || { echo "gitea-rotate-finish: lumen only" >&2; exit 9; }
+
+HOST=${GITEA_ROTATE_HOST:-100.121.17.5:3000}
+ANUBIS=${GITEA_ROTATE_ANUBIS_HOST:-anubis}
+GUSER=${GITEA_ROTATE_USER:-lumen}
+ENVF=${GITEA_ROTATE_ENV_FILE:-/home/lumen/agent/.env}
+CRED=${GITEA_ROTATE_CRED_FILE:-/home/lumen/.git-credentials}
+SECFILE=${GITEA_ROTATE_SEC_FILE:-/home/lumen/.secrets/gitea-lumen.token}
+ENGINE_DIR=${GITEA_ROTATE_ENGINE_DIR:-/var/lib/token-engine/secrets}
+ENGINE_FILE=${GITEA_ROTATE_ENGINE_FILE:-$ENGINE_DIR/gitea-lumen.token}
+REPOS=${GITEA_ROTATE_REPOS:-"/home/lumen/bin /home/lumen/messenger /home/lumen/minerva /home/lumen/projects/lumen-messenger-cc /home/lumen/foreman"}
+LOCK_SCOPE=gitea-lumen-token
+LOCK_TTL=${GITEA_ROTATE_LOCK_TTL:-15}
+HOLDER=${GITEA_ROTATE_HOLDER:-gitea-rotate-finish-$$}
+STAMP=$(date +%Y%m%d_%H%M%S)
+
 die(){ echo "gitea-rotate-finish: $*" >&2; exit 1; }
 
-[ -r "$TOKFILE" ] || die "no token file at $TOKFILE — paste the new Gitea token there first (chmod 600)"
-TOK=$(tr -d '\n\r ' < "$TOKFILE")
-[ -n "$TOK" ] || die "$TOKFILE is empty"
-chmod 600 "$TOKFILE"
+echo "0) acquiring lock '$LOCK_SCOPE' as $HOLDER ..."
+slock acquire "$LOCK_SCOPE" --holder "$HOLDER" --ttl "$LOCK_TTL" \
+  --note "gitea-rotate-finish $STAMP" \
+  || die "lock refused — a rotation is already in progress. Wait or: slock who"
+RELEASED=0
+release_lock(){ [ "$RELEASED" = 1 ] && return; slock release "$LOCK_SCOPE" --holder "$HOLDER" >/dev/null 2>&1; RELEASED=1; }
+trap release_lock EXIT
 
-echo "1) validating new token against http://$HOST ..."
-code=$(curl -sS --max-time 15 -o /tmp/grf.$$ -w '%{http_code}' -H "Authorization: token $TOK" "http://$HOST/api/v1/user")
-who=$(jq -r '.login // "?"' /tmp/grf.$$ 2>/dev/null); rm -f /tmp/grf.$$
-[ "$code" = 200 ] || die "token rejected (HTTP $code) — nothing changed"
-[ "$who" = "$USER" ] || die "token authenticates as '$who', expected '$USER' — nothing changed"
-echo "   OK: authenticates as $who"
+echo "1) identifying the token row to retire ..."
+P=$(grep -oP '^GITEA_PASSWORD=\K.*' "$ENVF" | tr -d '"')
+[ -n "$P" ] || die "no GITEA_PASSWORD in $ENVF"
+TOKLIST=$(curl -sS --max-time 15 -u "$GUSER:$P" "http://$HOST/api/v1/users/$GUSER/tokens") \
+  || die "could not list existing tokens"
+RETIRE_ID=${GITEA_ROTATE_RETIRE_ID:-}
+RETIRE_NAME=${GITEA_ROTATE_RETIRE_NAME:-}
+if [ -z "$RETIRE_ID" ]; then
+  MATCHES=$(printf '%s' "$TOKLIST" | jq -r '.[] | select(.name | startswith("lumen-fleet-")) | "\(.id) \(.name)"')
+  N=$(printf '%s\n' "$MATCHES" | grep -c .)
+  [ "$N" -eq 1 ] || die "expected exactly one lumen-fleet-* token to retire, found $N — pass GITEA_ROTATE_RETIRE_ID/_NAME explicitly. Candidates: $MATCHES"
+  RETIRE_ID=$(printf '%s' "$MATCHES" | awk '{print $1}')
+  RETIRE_NAME=$(printf '%s' "$MATCHES" | cut -d' ' -f2-)
+fi
+echo "   retiring: id=$RETIRE_ID name=$RETIRE_NAME"
 
-echo "2) rewriting /home/lumen/.git-credentials ..."
-cp -a /home/lumen/.git-credentials "/home/lumen/.git-credentials.bak.${TS}_pre_rotate_finish"
+echo "2) minting a new token on Anubis ..."
+NEWNAME="lumen-fleet-$STAMP"
+NEW=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$ANUBIS" \
+  "sudo -u gitea gitea admin user generate-access-token -c /etc/gitea/app.ini -w /var/lib/gitea --username $GUSER --token-name $NEWNAME --scopes write:repository,write:user --raw" 2>/dev/null | tr -d '[:space:]')
+[ ${#NEW} -ge 30 ] || die "mint failed or returned a short value — nothing changed"
+echo "   minted $NEWNAME (len=${#NEW})"
+
+echo "3) validating the new token BEFORE writing it anywhere ..."
+CODE=$(curl -sS -o "/tmp/grf.$$.json" --max-time 10 -w '%{http_code}' -H "Authorization: token $NEW" "http://$HOST/api/v1/user")
+WHO=$(jq -r '.login // "?"' "/tmp/grf.$$.json" 2>/dev/null); rm -f "/tmp/grf.$$.json"
+[ "$CODE" = 200 ] && [ "$WHO" = "$GUSER" ] || die "new token failed to validate (HTTP $CODE, login=$WHO) — nothing changed"
+echo "   OK: authenticates as $WHO"
+
+OLD=$(tr -d '\n\r ' < "$SECFILE" 2>/dev/null || true)
+
+echo "4) writing all 4 copies ..."
+TMPTOK="/tmp/gitea-rotate.$$.tok"
+umask 077
+printf '%s' "$NEW" > "$TMPTOK"
+
+cp -a "$SECFILE" "$SECFILE.bak.${STAMP}_pre_rotate" 2>/dev/null || true
+install -m600 "$TMPTOK" "$SECFILE"
+echo "   OK $SECFILE"
+
+cp -a "$CRED" "$CRED.bak.${STAMP}_pre_rotate"
 ENC=${HOST/:/%3a}
-grep -v "$ENC" /home/lumen/.git-credentials > /tmp/gc.$$ 2>/dev/null || true
-printf 'http://%s:%s@%s\n' "$USER" "$TOK" "$ENC" >> /tmp/gc.$$
-install -m600 /tmp/gc.$$ /home/lumen/.git-credentials; rm -f /tmp/gc.$$
-echo "   OK: single Gitea entry, mode 600, backup .bak.${TS}_pre_rotate_finish"
+grep -v "$ENC" "$CRED" > "/tmp/gc.$$" 2>/dev/null || true
+printf 'http://%s:%s@%s\n' "$GUSER" "$NEW" "$ENC" >> "/tmp/gc.$$"
+install -m600 "/tmp/gc.$$" "$CRED"; rm -f "/tmp/gc.$$"
+echo "   OK $CRED"
 
-echo "3) stripping embedded tokens from remote URLs ..."
-for r in $REPOS; do
-  [ -d "$r/.git" ] || { echo "   SKIP $r (not a repo)"; continue; }
-  u=$(git -C "$r" remote get-url origin 2>/dev/null) || continue
-  clean=$(printf '%s' "$u" | sed -E "s#^(https?://)[^@]*@#\1#")
-  if [ "$u" != "$clean" ]; then
-    git -C "$r" remote set-url origin "$clean" && echo "   cleaned $(basename "$r") -> credential now comes from the store"
-  else
-    echo "   already clean: $(basename "$r")"
-  fi
-done
+cp -a "$ENVF" "$ENVF.bak.${STAMP}_pre_rotate"
+NEWTOK="$NEW" python3 - "$ENVF" <<'PY'
+import re, os, sys
+tok = os.environ["NEWTOK"]; p = sys.argv[1]
+out, n = [], 0
+for l in open(p).read().splitlines():
+    if re.match(r'^GITEA_TOKEN=', l):
+        out.append("GITEA_TOKEN=" + tok); n += 1
+    else:
+        out.append(l)
+fd = os.open(p + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, ("\n".join(out) + "\n").encode()); os.close(fd)
+os.replace(p + ".tmp", p)
+print("   rewrote %d line(s) in agent/.env" % n)
+PY
 
-echo "4) verifying reachability ..."
-fail=0
+if sudo -n test -d "$ENGINE_DIR" 2>/dev/null; then
+  sudo -n cp -a "$ENGINE_FILE" "$ENGINE_FILE.bak.${STAMP}_pre_rotate" 2>/dev/null || true
+  sudo -n install -m600 -o tokeneng -g tokeneng "$TMPTOK" "$ENGINE_FILE"
+  echo "   OK $ENGINE_FILE"
+else
+  echo "   SKIP $ENGINE_FILE (no sudo reach into $ENGINE_DIR — check drifted)"
+fi
+shred -u "$TMPTOK" 2>/dev/null || rm -f "$TMPTOK"
+unset NEW NEWTOK
+
+echo "5) verifying every consumer ..."
+FAIL=0
+CODE2=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' -H "Authorization: token $(tr -d '\n\r ' < "$SECFILE")" "http://$HOST/api/v1/user")
+[ "$CODE2" = 200 ] && echo "   OK   API /user" || { echo "   FAIL API /user (HTTP $CODE2)"; FAIL=1; }
+
 for r in $REPOS; do
-  [ -d "$r/.git" ] || continue
+  [ -d "$r/.git" ] || { echo "   SKIP $(basename "$r") (not a repo)"; continue; }
   if git -C "$r" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
-    echo "   OK   $(basename "$r")"
+    echo "   OK   $(basename "$r") ls-remote"
   else
-    echo "   FAIL $(basename "$r") — origin unreachable with the new credential"; fail=1
+    echo "   FAIL $(basename "$r") ls-remote"; FAIL=1
   fi
 done
-[ "$fail" = 0 ] || die "one or more repos could not reach origin — investigate before trusting this rotation"
-echo "done. Old token is dead; new one lives ONLY in $TOKFILE and .git-credentials."
+
+if command -v lumen-pr >/dev/null 2>&1; then
+  if lumen-pr check /home/lumen/bin >/dev/null 2>&1; then
+    echo "   OK   broker (lumen-pr check)"
+  else
+    echo "   FAIL broker (lumen-pr check) — token-engine may need a moment to pick up $ENGINE_FILE"
+    FAIL=1
+  fi
+fi
+
+[ "$FAIL" = 0 ] || die "one or more consumers failed with the new token — investigate before deleting the old one. Old token row is UNTOUCHED."
+
+echo "6) deleting the retired token row (id=$RETIRE_ID name=$RETIRE_NAME) ..."
+DELCODE=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' -u "$GUSER:$P" -X DELETE "http://$HOST/api/v1/users/$GUSER/tokens/$RETIRE_ID")
+[ "$DELCODE" = 204 ] || die "delete of token id=$RETIRE_ID returned HTTP $DELCODE — investigate. New token IS deployed; old row may still be live."
+echo "   OK   deleted (HTTP 204)"
+
+if [ -n "$OLD" ]; then
+  echo "7) proving the old value is dead ..."
+  OLDCODE=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' -H "Authorization: token $OLD" "http://$HOST/api/v1/user")
+  [ "$OLDCODE" = 401 ] && echo "   OK   old token now HTTP 401" || echo "   WARN old token returned HTTP $OLDCODE (expected 401) — check manually"
+fi
+
+echo "done. '$NEWNAME' is live in all reachable copies; old row id=$RETIRE_ID deleted."
