@@ -3156,13 +3156,25 @@ def cmd_edit(a):
         if a.model == "": e = None    # clearing the model clears the pair
         m, e = norm_tuple(m, e)
         fields += ["model=?", "effort=?"]; vals += [m, e]
-    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype/--gate-type/--needs"); c.close(); return
+    # wq#2616: --attempt resets the attempt budget (e.g. after a re-route off a retired
+    # model whose failures shouldn't charge the model that replaces it). Negative refused.
+    attempt_note = None
+    if a.attempt is not None:
+        if a.attempt < 0:
+            print(f"REFUSED: --attempt {a.attempt} is negative (wq#2616)"); c.close(); sys.exit(1)
+        fields.append("attempt=?"); vals.append(a.attempt)
+        attempt_note = f"[{now()}] attempt reset to {a.attempt} via wq edit --attempt (wq#2616)"
+    if not fields: print("nothing to edit — pass --title/--detail/--pri/--lane/--status/--subsystems/--gate/--deps/--model/--effort/--archetype/--gate-type/--needs/--attempt"); c.close(); return
     vals.append(a.id); c.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
     reopened = bump_reopened(c, a.id) if is_reopen(prev_status, a.status) else 0
     if force_unmapped:
         prev = c.execute("SELECT notes FROM tasks WHERE id=?", (a.id,)).fetchone()[0] or ""
         c.execute("UPDATE tasks SET notes=? WHERE id=?",
                   ((prev + "\n" if prev else "") + f"[{now()}] " + _UNMAPPED_FORCE_NOTE.format(lane=a.lane, how=force_unmapped), a.id))
+    if attempt_note:
+        prev = c.execute("SELECT notes FROM tasks WHERE id=?", (a.id,)).fetchone()[0] or ""
+        c.execute("UPDATE tasks SET notes=? WHERE id=?",
+                  ((prev + "\n" if prev else "") + attempt_note, a.id))
     c.commit()
     print(f"edited {a.id}: {', '.join(x.split('=')[0] for x in fields)}{_reopen_tag(reopened)}"); c.close()
 def cmd_retire(a):
@@ -3407,7 +3419,7 @@ s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, a
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
 s=sub.add_parser("show"); s.add_argument("id",type=int); s.add_argument("--json",action="store_true",help="wq#1277: emit the row as a single JSON object — safe for multi-line detail fields; plain text truncates/mis-parses embedded newlines"); s.set_defaults(f=cmd_show)
-s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=_pri); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.add_argument("--force",action="store_true",help="wq#2139: file the lane even with no LANE_REPO row and no needs repo(...) tag (noted on the ticket)"); s.set_defaults(f=cmd_edit)
+s=sub.add_parser("edit"); s.add_argument("id",type=int); s.add_argument("--title"); s.add_argument("--detail"); s.add_argument("--pri",type=_pri); s.add_argument("--lane"); s.add_argument("--status"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--deps"); s.add_argument("--model",help="wq#617: dispatch model id ('' clears)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max ('' clears)"); s.add_argument("--archetype",help="wq#617: routing archetype"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: frank_decision or clear with ''"); s.add_argument("--needs",help="wq#1331: capability tags ('' clears), e.g. 'repo(/home/lumen/questfree)'"); s.add_argument("--force",action="store_true",help="wq#2139: file the lane even with no LANE_REPO row and no needs repo(...) tag (noted on the ticket)"); s.add_argument("--attempt",type=int,help="wq#2616: reset the row attempt counter (refused if negative), e.g. after a re-route off a retired model"); s.set_defaults(f=cmd_edit)
 s=sub.add_parser("note",help="wq#1331: APPEND one timestamped line to notes (never overwrites)"); s.add_argument("id",type=int); s.add_argument("text"); s.set_defaults(f=cmd_note)
 s=sub.add_parser("retire",help="wq#568: retire a session id or base name — releases its claims/slocks and refuses all its future wq/slock calls"); s.add_argument("target"); s.add_argument("--reason",default=None); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: required to retire a fworker-wq<id> per-ticket identity — confirms you mean to permanently poison future spawns of that ticket, not just clear a stale claim (use `wq release --dead-worker` for that instead)"); s.set_defaults(f=cmd_retire)
 s=sub.add_parser("reap",help="wq#647: independent sweep for expired claimed-ticket leases, ALL lanes by default — decoupled from `wq claim`, fq#614 fix"); s.add_argument("--lane",default=None,help="restrict the sweep to one lane (default: every lane)"); s.add_argument("--dry-run",action="store_true",help="report what would be reaped, mutate nothing"); s.set_defaults(f=cmd_reap)
