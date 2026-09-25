@@ -17,7 +17,8 @@ MIGRATION = os.path.join(BIN_DIR, "migrations", "wq1331_needs.py")
 CONFIG = {"lanes": {
     "build": {"enabled": True, "max_per_day": 5},
     "auto": {"enabled": True, "max_per_day": 5},
-    "simpill": {"enabled": True, "max_per_day": 5},
+    "simpill": {"enabled": True, "max_per_day": 5, "multi_repo": True},
+    "docs": {"enabled": True, "max_per_day": 5},
     "user": {"enabled": True, "max_per_day": 5},
     "off": {"enabled": False},
 }}
@@ -120,17 +121,47 @@ def test_repo_sweep_shape_accepted_into_auto(tmp_path):
 
 
 def test_needs_tag_does_not_rescue_unmapped_non_auto_lane(tmp_path):
-    """wq#2144: the dispatcher skips lane_unmapped for every lane but 'auto' before it reads the
-    needs tag, so a tag (even a managed path) or the repo-sweep shape must not admit simpill."""
+    """wq#2144: the dispatcher skips lane_unmapped for every lane but 'auto' (wq#2652: or a lane
+    flagged multi_repo) before it reads the needs tag, so a tag (even a managed path) or the
+    repo-sweep shape must not admit a plain unmapped lane like 'docs'."""
     env = make_env(tmp_path)
     wq(env, "list")
     migrate(env)
     for extra in (("--needs", "repo(/p)"), ("--detail", "body\nNeeds: repo(/f)"),
                   ("--detail", SWEEP_DETAIL)):
-        p = add(env, "simpill", SWEEP_TITLE + " s", *extra)
+        p = add(env, "docs", SWEEP_TITLE + " s", *extra)
         assert p.returncode == 1, (extra, p.stdout + p.stderr)
-        assert "REFUSED" in p.stdout and "LANE_REPO" in p.stdout and "'simpill'" in p.stdout
+        assert "REFUSED" in p.stdout and "LANE_REPO" in p.stdout and "'docs'" in p.stdout
     assert "does NOT rescue" in p.stdout
+
+
+def test_multi_repo_lane_rescued_by_managed_needs_tag(tmp_path):
+    """wq#2652: a lane flagged multi_repo in dispatcher/config.json (e.g. simpill) is rescued the
+    same way the hint lane 'auto' is (wq#2144) -- a needs repo(...) tag naming a managed repo, or
+    the repo-sweep title/detail shape -- mirrors test_needs_repo_tag_accepted but for lane simpill
+    instead of auto."""
+    env = make_env(tmp_path)
+    wq(env, "list")
+    migrate(env)
+    p = add(env, "simpill", "tagged", "--needs", "repo(/p)")
+    assert p.returncode == 0, p.stdout + p.stderr
+    p2 = add(env, "simpill", "tagged in detail", "--detail", "body\nNeeds: repo(/home/lumen/bin)")
+    assert p2.returncode == 0, p2.stdout + p2.stderr
+    p3 = add(env, "simpill", SWEEP_TITLE + " s", "--detail", SWEEP_DETAIL)
+    assert p3.returncode == 0, p3.stdout + p3.stderr
+    p4 = add(env, "simpill", "wrong tag", "--needs", "dir(/p)")
+    assert p4.returncode == 1 and "REFUSED" in p4.stdout
+
+
+def test_multi_repo_lane_unmanaged_tag_still_refused(tmp_path):
+    """wq#2652: the multi_repo rescue is scoped to a real managed repo, not a blanket lane
+    exemption -- same as test_unmanaged_needs_path_refused_into_auto, but for simpill."""
+    env = make_env(tmp_path)
+    wq(env, "list")
+    migrate(env)
+    p = add(env, "simpill", "unmanaged tag", "--needs", "repo(/home/lumen/questfree)")
+    assert p.returncode == 1 and "REFUSED" in p.stdout, p.stdout + p.stderr
+    assert "managed_repos" in p.stdout
 
 
 def test_unmanaged_needs_path_refused_into_auto(tmp_path):
@@ -191,12 +222,13 @@ def test_edit_lane_guarded(tmp_path):
     wq(env, "list")
     migrate(env)
     tid = tid_of(add(env, "build", "movable"))
-    p = wq(env, "edit", str(tid), "--lane", "simpill")
+    p = wq(env, "edit", str(tid), "--lane", "docs")
     assert p.returncode == 1 and "REFUSED" in p.stdout
     assert show(env, tid)["lane"] == "build"
-    # an existing managed repo tag rescues only the hint lane (wq#2144), never simpill
+    # an existing managed repo tag rescues only the hint lane or a multi_repo lane (wq#2144/wq#2652),
+    # never a plain unmapped lane like docs
     assert wq(env, "edit", str(tid), "--needs", "repo(/p)").returncode == 0
-    assert wq(env, "edit", str(tid), "--lane", "simpill").returncode == 1
+    assert wq(env, "edit", str(tid), "--lane", "docs").returncode == 1
     assert wq(env, "edit", str(tid), "--lane", "auto").returncode == 0
     # edits that do not touch the lane never trip it, even on an unmapped lane
     assert wq(env, "edit", str(tid), "--pri", "1").returncode == 0

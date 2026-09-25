@@ -243,12 +243,13 @@ def unmapped_dispatch_lanes():
         hint_lane = ast.literal_eval(_committed_assign(FOREMAN_DISPATCHER_PY, "REPO_HINT_LANE"))
         managed = {_static_str(FOREMAN_ROUTER_PY, v) for v in lane_repo.values}
         managed |= set(ast.literal_eval(_committed_assign(FOREMAN_REPO_SWEEP_PY, "EXTRA_REPOS")))
+        multi_repo = {ln for ln, p in cfg["lanes"].items() if isinstance(p, dict) and p.get("multi_repo") is True}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, SyntaxError,
             subprocess.SubprocessError) as e:
         eprint(f"WARNING (wq#2139): dispatch-lane repo check skipped, foreman policy unreadable: "
                f"{type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
         return None
-    return enabled - mapped - human, human, hint_lane, managed
+    return enabled - mapped - human, human, hint_lane, managed, multi_repo
 _UNMAPPED_FORCE_NOTE = ("[{how} wq#2139] filed in lane {lane!r} with no LANE_REPO row and no repo the "
                         "dispatcher can resolve: it will skip this as lane_unmapped until re-laned or fixed")
 def _resolvable_repo(title, needs, detail, managed):
@@ -277,7 +278,7 @@ def check_lane_has_repo(lane, needs, detail, force, title=None):
     res = unmapped_dispatch_lanes()
     if res is None or lane not in res[0]:
         return False
-    if lane == res[2] and _resolvable_repo(title, needs, detail, res[3]):
+    if (lane == res[2] or lane in res[4]) and _resolvable_repo(title, needs, detail, res[3]):
         return False
     if force:
         warn(f"--force: lane {lane!r} has no LANE_REPO row and the dispatcher cannot resolve a repo for it")
@@ -293,7 +294,7 @@ def check_lane_has_repo(lane, needs, detail, force, title=None):
         return "warn-mode"
     print(f"REFUSED: lane {lane!r} is enabled for dispatch but has no LANE_REPO row in the foreman "
           f"router — the dispatcher would skip this ticket as lane_unmapped forever (wq#2139).")
-    if lane == res[2]:
+    if lane == res[2] or lane in res[4]:
         print(f"Ways out: pick a mapped lane (e.g. build, ops, research, fleet), or give lane {lane!r} a "
               f"repo it can resolve: --needs 'repo(<managed repo path>)' (the path must be in "
               f"repo_sweep.managed_repos()). --force overrides, on the record in the ticket notes.")
