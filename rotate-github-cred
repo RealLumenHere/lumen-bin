@@ -7,7 +7,7 @@ same fingerprint mask_replay / mask-hits records use.
 
   rotate-github-cred --check          dry run: list github.com lines, their fingerprints and
                                       whether each is live (GET /user). No writes.
-  rotate-github-cred [NEWFILE]        NEWFILE (default ~/.secrets/github-reallumenhere.token.new,
+  rotate-github-cred [NEWFILE]        NEWFILE (default ~/.secrets/github-lumen-classic.token.new,
                                       0600) holds the new PAT. Steps:
     1. validate new token: /user login == $GH_LOGIN (RealLumenHere), scopes >= repo,workflow
     2. back up ~/.git-credentials (.bak.<ts>_pre_github_rotate, 0600)
@@ -16,7 +16,7 @@ same fingerprint mask_replay / mask-hits records use.
     4. verify new token from the rewritten store
     5. revoke each replaced old token via POST /credentials/revoke (unauthenticated, 202)
        and poll until it returns 401 (max 120s)
-    6. new token moves to ~/.secrets/github-reallumenhere.token (0600); NEWFILE removed
+    6. new token moves to ~/.secrets/github-lumen-classic.token (0600); NEWFILE removed
   --no-revoke skips step 5 (old token stays live; say so loudly).
 Idempotent: re-running after success finds no old live token to replace and exits 0.
 """
@@ -25,7 +25,7 @@ from datetime import datetime
 
 HOME = "/home/lumen"
 CRED = os.environ.get("GH_ROT_CRED", f"{HOME}/.git-credentials")
-CANON = os.environ.get("GH_ROT_CANON", f"{HOME}/.secrets/github-reallumenhere.token")
+CANON = os.environ.get("GH_ROT_CANON", f"{HOME}/.secrets/github-lumen-classic.token")
 GH_LOGIN = os.environ.get("GH_LOGIN", "RealLumenHere")
 NEED_SCOPES = {"repo", "workflow"}
 LINE_RX = re.compile(r"^(https?://)([^:@/]+):([^@]+)@(github\.com)$")
