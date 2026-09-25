@@ -38,7 +38,9 @@ usage:
   lumen-run start [--name NAME] [--mem SIZE] [--cpu QUOTA] [--mem-high SIZE]
                   [--tasks-max N] [--oom-policy POLICY] [--timeout-stop-sec SEC]
                   -- CMD [ARGS...]
-      Launch CMD as a detached system transient unit (runs as lumen).
+      Launch CMD as a detached system transient unit (runs as lumen), in
+      lumen-workers.slice (wq#2605: CPU/IO priority isolation from the control
+      plane — not configurable per-job, every lumen-run job is a worker).
       Prints: UNIT=<name>
       --name  slug for the unit (default: job); final unit = lumen-job-<slug>-<epoch>
       --mem   MemoryMax, e.g. 8G (guards the T5810 against OOM kills)
@@ -80,7 +82,13 @@ case "$cmd" in
     [ $# -gt 0 ] || { echo "lumen-run: no command given" >&2; usage; }
     slug=$(printf '%s' "$name" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')
     unit="lumen-job-${slug}-$(date +%s)"
-    props=(--property=OOMPolicy="$oom_policy" --property=Environment="PATH=${JOB_PATH}")
+    # wq#2605: every lumen-run job is a worker/job by definition (the control
+    # plane runs as its own persistent services, never through lumen-run), so
+    # it lands in lumen-workers.slice (CPUWeight=50 IOWeight=50 MemoryHigh=40G)
+    # instead of competing 1:1 against desktop-commander-mcp/cloudflared
+    # (CPUWeight=1000 IOWeight=1000) on the default system.slice — the fix for
+    # the 2026-09-25 04:28Z worker-storm-starves-control-plane incident.
+    props=(--slice=lumen-workers.slice --property=OOMPolicy="$oom_policy" --property=Environment="PATH=${JOB_PATH}")
     [ -n "$mem" ] && props+=(--property=MemoryMax="$mem")
     [ -n "$cpu" ] && props+=(--property=CPUQuota="$cpu")
     [ -n "$mem_high" ] && props+=(--property=MemoryHigh="$mem_high")
