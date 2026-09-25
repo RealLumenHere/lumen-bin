@@ -131,14 +131,20 @@ def cache_lookup(project, kind, query, n, ttl):
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("key") == key and (time.time() - rec.get("ts", 0)) < ttl:
-                    hit = rec          # last (freshest) wins
+                if rec.get("key") != key or (time.time() - rec.get("ts", 0)) >= ttl:
+                    continue
+                rec_results = rec.get("results")
+                if isinstance(rec_results, list) and not rec_results:
+                    continue          # wq#2603: empty-result record is not a hit
+                hit = rec          # last (freshest) valid record wins
     except OSError:
         return None
     return hit
 
 
 def cache_store(project, kind, query, n, results):
+    if isinstance(results, list) and not results:
+        return                        # wq#2603: never cache a claim of "no results"
     path, prior, base = _cache_paths(project)
     try:
         os.makedirs(base, exist_ok=True)
