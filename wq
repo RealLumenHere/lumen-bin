@@ -2918,6 +2918,36 @@ def cmd_preflight(a):
         print(f"Before state-changing work run: slock acquire <scope> --holder {holder}")
         sys.exit(2)
     print(f"OK: all of [{', '.join(subs)}] locked by you ({holder}).")
+def _judge_shadow_decide(tid, title, detail, gate_type, prompt, rec):
+    """wq#2799 (wq#2788 Phase 2). Shadow-only per Frank (2026-09-26): NOT the live
+    replacement wq#2799's own ticket text describes (wiring wq claim/hold/dispatch to
+    call the judge INSTEAD of the orchestrator, depends on wq#2798) -- that cutover is
+    explicitly out of scope until wq#2798 ships. What this does: the moment `wq decide`
+    runs IS the AUTONOMY POLICY's "judgment call goes to the orchestrator session" in
+    concrete form, so it fires a shadow judge call alongside it for later comparison
+    against orch_recommendation and Frank's eventual answer/review -- wq claim, wq hold,
+    and the dispatcher's own gate checks (LaneCap, Deps, etc.) are deterministic state
+    checks, not judgment calls, and are deliberately left alone.
+    Never blocks, never changes what `wq decide` does: launched DETACHED via lumen-run
+    so a synchronous, interactively-run session command never waits 10-30s on an LLM
+    call the way action_gate.py's already-blocking RED path can afford to (wq#2797).
+    Kill switch: FOREMAN_JUDGE_SHADOW=0 (default on, same convention as wq#2797)."""
+    if os.environ.get("FOREMAN_JUDGE_SHADOW", "1") == "0":
+        return
+    runner = os.environ.get("WQ_JUDGE_RUNNER", "/home/lumen/bin/lumen-run")
+    judge_bin = os.environ.get("FOREMAN_JUDGE_BIN", "/home/lumen/bin/judge")
+    command = f"{title}\n\n{detail or ''}"[:4000]
+    context = (f"gate_type={gate_type or 'frank_decision'}; "
+               f"decision_prompt={prompt}; orch_recommendation={rec}")[:2000]
+    try:
+        subprocess.Popen(
+            [runner, "start", "--name", f"wq{tid}-judge-shadow", "--",
+             judge_bin, "--actor", f"wq{tid}", "--kind", "advice",
+             "--command", command, "--context", context, "--gate-verdict", "AMBER"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except OSError:
+        pass  # best-effort observation -- never let a shadow call break `wq decide`
+
 def cmd_decide(a):
     """wq#662: ORCH sets the decision prompt + recommendation on a frank_gated ticket,
     advancing it to pending_review so Frank knows there is a queued question.
@@ -2963,6 +2993,7 @@ def cmd_decide(a):
     print(f"  prompt : {prompt[:120]}")
     print(f"  rec    : {rec[:120]}")
     print("  Next: Frank runs `wq answer {id} <response>`".format(id=a.id))
+    _judge_shadow_decide(a.id, _lc_row[0], _lc_new_detail, gt, prompt, rec)
 
 def cmd_answer(a):
     """wq#662: Frank (or MC) records a free-text response to a pending_review ticket.
