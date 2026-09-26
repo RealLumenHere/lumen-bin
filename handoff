@@ -49,7 +49,12 @@ verify(){
   echo -n "  "; python3 /home/lumen/minerva/lumen_coverage.py line 2>/dev/null \
     || echo "(coverage unavailable — lumen_coverage.py)"
   echo "## recent episodes"
-  python3 /home/lumen/minerva/lumen_episode.py recall "recent session work" 2>/dev/null | head -6 | sed 's/^/  /' || echo "  (none)"
+  # ISSUE-LOG #846: recall embeds the query; under load the embed socket can block forever
+  # and hang every `claude_context.sh --core` boot. Bound it and say so instead.
+  _eps=$(timeout 20 python3 /home/lumen/minerva/lumen_episode.py recall "recent session work" 2>/dev/null); _erc=$?
+  if [ "$_erc" = 124 ]; then echo "  (recall timed out after 20s — embedder busy; run lumen_episode.py recall by hand)"
+  elif [ -n "$_eps" ]; then printf '%s\n' "$_eps" | head -6 | sed 's/^/  /'
+  else echo "  (none)"; fi
   echo "## triage queue (aq — /home/lumen/agents/alert-queue)"
   if [ -f /home/lumen/agents/alert-queue/alerts.db ]; then
     echo "  open: $(/home/lumen/bin/aq open-count 2>/dev/null || echo '?') (aq triage for detail)"
