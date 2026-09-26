@@ -28,6 +28,7 @@ trail):
   lumen_verify.py sweep --now ISO8601   # deterministic for tests
 """
 import argparse
+import shlex
 import json
 import os
 import re
@@ -251,9 +252,50 @@ def probe_fleet_inventory(subject, facts):
     return result
 
 
+FLEET_INVENTORY_DIR = os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet/inventory")
+_SSH_TARGETS = {}
+
+
+class NotReachable(RuntimeError):
+    """The roster says this node is not reachable by design (ssh method n/a)."""
+
+
+def _ssh_target(node):
+    """(target, key) for `node` (wq#1688). The bare subject name only resolves for nodes
+    with a matching MagicDNS / ssh-config entry (`ssh gameboy` fails name resolution), so
+    every SSH probe silently answered unknown for the rest. Resolve user@tailscale_ip from
+    the roster (store-first, wq#1631); bare name only when the roster has no such node."""
+    if node in _SSH_TARGETS:
+        return _SSH_TARGETS[node]
+    try:
+        if FLEET_INVENTORY_DIR not in sys.path:
+            sys.path.insert(0, FLEET_INVENTORY_DIR)
+        import fleet_inventory as inv
+    except Exception:  # noqa: BLE001 - no roster module: behave as before
+        _SSH_TARGETS[node] = (node, None)
+        return _SSH_TARGETS[node]
+    rec = inv.get(node)
+    if rec is None:
+        _SSH_TARGETS[node] = (node, None)
+    else:
+        try:
+            _SSH_TARGETS[node] = (inv.ssh_target(node), inv.ssh_key(rec))
+        except inv.InventoryError as e:
+            _SSH_TARGETS[node] = (None, str(e))
+    return _SSH_TARGETS[node]
+
+
 def _ssh_argv(node, remote_argv):
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            node, "--", *remote_argv]
+    target, key = _ssh_target(node)
+    if target is None:
+        raise NotReachable(key)
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if key:
+        argv += ["-i", key]
+    # ssh joins its trailing args with spaces into ONE remote shell string, so an argv
+    # like ["sh", "-c", "a; b"] loses its quoting and runs `sh -c a` then `b` in the login
+    # shell (wq#1688 lost the system-serial section that way). Quote it ourselves.
+    return argv + [target, "--", shlex.join(remote_argv)]
 
 
 UNIT_NAME_RE = re.compile(
@@ -341,31 +383,175 @@ def _lsblk_bytes(out):
     """Whole-disk capacity: top-level `disk` devices only, so partitions, loop
     and optical devices are not counted twice or at all."""
     devices = json.loads(out).get("blockdevices", [])
-    return sum(int(d.get("size") or 0) for d in devices if d.get("type") == "disk")
+    return sum(int(d.get("size") or 0) for d in _real_disks(devices))
+
+
+def _real_disks(devices):
+    """lsblk reports zram swap as TYPE=disk (wq#1580 recorded thor's zram0 as a drive)."""
+    return [d for d in devices if d.get("type") == "disk"
+            and not str(d.get("name") or "").startswith(("zram", "loop"))]
+
+
+STATED_SERIAL_RE = re.compile(r"\bsn[:\s]+([A-Za-z0-9][A-Za-z0-9./_-]{4,})", re.I)
+MAC_RE = re.compile(r"\b([0-9a-f]{2}(?::[0-9a-f]{2}){5})\b", re.I)
+
+
+def _stated_serials(text):
+    """`sn A/B/C` (RAID members written together) states three serials."""
+    out = set()
+    for m in STATED_SERIAL_RE.findall(text or ""):
+        out |= {p.strip(".,;:()").upper() for p in m.split("/") if len(p.strip(".,;:()")) >= 5}
+    return out
+
+
+DMI_PLACEHOLDERS = {"default string", "to be filled by o.e.m.", "system serial number",
+                    "not specified", "not applicable", "none", "0123456789", "0",
+                    "chassis serial number", "base board serial number", ""}
+
+
+def _dmi_serials(text):
+    """Real serials from `dmidecode -s ...` output: one per line, vendor placeholders
+    ('Default string' on the Trigkey/WeiBu boards) dropped whole, never tokenized."""
+    out = set()
+    for line in (text or "").splitlines():
+        for part in line.split("/"):
+            v = part.strip()
+            if v and v.lower() not in DMI_PLACEHOLDERS and not v.startswith("#") and len(v) >= 5:
+                out.add(v.upper())
+    return out
+
+
+def _sudo_refused(err):
+    e = (err or "").lower()
+    return "password is required" in e or "interactive authentication" in e or "sorry, user" in e
 
 
 NODE_STORAGE_OBSERVERS = {
-    "ram": (["dmidecode", "--type", "17"], _dmidecode_bytes, "RAM"),
+    "ram": (["sudo", "-n", "dmidecode", "--type", "17"], _dmidecode_bytes, "RAM"),
     "storage": (["lsblk", "-J", "-b", "-d", "-o", "NAME,SIZE,TYPE"], _lsblk_bytes, "disk"),
 }
+
+
+LSBLK_SERIAL_ARGV = ["lsblk", "-J", "-b", "-d", "-o", "NAME,SIZE,TYPE,SERIAL"]
+
+
+def _confirm_storage_serials(subject, fact):
+    """wq#1688: storage is keyed by SERIAL, never by /dev name (lumen's boot nvme moved
+    nvme4 -> nvme5 across boots). Every serial the stored text states must be a whole disk
+    on the node now. Returns None when the value states no serial (caller falls back)."""
+    stated = _stated_serials(fact["value"])
+    if not stated:
+        return None
+    key = (subject, fact["predicate"])
+    rc, out, err = run(LSBLK_SERIAL_ARGV if subject == "lumen" else _ssh_argv(subject, LSBLK_SERIAL_ARGV))
+    if rc != 0:
+        return {key: (None, f"ssh {subject}: {err[:120] or 'lsblk failed'}")}
+    try:
+        seen = {str(d.get("serial") or "").strip().upper()
+                for d in _real_disks(json.loads(out).get("blockdevices", []))}
+    except ValueError as e:
+        return {key: (None, f"lsblk unparseable: {e}")}
+    missing = sorted(stated - seen)
+    if missing:
+        return {key: (None, f"MISMATCH: stated disk serial(s) {missing} not on {subject} "
+                            f"(observed {sorted(s for s in seen if s)})")}
+    return {key: (fact["value"], None)}
 
 
 def probe_node_storage(subject, facts):
     result = {}
     for f in facts:
         key = (subject, f["predicate"])
+        if f["predicate"] in ("storage", "storage_layout"):
+            by_serial = _confirm_storage_serials(subject, f)
+            if by_serial is not None:
+                result.update(by_serial)
+                continue
+            if f["predicate"] == "storage_layout":
+                result[key] = (None, "storage_layout states no disk serial to confirm")
+                continue
         if f["predicate"] not in NODE_STORAGE_OBSERVERS:
             result[key] = (None, f"node_storage cannot observe {f['predicate']}")
             continue
         argv, measure, what = NODE_STORAGE_OBSERVERS[f["predicate"]]
         rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
         if rc != 0:
-            result[key] = (None, f"ssh {subject}: {err[:120]}")
+            result[key] = (None, "sudo -n denied" if _sudo_refused(err) else f"ssh {subject}: {err[:120]}")
             continue
         try:
             result.update(_confirm_size(subject, f, measure(out), what))
         except ValueError as e:
             result[key] = (None, f"{argv[0]} unparseable: {e}")
+    return result
+
+
+IDENTITY_ARGV = ["sh", "-c",
+                 "echo ---SYS---; sudo -n dmidecode -s system-serial-number 2>&1; "
+                 "echo ---BOARD---; sudo -n dmidecode -s baseboard-serial-number 2>&1; "
+                 "echo ---LINK---; ip -o link 2>&1"]
+
+
+def _sections(out):
+    sec, cur = {}, None
+    for line in out.splitlines():
+        m = re.fullmatch(r"---([A-Z]+)---", line.strip())
+        if m:
+            cur = m.group(1)
+            sec[cur] = []
+        elif cur:
+            sec[cur].append(line)
+    return {k: "\n".join(v).strip() for k, v in sec.items()}
+
+
+def probe_node_identity(subject, facts):
+    """wq#1688: hardware / nic / nic_config hold curated free text, so a probe string is
+    never the new value (wq#2204). Stable tokens CONFIRM the stored value or it is unknown:
+    hardware -> DMI system or baseboard serial appears in the text; nic -> every MAC the
+    text states is on the node. A stated token that is not observed is a MISMATCH, logged
+    as unknown for a human, never superseded."""
+    result = {}
+    argv = IDENTITY_ARGV
+    rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
+    if rc != 0 and not out.strip():
+        return {(subject, f["predicate"]): (None, f"ssh {subject}: {err[:120] or 'no output'}")
+                for f in facts}
+    sec = _sections(out)
+    serials = set()
+    sudo_denied = False
+    for part in ("SYS", "BOARD"):
+        v = sec.get(part, "")
+        if _sudo_refused(v):
+            sudo_denied = True
+            continue
+        serials |= _dmi_serials(v)
+    macs = {m.lower() for m in re.findall(r"link/ether\s+([0-9a-f:]{17})", sec.get("LINK", ""), re.I)}
+    for f in facts:
+        key = (subject, f["predicate"])
+        text = f["value"] or ""
+        if f["predicate"] == "hardware":
+            if sudo_denied or not serials:
+                result[key] = (None, "sudo -n denied" if sudo_denied else "no DMI serial readable")
+                continue
+            words = {w.strip("/.,;:()").upper() for w in re.split(r"\s+", text)}
+            if serials & words:
+                result[key] = (text, None)
+            elif _stated_serials(text):
+                result[key] = (None, f"MISMATCH: stated serial(s) {sorted(_stated_serials(text))} "
+                                     f"vs observed {sorted(serials)}")
+            else:
+                result[key] = (None, "stored value states no serial to confirm")
+        elif f["predicate"] in ("nic", "nic_config"):
+            stated = {m.lower() for m in MAC_RE.findall(text)}
+            if not stated:
+                result[key] = (None, "stored value states no MAC to confirm")
+            elif not macs:
+                result[key] = (None, "no MAC observed (ip -o link empty)")
+            elif stated <= macs:
+                result[key] = (text, None)
+            else:
+                result[key] = (None, f"MISMATCH: stated MAC(s) {sorted(stated - macs)} not on {subject}")
+        else:
+            result[key] = (None, f"node_identity cannot observe {f['predicate']}")
     return result
 
 
@@ -467,6 +653,7 @@ PROBES = {
     "service_state": probe_service_state,
     "node_storage": probe_node_storage,
     "os_kernel": probe_os_kernel,
+    "node_identity": probe_node_identity,
     "plug_map": probe_plug_map,
     "endpoint_live": probe_endpoint_live,
     "node_liveness": probe_node_liveness,
@@ -554,7 +741,8 @@ def reconcile(conn, fact, probe_id, observed, error, now):
 
 # ------------------------------------------------------------------- sweep
 
-SSH_PROBES = frozenset({"fleet_inventory", "service_state", "node_storage", "os_kernel"})
+SSH_PROBES = frozenset({"fleet_inventory", "service_state", "node_storage", "os_kernel",
+                        "node_identity"})
 
 
 def closed_subjects(conn):
@@ -566,10 +754,26 @@ def closed_subjects(conn):
         (reg["lifecycle"],)) if r["value"] in reg["closing"]}
 
 
-def sweep(conn, registry, now=None, dry_run=False):
+def node_facts(conn, registry, subjects, probes):
+    """wq#1688: every open fact of `subjects` whose predicate maps to one of `probes`,
+    due or not -- `fleet-inv verify` asks now, it does not wait for the interval."""
+    batches = {}
+    marks = ",".join("?" * len(subjects))
+    for row in conn.execute(
+            f"SELECT * FROM state_facts WHERE valid_to IS NULL AND subject IN ({marks})",
+            [s.lower() for s in subjects]):
+        fact = dict(row)
+        probe_id = registry.probe_id(fact["predicate"])
+        if probe_id in probes and probe_id in PROBES:
+            batches.setdefault((probe_id, fact["subject"]), []).append(fact)
+    return batches
+
+
+def sweep(conn, registry, now=None, dry_run=False, batches=None):
     now = now or datetime.now(timezone.utc)
     migrate(conn)
-    batches = due_facts(conn, registry, now)
+    if batches is None:
+        batches = due_facts(conn, registry, now)
     counts = {"confirmed": 0, "superseded": 0, "unknown": 0, "skipped": 0}
     detail = []
     closed = closed_subjects(conn)
@@ -619,13 +823,30 @@ def main(argv=None):
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--now", default=None, help="ISO8601, for deterministic runs")
+    np_ = sub.add_parser("node", help="wq#1688: run probes on these subjects now, due or not")
+    np_.add_argument("subjects", nargs="+")
+    np_.add_argument("--probes", default="node_identity,node_storage,os_kernel",
+                     help="comma list (default: the hardware identity set)")
+    np_.add_argument("--db", default=MINERVA_DB)
+    np_.add_argument("--registry", default=REGISTRY_PATH)
+    np_.add_argument("--dry-run", action="store_true")
+    np_.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
     registry = Registry(args.registry)
-    now = datetime.fromisoformat(args.now) if args.now else None
-    result = sweep(conn, registry, now=now, dry_run=args.dry_run)
+    now = datetime.fromisoformat(args.now) if getattr(args, "now", None) else None
+    batches = None
+    if args.cmd == "node":
+        probes = {p.strip() for p in args.probes.split(",") if p.strip()}
+        unknown = probes - set(PROBES)
+        if unknown:
+            print(f"unknown probe(s): {sorted(unknown)}", file=sys.stderr)
+            return 2
+        migrate(conn)
+        batches = node_facts(conn, registry, args.subjects, probes)
+    result = sweep(conn, registry, now=now, dry_run=args.dry_run, batches=batches)
     if args.json:
         print(json.dumps(result, indent=2))
     else:
