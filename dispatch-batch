@@ -24,6 +24,7 @@ ROUTER="${DISPATCH_BATCH_ROUTER:-$FOREMAN_ROOT/orchestrator/router.py}"
 RUN_DIR="${DISPATCH_BATCH_RUN_DIR:-$FOREMAN_ROOT/_runs/dispatch}"
 CLAIM_WAIT_S="${DISPATCH_BATCH_CLAIM_WAIT_S:-60}"
 CLAIM_POLL_S="${DISPATCH_BATCH_CLAIM_POLL_S:-3}"
+ADMISSION_GATE="${DISPATCH_BATCH_ADMISSION_GATE:-$FOREMAN_ROOT/dispatcher/admission_gate.py}"
 
 usage() { echo "usage: dispatch-batch TICKET_ID [TICKET_ID ...]" >&2; exit "${1:-64}"; }
 case "${1:-}" in -h|--help) usage 0 ;; esac
@@ -65,6 +66,39 @@ spawn_ticket() {
   fi
 }
 
+# wq#2631/wq#2647: dispatch-batch used to spawn straight through lumen-run with no
+# admission control of its own, bypassing the same cloud-concurrency-ceiling + CPU-PSI
+# cap foreman_dispatcher.py's own dispatch pass already enforces in-process
+# (dispatcher/concurrency.py + dispatcher/cpu_pressure.py, wired via
+# dispatcher/admission_gate.py — see that file's docstring: it exists specifically so an
+# out-of-process caller like this one gets the identical verdict instead of duplicating
+# the logic). 2026-09-25 04:28Z: three orchestrators pasting batches in parallel on top of
+# 14 running fworkers pushed load to 104 on 44 cores and nearly took Commander down.
+#
+# admission_check prints a one-line reason to stdout and returns 0=admit, nonzero=deny.
+# DISPATCH_BATCH_ADMISSION_CMD overrides the whole check (tests only — must behave the
+# same way: 0/nonzero exit, reason on stdout). A missing gate script fails OPEN (admit) —
+# this script's job is spawn-vs-queue, not to become a second place the fleet can wedge
+# itself if the gate tool is absent from a stripped-down checkout.
+#
+# Emergency override, deliberate and on the record: export BOTH
+# ADMISSION_GATE_OVERRIDE=1 and ADMISSION_GATE_OVERRIDE_REASON="<why>" in the caller's
+# environment before running dispatch-batch. admission_gate.py itself honors this pair
+# (a bare ADMISSION_GATE_OVERRIDE=1 with no reason does NOT bypass, so a stray env var
+# can't silently punch through the gate) and echoes the reason back into its verdict, so
+# the override shows up in the batch log same as any other admission reason.
+admission_check() {
+  if [ -n "${DISPATCH_BATCH_ADMISSION_CMD:-}" ]; then
+    "$DISPATCH_BATCH_ADMISSION_CMD"
+    return $?
+  fi
+  if [ ! -f "$ADMISSION_GATE" ]; then
+    echo "admission_gate_missing: $ADMISSION_GATE (failing open)"
+    return 0
+  fi
+  python3 "$ADMISSION_GATE" check 2>&1
+}
+
 claimed_by_of() {
   "$WQ_BIN" show "$1" 2>/dev/null | sed -n 's/^claimed_by[[:space:]]*:[[:space:]]*//p'
 }
@@ -101,6 +135,19 @@ run_batch() {
     esac
     if [ -n "$pre" ] && [ "$pre" != "None" ]; then
       echo "wq#$id SKIP already claimed_by=$pre" | tee -a "$log"; continue
+    fi
+    # Admission gate: re-checked per ticket (each spawn changes the running count, and a
+    # long batch can span a load spike starting or clearing mid-run). A denied ticket is
+    # left OPEN, not touched — it stays exactly as claimable as it was, and the ordinary
+    # 20-min lumen-foreman-dispatch.timer pass (itself admission-gated, same check) picks
+    # it up once load clears. Nothing to release or re-lane: dispatch-batch never claimed
+    # it in the first place.
+    local adm_out adm_rc
+    adm_rc=0
+    adm_out=$(admission_check) || adm_rc=$?
+    if [ "$adm_rc" -ne 0 ]; then
+      echo "wq#$id QUEUED admission denied: ${adm_out:-no reason given} (left open for the next dispatcher pass)" | tee -a "$log"
+      continue
     fi
     if ! out=$(spawn_ticket "$id" 2>>"$log"); then
       echo "wq#$id: spawn failed — see $log" | tee -a "$log"

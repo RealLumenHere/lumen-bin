@@ -62,6 +62,12 @@ def make_env(tmp_path, **overrides):
     # wq#912: scratch lane is never a real dispatcher lane — point the guard at a path
     # that doesn't exist so it fails open instead of consulting the live config.
     env["WQ_DISPATCHER_CONFIG"] = str(tmp_path / "no-such-dispatcher-config.json")
+    # wq#2631/wq#2647: same fail-open pattern as WQ_DISPATCHER_CONFIG above -- a test that
+    # doesn't care about admission shouldn't be at the mercy of the real box's live CPU
+    # load/concurrency state. Point at a path that doesn't exist so admission_check()
+    # always admits; tests that DO care override DISPATCH_BATCH_ADMISSION_CMD instead
+    # (which takes priority over this path entirely -- see admission_check() itself).
+    env["DISPATCH_BATCH_ADMISSION_GATE"] = str(tmp_path / "no-such-admission-gate.py")
     env["WQ_BIN"] = WQ_BIN
     env["DISPATCH_BATCH_RUN_DIR"] = str(tmp_path / "runs")
     env["SPAWN_RECIPE_DIR"] = str(tmp_path / "recipes")
@@ -274,3 +280,98 @@ def test_default_spawn_refuses_to_eval_non_lumen_run_output(tmp_path):
     assert "done rc=1" in text
     ticket_log = (tmp_path / "runs" / f"{tid}.log").read_text()
     assert "refusing to eval non-lumen-run output" in ticket_log
+
+
+# wq#2631/wq#2647: dispatch-batch spawned straight through lumen-run with no admission
+# control, bypassing the same cloud-concurrency + CPU-PSI cap foreman_dispatcher.py's own
+# pass enforces in-process. N orchestrators pasting batches in parallel could push load
+# well past what the box can hold (2026-09-25 04:28Z: load 104 on 44 cores).
+# DISPATCH_BATCH_ADMISSION_CMD is the test seam: an executable dispatch-batch invokes with
+# no args that must exit 0 (admit) or nonzero (deny) and may print a reason.
+
+def make_admission_stub(tmp_path, verdict, reason="test reason"):
+    stub = tmp_path / "admission_stub.sh"
+    rc = 0 if verdict == "ok" else 1
+    stub.write_text(f'#!/usr/bin/env bash\necho "{reason}"\nexit {rc}\n')
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def claimed_by_of_helper(env, tid):
+    p = subprocess.run([WQ_BIN, "show", str(tid)], capture_output=True, text=True, env=env)
+    m = re.search(r"^claimed_by\s*:\s*(\S+)", p.stdout, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def test_admission_denied_queues_instead_of_spawning(tmp_path):
+    env = make_env(tmp_path, DISPATCH_BATCH_SPAWN_CMD=write_stub(tmp_path),
+                   DISPATCH_BATCH_ADMISSION_CMD=make_admission_stub(
+                       tmp_path, "deny", "cpu_pressure: cpu_some_avg60=42.00%>=30.0%"))
+    ids = [add_ticket(env, f"dispatch-batch admission-deny {i}") for i in range(3)]
+    for i in ids:
+        set_recipe(tmp_path, i, "claim_immediate")
+
+    p = run_dispatch_batch(env, *ids)
+    assert p.returncode == 0, f"{p.stdout}\n{p.stderr}"
+
+    def batch_done():
+        logs = batch_logs(tmp_path)
+        return logs and "done rc=" in logs[-1].read_text()
+
+    assert wait_for(batch_done, timeout_s=10), "detached batch never finished"
+    text = batch_logs(tmp_path)[-1].read_text()
+    for i in ids:
+        assert f"wq#{i} QUEUED admission denied: cpu_pressure: cpu_some_avg60=42.00%>=30.0%" in text
+        assert f"wq#{i} UNIT=" not in text, f"wq#{i} must not have been spawned while admission denied"
+    # AC: batch spawns 0, queues N, and still exits 0 — a denied admission is backpressure,
+    # not a batch failure.
+    assert "done rc=0" in text
+
+    # Queued tickets are left untouched (dispatch-batch never claimed them) so the ordinary
+    # dispatcher timer can still pick them up once load clears.
+    for i in ids:
+        assert claimed_by_of_helper(env, i) in (None, "None")
+
+
+def test_admission_ok_spawns_normally(tmp_path):
+    # Regression guard: an admitted ticket must still go through the exact same
+    # spawn/claim-verify path as before this ticket existed.
+    env = make_env(tmp_path, DISPATCH_BATCH_SPAWN_CMD=write_stub(tmp_path),
+                   DISPATCH_BATCH_ADMISSION_CMD=make_admission_stub(tmp_path, "ok"))
+    tid = add_ticket(env, "dispatch-batch admission-ok")
+    set_recipe(tmp_path, tid, "claim_immediate")
+
+    p = run_dispatch_batch(env, tid)
+    assert p.returncode == 0, f"{p.stdout}\n{p.stderr}"
+
+    def batch_done():
+        logs = batch_logs(tmp_path)
+        return logs and "done rc=" in logs[-1].read_text()
+
+    assert wait_for(batch_done, timeout_s=10), "detached batch never finished"
+    text = batch_logs(tmp_path)[-1].read_text()
+    assert f"wq#{tid} UNIT=stub-{tid}" in text
+    assert f"wq#{tid} OK unit=stub-{tid} claimed_by=stub-agent-{tid}" in text
+    assert "QUEUED" not in text
+    assert "done rc=0" in text
+
+
+def test_missing_admission_gate_fails_open(tmp_path):
+    # A stripped-down checkout without dispatcher/admission_gate.py must not become a new
+    # way for the fleet to wedge itself — absence of the gate script admits, it never denies.
+    env = make_env(tmp_path, DISPATCH_BATCH_SPAWN_CMD=write_stub(tmp_path),
+                   DISPATCH_BATCH_ADMISSION_GATE=str(tmp_path / "no-such-admission-gate.py"))
+    tid = add_ticket(env, "dispatch-batch admission-gate-missing")
+    set_recipe(tmp_path, tid, "claim_immediate")
+
+    p = run_dispatch_batch(env, tid)
+    assert p.returncode == 0, f"{p.stdout}\n{p.stderr}"
+
+    def batch_done():
+        logs = batch_logs(tmp_path)
+        return logs and "done rc=" in logs[-1].read_text()
+
+    assert wait_for(batch_done, timeout_s=10), "detached batch never finished"
+    text = batch_logs(tmp_path)[-1].read_text()
+    assert f"wq#{tid} OK unit=stub-{tid}" in text
+    assert "done rc=0" in text
