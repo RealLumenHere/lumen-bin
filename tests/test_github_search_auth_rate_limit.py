@@ -157,6 +157,53 @@ def test_401_error_names_credential_helper_not_agent_env(monkeypatch, capsys):
     assert out["authenticated"] is False
 
 
+def test_200_with_remaining_zero_and_items_returns_ok_true_not_dropped(monkeypatch, capsys):
+    """wq#2598: GitHub sets X-RateLimit-Remaining:0 on the LAST request a budget still
+    permits, and that response carries real items. The header-only guard from wq#2569
+    dropped them; this must return the items with rate_limit_remaining surfaced."""
+    monkeypatch.setattr(fs, "cache_store", lambda *a, **kw: None)
+    monkeypatch.setattr(fs, "_resolve_github_token",
+                         lambda: ("tok", "/home/lumen/.secrets/github-frank.token"))
+    monkeypatch.setattr(fs, "_get_json_with_headers",
+                         lambda *a, **kw: (200,
+                                            {"items": [{"full_name": "lumen/repo", "html_url": "https://x",
+                                                        "stargazers_count": 1, "description": "d",
+                                                        "updated_at": "2026-01-01"}],
+                                             "total_count": 1},
+                                            None, {"remaining": "0", "reset": "1735689600"}))
+
+    with pytest.raises(SystemExit) as ei:
+        fs.cmd_github(_gh_args())
+    assert ei.value.code == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert len(out["results"]) == 1
+    assert out["rate_limit_remaining"] == "0"
+
+
+def test_200_with_populated_rl_none_returns_ok_true_no_crash(monkeypatch, capsys):
+    """rl None (no rate-limit headers at all) must not crash the exhausted check."""
+    monkeypatch.setattr(fs, "cache_store", lambda *a, **kw: None)
+    monkeypatch.setattr(fs, "_resolve_github_token", lambda: ("", ""))
+    monkeypatch.setattr(fs, "_get_json_with_headers",
+                         lambda *a, **kw: (200,
+                                            {"items": [{"full_name": "lumen/repo", "html_url": "https://x",
+                                                        "stargazers_count": 1, "description": "d",
+                                                        "updated_at": "2026-01-01"}],
+                                             "total_count": 1},
+                                            None, None))
+
+    with pytest.raises(SystemExit) as ei:
+        fs.cmd_github(_gh_args())
+    assert ei.value.code == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert len(out["results"]) == 1
+    assert out["rate_limit_remaining"] is None
+
+
 def test_success_reports_authenticated_and_token_source(monkeypatch, capsys):
     monkeypatch.setattr(fs, "cache_store", lambda *a, **kw: None)
     monkeypatch.setattr(fs, "_resolve_github_token",

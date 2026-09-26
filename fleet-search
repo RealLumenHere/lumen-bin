@@ -451,13 +451,10 @@ def cmd_github(args):
                       error="github 401 — no usable token (credential helper checked "
                             "identity-map, github-frank.token, agent/.env and found none valid)",
                       query=args.query, authenticated=False))
-    # wq#2569: 403/429 is GitHub's explicit "you're rate limited" signal; a bare status
-    # check misses the case where the SAME exhausted budget answers 200 with an empty
-    # result set (silently reads as "no findings" otherwise), so also trip on the
-    # X-RateLimit-Remaining header regardless of status.
-    if status in (403, 429) or (rl or {}).get("remaining") == "0":
+    # wq#2569: 403/429 is GitHub's explicit "you're rate limited" signal.
+    if status in (403, 429):
         emit(envelope(kind, False,
-                      error=(f"github {status or 200} — rate limited "
+                      error=(f"github {status} — rate limited "
                              f"(X-RateLimit-Remaining=0{', resets ' + reset_at if reset_at else ''}"
                              f"{'; unauthenticated' if not token else ''})"),
                       query=args.query, authenticated=bool(token), rate_limit_reset=reset_at))
@@ -465,6 +462,17 @@ def cmd_github(args):
         emit(envelope(kind, False, error=f"github 422 — unprocessable query (code search needs auth + real terms): {err}", query=args.query))
     if status != 200 or data is None:
         emit(envelope(kind, False, error=f"github http {status}: {err}", query=args.query))
+    # wq#2598: GitHub sets X-RateLimit-Remaining:0 on the LAST request a budget still
+    # permits, and that response carries real items — the header alone over-fires and
+    # discards them. Gate on the body (items), not the header or total_count: only
+    # hard-fail when the budget is exhausted AND this response has nothing usable.
+    exhausted = (rl or {}).get("remaining") == "0"
+    if exhausted and not (data or {}).get("items"):
+        emit(envelope(kind, False,
+                      error=(f"github {status} — rate limited "
+                             f"(X-RateLimit-Remaining=0{', resets ' + reset_at if reset_at else ''}"
+                             f"{'; unauthenticated' if not token else ''})"),
+                      query=args.query, authenticated=bool(token), rate_limit_reset=reset_at))
     out = []
     for r in data.get("items", [])[:args.n]:
         if kind == "github-code":
@@ -489,7 +497,9 @@ def cmd_github(args):
                         "updated": r.get("updated_at", "")})
     cache_store(args.project, kind, args.query, args.n, out)
     emit(envelope(kind, True, {"results": out, "total": data.get("total_count", 0),
-                  "authenticated": bool(token), "token_source": token_source or None},
+                  "authenticated": bool(token), "token_source": token_source or None,
+                  "rate_limit_remaining": (rl or {}).get("remaining"),
+                  "rate_limit_reset": reset_at},
                   query=args.query, cached=False))
 
 
