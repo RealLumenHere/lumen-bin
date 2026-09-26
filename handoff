@@ -20,9 +20,21 @@ svc(){ local n="$1" st d; st=$(systemctl is-active "$n" 2>/dev/null)
 verify(){
   echo "===== VERIFY NOW — live state @ $(pt '+%Y-%m-%d %H:%M %Z') (trust THIS over prose) ====="
   echo "## vault HA"
-  bash /home/lumen/bin/wadjet-ha-failback.sh status 2>/dev/null | sed 's/^/  /' || echo "  (ha status unavailable)"
+  _ha=$(bash /home/lumen/bin/wadjet-ha-failback.sh status 2>/dev/null) || _ha=""
+  if [ -n "$_ha" ]; then printf '%s\n' "$_ha" | sed 's/^/  /'; else echo "  (ha status unavailable)"; fi
   { [ -f /home/lumen/ha/AUTO_PROMOTE_ENABLED ] && echo "  auto_promote: ARMED"; } || echo "  auto_promote: DISARMED"
-  echo -n "  ha_monitor_timer: "; systemctl is-active wadjet-ha-monitor.timer 2>/dev/null || true
+  _tm=$(systemctl is-active wadjet-ha-monitor.timer 2>/dev/null)
+  echo "  ha_monitor_timer: ${_tm:-unknown}"
+  # ISSUE-LOG #847: 'sobek in_recovery: f' printed here for ~4 weeks (2026-08-31 -> 09-26) and
+  # was never read as an alarm. Exactly one node may be out of recovery. Say it loudly.
+  _prim=$(printf '%s\n' "$_ha" | grep -cE 'in_recovery: *f')
+  if [ "${_prim:-0}" -gt 1 ]; then
+    echo "  !!! SPLIT BRAIN: $_prim nodes report in_recovery=f (two read-write primaries). Do NOT re-arm"
+    echo "  !!! or switch over. See ISSUE-LOG #847 and lumen_state current sobek / vault."
+  fi
+  if [ -f /home/lumen/ha/AUTO_PROMOTE_ENABLED ] && [ "${_tm}" != active ]; then
+    echo "  !!! auto_promote ARMED but wadjet-ha-monitor.timer is ${_tm:-unknown}: failover is NOT actually armed"
+  fi
   echo "## dead-man: critical timer LastTrigger age (wq#1658)"
   for t in wadjet-ha-monitor.timer lumen-backup-critical.timer; do
     lt=$(systemctl show "$t" -p LastTriggerUSec --value 2>/dev/null)
