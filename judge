@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""judge -- wq#2788 Phase 0: the central risk-tiered judge CLI.
+
+Agents execute, they never judge (claude_memory.md AUTONOMY POLICY, 2026-09-26).
+Any judgment call an agent or the deterministic action_gate.py hits comes here
+instead. This is the ONLY thing that decides a risk tier or whether a rule may
+bend. One LOCAL model call, zero cloud/session credit per decision, every
+verdict logged, fails CLOSED (never allows, never guesses) if the model is
+down, times out, or returns something the parser can't validate.
+
+USAGE
+  judge --actor <wq-id-or-agent-name> --kind bash|diff|file_write|advice|other \
+        --command '<the actual command/diff/target text>' \
+        [--context '<extra context: project, hardware_class, live fleet state>'] \
+        [--gate-verdict RED|AMBER|GREEN]
+
+  # or pipe a JSON case object (same shape as judge_eval_set.jsonl) on stdin:
+  echo '{"actor":"wq2801","action_kind":"bash","command":"..."}' | judge --stdin
+
+STDOUT: one JSON object -- {"tier","verdict","conditions","rationale","model",
+"latency_s"} on success, or {"verdict":"FAIL_CLOSED","reason":...} on failure.
+
+EXIT CODES (mirrors action_gate.py's 0/2 convention, extended):
+  0 = allow            1 = deny
+  2 = allow-with-conditions   3 = FAIL_CLOSED (model down / timeout / unparseable)
+
+Every call -- success or fail-closed -- is logged to minerva.db (judge_verdicts).
+A fail-closed call ALSO lands in fail_closed_queue.jsonl and pages aq, because
+"the judge didn't answer" must never quietly become "so nothing happened" NOR
+"so fall back to cloud" -- per Frank: zero cloud fallback, queue + alert only.
+"""
+import argparse
+import datetime
+import json
+import os
+import sqlite3
+import sys
+import subprocess
+
+sys.path.insert(0, "/home/lumen/foreman/judge")
+from judge_common import call_judge, litellm_key  # noqa: E402
+
+MINERVA_DB = "/home/lumen/minerva/minerva.db"
+PIN_FILE = "/home/lumen/foreman/judge/JUDGE_MODEL_PIN"
+FAIL_QUEUE = "/home/lumen/foreman/judge/fail_closed_queue.jsonl"
+EXIT_BY_VERDICT = {"allow": 0, "deny": 1, "allow-with-conditions": 2}
+
+
+def resolve_model():
+    env = os.environ.get("JUDGE_MODEL")
+    if env:
+        return env, "env:JUDGE_MODEL"
+    if os.path.isfile(PIN_FILE):
+        pin = open(PIN_FILE).read().strip()
+        if pin:
+            return pin, f"pin:{PIN_FILE}"
+    sys.stderr.write(
+        "judge: no model configured. Set JUDGE_MODEL or write the pinned model "
+        f"name to {PIN_FILE} (see research/RISK_TIERED_JUDGE.md).\n")
+    sys.exit(3)
+
+
+def db_init():
+    c = sqlite3.connect(MINERVA_DB)
+    c.execute("""CREATE TABLE IF NOT EXISTS judge_verdicts(
+      ts TEXT NOT NULL, actor TEXT, action_kind TEXT, command TEXT,
+      context TEXT, input_gate_verdict TEXT, model TEXT, model_source TEXT,
+      tier TEXT, verdict TEXT, conditions TEXT, rationale TEXT,
+      latency_s REAL, fail_closed INT NOT NULL DEFAULT 0, error TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_ts ON judge_verdicts(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_actor ON judge_verdicts(actor)")
+    c.commit()
+    return c
+
+
+def log_verdict(conn, ts, case, model, model_source, result, fail_closed):
+    v = result.get("verdict")
+    conn.execute(
+        "INSERT INTO judge_verdicts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ts, case.get("actor"), case.get("action_kind"), case.get("command"),
+         case.get("context"), case.get("gate_verdict"), model, model_source,
+         (v or {}).get("tier"), (v or {}).get("verdict"),
+         json.dumps((v or {}).get("conditions") or []), (v or {}).get("rationale"),
+         result.get("latency_s"), int(fail_closed), result.get("error")))
+    conn.commit()
+
+
+def fail_closed(conn, ts, case, model, model_source, result):
+    reason = result.get("error") or "unparseable/empty judge response"
+    log_verdict(conn, ts, case, model, model_source, result, fail_closed=True)
+    entry = {"ts": ts, "actor": case.get("actor"), "model": model, "reason": reason,
+             "case": case}
+    try:
+        os.makedirs(os.path.dirname(FAIL_QUEUE), exist_ok=True)
+        with open(FAIL_QUEUE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+    # Best-effort page -- never let alerting itself crash a fail-closed path.
+    try:
+        subprocess.run(
+            ["aq", "add", "judge", f"fail-closed-{case.get('actor', 'unknown')}",
+             "judge FAIL_CLOSED -- action blocked, needs manual review",
+             f"model={model} reason={reason} actor={case.get('actor')} "
+             f"command={str(case.get('command'))[:200]}"],
+            timeout=10, capture_output=True)
+    except Exception:
+        pass
+    out = {"verdict": "FAIL_CLOSED", "reason": reason, "model": model,
+           "note": "no cloud fallback by design -- queued to fail_closed_queue.jsonl "
+                   "and paged to aq lane 'judge'. This action is NOT allowed."}
+    print(json.dumps(out, indent=2))
+    sys.exit(3)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--actor")
+    ap.add_argument("--kind", dest="action_kind",
+                     choices=["bash", "diff", "file_write", "service_action", "advice", "other"])
+    ap.add_argument("--command")
+    ap.add_argument("--context", default="")
+    ap.add_argument("--gate-verdict", dest="gate_verdict", choices=["RED", "AMBER", "GREEN"])
+    ap.add_argument("--stdin", action="store_true", help="read a JSON case object from stdin")
+    ap.add_argument("--timeout", type=int, default=240)
+    args = ap.parse_args()
+
+    if args.stdin:
+        case = json.loads(sys.stdin.read())
+    else:
+        if not args.command:
+            ap.error("--command is required unless --stdin is used")
+        case = {"actor": args.actor, "action_kind": args.action_kind or "other",
+                "command": args.command, "context": args.context,
+                "gate_verdict": args.gate_verdict}
+
+    model, model_source = resolve_model()
+    try:
+        key = litellm_key()
+    except Exception as e:
+        sys.stderr.write(f"judge: cannot load LiteLLM key: {e}\n")
+        sys.exit(3)
+
+    conn = db_init()
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    result = call_judge(model, case, timeout=args.timeout, key=key)
+
+    if result["verdict"] is None:
+        fail_closed(conn, ts, case, model, model_source, result)
+        return  # unreachable, fail_closed() exits
+
+    log_verdict(conn, ts, case, model, model_source, result, fail_closed=False)
+    v = result["verdict"]
+    out = {"tier": v["tier"], "verdict": v["verdict"], "conditions": v["conditions"],
+           "rationale": v["rationale"], "model": model, "latency_s": result["latency_s"]}
+    print(json.dumps(out, indent=2))
+    sys.exit(EXIT_BY_VERDICT[v["verdict"]])
+
+
+if __name__ == "__main__":
+    main()
