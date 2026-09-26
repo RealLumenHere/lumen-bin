@@ -88,15 +88,25 @@ spawn_ticket() {
 # can't silently punch through the gate) and echoes the reason back into its verdict, so
 # the override shows up in the batch log same as any other admission reason.
 admission_check() {
+  # $1 = ticket id. wq#2127/wq#2790: pass --ticket so the gate PARTITIONS on the
+  # ticket's routed model — a local-pool ticket is checked against the Macs' free
+  # slots, a cloud ticket against the budget-aware cloud_ceiling counting cloud units
+  # only. Without --ticket the gate falls back to the unpartitioned config ceiling and
+  # counts local units against it (the "flat 3-slot ceiling", ISSUE wq#2127 step 12).
+  local id="${1:-}"
   if [ -n "${DISPATCH_BATCH_ADMISSION_CMD:-}" ]; then
-    "$DISPATCH_BATCH_ADMISSION_CMD"
+    "$DISPATCH_BATCH_ADMISSION_CMD" "$id"
     return $?
   fi
   if [ ! -f "$ADMISSION_GATE" ]; then
     echo "admission_gate_missing: $ADMISSION_GATE (failing open)"
     return 0
   fi
-  python3 "$ADMISSION_GATE" check 2>&1
+  if [ -n "$id" ]; then
+    python3 "$ADMISSION_GATE" check --ticket "$id" 2>&1
+  else
+    python3 "$ADMISSION_GATE" check 2>&1
+  fi
 }
 
 claimed_by_of() {
@@ -144,7 +154,7 @@ run_batch() {
     # it in the first place.
     local adm_out adm_rc
     adm_rc=0
-    adm_out=$(admission_check) || adm_rc=$?
+    adm_out=$(admission_check "$id") || adm_rc=$?
     if [ "$adm_rc" -ne 0 ]; then
       echo "wq#$id QUEUED admission denied: ${adm_out:-no reason given} (left open for the next dispatcher pass)" | tee -a "$log"
       continue

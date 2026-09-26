@@ -287,7 +287,7 @@ def test_default_spawn_refuses_to_eval_non_lumen_run_output(tmp_path):
 # pass enforces in-process. N orchestrators pasting batches in parallel could push load
 # well past what the box can hold (2026-09-25 04:28Z: load 104 on 44 cores).
 # DISPATCH_BATCH_ADMISSION_CMD is the test seam: an executable dispatch-batch invokes with
-# no args that must exit 0 (admit) or nonzero (deny) and may print a reason.
+# the ticket id as $1 (wq#2790) that must exit 0 (admit) or nonzero (deny) and may print a reason.
 
 def make_admission_stub(tmp_path, verdict, reason="test reason"):
     stub = tmp_path / "admission_stub.sh"
@@ -375,3 +375,28 @@ def test_missing_admission_gate_fails_open(tmp_path):
     text = batch_logs(tmp_path)[-1].read_text()
     assert f"wq#{tid} OK unit=stub-{tid}" in text
     assert "done rc=0" in text
+
+
+def test_admission_check_receives_ticket_id(tmp_path):
+    # wq#2127 step 12 / wq#2790: the gate is PARTITIONED on the ticket's model, so
+    # dispatch-batch must hand the ticket id to the admission check (the real gate gets
+    # `check --ticket <id>`; the test seam gets it as $1). Without the id the gate falls
+    # back to the flat unpartitioned ceiling that counted local units against cloud.
+    seen = tmp_path / "admission_seen.txt"
+    stub = tmp_path / "admission_stub_id.sh"
+    stub.write_text(f'#!/usr/bin/env bash\necho "$1" >> "{seen}"\necho ok\nexit 0\n')
+    stub.chmod(0o755)
+    env = make_env(tmp_path, DISPATCH_BATCH_SPAWN_CMD=write_stub(tmp_path),
+                   DISPATCH_BATCH_ADMISSION_CMD=str(stub))
+    tid = add_ticket(env, "dispatch-batch admission-ticket-id")
+    set_recipe(tmp_path, tid, "claim_immediate")
+
+    p = run_dispatch_batch(env, tid)
+    assert p.returncode == 0, f"{p.stdout}\n{p.stderr}"
+
+    def batch_done():
+        logs = batch_logs(tmp_path)
+        return logs and "done rc=" in logs[-1].read_text()
+
+    assert wait_for(batch_done, timeout_s=10), "detached batch never finished"
+    assert seen.read_text().split() == [str(tid)], seen.read_text()
