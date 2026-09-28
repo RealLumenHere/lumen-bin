@@ -8,7 +8,10 @@ access log wrote to stdout in cleartext for `docker logs litellm` to keep foreve
 import hashlib, json, os, sys, urllib.request, pathlib
 
 LITELLM = "http://localhost:4000"
-MASTER_KEY = pathlib.Path("/home/lumen/.secrets/litellm-master.env").read_text().split("=",1)[1].strip()
+# wq#1747: the file holds more than one line since 2026-09-25 (GEMINI_API_KEY). split("=",1) on the whole file
+# took the master key PLUS every later line, so every /key/info call failed (budget alerts silently dead since then).
+MASTER_KEY = next(l.split("=", 1)[1].strip() for l in pathlib.Path("/home/lumen/.secrets/litellm-master.env").read_text().splitlines()
+                  if l.startswith("LITELLM_MASTER_KEY="))
 SECRETS_DIR = pathlib.Path("/home/lumen/.secrets/litellm-service-keys")
 THRESHOLD = 0.80  # alert at 80%
 
