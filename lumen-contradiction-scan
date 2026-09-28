@@ -85,6 +85,15 @@ Exit 0 = ran clean, 2 = the scan itself broke, 1 = actionable hits (only with
 red). pgvector being unreachable WARNs and leaves the exit code alone — the
 corpus half must never take the fleet-facing half down (§4.3).
 
+wq#3030: the dead-value index also reads `archival_notes.supersedes`
+(build_note_supersession_index), not just `state_facts`. The reach diagnostic
+in ops/wq1614-search-v3-contradiction-penalty/REPORT.md §3 measured the index
+covering only 5 fleet-hardware predicates (ts_ip, status, ollama_version,
+fan_status, power_plug) and none of the wq#1614 trap@1 queries — they are
+project/infra narrative (an ingestion outage, a dashboard, a backup
+checkpoint, a migration) that never had a state_facts subject and so could
+never reach the index through build_dead_value_index() alone.
+
   lumen-contradiction-scan [--json] [--apply] [--strict] [--db PATH]
   lumen-contradiction-scan --corpus [--corpus-apply] [--corpus-env PATH]
   lumen-contradiction-scan --selftest
@@ -110,6 +119,19 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9._:/@\-]+$")
 # Resale prices are volatile by design (VOLATILE_HALFLIFE); a doc quoting last
 # month's eBay price is not fleet staleness.
 VOLATILE_PREDICATES = {"price", "actual_load", "pr_count"}
+
+# Predicates whose values are fleet vocabulary rather than identifiers: a kernel
+# build, OS release, BIOS/firmware revision, hardware model or any `*_version` is
+# shared across subjects by construction, so it is matched subject-scoped no
+# matter how many digits and separators self_identifying() sees in its shape
+# (wq#2850 item 1, wq#2878). Derived-from-the-state-store sharing still covers
+# every other predicate; this is the floor for the classes that can never carry
+# a subject, including after a fleet-wide bump closes the old value everywhere
+# and the live sharer count drops to zero.
+SHARED_VALUE_PREDICATE_RE = re.compile(
+    r"^(?:kernel|os|distro|bios|firmware|model)(?:_\w+)?$|(?:^|_)version$",
+    re.IGNORECASE,
+)
 
 # Shapes that carry their own subject, so they may be matched anywhere.
 SELF_IDENTIFYING = (
@@ -179,6 +201,47 @@ FAILURE_MODE_RE = re.compile(
     r"|\bfallback\b|\brecovery\b",
     re.IGNORECASE,
 )
+
+# wq#3030 shipped this as a bare shape test (^[A-Z][A-Z0-9_-]+$) with no status
+# vocabulary behind it, so it harvested any shouted acronym in note prose --
+# `PR` alone was 667/6611 (10%) of the matches over kb/ISSUE-LOG.md, and 89% of
+# all matches were not status words (wq#3041 judgment,
+# reports/wq3041_judgment_wq3030_note_status_false_positive.md). Subject-scoping
+# does not guard this: it limits WHERE a value is attributed, not WHETHER it is
+# a status. wq#3053 replaces the shape test with an allowlist (NOTE_STATUS_WORDS)
+# of the fleet's actual status vocabulary, generalising the state_facts side's
+# bare-label/shouted-word handling (COMMON_WORD_VALUES, SHOUTED_SHORT_RE) to
+# note-to-note supersession.
+NOTE_STATUS_RE = re.compile(r"^[A-Z][A-Z0-9_-]{1,}$")
+
+NOTE_STATUS_WORDS = frozenset({
+    "OUTAGE", "CRITICAL", "STALLED", "RESOLVED", "OK", "DONE",
+    "DEGRADED", "DOWN", "UP", "FAILED", "FAILING", "BLOCKED",
+    "DEAD", "ACTIVE", "INACTIVE", "PENDING", "CLOSED", "OPEN",
+    "WORKING", "BROKEN", "FIXED", "STABLE", "UNSTABLE",
+    "ERROR", "WARNING", "HEALTHY", "UNHEALTHY", "ONLINE", "OFFLINE",
+    "RUNNING", "STOPPED", "PAUSED", "TIMEOUT", "ABORTED", "CANCELLED",
+    "COMPLETE", "COMPLETED", "QUEUED", "SKIPPED", "PASS", "FAIL",
+    "PASSED", "SUCCESS", "SUCCEEDED", "MERGED", "DEPLOYED",
+    "ROLLBACK", "VERIFIED", "UNVERIFIED", "EXPIRED", "REVOKED",
+    "DISABLED", "ENABLED", "RETIRED", "REPLACED", "SUPERSEDED",
+})
+
+# The real cue gate wq#3041 found missing: predicate_cues(val.lower()) just
+# echoed the value back, so "subject + cue" was really just "subject" for any
+# short token. These are independent of the value itself -- prose actually
+# making a status claim about a subject, not merely containing the acronym.
+NOTE_STATUS_CUE_WORDS = ("status", "state", "outage", "condition", "health")
+
+# Generic note-title words that are not slug-shaped subject identifiers.
+# "... status update" titles were the wq#3041 cross-subject bleed vector: two
+# unrelated notes ("hathor GPU status update", "isis status update") shared
+# subject tokens "status"/"update" and nothing else, so a dead value harvested
+# from one fired on the other.
+NOTE_GENERIC_TITLE_WORDS = frozenset({
+    "status", "update", "updates", "notes", "note", "fleet", "report",
+    "reports", "summary", "checkpoint", "runbook",
+})
 
 TIER_NOTE = "note_row"
 TIER_REGEN = "regenerate"
@@ -326,14 +389,13 @@ def build_dead_value_index(conn):
         open_by_subject.setdefault(subj, []).append(val)
         open_subjects_by_value.setdefault(val, set()).add(subj)
 
-    # A value simultaneously OPEN on two or more subjects can't be carrying a
-    # subject of its own (wq#2850): a kernel build, OS version, or BIOS/model
-    # string is fleet vocabulary, not an identifier, however many digits or
-    # separators self_identifying() sees in its shape. nephthys.yaml quoting
-    # '7.0.0-30-generic' isn't a claim about sobek just because sobek once
-    # closed that same string — every other node still open on -30 makes it
-    # shared, so it is matched subject-scoped like any ordinary word.
-    shared_values = {v for v, subs in open_subjects_by_value.items() if len(subs) >= 2}
+    # A value still OPEN on any OTHER subject can't be carrying a subject of its
+    # own (wq#2850 item 2): nephthys.yaml quoting '7.0.0-30-generic' isn't a claim
+    # about sobek just because sobek once closed that same string, so it is matched
+    # subject-scoped like any ordinary word. wq#2878 lowered this from ">=2 subjects
+    # open on the value": wq#2812's incident had exactly ONE other node still on
+    # -30, so a >=2 threshold sat above the bug's own minimum reproduction and left
+    # it firing unchanged through the patched path.
 
     index = []
     for fid, subj, pred, val, valid_to, fclass in conn.execute(
@@ -360,6 +422,10 @@ def build_dead_value_index(conn):
             for other in open_by_subject.get(subj, ())
         ):
             continue
+        shared = bool(
+            SHARED_VALUE_PREDICATE_RE.search(pred)
+            or open_subjects_by_value.get(val, frozenset()) - {subj}
+        )
         index.append(
             {
                 "fact_id": fid,
@@ -368,7 +434,7 @@ def build_dead_value_index(conn):
                 "dead_value": val,
                 "current_value": current,
                 "valid_to": valid_to,
-                "scoped": not self_identifying(val) or val in shared_values,
+                "scoped": not self_identifying(val) or shared,
                 "value_re": value_re,
                 "subject_res": [boundary_re(t) for t in subject_tokens(subj)],
                 "cue_res": [boundary_re(c) for c in predicate_cues(pred)],
@@ -378,6 +444,104 @@ def build_dead_value_index(conn):
                 "case_re": re.compile(value_re.pattern),
             }
         )
+    return index
+
+
+# --------------------------------------------------- note-supersession index
+
+def _note_status_tokens(text):
+    """Shouted status tokens in note prose: `OUTAGE`, `CRITICAL`, `RESOLVED`.
+    Must be shape-plausible (NOTE_STATUS_RE) AND real status vocabulary
+    (NOTE_STATUS_WORDS, wq#3053) -- the shape test alone matched any shouted
+    acronym (`PR`, `CI`, `TODO`), which was 89% of all matches over fleet prose
+    (wq#3041 judgment)."""
+    tokens = set()
+    for raw in re.split(r"[^A-Za-z0-9._:/@-]+", text or ""):
+        tok = raw.strip(".,:;()[]'\"")
+        if tok and NOTE_STATUS_RE.fullmatch(tok) and tok in NOTE_STATUS_WORDS:
+            tokens.add(tok)
+    return tokens
+
+
+def _note_subject_tokens(text):
+    """Lowercase slug-shaped identifiers in a note title: `scout-x`,
+    `power-dashboard`, `restic`, `pgvector`. Same >=3-char floor
+    subject_tokens() uses for a state_facts subject; PREDICATE_STOPWORDS keeps
+    ordinary connective words out. NOTE_GENERIC_TITLE_WORDS additionally drops
+    generic note-structure words ("status", "update", ...) that are not
+    identifiers of anything -- two unrelated notes sharing only "status
+    update" in their titles is not a shared subject (wq#3041 judgment, case D)."""
+    tokens = set()
+    for raw in re.split(r"[^A-Za-z0-9-]+", (text or "").lower()):
+        if (len(raw) >= 3 and raw not in PREDICATE_STOPWORDS
+                and raw not in NOTE_GENERIC_TITLE_WORDS):
+            tokens.add(raw)
+    return tokens
+
+
+def build_note_supersession_index(conn):
+    """Dead-value entries mined from `archival_notes.supersedes`, never from
+    `state_facts` (wq#3030).
+
+    wq#1610 only ever read state_facts, so a claim that lives *only* in a
+    note — scout-X's ingestion outage, the power dashboard, a restic checkpoint,
+    the pgvector migration — has no fleet subject and could never enter
+    build_dead_value_index(). Every wq#1614 trap@1 query the reach diagnostic
+    named is exactly this shape (REPORT.md §3): project/infra narrative, not
+    fleet-hardware state.
+
+    A note that supersedes another is asserting the same closed-value
+    relationship build_dead_value_index reads out of state_facts, just carried
+    in note lineage: the predecessor's shouted status tokens (NOTE_STATUS_WORDS,
+    not any shouted acronym -- wq#3053) that do not reappear in the successor
+    are dead, scoped to whatever slug-shaped subject the two titles share
+    (NOTE_GENERIC_TITLE_WORDS excludes generic non-identifiers like "status").
+    `supersedes` already exists in the schema (test_lumen_contradiction_
+    scan.py's SCHEMA, `add_note(..., superseded_by=...)`); nothing before this
+    read it."""
+    index = []
+    rows = conn.execute(
+        "select id, title, content, supersedes from archival_notes "
+        "where revoked_at is null and superseded_by is null "
+        "and supersedes is not null and supersedes != ''"
+    )
+    for new_id, new_title, new_content, old_id in rows:
+        old_row = conn.execute(
+            "select title, content from archival_notes where id = ?", (old_id,)
+        ).fetchone()
+        if old_row is None:
+            continue
+        old_title, old_content = old_row
+        subjects = _note_subject_tokens(old_title) & _note_subject_tokens(new_title)
+        if not subjects:
+            continue
+        old_text = f"{old_title or ''}\n{old_content or ''}"
+        new_text = f"{new_title or ''}\n{new_content or ''}"
+        dead_tokens = _note_status_tokens(old_text) - _note_status_tokens(new_text)
+        for subject in sorted(subjects):
+            for val in sorted(dead_tokens):
+                value_re = boundary_re(val, case_exact=True)
+                predicate = val.lower()
+                index.append(
+                    {
+                        "fact_id": f"note:{old_id}",
+                        "subject": subject,
+                        "predicate": predicate,
+                        "dead_value": val,
+                        "current_value": None,
+                        "valid_to": None,
+                        "scoped": True,
+                        "value_re": value_re,
+                        "subject_res": [boundary_re(t) for t in subject_tokens(subject)],
+                        # Not predicate_cues(predicate): that just echoed the
+                        # value back (predicate == val.lower()), so "subject +
+                        # cue" was really just "subject" for any short token
+                        # (wq#3041 judgment). This is independent of the value.
+                        "cue_res": [boundary_re(c) for c in NOTE_STATUS_CUE_WORDS],
+                        "current_res": [],
+                        "case_re": re.compile(value_re.pattern),
+                    }
+                )
     return index
 
 
@@ -898,7 +1062,15 @@ def render(result):
 def scan(db_path, apply=False, artifacts=FILE_ARTIFACTS, corpus=False,
          corpus_apply=False, corpus_env_path=CORPUS_ENV):
     conn = connect(db_path, readonly=not apply)
-    index = build_dead_value_index(conn)
+    state_index = build_dead_value_index(conn)
+    note_index = build_note_supersession_index(conn)
+    # Note-sourced entries stay out of scan_files (the ticket/regenerate file
+    # tiers, wq#3053 item 4): they are harvested from free note prose with no
+    # typed status column behind them, so a residual false positive there must
+    # not be able to auto-file a wq ticket or trigger a state regen. They are
+    # still matched against notes themselves, where the intended recall gain
+    # (a note-only claim contradicting a still-open note) lives.
+    index = state_index + note_index
     closed_values = [
         r[0] for r in conn.execute(
             "select value from state_facts where valid_to is not null"
@@ -908,7 +1080,7 @@ def scan(db_path, apply=False, artifacts=FILE_ARTIFACTS, corpus=False,
     # What lumen_dream.superseded_ips() saw: IP_RE.fullmatch over closed values.
     ip_only = sum(1 for v in closed_values if SELF_IDENTIFYING[0].fullmatch(v))
 
-    hits = scan_notes(conn, index) + scan_files(index, artifacts)
+    hits = scan_notes(conn, index) + scan_files(state_index, artifacts)
     corpus_meta = {"status": "off"}
     if corpus:
         corpus_hits, corpus_meta = corpus_tier(
