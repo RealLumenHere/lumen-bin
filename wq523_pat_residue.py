@@ -305,8 +305,11 @@ def cmd_alert():
     LIVE credential in a backup is exactly what wq#523 found. So severity is a property of
     the file, not of its directory:
 
-      CRITICAL  world-readable (any mode bit in 0o007), or holds a token that STILL
-                authenticates (fingerprint matches one in a canonical home)
+      CRITICAL  holds a token that STILL authenticates (fingerprint matches one in a
+                canonical home); the verdict also says whether it is world-readable
+      WARN      world-readable (any mode bit in 0o007) but every literal in it is dead —
+                a pattern match, not a credential (wq#2911: a replay log echoing ghp_
+                fixtures paged CRITICAL on pattern alone). Queued to aq, never paged.
       noted     everything else — counted, never suppressed, but does not alert
 
     Exit 1 only on CRITICAL. Never prints a token value.
@@ -317,7 +320,7 @@ def cmd_alert():
     live = live_fingerprints()
     stray = [f for f in files if f not in canonical and not is_false_positive(f, index[f])]
 
-    critical, noted = [], []
+    critical, warn, noted = [], [], []
     for f in stray:
         try:
             st = os.stat(f)
@@ -327,16 +330,29 @@ def cmd_alert():
         fps = {hashlib.sha256(t).hexdigest()[:12] for t in index[f]}
         hot = fps & live
         why = []
-        if world:
-            why.append("WORLD-READABLE")
         if hot:
             why.append("LIVE token " + ",".join(sorted(hot)))
-        (critical if why else noted).append((f, oct(st.st_mode)[-3:], "; ".join(why)))
+        if world:
+            why.append("WORLD-READABLE" if hot else "WORLD-READABLE literal, no live match")
+        bucket = critical if hot else warn if world else noted
+        bucket.append((f, oct(st.st_mode)[-3:], "; ".join(why)))
 
     print(f"pat-alert: {len(stray)} stray file(s) — {len(critical)} CRITICAL, "
-          f"{len(noted)} noted (dead tokens in mode-600 backups)")
+          f"{len(warn) + len(noted)} below critical ({len(warn)} WARN world-readable dead "
+          f"literal, {len(noted)} noted dead tokens in mode-600 backups)")
     for f, mode, why in critical:
         print(f"  CRITICAL {mode} {f}  [{why}]")
+    for f, mode, why in warn:
+        print(f"  WARN {mode} {f}  [{why}]")
+    if warn:
+        _key = hashlib.sha256(",".join(sorted(f for f, _, _ in warn)).encode()).hexdigest()[:16]
+        try:
+            subprocess.run(["/home/lumen/bin/aq", "add", "pat-scan-warn", _key,
+                            f"pat-scan: {len(warn)} world-readable file(s) hold a dead token literal",
+                            "; ".join(f for f, _, _ in warn)[:1500], "--owner", "claude"],
+                           capture_output=True, text=True, timeout=20)
+        except Exception:
+            pass
     if critical:
         # wq#2572: self-alert independent of systemd state -- see DESIGN.md in
         # ops/wq2572-guard-crash-vs-finding for why this can no longer rely on
@@ -355,7 +371,7 @@ def cmd_alert():
         except Exception:
             pass
     if not critical:
-        print("  no stray file is world-readable or holds a live token")
+        print("  no stray file holds a live token")
     if oversize:
         print(f"  note: {len(oversize)} text file(s) over the {MAX_FILE_BYTES>>20}MB cap NOT "
               f"scanned (bounded for memory; listed so the skip is visible):")
