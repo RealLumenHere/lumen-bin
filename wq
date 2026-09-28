@@ -1068,30 +1068,60 @@ def deps_met(c, deps):
         r = c.execute("SELECT status FROM tasks WHERE id=?", (d,)).fetchone()
         if not r or r[0] != 'done': return False
     return True
+def gate_clause(clause):
+    """wq#3054: the one parse of a gate clause, shared by the reader (gate_met) and the
+    writer-side guard (bad_gate_clauses) so the two can never disagree about what a clause
+    means. Returns (head, cond): cond 'exists'/'missing' => head is a file path this clause
+    ENFORCES; any other cond => 'label:value' marker gate_met treats as vacuously met."""
+    if ':' in clause:
+        head, cond = clause.rsplit(':', 1)
+    else:
+        head, cond = clause, 'exists'
+    return head.strip(), cond.strip().lower()
 def gate_met(gate):
     """Enforced precondition. Format: comma-list of 'path' (must exist) or 'path:exists'/'path:missing'.
-    Empty gate = always met. Returns (ok, reason)."""
+    A clause whose tail after the last ':' is anything else is a 'label:value' marker
+    (wq#319's deploy_pending:<report>, frank-bench-time:hold) and is always met -- see
+    bad_gate_clauses(). Empty gate = always met. Returns (ok, reason)."""
     if not gate or not gate.strip(): return True, ""
     for clause in [x.strip() for x in gate.split(',') if x.strip()]:
-        if ':' in clause:
-            path, cond = clause.rsplit(':', 1)
-        else:
-            path, cond = clause, 'exists'
-        path = path.strip(); cond = cond.strip().lower()
+        path, cond = gate_clause(clause)
         present = os.path.exists(path)
         if cond == 'exists' and not present: return False, f"gate: {path} missing"
         if cond == 'missing' and present:    return False, f"gate: {path} present (must be absent)"
     return True, ""
 def bad_gate_clauses(gate):
-    """wq#3033: a --gate clause that isn't an absolute or ~ path can never satisfy gate_met()
+    """wq#3033: a --gate clause gate_met() ENFORCES as a file check but that can never pass
     -- free-text acceptance prose (wq#2844, wq#2484) parses as a path that never exists and
-    claim --id is refused forever. Returns the offending raw clauses, or [] if gate is clean/empty."""
+    claim --id is refused forever. Returns the offending raw clauses, or [] if clean/empty.
+
+    wq#3054 (wq#3047 CONTRADICT): the shipped guard flagged every clause that didn't start
+    with '/' or '~', which re-derived "looks like a path" independently of gate_met() and so
+    refused the documented 'label:value' marker convention (reports/staged_review_ui_design.md:30
+    `wq edit <id> --gate "deploy_pending:<report>"`, live on wq#319/401/402/405/407). Mirror
+    gate_met()'s own parse instead: a marker clause has a cond gate_met never tests, so it is
+    vacuously met and can never strand a ticket -- only an ENFORCED clause needs a real path.
+    Prose stays refused on both branches: as a bare clause it is enforced-and-unsatisfiable,
+    and a sentence that happens to contain a colon still carries whitespace, which a marker
+    (one 'label:value' token -- deploy_pending:reports/..., frank-bench-time:hold) never does."""
     if not gate or not gate.strip(): return []
     bad = []
     for clause in [x.strip() for x in gate.split(',') if x.strip()]:
-        path = clause.rsplit(':', 1)[0].strip() if ':' in clause else clause
-        if not (path.startswith('/') or path.startswith('~')): bad.append(clause)
+        head, cond = gate_clause(clause)
+        if cond in ('exists', 'missing'):
+            if not (head.startswith('/') or head.startswith('~')): bad.append(clause)
+        elif not head or any(ch.isspace() for ch in clause):
+            bad.append(clause)
     return bad
+def print_bad_gate(bad):
+    """wq#3054: one refusal text for both write paths (cmd_add, cmd_edit)."""
+    print(f"REFUSED: --gate clause(s) not an absolute or ~ path and not a label:value marker: "
+          f"{', '.join(bad)} (wq#3033, wq#3054)")
+    print("wq gate is a comma list of enforced file paths (absolute or ~, path[:exists|missing]) "
+          "and/or 'label:value' markers gate_met() never tests (deploy_pending:reports/319_staged-review-ui.md, "
+          "frank-bench-time:hold). A bare or relative clause is enforced as a file check that can "
+          "never pass, so claim --id would be refused forever. Put prose in --detail, a checkable "
+          "probe in --liveness, or --force to override (discouraged).")
 def ro_holders(c, base, t_now, exclude=None):
     """wq#1675: live readers on a base scope, minus `exclude` (normally the caller, whose own
     read hold must never block its own writer claim on the same base)."""
@@ -1524,15 +1554,12 @@ def cmd_add(a):
                   f"--force to override.")
             sys.exit(1)
     # wq#3033: --gate is an enforced file-path precondition (path[:exists|missing]), not free
-    # text -- a non-path clause can never resolve and claim --id would be refused forever
-    # (wq#2844, wq#2484). Same fail-open-only-via-force shape as the lane/archetype guards above.
+    # text -- an enforced non-path clause can never resolve and claim --id would be refused
+    # forever (wq#2844, wq#2484). wq#3054: 'label:value' markers are exempt, gate_met() never
+    # tests them. Same fail-open-only-via-force shape as the lane/archetype guards above.
     bad_gate = [] if a.force else bad_gate_clauses(a.gate)
     if bad_gate:
-        print(f"REFUSED: --gate clause(s) not an absolute or ~ path: {', '.join(bad_gate)} (wq#3033)")
-        print("wq gate is an enforced file-path precondition (comma list of path[:exists|missing]), "
-              "not acceptance prose -- a non-path clause can never resolve, so claim --id would be "
-              "refused forever. Put prose in --detail, a checkable probe in --liveness, or "
-              "--force to override (discouraged).")
+        print_bad_gate(bad_gate)
         sys.exit(1)
     c = conn()
     if not a.force:
@@ -3411,15 +3438,12 @@ def cmd_edit(a):
     # --detail that carries (or edits) a Liveness: line
     if a.detail is not None:
         _reject_liveness_grep_invert(a.detail)
-    # wq#3033: same --gate path guard as cmd_add -- free-text acceptance prose in --gate
-    # parses as a path that never exists and claim --id is refused forever (wq#2844, wq#2484).
+    # wq#3033: same --gate guard as cmd_add -- free-text acceptance prose in --gate parses as
+    # a path that never exists and claim --id is refused forever (wq#2844, wq#2484). wq#3054:
+    # 'label:value' markers pass, so `wq edit <id> --gate "deploy_pending:<report>"` still works.
     bad_gate = [] if a.force else bad_gate_clauses(a.gate)
     if bad_gate:
-        print(f"REFUSED: --gate clause(s) not an absolute or ~ path: {', '.join(bad_gate)} (wq#3033)")
-        print("wq gate is an enforced file-path precondition (comma list of path[:exists|missing]), "
-              "not acceptance prose -- a non-path clause can never resolve, so claim --id would be "
-              "refused forever. Put prose in --detail, a checkable probe in --liveness, or "
-              "--force to override (discouraged).")
+        print_bad_gate(bad_gate)
         c.close(); sys.exit(1)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
