@@ -1082,7 +1082,12 @@ def gate_met(gate):
     """Enforced precondition. Format: comma-list of 'path' (must exist) or 'path:exists'/'path:missing'.
     A clause whose tail after the last ':' is anything else is a 'label:value' marker
     (wq#319's deploy_pending:<report>, frank-bench-time:hold) and is always met -- see
-    bad_gate_clauses(). Empty gate = always met. Returns (ok, reason)."""
+    bad_gate_clauses(). Empty gate = always met. Returns (ok, reason).
+
+    wq#3068: the path is checked verbatim -- no expanduser(), no abspath(). A stored gate is
+    read back by whatever process calls claim, so only a string that names the same file in
+    every process (an absolute path) is enforceable; bad_gate_clauses() refuses the rest at
+    write time."""
     if not gate or not gate.strip(): return True, ""
     for clause in [x.strip() for x in gate.split(',') if x.strip()]:
         path, cond = gate_clause(clause)
@@ -1103,25 +1108,36 @@ def bad_gate_clauses(gate):
     vacuously met and can never strand a ticket -- only an ENFORCED clause needs a real path.
     Prose stays refused on both branches: as a bare clause it is enforced-and-unsatisfiable,
     and a sentence that happens to contain a colon still carries whitespace, which a marker
-    (one 'label:value' token -- deploy_pending:reports/..., frank-bench-time:hold) never does."""
+    (one 'label:value' token -- deploy_pending:reports/..., frank-bench-time:hold) never does.
+
+    wq#3068 (wq#3066 CONTRADICT): '~' is no longer a legal enforced head. wq#3033 accepted it
+    and wq#3054 re-shipped it, but gate_met() never expands it, so '~/x:exists' was accepted at
+    write time and then refused forever at claim time ('gate: ~/x missing') even when the file
+    exists -- wq#3033's own bug class, reachable through a form print_bad_gate() advertised.
+    Expanding it in the reader would only make the two agree when the writer's HOME and the
+    claimant's HOME happen to match; an enforced clause must denote one file for every process
+    that reads it, which is the same reason a cwd-dependent relative path is refused. So the
+    one legal enforced head is an absolute path. Zero live rows carried a '~' gate when this
+    landed, and gate_met() is unchanged, so no stored gate changes meaning."""
     if not gate or not gate.strip(): return []
     bad = []
     for clause in [x.strip() for x in gate.split(',') if x.strip()]:
         head, cond = gate_clause(clause)
         if cond in ('exists', 'missing'):
-            if not (head.startswith('/') or head.startswith('~')): bad.append(clause)
+            if not head.startswith('/'): bad.append(clause)
         elif not head or any(ch.isspace() for ch in clause):
             bad.append(clause)
     return bad
 def print_bad_gate(bad):
     """wq#3054: one refusal text for both write paths (cmd_add, cmd_edit)."""
-    print(f"REFUSED: --gate clause(s) not an absolute or ~ path and not a label:value marker: "
-          f"{', '.join(bad)} (wq#3033, wq#3054)")
-    print("wq gate is a comma list of enforced file paths (absolute or ~, path[:exists|missing]) "
+    print(f"REFUSED: --gate clause(s) not an absolute path and not a label:value marker: "
+          f"{', '.join(bad)} (wq#3033, wq#3054, wq#3068)")
+    print("wq gate is a comma list of enforced file paths (absolute, path[:exists|missing]) "
           "and/or 'label:value' markers gate_met() never tests (deploy_pending:reports/319_staged-review-ui.md, "
-          "frank-bench-time:hold). A bare or relative clause is enforced as a file check that can "
-          "never pass, so claim --id would be refused forever. Put prose in --detail, a checkable "
-          "probe in --liveness, or --force to override (discouraged).")
+          "frank-bench-time:hold). A bare, relative or '~' clause is enforced as a file check that "
+          "can never pass -- gate_met() does not expand '~' (wq#3068) -- so claim --id would be "
+          "refused forever. Write the path out in full (/abs/path, not ~/path). Put prose in "
+          "--detail, a checkable probe in --liveness, or --force to override (discouraged).")
 def ro_holders(c, base, t_now, exclude=None):
     """wq#1675: live readers on a base scope, minus `exclude` (normally the caller, whose own
     read hold must never block its own writer claim on the same base)."""

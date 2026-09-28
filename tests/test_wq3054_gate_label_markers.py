@@ -6,7 +6,8 @@ documented use of the same column as a status label --
 `wq edit <id> --gate "deploy_pending:<report>"` (reports/staged_review_ui_design.md:30, live on
 wq#319/401/402/405/407). Judgment (wq#3054): mirror gate_met()'s own parse. A clause whose tail
 after the last ':' is neither 'exists' nor 'missing' is never tested by gate_met(), so it is
-vacuously met and cannot strand a ticket -- only an ENFORCED clause needs a real absolute/~ path.
+vacuously met and cannot strand a ticket -- only an ENFORCED clause needs a real absolute path
+(wq#3068 dropped '~' from the legal enforced heads; see test_wq3068_gate_tilde_refused.py).
 Prose stays refused on both branches: bare prose is enforced-and-unsatisfiable, and prose with a
 colon in it leaves whitespace in the label, which a marker label (one token) never has.
 
@@ -142,7 +143,7 @@ def test_add_still_refuses_bare_prose(tmp_path):
     env = make_env(tmp_path)
     p = add(env, "wq2844 repro", gate="netdata bundle confirmed live on both Mac Pros")
     assert p.returncode != 0
-    assert "not an absolute or ~ path" in p.stdout
+    assert "not an absolute path" in p.stdout
 
 
 def test_add_still_refuses_prose_that_contains_a_colon(tmp_path):

@@ -1,4 +1,7 @@
-"""wq#3033 -- `wq add`/`wq edit` refuse a --gate clause that isn't an absolute or ~ path.
+"""wq#3033 -- `wq add`/`wq edit` refuse a --gate clause that isn't an absolute path.
+
+wq#3068 narrowed "absolute or ~" to "absolute": see test_wq3068_gate_tilde_refused.py for
+why, and for the inverted tilde case that used to live here.
 
 wq gate is an enforced file-path precondition (gate_met(): comma list of
 path[:exists|missing]), but add/edit used to accept any string. Acceptance prose typed
@@ -50,7 +53,7 @@ def test_add_refuses_prose_masquerading_as_a_gate(tmp_path):
     env = make_env(tmp_path)
     p = add(env, "wq2844 repro", gate="netdata bundle confirmed live on both Mac Pros")
     assert p.returncode != 0
-    assert "not an absolute or ~ path" in p.stdout
+    assert "not an absolute path" in p.stdout
     assert "--detail" in p.stdout
 
 
@@ -60,10 +63,14 @@ def test_add_accepts_an_absolute_path_gate(tmp_path):
     assert p.returncode == 0
 
 
-def test_add_accepts_a_tilde_path_gate(tmp_path):
+def test_add_refuses_a_tilde_path_gate(tmp_path):
+    # wq#3068 (was test_add_accepts_a_tilde_path_gate): gate_met() checks os.path.exists()
+    # on the literal head, so a '~' clause was accepted here and then refused forever at
+    # claim time. The guard now refuses it at write time instead.
     env = make_env(tmp_path)
     p = add(env, "tilde path gate", gate="~/kb/ISSUE-LOG.md:exists")
-    assert p.returncode == 0
+    assert p.returncode != 0
+    assert "not an absolute path" in p.stdout
 
 
 def test_add_accepts_a_multi_clause_path_gate(tmp_path):
@@ -91,7 +98,7 @@ def test_edit_refuses_prose_masquerading_as_a_gate(tmp_path):
                     "--title", "edit target").stdout.strip().split()[2])
     p = wq(env, "edit", str(tid), "--gate", "some free-text acceptance note")
     assert p.returncode != 0
-    assert "not an absolute or ~ path" in p.stdout
+    assert "not an absolute path" in p.stdout
 
 
 def test_edit_accepts_an_absolute_path_gate(tmp_path):
