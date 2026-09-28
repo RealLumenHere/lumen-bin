@@ -2673,14 +2673,41 @@ def _sha256(path):
     except OSError:
         return None
 
-def ops_deploy_check(abs_path, deployed_target):
+# wq#2762 (ISSUE-LOG #859, closes wq#1734's verify-pass escalation): a --deployed path
+# resolving inside the artifact's own directory byte-matches itself and passes with zero
+# real deployment — reject that before the walk, not after.
+_DEPLOY_VERIFY_PREMISE_RE = re.compile(r"premise\s*:\s*\S")
+_DEPLOY_VERIFY_PROBE_RE = re.compile(r"probe\s*:\s*\S")
+
+def _ops_deploy_verify_check(deployed_target, cand, art_dir, deploy_verify):
+    """wq#2762 (ISSUE-LOG #859): a byte-match only proves the artifact's payload reached
+    *some* file — it proves nothing about whether the ticket's premise about the target's
+    live state still held at deploy time (wq#2713) or whether the install was tried
+    read-only first (wq#2472). Require a --deploy-verify naming both, checked structurally
+    per wq#2630 ("a probe must be able to fail") so a bare non-empty string can't satisfy it."""
+    verify = str(deploy_verify or "").strip()
+    if not verify:
+        return "undeployed", (f"{deployed_target} byte-matches {cand}, but that only proves "
+                              f"the payload reached a file, not that the ticket's premise "
+                              f"about the target's live state still held or that the install "
+                              f"was tried read-only first; add --deploy-verify \"<text>\" "
+                              f"naming both a 'premise: <re-check against live state>' and a "
+                              f"'probe: <dry-run/read-only check against the real target>'")
+    if not (_DEPLOY_VERIFY_PREMISE_RE.search(verify) and _DEPLOY_VERIFY_PROBE_RE.search(verify)):
+        return "undeployed", (f"--deploy-verify {verify!r} must name both a 'premise: "
+                              f"<re-check>' and a 'probe: <dry-run/read-only check>' against "
+                              f"the real target")
+    return "deployed", f"{deployed_target} byte-matches {cand} shipped in {art_dir}; deploy_verify={verify!r}"
+
+def ops_deploy_check(abs_path, deployed_target, deploy_verify=None):
     """abs_path is the citation `find_artifact` resolved for this close. Returns (verdict, why):
     'none' when abs_path isn't an ops/*/install.sh artifact at all (gate does not apply);
     'deployed' when --deployed names a live file whose bytes match a file shipped alongside
     install.sh in the same artifact dir (proof the install actually ran, not just that the
-    script exists); 'undeployed' otherwise — no --deployed given, the named target is missing,
-    or its bytes match nothing the artifact ships (install.sh landed but never ran, or ran
-    against a target this citation doesn't name)."""
+    script exists) AND --deploy-verify names both a premise re-check and a dry-run/read-only
+    probe against the real target; 'undeployed' otherwise — no --deployed given, the named
+    target is missing, resolves inside the artifact's own dir, its bytes match nothing the
+    artifact ships, or --deploy-verify is missing/structurally incomplete."""
     if not OPS_INSTALL_RE.search(abs_path):
         return "none", ""
     if not deployed_target:
@@ -2688,15 +2715,20 @@ def ops_deploy_check(abs_path, deployed_target):
                               f"proves the script landed, not that it ran against a target")
     if not os.path.exists(deployed_target):
         return "undeployed", f"--deployed {deployed_target} does not exist"
-    target_hash = _sha256(deployed_target)
     art_dir = os.path.dirname(abs_path)
+    real_target = os.path.realpath(deployed_target)
+    real_art_dir = os.path.realpath(art_dir)
+    if real_target == real_art_dir or real_target.startswith(real_art_dir + os.sep):
+        return "undeployed", (f"--deployed {deployed_target} resolves inside {art_dir} — the "
+                              f"artifact's own shipped payload cannot prove its own delivery")
+    target_hash = _sha256(deployed_target)
     for root, _dirs, files in os.walk(art_dir):
         for name in files:
             if name == "install.sh":
                 continue
             cand = os.path.join(root, name)
             if target_hash is not None and _sha256(cand) == target_hash:
-                return "deployed", f"{deployed_target} byte-matches {cand} shipped in {art_dir}"
+                return _ops_deploy_verify_check(deployed_target, cand, art_dir, deploy_verify)
     return "undeployed", (f"--deployed {deployed_target} matches no file shipped in {art_dir} — "
                           f"install.sh landed but its target does not carry the artifact's bytes")
 
@@ -2777,18 +2809,24 @@ def cmd_done(a):
             if verdict == "unknown":
                 print(f"WARNING: wq#1673 evidence-durability gate could not verify {abs_path} "
                       f"({why}). Closing anyway — the gate does not block on git trouble.")
-            ov, owhy = ops_deploy_check(abs_path, getattr(a, "deployed", None))
+            ov, owhy = ops_deploy_check(abs_path, getattr(a, "deployed", None),
+                                        getattr(a, "deploy_verify", None))
             if ov == "undeployed" and not getattr(a, "no_deploy_needed", None):
-                eprint(f"REFUSED: wq#1724 ops-deploy gate — task {a.id} not closed. {owhy}. "
-                      f"An ops/*/install.sh landing on main is not deploy evidence by itself "
-                      f"(wq#1632: closed done this way, artifact never reached its target). "
-                      f"Prove the target was actually touched with --deployed \"<live target "
-                      f"path>\" (its bytes must match a file this artifact ships), or record "
-                      f"why no deploy applies with --no-deploy-needed \"<reason>\".")
+                eprint(f"REFUSED: wq#1724/wq#2762 ops-deploy gate — task {a.id} not closed. "
+                      f"{owhy}. An ops/*/install.sh landing on main is not deploy evidence by "
+                      f"itself (wq#1632: closed done this way, artifact never reached its "
+                      f"target). Prove the target was actually touched with --deployed "
+                      f"\"<live target path>\" (its bytes must match a file this artifact "
+                      f"ships, and must not resolve inside the artifact's own dir — wq#1734), "
+                      f"plus --deploy-verify \"<text>\" naming both a 'premise: <re-check "
+                      f"against live state>' and a 'probe: <dry-run/read-only check>' "
+                      f"(wq#2762), or record why no deploy applies with --no-deploy-needed "
+                      f"\"<reason>\".")
                 sys.exit(9)
             if ov == "deployed":
-                print(f"note: wq#1724 ops-deploy gate — {owhy}.")
+                print(f"note: wq#1724/wq#2762 ops-deploy gate — {owhy}.")
                 a.notes = _stamp(a.notes, f"[DEPLOYED: {getattr(a, 'deployed', None)}]")
+                a.notes = _stamp(a.notes, f"[DEPLOY-VERIFY: {getattr(a, 'deploy_verify', None)}]")
             elif ov == "undeployed" and getattr(a, "no_deploy_needed", None):
                 a.notes = _stamp(a.notes, f"[NO-DEPLOY-NEEDED: {a.no_deploy_needed}]")
     # wq#1702 (D2): a ticket that says it lands via lumen-pr is not done until something in
@@ -3443,7 +3481,7 @@ s=sub.add_parser("concurrency",help="wq#594: report one session id being driven 
 s=sub.add_parser("orch",help="wq#1116: one orchestrator per lane-set — show/acquire/release the lease"); s.add_argument("--acquire",metavar="LANES",default=None,help="take the lease over a comma/space list of lanes (requires a registered identity)"); s.add_argument("--release",action="store_true",help="drop every orchestrator lease this identity holds"); s.add_argument("--ttl",type=int,default=None,help=f"lease minutes (default WQ_ORCH_TTL={ORCH_TTL_MIN})"); s.add_argument("--note",default=None,help="what this orchestrator is driving"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_orch)
 s=sub.add_parser("scratch",help="wq#598: print (and create) this session's own scratch dir under /tmp"); s.add_argument("--path-only",action="store_true",help="print the path without creating it"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_scratch)
 s=sub.add_parser("heartbeat"); s.add_argument("id",type=int); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_heartbeat)
-s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--unlanded",default=None,metavar="REASON",help="wq#1673/wq#1702: close while the ticket's named output or landing term is not met (worktree-only or uncommitted path, missing deliverable, no landed PR/commit for a 'via lumen-pr' ticket), on the record"); s.add_argument("--deployed",default=None,metavar="TARGET_PATH",help="wq#1724: when the artifact is an ops/*/install.sh, the live path it deploys to — must byte-match a file the artifact ships, or the close is refused"); s.add_argument("--no-deploy-needed",dest="no_deploy_needed",default=None,metavar="REASON",help="wq#1724: close over an ops/*/install.sh artifact with no --deployed target, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
+s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes"); s.add_argument("--no-artifact",dest="no_artifact",default=None,metavar="REASON",help="wq#759: close without a verifiable artifact, on the record — refused silently otherwise"); s.add_argument("--unmerged",default=None,metavar="REASON",help="wq#899: close while the cited PR is still open and unlanded, on the record"); s.add_argument("--unlanded",default=None,metavar="REASON",help="wq#1673/wq#1702: close while the ticket's named output or landing term is not met (worktree-only or uncommitted path, missing deliverable, no landed PR/commit for a 'via lumen-pr' ticket), on the record"); s.add_argument("--deployed",default=None,metavar="TARGET_PATH",help="wq#1724: when the artifact is an ops/*/install.sh, the live path it deploys to — must byte-match a file the artifact ships, and must not resolve inside the artifact's own dir (wq#1734), or the close is refused"); s.add_argument("--deploy-verify",dest="deploy_verify",default=None,metavar="TEXT",help="wq#2762: required alongside --deployed — must name both a 'premise: <re-check against live state>' and a 'probe: <dry-run/read-only check against the real target>', checked structurally, not a bare non-empty string"); s.add_argument("--no-deploy-needed",dest="no_deploy_needed",default=None,metavar="REASON",help="wq#1724: close over an ops/*/install.sh artifact with no --deployed target, on the record"); s.add_argument("--reclose",default=None,metavar="REASON",help="wq#1116: overwrite the notes of an ALREADY-done ticket, on the record — refused silently otherwise"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_done)
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: release a claim held by a DIFFERENT identity if, and only if, it verifiably has no live session and (for fworker-wq<id>) no running unit — the stale-claim path that does not poison a per-ticket identity the way `wq retire` does"); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_block)
 s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)

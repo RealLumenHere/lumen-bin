@@ -9,6 +9,15 @@ over it (rc=9) unless --deployed names a live file whose bytes match one the art
 the caller records --no-deploy-needed on the record. Extends the wq#1673 gate in cmd_done
 (ops_deploy_check) rather than adding a parallel evidence path — same subprocess-driven pattern
 as test_wq_evidence_durability.py.
+
+wq#2813 mirrors wq#2762/wq#1734 (foreman/harness/acceptance.py's identical ops-deploy gate)
+into this bin/wq copy of the same algorithm: (1) a --deployed path resolving inside the
+artifact's own directory byte-matches itself and must be rejected (wq#1734's escalated-but-
+never-landed bypass); (2) a real deploy must also carry --deploy-verify naming a premise
+re-check against live state AND a dry-run/read-only probe against the real target, checked
+structurally per wq#2630 ("a probe must be able to fail") so a bare non-empty string can't
+satisfy it (wq#2713/2472/1688 each passed fixture-only tests and would have caused live
+damage on deploy).
 """
 import os
 import subprocess
@@ -89,6 +98,12 @@ def test_ops_install_citation_without_deploy_refuses_rc9(tmp_path, repo_with_ops
     assert notes_of(env, tid) == "", "a refused close must not write notes"
 
 
+_DEPLOY_VERIFY = ("premise: re-checked lumen_state.py's lifecycle-closure bug is still "
+                  "live on the target before deploying; "
+                  "probe: dry-run diff of install.sh's cp against the live target showed "
+                  "only the intended file changing")
+
+
 def test_ops_install_citation_with_matching_deployed_target_closes(tmp_path, repo_with_ops_artifact):
     env = make_env(tmp_path)
     repo, art_dir, target = repo_with_ops_artifact
@@ -97,9 +112,64 @@ def test_ops_install_citation_with_matching_deployed_target_closes(tmp_path, rep
     tid = open_ticket(env, "wq1724 self-test: deployed ops artifact")
 
     done = wq(env, "done", tid, "--notes", f"shipped {art_dir}/install.sh",
-              "--deployed", str(live), cwd=repo)
+              "--deployed", str(live), "--deploy-verify", _DEPLOY_VERIFY, cwd=repo)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert f"[DEPLOYED: {live}]" in notes_of(env, tid)
+    notes = notes_of(env, tid)
+    assert f"[DEPLOYED: {live}]" in notes
+    assert f"[DEPLOY-VERIFY: {_DEPLOY_VERIFY}]" in notes
+
+
+def test_ops_install_citation_with_self_referential_deployed_target_refuses(
+        tmp_path, repo_with_ops_artifact):
+    """wq#2762 (ISSUE-LOG #859, closes wq#1734): pointing --deployed at the artifact's own
+    shipped payload byte-matches itself and would pass with zero real deployment."""
+    env = make_env(tmp_path)
+    repo, art_dir, _target = repo_with_ops_artifact
+    self_target = art_dir / "lumen_state.py"
+    tid = open_ticket(env, "wq1734 self-test: self-referential deployed target")
+
+    done = wq(env, "done", tid, "--notes", f"shipped {art_dir}/install.sh",
+              "--deployed", str(self_target), "--deploy-verify", _DEPLOY_VERIFY, cwd=repo)
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "resolves inside" in done.stdout + done.stderr
+
+
+def test_ops_install_citation_with_matching_deployed_target_but_no_deploy_verify_refuses(
+        tmp_path, repo_with_ops_artifact):
+    """wq#2762 (ISSUE-LOG #859): a byte-match alone proves delivery, not that the ticket's
+    premise still held or that the install was tried read-only first (wq#2713, wq#2472)."""
+    env = make_env(tmp_path)
+    repo, art_dir, target = repo_with_ops_artifact
+    live = target / "lumen_state.py"
+    live.write_text("# fixed lifecycle closure logic\n")
+    tid = open_ticket(env, "wq2762 self-test: deployed with no deploy-verify")
+
+    done = wq(env, "done", tid, "--notes", f"shipped {art_dir}/install.sh",
+              "--deployed", str(live), cwd=repo)
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "deploy-verify" in (done.stdout + done.stderr).lower()
+    assert notes_of(env, tid) == "", "a refused close must not write notes"
+
+
+@pytest.mark.parametrize("deploy_verify", [
+    "premise: checked the target is still live",  # no probe: half
+    "probe: dry-run diff came back clean",  # no premise: half
+    "verified everything works fine before deploying",  # bare non-empty string, no structure
+])
+def test_ops_install_citation_with_incomplete_deploy_verify_refuses(
+        tmp_path, repo_with_ops_artifact, deploy_verify):
+    """wq#2762 (ISSUE-LOG #859, per wq#2630 'a probe must be able to fail'): deploy_verify is
+    checked structurally so a bare claim can't satisfy it — both halves are required."""
+    env = make_env(tmp_path)
+    repo, art_dir, target = repo_with_ops_artifact
+    live = target / "lumen_state.py"
+    live.write_text("# fixed lifecycle closure logic\n")
+    tid = open_ticket(env, "wq2762 self-test: incomplete deploy-verify")
+
+    done = wq(env, "done", tid, "--notes", f"shipped {art_dir}/install.sh",
+              "--deployed", str(live), "--deploy-verify", deploy_verify, cwd=repo)
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "deploy-verify" in (done.stdout + done.stderr).lower()
 
 
 def test_ops_install_citation_with_stale_deployed_target_refuses(tmp_path, repo_with_ops_artifact):
