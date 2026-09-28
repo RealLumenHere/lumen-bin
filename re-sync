@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# re-sync — pull RE project working copies from edge machines into /home/lumen/re/
+# (the canonical project store). Design: /home/lumen/foreman/ops/re-sync/DESIGN.md
+#
+# POLICY (re.sync_policy in lumen_state): ADDITIVE ONLY.
+#   rsync -a --checksum --update, never --delete. The edge copy wins unless the Lumen
+#   copy is newer by mtime, so work done directly in /home/lumen/re/ is never clobbered.
+#
+# EXIT CODES (wq#1657 guard contract; unit is tagged X-Lumen-Guard=finding-exit):
+#   0  every leg OK, or its host offline (SKIP — edge boxes are off most of the day)
+#   1  FINDING: >=1 leg failed on a REACHABLE host. Details in aq row  re-sync <dst>
+#   2  script crash (lock/usage) -> OnFailure pages urgent
+#
+# Test hook: RE_SYNC_TEST_LEG='name|user@host|/src/|/dst/|' appends one extra leg.
+set -uo pipefail
+LOG=/home/lumen/logs/re-sync.log
+STATE=/home/lumen/logs/re-sync.state     # host=<consecutive offline runs>
+LOCK=/home/lumen/logs/re-sync.lock
+AQ=/home/lumen/bin/aq
+OFFLINE_ALERT_RUNS=${OFFLINE_ALERT_RUNS:-48}   # 48 x 30 min = ~24 h offline -> aq row
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+mkdir -p /home/lumen/logs
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
+
+exec 9>"$LOCK"
+if ! flock -n 9; then log "SKIP run: another re-sync holds $LOCK"; exit 0; fi
+
+# name|user@host|src|dst|remote rsync-path (empty = plain rsync)
+LEGS=(
+  "thor|thor@100.112.151.100|/home/thor/projects/miko2/|/home/lumen/re/miko/miko2/|"
+  "thor|thor@100.112.151.100|/home/thor/projects/miko3/|/home/lumen/re/miko/miko3/|"
+  "thor|thor@100.112.151.100|/home/thor/projects/miko_animations/|/home/lumen/re/miko/animations/|"
+  "thor|thor@100.112.151.100|/home/thor/projects/nest/|/home/lumen/re/nest/|"
+  "thor|thor@100.112.151.100|/home/thor/projects/winforge/|/home/lumen/re/winforge/|"
+  "thor|thor@100.112.151.100|/home/thor/projects/winnovo_m8/|/home/lumen/re/winnovo-m8/|"
+  "thor|thor@100.112.151.100|/home/thor/miko_*.sh|/home/lumen/re/common/scripts/|"
+  # maksoor: sudo'd flashers leave root-owned files in the dump tree -> read as root
+  "maksoor|maksoor@100.81.204.74|/home/maksoor/rk3399_dump/|/home/lumen/re/rk3399-scanner/dump/|sudo rsync"
+  "maksoor|maksoor@100.81.204.74|/home/maksoor/dtbo.img|/home/lumen/re/rk3399-scanner/|sudo rsync"
+  "maksoor|maksoor@100.81.204.74|/home/maksoor/rk3399_dump/apks/|/home/lumen/re/common/apks/|sudo rsync"
+)
+if [[ -n ${RE_SYNC_TEST_LEG:-} ]]; then
+  [[ ${RE_SYNC_TEST_ONLY:-0} == 1 ]] && LEGS=() ; LEGS+=("$RE_SYNC_TEST_LEG")   # test hook only
+fi
+
+# ---- state helpers -----------------------------------------------------------
+declare -A OFFL
+[[ -r $STATE ]] && while IFS='=' read -r k v; do [[ -n $k ]] && OFFL[$k]=$v; done < "$STATE"
+save_state() { : > "$STATE"; for k in "${!OFFL[@]}"; do echo "$k=${OFFL[$k]}" >> "$STATE"; done; }
+
+aq_open_id() { # $1=key -> id of an OPEN re-sync row with that key, or empty
+  "$AQ" list open 2>/dev/null | sed -n "s/^\[ *\([0-9]*\)\] *open *x[0-9]* *re-sync *$(printf '%s' "$1" | sed 's/[][\/.*^$]/\\&/g') .*/\1/p" | head -1
+}
+aq_raise()   { "$AQ" add re-sync "$1" "$2" "$3" >/dev/null 2>&1 || log "WARN aq add failed for $1"; }
+aq_recover() { local id; id=$(aq_open_id "$1"); [[ -n $id ]] && { "$AQ" resolve "$id" "re-sync: recovered $(date -u +%FT%TZ)" >/dev/null 2>&1; log "  aq#$id resolved ($1)"; }; }
+
+# ---- reachability, once per host --------------------------------------------
+declare -A UP
+host_up() { # $1=name $2=user@host
+  [[ -n ${UP[$1]:-} ]] && return "${UP[$1]}"
+  if ssh "${SSH_OPTS[@]}" "$2" true >/dev/null 2>&1; then
+    UP[$1]=0; OFFL[$1]=0; aq_recover "host:$1:offline"
+  else
+    UP[$1]=1; OFFL[$1]=$(( ${OFFL[$1]:-0} + 1 ))
+    log "SKIP host $1 offline (run ${OFFL[$1]} in a row)"
+    if (( OFFL[$1] >= OFFLINE_ALERT_RUNS )); then
+      aq_raise "host:$1:offline" "re-sync: $1 unreachable ${OFFL[$1]} runs (~$(( OFFL[$1] / 2 ))h)" \
+        "edge host $1 ($2) has not answered ssh for ${OFFL[$1]} consecutive 30-min runs; /home/lumen/re/ is stale for its projects"
+    fi
+  fi
+  return "${UP[$1]}"
+}
+
+# ---- legs ----------------------------------------------------------------------
+log "=== re-sync start ==="
+ok=0 fail=0 skip=0
+for leg in "${LEGS[@]}"; do
+  IFS='|' read -r name host src dst rpath <<< "$leg"
+  if ! host_up "$name" "$host"; then skip=$((skip+1)); continue; fi
+  mkdir -p "$dst"
+  args=(-a --checksum --update --timeout=120)
+  [[ -n $rpath ]] && args+=(--rsync-path="$rpath")
+  err=$(rsync "${args[@]}" "$host:$src" "$dst" 2>&1 >/dev/null); rc=$?
+  case $rc in
+    0|24) ok=$((ok+1)); log "  OK   rc=$rc $host:$src -> $dst"; aq_recover "$dst" ;;
+    *)    fail=$((fail+1)); tail_err=$(printf '%s' "$err" | tail -c 400 | tr '\n' ' ')
+          log "  FAIL rc=$rc $host:$src -> $dst :: $tail_err"
+          aq_raise "$dst" "re-sync FAIL rc=$rc: $host:$src" "-> $dst :: $tail_err" ;;
+  esac
+done
+save_state
+log "=== re-sync done: ok=$ok fail=$fail skip=$skip ==="
+(( fail > 0 )) && exit 1
+exit 0

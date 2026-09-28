@@ -21,6 +21,17 @@ from datetime import datetime, timezone
 
 WQ_DB = "/home/lumen/agents/work-queue/queue.db"
 KB_DIR = "/home/lumen/kb"
+# wq#2759: the ONE sanctioned direct-Edit target inside a primary tree (wq#1831) —
+# guard.sh lets a worker Edit this file in place, but no worker can commit it: kb
+# has no origin (lumen-pr/sync-live both refuse it) and guard.sh's commit-creating-
+# verb wall (wq#900/wq#929) blocks a raw `git commit` in any primary tree. The
+# result was a doctrine with no landing path — rows sat uncommitted for a day+
+# (row 824) until someone ran a manual sweep (03f5b49, wq#2639). session-handoff
+# already commits its own paths here every 30 min as a trusted, non-sandboxed
+# service (session-handoff.timer); folding ISSUE-LOG.md into that same explicit,
+# scoped git add is the "make it the easy one" fix — no allowlist to widen, no
+# guard rule to relax, a worker's Edit just gets picked up on the next cycle.
+ISSUE_LOG_PATH = os.path.join(KB_DIR, "ISSUE-LOG.md")
 OUT_PATH = os.path.join(KB_DIR, "SESSION-HANDOFF.md")
 NOTES_PATH = os.path.join(KB_DIR, ".session-handoff-notes.log")
 LOG_DIR = "/home/lumen/logs"
@@ -239,7 +250,7 @@ def main():
     print(f"session-handoff: wrote {OUT_PATH}")
 
     if not a.no_commit:
-        git_commit([OUT_PATH, NOTES_PATH])
+        git_commit([OUT_PATH, NOTES_PATH, ISSUE_LOG_PATH])
 
 
 if __name__ == "__main__":

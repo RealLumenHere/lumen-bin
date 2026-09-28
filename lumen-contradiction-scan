@@ -318,11 +318,22 @@ def build_dead_value_index(conn):
     """One entry per closed fact whose value is structured enough to match."""
     open_now = {}
     open_by_subject = {}
+    open_subjects_by_value = {}
     for subj, pred, val in conn.execute(
         "select subject, predicate, value from state_facts where valid_to is null"
     ):
         open_now[(subj, pred)] = val
         open_by_subject.setdefault(subj, []).append(val)
+        open_subjects_by_value.setdefault(val, set()).add(subj)
+
+    # A value simultaneously OPEN on two or more subjects can't be carrying a
+    # subject of its own (wq#2850): a kernel build, OS version, or BIOS/model
+    # string is fleet vocabulary, not an identifier, however many digits or
+    # separators self_identifying() sees in its shape. nephthys.yaml quoting
+    # '7.0.0-30-generic' isn't a claim about sobek just because sobek once
+    # closed that same string — every other node still open on -30 makes it
+    # shared, so it is matched subject-scoped like any ordinary word.
+    shared_values = {v for v, subs in open_subjects_by_value.items() if len(subs) >= 2}
 
     index = []
     for fid, subj, pred, val, valid_to, fclass in conn.execute(
@@ -357,7 +368,7 @@ def build_dead_value_index(conn):
                 "dead_value": val,
                 "current_value": current,
                 "valid_to": valid_to,
-                "scoped": not self_identifying(val),
+                "scoped": not self_identifying(val) or val in shared_values,
                 "value_re": value_re,
                 "subject_res": [boundary_re(t) for t in subject_tokens(subj)],
                 "cue_res": [boundary_re(c) for c in predicate_cues(pred)],

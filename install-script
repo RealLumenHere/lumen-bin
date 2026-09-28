@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# install-script — replace a script by rename, never by overwrite (wq#2856).
+#
+# bash reads a script incrementally from its open fd. `cp new /home/lumen/bin/x`
+# rewrites x's EXISTING inode, so a timer's still-running bash resumes reading the
+# NEW bytes at the OLD offset: lumen-re-sync.service died 2026-09-28T03:25:42Z with
+# "aq: Permission denied / LOCK: unbound variable" exactly that way. Writing a temp
+# file beside <dst> and mv-ing it over gives <dst> a NEW inode; the running process
+# keeps the old one and finishes on the bytes it started with.
+#
+# usage: install-script [-m MODE] <src> <dst>
+#   <dst> may be a directory (installs to <dst>/<basename src>).
+#   MODE defaults to the current <dst>'s mode, else 0755.
+#   A symlinked <dst> is resolved so the link target is replaced, not the link.
+# exit: 0 installed or unchanged, 1 failure, 2 usage.
+set -euo pipefail
+
+usage() { sed -n '11,15p' "$0" | sed 's/^# \{0,1\}//'; }
+die() { printf 'install-script: %s\n' "$*" >&2; exit 1; }
+
+MODE=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) [ $# -ge 2 ] || { usage >&2; exit 2; }; MODE=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) usage >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 2 ] || { usage >&2; exit 2; }
+SRC=$1 DST=$2
+[ -z "$MODE" ] || [[ "$MODE" =~ ^[0-7]{3,4}$ ]] || die "MODE must be octal (e.g. 0755): $MODE"
+
+[ -f "$SRC" ] || die "source is not a regular file: $SRC"
+[ -d "$DST" ] && DST="${DST%/}/$(basename "$SRC")"
+[ -L "$DST" ] && DST=$(readlink -f "$DST")
+[ -e "$DST" ] && [ ! -f "$DST" ] && die "destination exists and is not a regular file: $DST"
+[ -e "$DST" ] && [ "$SRC" -ef "$DST" ] && die "source and destination are the same file: $DST"
+
+if [ -z "$MODE" ]; then
+  if [ -e "$DST" ]; then MODE=$(stat -c %a "$DST"); else MODE=0755; fi
+fi
+
+if [ -e "$DST" ] && cmp -s "$SRC" "$DST" && [ "$(stat -c %a "$DST")" = "$(printf '%o' "$((8#$MODE))")" ]; then
+  echo "unchanged: $DST"
+  exit 0
+fi
+
+# Same directory as <dst> so the mv is a rename(2) on one filesystem, not a copy.
+TMP=$(mktemp "$(dirname "$DST")/.$(basename "$DST").install.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+cat -- "$SRC" > "$TMP"
+chmod "$MODE" "$TMP"
+mv -f -- "$TMP" "$DST"
+trap - EXIT
+echo "installed: $DST"
