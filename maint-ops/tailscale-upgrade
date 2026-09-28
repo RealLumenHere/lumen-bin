@@ -1,0 +1,80 @@
+#!/bin/bash
+# tailscale-upgrade - one node, one op (wq#2987 / wq#2989). Rolling upgrades = one queued op per node.
+# usage: tailscale-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip> <ts_ip>
+# Control path is ALWAYS the LAN ip (a tailscaled restart must not kill our own session); the tailnet path is only verified.
+# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (needs a human) | 3 precheck abort
+# Never reboots. Thor is refused outright.
+set -u
+MODE="${1:-}"; NAME="${2:-}"; USR="${3:-}"; LAN="${4:-}"; TSIP="${5:-}"
+TARGET_VERSION=${TARGET_VERSION:-1.102.4}
+FORCE_VERIFY_FAIL=${FORCE_VERIFY_FAIL:-0}
+STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}; mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/tailscale-$NAME.state"
+log() { echo "[tailscale-upgrade $NAME $(date -u +%H:%M:%S)Z] $*"; }
+[ -n "$NAME" ] && [ -n "$USR" ] && [ -n "$LAN" ] && [ -n "$TSIP" ] || { echo "usage: tailscale-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip> <ts_ip>"; exit 64; }
+case "$NAME:$TSIP" in thor:*|*:100.112.151.100) echo "REFUSED: Thor is never touched"; exit 3 ;; esac
+R() { ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$USR@$LAN" "$@"; }
+short_ver() { R 'tailscale version 2>/dev/null | head -1' 2>/dev/null | tr -d '\r'; }
+pkg_ver()   { R "dpkg-query -W -f='\${Version}' tailscale" 2>/dev/null; }
+apt_run()   { R "sudo -n systemd-run --unit=ts-upgrade-\$(date +%s) --wait --collect -q -E DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold $1" >/dev/null 2>&1; }
+
+tailnet_ok() {   # tailnet reachability from Lumen, retried while tailscaled settles
+  local i
+  for i in $(seq 1 12); do
+    if tailscale ping -c 1 --timeout=5s "$TSIP" >/dev/null 2>&1 && ssh -o BatchMode=yes -o ConnectTimeout=6 "$USR@$TSIP" true >/dev/null 2>&1; then return 0; fi
+    sleep 5
+  done; return 1
+}
+verify() {   # verify <want_short_version> <inject:0|1>
+  local want="$1" inject="$2" have st
+  have=$(short_ver); [ "$have" = "$want" ] || { log "VERIFY FAIL: version '$have' != '$want'"; return 1; }
+  [ "$(R 'systemctl is-active tailscaled' 2>/dev/null)" = "active" ] || { log "VERIFY FAIL: tailscaled not active"; return 1; }
+  st=$(R "tailscale status --json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"BackendState\"))'" 2>/dev/null)
+  [ "$st" = "Running" ] || { log "VERIFY FAIL: BackendState '$st'"; return 1; }
+  tailnet_ok || { log "VERIFY FAIL: tailnet path to $TSIP not restored in 60s"; return 1; }
+  [ "$inject" = "1" ] && [ "$FORCE_VERIFY_FAIL" = "1" ] && { log "VERIFY FAIL: injected (FORCE_VERIFY_FAIL=1)"; return 1; }
+  log "verify PASS ($have, Running, tailnet ok)"; return 0
+}
+precheck() {
+  local cur cand
+  R true 2>/dev/null || { log "PRECHECK FAIL: LAN ssh to $USR@$LAN"; return 3; }
+  R 'sudo -n true' 2>/dev/null || { log "PRECHECK FAIL: sudo -n"; return 3; }
+  cur=$(short_ver); [ -n "$cur" ] || { log "PRECHECK FAIL: cannot read version"; return 3; }
+  cand=$(R "apt-cache policy tailscale | awk '/Candidate:/{print \$2}'" 2>/dev/null)
+  [ "$cand" = "$TARGET_VERSION" ] || { log "PRECHECK FAIL: apt candidate '$cand' != target $TARGET_VERSION (run apt update?)"; return 3; }
+  R "apt-mark showhold | grep -qx tailscale" 2>/dev/null && { log "PRECHECK FAIL: tailscale is on hold"; return 3; }
+  R 'sudo -n flock -n /var/lib/dpkg/lock-frontend true' 2>/dev/null || { log "PRECHECK FAIL: dpkg lock busy"; return 3; }
+  if [ "$cur" != "$TARGET_VERSION" ]; then
+    R "apt-cache madison tailscale | awk '{print \$3}' | grep -qx '$(pkg_ver)'" 2>/dev/null || { log "PRECHECK FAIL: current package $(pkg_ver) not in apt (no rollback path)"; return 3; }
+  fi
+  R "[ \$(df --output=avail -k /var | tail -1) -gt 500000 ]" 2>/dev/null || { log "PRECHECK FAIL: <500MB free on /var"; return 3; }
+  [ "$(R "tailscale status --json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"BackendState\"))'" 2>/dev/null)" = "Running" ] || { log "PRECHECK FAIL: node not Running"; return 3; }
+  tailnet_ok || { log "PRECHECK FAIL: tailnet path not healthy before change"; return 3; }
+  log "PRECHECK OK: $cur -> $TARGET_VERSION, LAN path $LAN, rollback pkg $(pkg_ver)"; return 0
+}
+rollback() {
+  local oldpkg oldshort
+  oldpkg=$(grep '^OLDPKG=' "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-); oldshort=$(grep '^OLDSHORT=' "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-)
+  [ -n "$oldpkg" ] && [ -n "$oldshort" ] || { log "ROLLBACK IMPOSSIBLE: no previous version recorded in $STATE"; return 2; }
+  log "ROLLING BACK to tailscale=$oldpkg"
+  apt_run "--allow-downgrades tailscale=$oldpkg"
+  if verify "$oldshort" 0; then log "ROLLED BACK cleanly to $oldshort"; return 1; fi
+  log "CRITICAL: rollback did not verify - $NAME needs a human (LAN ssh: $USR@$LAN)"; return 2
+}
+apply() {
+  local cur
+  cur=$(short_ver)
+  if [ "$cur" = "$TARGET_VERSION" ]; then log "already at $TARGET_VERSION; verifying only"; verify "$TARGET_VERSION" 0 && return 0 || return 1; fi
+  precheck || return 3
+  printf 'OLDSHORT=%s\nOLDPKG=%s\nNEW=%s\nAT=%s\n' "$cur" "$(pkg_ver)" "$TARGET_VERSION" "$(date -u +%FT%TZ)" >> "$STATE"
+  log "upgrading tailscale $cur -> $TARGET_VERSION (detached apt on the node, driven over LAN)"
+  apt_run "--only-upgrade tailscale"
+  if verify "$TARGET_VERSION" 1; then log "UPGRADE OK"; return 0; fi
+  rollback; return $?
+}
+case "$MODE" in
+  --precheck) precheck; exit $? ;;
+  --apply)    apply; exit $? ;;
+  --verify)   verify "$TARGET_VERSION" 0; exit $? ;;
+  --rollback) rollback; exit $? ;;
+  *) echo "usage: tailscale-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip> <ts_ip>"; exit 64 ;;
+esac
