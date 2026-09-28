@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# wq#2906 — consumer inventory for a credential VAR before/after rotation.
+# Rotation verified the key, not the consumers: langfuse-evaluator + langfuse-idle-alert sat on the
+# old LANGFUSE_* pair for 2 days (401 x47) after wq#2756. Run this, restart every unit listed,
+# recreate every container listed, then verify each one — and only then close the rotation ticket.
+# Usage: cred-consumers VAR_NAME [VAR_NAME...]     (prints names/paths only, never values)
+set -uo pipefail
+[ $# -ge 1 ] || { echo "usage: cred-consumers VAR_NAME [VAR_NAME...]" >&2; exit 2; }
+for VAR in "$@"; do
+  echo "== $VAR"
+  echo "-- files defining it (0600 env files + agent/.env):"
+  grep -lsE "^(export )?$VAR=" /home/lumen/agent/.env /home/lumen/.secrets/*.env /home/lumen/.secrets/*/env/*.env /home/lumen/secrets/*.env 2>/dev/null | sed 's/^/   /'
+  echo "-- systemd units whose EnvironmentFile defines it, or whose ExecStart script reads it:"
+  for u in /etc/systemd/system/*.service; do
+    hit=""
+    for ef in $(grep -oE '^EnvironmentFile=-?[^ ]+' "$u" 2>/dev/null | sed 's/^EnvironmentFile=-\?//'); do
+      grep -qsE "^(export )?$VAR=" "$ef" && hit="$hit env:$ef"
+    done
+    for s in $(grep -oE '^ExecStart=.*' "$u" 2>/dev/null | grep -oE '/home/lumen/[^ ]+\.(py|sh)'); do
+      grep -qs "$VAR" "$s" 2>/dev/null && hit="$hit reads:$s"
+    done
+    [ -n "$hit" ] && printf '   %-40s %s  [%s]\n' "$(basename "$u")" "$hit" "$(systemctl show -p Result --value "$(basename "$u")" 2>/dev/null)"
+  done
+  echo "-- docker containers carrying it in env (recreate, not restart, to pick up env_file changes):"
+  for c in $(docker ps -a --format '{{.Names}}' 2>/dev/null); do
+    docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep -q "^$VAR=" && printf '   %-30s %s\n' "$c" "$(docker inspect "$c" --format '{{.State.Status}}')"
+  done
+  echo "-- other readers under services/ bin/ foreman/harness (grep, may include docs/tests):"
+  grep -rlsw "$VAR" /home/lumen/services /home/lumen/bin /home/lumen/foreman/harness 2>/dev/null | grep -vE '__pycache__|\.bak|/tests?/|\.archive' | sed 's/^/   /'
+done
