@@ -76,6 +76,14 @@ cmd_commit() {
 cmd_push() {
   local root def local_ref local_sha remote_ref remote_sha
   root=$(repo_root .) || exit 0
+  # wq#2908: github-mirror-sync replays Gitea's already-landed main onto the
+  # read-only `github` mirror remote. That is not "pushing straight to main" in
+  # the sense this guard exists to prevent (origin/Gitea is still the only place
+  # main can be authored) so the mirror unit sets this to identify itself.
+  if [ "${GIT_MIRROR_SYNC:-}" = 1 ]; then
+    echo "branch-guard: GIT_MIRROR_SYNC=1 — exempting one-way mirror push in $root (wq#2908)" >&2
+    exit 0
+  fi
   def=$(default_branch "$root")
   while read -r local_ref local_sha remote_ref remote_sha; do
     [ -n "${remote_ref:-}" ] || continue

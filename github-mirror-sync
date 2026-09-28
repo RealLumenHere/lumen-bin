@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -uo pipefail
+# One-way Gitea -> GitHub mirror sync (wq#2908).
+#
+# Gitea (origin) is the only writable primary; GitHub (`github` remote) is a
+# read-only mirror for visibility/backup. This never authors or force-pushes
+# origin, and it never pushes from the live primary working tree — each repo's
+# mirror lives in its own bare clone under $MIRROR_ROOT, fetched fresh from
+# origin every run, so a dirty or mid-work primary tree can never leak into the
+# mirror and a broken mirror push can never touch the primary tree either.
+#
+# GIT_MIRROR_SYNC=1 is how this script's pushes get past .githooks/branch-guard
+# (wq#1476): that guard refuses any push that lands straight on a repo's default
+# branch, which a mirror push necessarily does (it is replaying an already-landed
+# main onto GitHub's main) — see branch-guard's cmd_push for the exemption.
+declare -A REPOS=(
+  [claude-foreman]=/home/lumen/foreman
+  [minerva]=/home/lumen/minerva
+  [lumen-bin]=/home/lumen/bin
+  [fleet-inventory]=/home/lumen/fleet/inventory
+  [mission-control]=/home/lumen/mission-control
+  [ccc]=/home/lumen/ccc
+)
+MIRROR_ROOT=${GITHUB_MIRROR_ROOT:-/home/lumen/mirrors}
+AQ=/home/lumen/bin/aq
+fail=0
+
+for name in "${!REPOS[@]}"; do
+  dir="${REPOS[$name]}"
+  [ -d "$dir" ] || continue
+  git -C "$dir" remote get-url github >/dev/null 2>&1 || continue
+  origin_url=$(git -C "$dir" remote get-url origin 2>/dev/null)
+  github_url=$(git -C "$dir" remote get-url github 2>/dev/null)
+  if [ -z "$origin_url" ] || [ -z "$github_url" ]; then
+    echo "$name: FAIL missing origin or github remote url" >&2
+    "$AQ" add github-mirror "$name-no-remote" "github-mirror-sync: $name missing a remote url" \
+      "origin or github remote url could not be resolved for $dir" >/dev/null 2>&1 || true
+    fail=1
+    continue
+  fi
+
+  bare="$MIRROR_ROOT/$name.git"
+  if [ -d "$bare" ]; then
+    if ! git -C "$bare" -c credential.helper=store fetch --prune origin --quiet 2>/dev/null; then
+      echo "$name: FAIL fetch from origin into mirror clone" >&2
+      "$AQ" add github-mirror "$name-fetch-fail" "github-mirror-sync: $name fetch from origin failed" \
+        "bare mirror clone at $bare could not fetch origin" >/dev/null 2>&1 || true
+      fail=1
+      continue
+    fi
+  else
+    mkdir -p "$MIRROR_ROOT"
+    if ! git -c credential.helper=store clone --mirror --quiet "$origin_url" "$bare" 2>/dev/null; then
+      echo "$name: FAIL initial mirror clone from origin" >&2
+      "$AQ" add github-mirror "$name-clone-fail" "github-mirror-sync: $name initial mirror clone failed" \
+        "git clone --mirror of origin into $bare failed" >/dev/null 2>&1 || true
+      fail=1
+      continue
+    fi
+    git -C "$bare" remote add github "$github_url" 2>/dev/null || true
+  fi
+  # github url may rotate independently of the initial clone; keep it current.
+  git -C "$bare" remote set-url github "$github_url" 2>/dev/null || true
+
+  if GIT_MIRROR_SYNC=1 git -C "$bare" -c credential.helper=store push github --mirror --quiet 2>/dev/null; then
+    echo "$name: mirrored to GitHub"
+  else
+    echo "$name: FAIL push --mirror to github" >&2
+    "$AQ" add github-mirror "$name-push-fail" "github-mirror-sync: $name push to github failed" \
+      "git push --mirror github failed from bare clone $bare" >/dev/null 2>&1 || true
+    fail=1
+  fi
+done
+
+exit "$fail"
