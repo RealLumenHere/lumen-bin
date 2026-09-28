@@ -16,6 +16,9 @@ SMOKE_KEY_FILE=${SMOKE_KEY_FILE:-/home/lumen/secrets/maint_smoke_key.json}
 STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}
 PGDUMP=${PGDUMP:-1}
 FORCE_VERIFY_FAIL=${FORCE_VERIFY_FAIL:-0}
+# NEG_CONTROL=1 also asserts an out-of-scope model is refused. That is a deliberate 401, and litellm-auth-alert pages at
+# 5 auth_401 in 10 min, so it stays OFF on prod (harness only). Scope enforcement was proven in the rehearsal + harness.
+NEG_CONTROL=${NEG_CONTROL:-0}
 HEALTH_WAIT=${HEALTH_WAIT:-180}
 mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/litellm-$CONTAINER.state"
 
@@ -43,8 +46,8 @@ verify() {
     docker exec "$CONTAINER" grep -q 'request.scope' /app/litellm/proxy/auth/auth_utils.py 2>/dev/null \
       || { log "VERIFY FAIL: host-header fix marker (request.scope) missing in running code"; return 1; }
   fi
-  python3 - "$PORT" "$SMOKE_KEY_FILE" <<'PY' || return 1
-import json, sys, urllib.request, urllib.error
+  NEG_CONTROL="$NEG_CONTROL" python3 - "$PORT" "$SMOKE_KEY_FILE" <<'PY' || return 1
+import json, os, sys, urllib.request, urllib.error
 port, keyfile = sys.argv[1], sys.argv[2]
 key = json.load(open(keyfile))["key"]
 def call(m, p, b=None):
@@ -64,8 +67,11 @@ txt = ""
 try: txt = r["choices"][0]["message"]["content"]
 except Exception: pass
 print(f"  completion http={st} reply_len={len(txt)}"); ok &= (st == 200 and len(txt) > 0)
-st, r = call("POST", "/v1/chat/completions", {"model": "kimi-k3", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
-print(f"  out-of-scope model http={st} (want 401/403)"); ok &= (st in (401, 403))
+if os.environ.get("NEG_CONTROL") == "1":
+    st, r = call("POST", "/v1/chat/completions", {"model": "kimi-k3", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
+    print(f"  out-of-scope model http={st} (want 401/403)"); ok &= (st in (401, 403))
+else:
+    print("  out-of-scope check skipped (NEG_CONTROL=0: a deliberate 401 would trip litellm-auth-alert)")
 sys.exit(0 if ok else 1)
 PY
   [ "$inject" = "1" ] && [ "$FORCE_VERIFY_FAIL" = "1" ] && { log "VERIFY FAIL: injected failure (FORCE_VERIFY_FAIL=1)"; return 1; }

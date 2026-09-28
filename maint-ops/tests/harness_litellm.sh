@@ -64,7 +64,7 @@ r=urllib.request.Request("http://127.0.0.1:4002/key/generate",data=json.dumps({"
 k=json.loads(urllib.request.urlopen(r,timeout=60).read())["key"]
 fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); open(fd,"w").write(json.dumps({"key":k})); print("harness smoke key created")
 PY
-export COMPOSE_FILE=$H/compose.yml PROJECT=litellm-harness CONTAINER=litellm-harness PORT=4002 SMOKE_KEY_FILE=$H/smoke.json STATE_DIR=$H/state PGDUMP=0 HEALTH_WAIT=150
+export COMPOSE_FILE=$H/compose.yml PROJECT=litellm-harness CONTAINER=litellm-harness PORT=4002 SMOKE_KEY_FILE=$H/smoke.json STATE_DIR=$H/state PGDUMP=0 HEALTH_WAIT=150 NEG_CONTROL=1
 echo; echo "== A. precheck on healthy old instance (want rc 0)"
 bash $SCRIPT --precheck 2>&1 | sed 's/^/    /'; check "A precheck rc" "${PIPESTATUS[0]}" 0
 echo; echo "== B. apply with INJECTED verify failure (want rc 1, rolled back to OLD)"

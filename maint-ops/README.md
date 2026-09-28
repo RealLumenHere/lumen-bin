@@ -11,3 +11,5 @@ Exit codes: 0 ok, 1 failed and rolled back cleanly, 2 failed and rollback failed
 then verifies with the maint-smoke key (models, a real completion, an out-of-scope model must be refused) and the
 host-header fix marker in the running code. The patch reports version 1.83.10, so the version string is not a check.
 Test to failure with `tests/harness_litellm.sh` (throwaway compose project on 127.0.0.1:4002 and a scratch DB copy; never touches prod).
+
+Note: verify never makes a deliberate 401 on prod (NEG_CONTROL=0). litellm-auth-alert pages at 5 auth_401 in 10 minutes, and an early run of this op tripped it. The harness sets NEG_CONTROL=1 (its port is not monitored) to keep the scope-enforcement assertion.
