@@ -9,10 +9,13 @@ set -uo pipefail
 # origin every run, so a dirty or mid-work primary tree can never leak into the
 # mirror and a broken mirror push can never touch the primary tree either.
 #
-# GIT_MIRROR_SYNC=1 is how this script's pushes get past .githooks/branch-guard
-# (wq#1476): that guard refuses any push that lands straight on a repo's default
-# branch, which a mirror push necessarily does (it is replaying an already-landed
-# main onto GitHub's main) — see branch-guard's cmd_push for the exemption.
+# A mirror push does land straight on the mirror's default branch, which is what
+# .githooks/branch-guard (wq#1476) refuses — but the guard is never in the way here
+# and needs no exemption (wq#2947): it runs as a pre-push hook, and the bare clones
+# under $MIRROR_ROOT have no hooks wired (`git clone --mirror` carries none, and
+# nothing installs the guard there). Keeping the push out of the guarded primary
+# trees is the whole point of the bare clone. If a mirror push ever does start
+# tripping the guard, unguard the mirror clone — do not weaken cmd_push.
 declare -A REPOS=(
   [claude-foreman]=/home/lumen/foreman
   [minerva]=/home/lumen/minerva
@@ -62,7 +65,7 @@ for name in "${!REPOS[@]}"; do
   # github url may rotate independently of the initial clone; keep it current.
   git -C "$bare" remote set-url github "$github_url" 2>/dev/null || true
 
-  if GIT_MIRROR_SYNC=1 git -C "$bare" -c credential.helper=store push github --mirror --quiet 2>/dev/null; then
+  if git -C "$bare" -c credential.helper=store push github --mirror --quiet 2>/dev/null; then
     echo "$name: mirrored to GitHub"
   else
     echo "$name: FAIL push --mirror to github" >&2

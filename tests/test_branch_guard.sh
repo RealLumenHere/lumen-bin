@@ -12,6 +12,8 @@
 #   (viii) a LINKED worktree on an OLD branch (no tracked hooks) is guarded too
 #   (ix)   guard runs once per event when both dispatcher and tracked copy exist
 #   (x)    uninstall restores hooksPath and removes only our files; status flips to NOT GUARDED
+#   (xi)   no env var silences the push guard (wq#2947: reverts wq#2908's GIT_MIRROR_SYNC bypass)
+#   (xii)  a --mirror clone of a guarded repo is hookless, so a mirror push needs no exemption
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=$(cd "$HERE/.." && pwd)/.githooks
@@ -71,10 +73,42 @@ expect_rc 1 git -C "$W" push -q origin :main; expect_grep "DELETE of main"
 git -C "$W" tag -a v0-test -m t; expect_rc 0 git -C "$W" push -q origin v0-test
 [ "$(git -C "$T/origin.git" rev-parse main)" = "$(git -C "$W" rev-parse main)" ] && ok "origin main untouched" || bad "origin main moved"
 
+echo "== (xi) no env var silences the push guard (wq#2947 reverting wq#2908) =="
+# wq#2908 added `if [ "$GIT_MIRROR_SYNC" = 1 ]; then exit 0; fi` to the top of cmd_push, before
+# the remote/ref are read: one env var exempted EVERY push in EVERY guarded tree, origin/main
+# included. These probe from outside the population that fix was designed for — remote `origin`,
+# not the `github` mirror — so re-adding any unscoped env exemption fails here.
+expect_rc 1 env GIT_MIRROR_SYNC=1 git -C "$W" push -q origin fix/thing:main; expect_grep "REFUSED push straight to 'main'"
+expect_rc 1 env GIT_MIRROR_SYNC=1 git -C "$W" push -q origin :main; expect_grep "DELETE of main"
+[ "$(git -C "$T/origin.git" rev-parse main)" = "$(git -C "$W" rev-parse main)" ] && ok "origin main untouched under GIT_MIRROR_SYNC=1" || bad "origin main moved under GIT_MIRROR_SYNC=1"
+# structural, so the header comment naming the reverted variable does not satisfy it: the guard
+# must not EXPAND GIT_MIRROR_SYNC, and cmd_push must not early-exit on any bare env var.
+grep -qE '\$\{?GIT_MIRROR_SYNC' "$SRC/branch-guard" && bad "branch-guard reads GIT_MIRROR_SYNC again" || ok "branch-guard expands no GIT_MIRROR_SYNC"
+grep -qE '^ *if \[ "\$\{[A-Z_]+:?-[^}]*\}" = 1 \]; then' "$SRC/branch-guard" \
+  && bad "cmd_push has a bare env-var early exit" || ok "no bare env-var early exit in the guard"
+MIRROR="$SRC/../github-mirror-sync"
+if [ -f "$MIRROR" ]; then
+  grep -q 'GIT_MIRROR_SYNC=1 git' "$MIRROR" && bad "github-mirror-sync still sets GIT_MIRROR_SYNC on its push" \
+    || ok "github-mirror-sync pushes without an env exemption (its bare clone has no hooks)"
+fi
+
+echo "== (xii) a --mirror clone of a guarded repo is hookless, so a mirror push needs no exemption =="
+# This is why (xi) costs nothing: github-mirror-sync pushes from a bare clone, and hooks live in
+# the common dir, not in repo content, so the guard is not there to be exempted (wq#2947).
+git clone -q --mirror "$W" "$T/mirror.git"
+n_live=$(find "$T/mirror.git/hooks" -maxdepth 1 -type f ! -name '*.sample' | grep -c . || true)
+[ "$n_live" = 0 ] && ok "--mirror clone of a GUARDED repo carries no live hook ($n_live non-sample files)" || { bad "mirror clone carried $n_live hook(s)"; }
+[ -z "$(git -C "$T/mirror.git" config --get core.hooksPath)" ] && ok "mirror clone has no core.hooksPath" || bad "mirror clone set core.hooksPath"
+git init -q --bare "$T/ghmirror.git" && git -C "$T/ghmirror.git" symbolic-ref HEAD refs/heads/main
+git -C "$T/mirror.git" remote add github "$T/ghmirror.git"
+expect_rc 0 git -C "$T/mirror.git" push -q github --mirror        # no GIT_MIRROR_SYNC, and it lands on main
+[ "$(git -C "$T/ghmirror.git" rev-parse main)" = "$(git -C "$W" rev-parse main)" ] && ok "mirror push replicated main with no env exemption" || bad "mirror push did not replicate main"
+
 echo "== (viii) linked worktree on an old branch is guarded by the common dispatcher =="
 echo w > "$T/oldwt/w"; git -C "$T/oldwt" add w
 expect_rc 0 git -C "$T/oldwt" commit -q -m "feat: old wt"         # feature branch: allowed
 expect_rc 1 git -C "$T/oldwt" push -q origin feat/old:main; expect_grep "REFUSED push straight to 'main'"
+expect_rc 1 env GIT_MIRROR_SYNC=1 git -C "$T/oldwt" push -q origin feat/old:main; expect_grep "REFUSED push straight to 'main'"   # (xi) in a linked worktree too
 
 echo "== (ix) tracked + dispatcher present: guard runs once, chained tracked hook still runs =="
 git -C "$W" checkout -q feat/hooks; echo h > "$W/h"; git -C "$W" add h
@@ -97,7 +131,9 @@ if [ -f "$RECONCILE" ]; then
 fi
 if [ -f "$SWEEP" ]; then
   out=$(python3 "$SWEEP" --dry-run --repo "$W" 2>&1); rc=$?
-  printf '%s' "$out" | grep -q 'would file' && ok "repo_sweep dry-run would file a ticket: $(printf '%s' "$out" | head -1)" || { bad "repo_sweep dry-run did not flag it (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/    /'; }
+  # repo_sweep.py:307 tags a dry-run find "[dry run — would record]"; it never prints "would
+  # file", so the original grep for that string could not match on any input (wq#2947).
+  printf '%s' "$out" | grep -q 'would record' && ok "repo_sweep dry-run would record a ticket: $(printf '%s' "$out" | head -1)" || { bad "repo_sweep dry-run did not flag it (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/    /'; }
 fi
 expect_rc 0 git -C "$W" push -q --no-verify origin main
 ok "push --no-verify lands (documented limit: no server-side protection; sweeps are the backstop)"

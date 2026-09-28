@@ -12,6 +12,14 @@
 # Deterministic, no LLM, no env override. `--no-verify` still works and is still caught by
 # repo-sweep (wq#800) + git-hygiene-sweep, which is why they stay on their timers.
 #
+# "No env override" is load-bearing, not a slogan (wq#2947, reverting wq#2908's
+# `GIT_MIRROR_SYNC=1` exemption): a bare env-var check in cmd_push fires before the remote and
+# ref are read, so it silences the guard for EVERY push in every guarded tree, origin/main
+# included. Nothing needs it — a push that must skip the guard runs outside a guarded tree
+# (github-mirror-sync pushes from a hookless bare clone under /home/lumen/mirrors, where no
+# pre-push hook exists to exempt). Scope an exemption to a remote and a ref, or do not add one.
+# tests/test_branch_guard.sh case (xi) fails if this comes back.
+#
 # Modes:
 #   branch-guard commit             (from a pre-commit hook) refuse if HEAD is on the default branch
 #   branch-guard push               (from a pre-push hook)   read pre-push stdin; refuse any update or
@@ -76,14 +84,6 @@ cmd_commit() {
 cmd_push() {
   local root def local_ref local_sha remote_ref remote_sha
   root=$(repo_root .) || exit 0
-  # wq#2908: github-mirror-sync replays Gitea's already-landed main onto the
-  # read-only `github` mirror remote. That is not "pushing straight to main" in
-  # the sense this guard exists to prevent (origin/Gitea is still the only place
-  # main can be authored) so the mirror unit sets this to identify itself.
-  if [ "${GIT_MIRROR_SYNC:-}" = 1 ]; then
-    echo "branch-guard: GIT_MIRROR_SYNC=1 — exempting one-way mirror push in $root (wq#2908)" >&2
-    exit 0
-  fi
   def=$(default_branch "$root")
   while read -r local_ref local_sha remote_ref remote_sha; do
     [ -n "${remote_ref:-}" ] || continue
