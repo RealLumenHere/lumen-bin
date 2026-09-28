@@ -1,0 +1,18 @@
+#!/bin/bash
+# ghidra-mcp-headless start|stop|status|health|log   (wq#1304) — on-demand, NOT enabled at boot, capped at GHIDRA_MCP_MAX_HOURS (default 4)
+PORT="${GHIDRA_MCP_PORT:-8089}"; URL="http://127.0.0.1:$PORT"
+unit() { systemctl list-units --plain --no-legend --state=active 'lumen-job-ghidra-mcp-*' 2>/dev/null | awk '{print $1}' | head -1; }
+health() { curl -fsS --max-time 3 "$URL/check_connection" 2>/dev/null; }
+case "${1:-status}" in
+  health) health; echo; [ -n "$(health)" ] ;;
+  status) u=$(unit); if [ -n "$u" ]; then echo "RUNNING unit=$u"; health; echo; else echo "STOPPED"; fi ;;
+  start)
+    if [ -n "$(health)" ]; then echo "already up: $(unit)"; exit 0; fi
+    /home/lumen/bin/lumen-run start --name ghidra-mcp --mem 4G --cpu 300% --tasks-max 512 --timeout-stop-sec 60 -- /opt/ghidra-mcp/run-headless.sh || exit 1
+    for i in $(seq 1 90); do [ -n "$(health)" ] && { echo "up after ${i}s"; exit 0; }; sleep 1; done
+    echo "TIMEOUT waiting for $URL (see: ghidra-mcp-headless log)"; exit 1 ;;
+  stop) u=$(unit); [ -n "$u" ] && sudo systemctl stop "$u" && echo "stopped $u" || echo "not running" ;;
+  log) u=$(unit); [ -z "$u" ] && u=$(systemctl list-units --plain --no-legend --all 'lumen-job-ghidra-mcp-*' | awk '{print $1}' | tail -1)
+       if [ -n "$u" ]; then journalctl -u "$u" --no-pager -n "${2:-80}"; else journalctl --no-pager -n "${2:-80}" -t systemd-run 2>/dev/null | grep -i ghidra-mcp | tail -"${2:-80}"; echo "(no live/loaded ghidra-mcp unit; finished transient units are garbage-collected — capture via: journalctl _SYSTEMD_UNIT=lumen-job-ghidra-mcp-<epoch>.service)"; fi ;;
+  *) echo "usage: $0 start|stop|status|health|log"; exit 2 ;;
+esac
