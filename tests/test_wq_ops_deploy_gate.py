@@ -134,6 +134,24 @@ def test_ops_install_citation_with_self_referential_deployed_target_refuses(
     assert "resolves inside" in done.stdout + done.stderr
 
 
+def test_ops_install_citation_with_hardlinked_self_target_refuses(tmp_path, repo_with_ops_artifact):
+    """wq#2813: a hard link outside the artifact dir to its own shipped payload survives the
+    realpath check (a hard link has no single real path) and is still zero real deployment."""
+    env = make_env(tmp_path)
+    repo, art_dir, target = repo_with_ops_artifact
+    linked = target / "lumen_state.py"
+    if linked.exists():
+        linked.unlink()
+    os.link(art_dir / "lumen_state.py", linked)
+    tid = open_ticket(env, "wq2813 self-test: hard-linked self target")
+
+    done = wq(env, "done", tid, "--notes", f"shipped {art_dir}/install.sh",
+              "--deployed", str(linked), "--deploy-verify", _DEPLOY_VERIFY, cwd=repo)
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "hard link" in done.stdout + done.stderr
+    assert notes_of(env, tid) == "", "a refused close must not write notes"
+
+
 def test_ops_install_citation_with_matching_deployed_target_but_no_deploy_verify_refuses(
         tmp_path, repo_with_ops_artifact):
     """wq#2762 (ISSUE-LOG #859): a byte-match alone proves delivery, not that the ticket's

@@ -2721,6 +2721,21 @@ def ops_deploy_check(abs_path, deployed_target, deploy_verify=None):
     if real_target == real_art_dir or real_target.startswith(real_art_dir + os.sep):
         return "undeployed", (f"--deployed {deployed_target} resolves inside {art_dir} — the "
                               f"artifact's own shipped payload cannot prove its own delivery")
+    # wq#2813: realpath does not see through a hard link — a --deployed path outside the
+    # artifact dir that shares an inode with a shipped file is still the artifact's own
+    # payload, not a deployed copy. Checked against every shipped file before any byte-match,
+    # so a duplicate payload elsewhere in the artifact cannot launder it.
+    for root, _dirs, files in os.walk(art_dir):
+        for name in files:
+            cand = os.path.join(root, name)
+            try:
+                same = os.path.samefile(deployed_target, cand)
+            except OSError:
+                same = False
+            if same:
+                return "undeployed", (f"--deployed {deployed_target} is a hard link to {cand} — "
+                                      f"the artifact's own shipped payload cannot prove its own "
+                                      f"delivery")
     target_hash = _sha256(deployed_target)
     for root, _dirs, files in os.walk(art_dir):
         for name in files:
