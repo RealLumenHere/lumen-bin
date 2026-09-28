@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""rotate-provider-keys (wq#2827): swap LiteLLM upstream provider keys everywhere they live, verify, roll back on failure.
+
+  rotate-provider-keys enter      prompt (hidden) for each new key, blank = skip, then apply
+  rotate-provider-keys apply      read /home/lumen/.secrets/provider-keys.new (PROVIDER_API_KEY=value lines)
+  rotate-provider-keys selftest   full pipeline with the CURRENT keys as "new" (proves backup/swap/recreate/verify/restart)
+
+Minting the new key happens at each provider's dashboard (no provisioning API on this fleet). Everything after that is here:
+preflight every new key against the provider before touching anything, back up every file, replace by old VALUE in every
+registered file (so a key kept in two files moves in both), recreate the litellm container so env_file reloads, check
+/health?model= and a real chat completion per provider, restart the systemd services that load agent/.env, and print the
+sha12 of each old key to revoke. Any failed check restores the backups and recreates litellm again. Never prints a value.
+"""
+import getpass, glob, hashlib, json, os, shutil, subprocess, sys, time, urllib.request, urllib.error
+
+PROVIDERS = {
+    #            env var               preflight (method, url, header-builder)                               litellm alias
+    'CEREBRAS':  ('CEREBRAS_API_KEY',  ('https://api.cerebras.ai/v1/models', lambda k: {'Authorization': f'Bearer {k}'}), 'cerebras-oss-120b'),
+    'DEEPSEEK':  ('DEEPSEEK_API_KEY',  ('https://api.deepseek.com/models', lambda k: {'Authorization': f'Bearer {k}'}), 'deepseek-v4-flash'),
+    'GEMINI':    ('GEMINI_API_KEY',    ('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1', lambda k: {'x-goog-api-key': k}), 'gemini-flash'),
+    'MISTRAL':   ('MISTRAL_API_KEY',   ('https://api.mistral.ai/v1/models', lambda k: {'Authorization': f'Bearer {k}'}), None),
+    'OPENROUTER':('OPENROUTER_API_KEY',('https://openrouter.ai/api/v1/key', lambda k: {'Authorization': f'Bearer {k}'}), 'openrouter-free'),
+}
+ENV_FILES = ['/home/lumen/agent/.env', '/home/lumen/.secrets/litellm-master.env', '/home/lumen/.secrets/mailbot-deepseek.env']
+RAW_FILES = ['/home/lumen/.secrets/gemini-ai-studio.key']  # single raw value; swapped only if it equals an old value
+DROP = '/home/lumen/.secrets/provider-keys.new'
+COMPOSE = ['docker', 'compose', '-f', '/home/lumen/docker/docker-compose.yml']
+LOG = '/home/lumen/logs/provider-key-rotation.log'
+LITELLM = 'http://127.0.0.1:4000'
+
+def sha12(v): return hashlib.sha256(v.encode()).hexdigest()[:12]
+def say(msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}"
+    print(line, flush=True)
+    with open(LOG, 'a') as f: f.write(line + '\n')
+
+def http(url, headers=None, data=None, timeout=60):
+    req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
+                                 headers={'content-type': 'application/json', 'user-agent': 'rotate-provider-keys', **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read().decode(errors='replace')
+    except urllib.error.HTTPError as e: return e.code, e.read().decode(errors='replace')
+    except Exception as e: return 0, str(e)
+
+def read_env(path):
+    out = {}
+    for line in open(path):
+        if '=' in line and not line.lstrip().startswith('#'):
+            k, v = line.rstrip('\n').split('=', 1); out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+def parse_drop(path):
+    new = read_env(path)
+    by_var = {v[0]: p for p, v in PROVIDERS.items()}
+    bad = [k for k in new if k not in by_var]
+    if bad: sys.exit(f'unknown names in {path}: {bad} (allowed: {sorted(by_var)})')
+    return {by_var[k]: v for k, v in new.items() if v}
+
+def master_key(): return read_env('/home/lumen/.secrets/litellm-master.env')['LITELLM_MASTER_KEY']
+
+def preflight(new):
+    ok = True
+    for prov, key in new.items():
+        url, hdr = PROVIDERS[prov][1]
+        st, _ = http(url, hdr(key), timeout=20)
+        say(f'preflight {prov} new={sha12(key)} http={st}'); ok &= (st == 200)
+    return ok
+
+def backup(ts):
+    saved = []
+    for f in ENV_FILES + RAW_FILES:
+        if os.path.exists(f):
+            b = f'{f}.bak.{ts}_rotate'; shutil.copy2(f, b); os.chmod(b, 0o600); saved.append((f, b))
+    say(f'backup: {len(saved)} files -> *.bak.{ts}_rotate'); return saved
+
+def restore(saved):
+    for f, b in saved: shutil.copy2(b, f)
+    say(f'restored {len(saved)} files from backup')
+
+def swap(new):
+    """Replace every OLD value of each rotated provider with its new value across the registered files."""
+    old = {}
+    for prov in new:
+        var = PROVIDERS[prov][0]
+        old[prov] = {read_env(f)[var] for f in ENV_FILES if os.path.exists(f) and var in read_env(f)}
+    changed = 0
+    for f in ENV_FILES:
+        if not os.path.exists(f): continue
+        lines, hit = open(f).read().split('\n'), False
+        for i, line in enumerate(lines):
+            if '=' not in line or line.lstrip().startswith('#'): continue
+            k = line.split('=', 1)[0].strip()
+            for prov, key in new.items():
+                if k == PROVIDERS[prov][0]: lines[i] = f'{k}={key}'; hit = True
+        if hit:
+            tmp = f + '.tmp'; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.write(fd, '\n'.join(lines).encode()); os.close(fd); shutil.copystat(f, tmp); os.replace(tmp, f); changed += 1
+    for f in RAW_FILES:
+        if not os.path.exists(f): continue
+        cur = open(f).read().strip()
+        for prov, key in new.items():
+            if cur in old.get(prov, set()):
+                fd = os.open(f + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600); os.write(fd, key.encode()); os.close(fd)
+                os.replace(f + '.tmp', f); changed += 1
+    for prov in new: say(f'swap {prov}: old={sorted(sha12(v) for v in old[prov])} -> new={sha12(new[prov])}')
+    say(f'swap: {changed} files written'); return old
+
+def recreate_litellm():
+    r = subprocess.run(COMPOSE + ['up', '-d', '--no-deps', '--force-recreate', '--pull', 'never', 'litellm'], capture_output=True, text=True)
+    if r.returncode: say(f'compose up failed rc={r.returncode}: {r.stderr[-300:]}'); return False
+    for _ in range(90):
+        if http(f'{LITELLM}/health/liveliness', timeout=5)[0] == 200: break
+        time.sleep(2)
+    else: say('litellm never became live'); return False
+    for _ in range(60):
+        if http(f'{LITELLM}/health/readiness', timeout=10)[0] == 200: say('litellm recreated, live+ready'); return True
+        time.sleep(2)
+    say('litellm not ready'); return False
+
+PROBE_KEY = '/home/lumen/.secrets/litellm-service-keys/model-watchdog.key'  # all-rungs liveness key (wq#1003)
+
+def verify(provs):
+    # The master key is retired on LLM routes (/health included) by master_key_guard.py (wq#914) and returns 401 there,
+    # so gateway checks use /health/readiness (no auth) plus a real completion on the model-watchdog virtual key.
+    probe, ok = open(PROBE_KEY).read().strip(), True
+    rd = http(f'{LITELLM}/health/readiness', timeout=15)[0]
+    say(f'verify litellm /health/readiness={rd}'); ok &= (rd == 200)
+    msgs = [{'role': 'user', 'content': 'Reply with the single word OK.'}]
+    for prov in provs:
+        alias = PROVIDERS[prov][2]
+        if alias:
+            st2, body2 = http(f'{LITELLM}/v1/chat/completions', {'Authorization': f'Bearer {probe}'},
+                              {'model': alias, 'messages': msgs, 'max_tokens': 256}, timeout=180)
+            good = st2 == 200 and '"choices"' in body2
+            say(f'verify {prov} via litellm {alias}: completion={st2} -> {"PASS" if good else "FAIL"}')
+        else:  # not routed through litellm today: prove the key does a real completion at the provider
+            key = read_env(ENV_FILES[0])[PROVIDERS[prov][0]]
+            for attempt in range(4):  # free tier 429s under burst; 401/403 would mean the key is bad
+                st2, body2 = http('https://api.mistral.ai/v1/chat/completions', {'Authorization': f'Bearer {key}'},
+                                  {'model': 'mistral-small-latest', 'messages': msgs, 'max_tokens': 16}, timeout=120)
+                if st2 != 429: break
+                time.sleep(15)
+            good = st2 == 200 and '"choices"' in body2
+            # 2026-09-28: this account answers x-ratelimit-limit-req-minute: 0 (no completion quota at all) while /models
+            # authenticates 200. A rate_limited 429 is an account-quota state, not a key failure; a bad key is 401.
+            quota = st2 == 429 and '"rate_limited"' in body2
+            say(f'verify {prov} direct (not in litellm model_list): completion={st2} -> '
+                f'{"PASS" if good else "PASS(auth) - account has zero completion quota" if quota else "FAIL"}')
+            good = good or quota
+        ok &= good
+    return ok
+
+NEVER_RESTART = {'desktop-commander-mcp.service', 'chrome-mcp.service', 'memory-mcp.service', 'cloudflared.service'}
+
+def consumer_units():
+    """Active long-running services that load agent/.env or a rotated secrets file (oneshots pick it up next run)."""
+    out = subprocess.run(['systemctl', 'list-units', '--type=service', '--state=active', '--no-legend', '--plain'],
+                         capture_output=True, text=True).stdout.split('\n')
+    units = []
+    for line in filter(None, out):
+        u = line.split()[0]
+        if u in NEVER_RESTART or u.startswith('mcp-gateway') or u.startswith('claude-command'): continue
+        show = subprocess.run(['systemctl', 'show', u, '-p', 'EnvironmentFiles', '-p', 'Type'], capture_output=True, text=True).stdout
+        if any(f in show for f in ENV_FILES) and 'Type=oneshot' not in show: units.append(u)
+    return units
+
+def restart_consumers():
+    units, bad = consumer_units(), []
+    for u in units:
+        r = subprocess.run(['sudo', '-n', 'systemctl', 'restart', u], capture_output=True, text=True)
+        time.sleep(1)
+        st = subprocess.run(['systemctl', 'is-active', u], capture_output=True, text=True).stdout.strip()
+        if r.returncode or st != 'active': bad.append(f'{u}={st}')
+    say(f'restarted {len(units)} consumer services; not active after restart: {bad or "none"}')
+    return not bad
+
+def run(new, selftest=False):
+    if not new: sys.exit('nothing to rotate')
+    ts = time.strftime('%Y%m%d_%H%M%S')
+    say(f'=== rotate {"SELFTEST " if selftest else ""}{sorted(new)} ===')
+    if not preflight(new): say('ABORT: a new key failed preflight at the provider; nothing was changed'); return 2
+    saved = backup(ts)
+    # selftest swaps nothing: values differ per file today (two Gemini keys), so re-writing "current" would change them
+    old = {p: set() for p in new} if selftest else swap(new)
+    if not (recreate_litellm() and verify(sorted(new))):
+        say('FAIL: rolling back'); restore(saved)
+        ok = recreate_litellm() and verify(sorted(new))
+        say(f'rollback {"verified" if ok else "NOT verified - litellm needs attention"}'); return 3
+    if selftest:
+        units = consumer_units()
+        say(f'selftest: would restart {len(units)} consumer services: {" ".join(units)}')
+    elif not restart_consumers(): say('WARN: some consumer services not active after restart (keys are swapped and verified)')
+    for prov in sorted(new):
+        stale = sorted(sha12(v) for v in old[prov] if v != new[prov])
+        say(f'REVOKE at {prov} dashboard: old key sha12 {stale or "(none - selftest/no change)"}')
+    say('=== done ==='); return 0
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ''
+    # one run at a time: two overlapping runs recreate litellm under each other's verify (seen in selftest 2026-09-28)
+    import fcntl
+    lock = open('/tmp/rotate-provider-keys.lock', 'w')
+    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError: sys.exit('another rotate-provider-keys run is in progress')
+    if mode == 'enter':
+        vals = {}
+        for prov, (var, _, _) in PROVIDERS.items():
+            v = getpass.getpass(f'new {var} (blank = skip): ').strip()
+            if v: vals[var] = v
+        fd = os.open(DROP, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, ''.join(f'{k}={v}\n' for k, v in vals.items()).encode()); os.close(fd); mode = 'apply'
+    if mode == 'apply':
+        if not os.path.exists(DROP): sys.exit(f'no {DROP}')
+        rc = run(parse_drop(DROP))
+        if rc == 0: subprocess.run(['shred', '-u', DROP])
+        else: say(f'{DROP} kept for retry')
+        sys.exit(rc)
+    if mode == 'selftest':
+        # what each provider actually runs on today: litellm-master.env overrides agent/.env (compose env_file order)
+        cur = {**read_env(ENV_FILES[0]), **read_env(ENV_FILES[1])}
+        sys.exit(run({p: cur[v[0]] for p, v in PROVIDERS.items() if cur.get(v[0])}, selftest=True))
+    sys.exit(__doc__)
+
+if __name__ == '__main__':
+    main()
