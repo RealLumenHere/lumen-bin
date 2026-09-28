@@ -1082,6 +1082,16 @@ def gate_met(gate):
         if cond == 'exists' and not present: return False, f"gate: {path} missing"
         if cond == 'missing' and present:    return False, f"gate: {path} present (must be absent)"
     return True, ""
+def bad_gate_clauses(gate):
+    """wq#3033: a --gate clause that isn't an absolute or ~ path can never satisfy gate_met()
+    -- free-text acceptance prose (wq#2844, wq#2484) parses as a path that never exists and
+    claim --id is refused forever. Returns the offending raw clauses, or [] if gate is clean/empty."""
+    if not gate or not gate.strip(): return []
+    bad = []
+    for clause in [x.strip() for x in gate.split(',') if x.strip()]:
+        path = clause.rsplit(':', 1)[0].strip() if ':' in clause else clause
+        if not (path.startswith('/') or path.startswith('~')): bad.append(clause)
+    return bad
 def ro_holders(c, base, t_now, exclude=None):
     """wq#1675: live readers on a base scope, minus `exclude` (normally the caller, whose own
     read hold must never block its own writer claim on the same base)."""
@@ -1513,6 +1523,17 @@ def cmd_add(a):
                   f"Omit --archetype to let the router classify it, use a known one, or "
                   f"--force to override.")
             sys.exit(1)
+    # wq#3033: --gate is an enforced file-path precondition (path[:exists|missing]), not free
+    # text -- a non-path clause can never resolve and claim --id would be refused forever
+    # (wq#2844, wq#2484). Same fail-open-only-via-force shape as the lane/archetype guards above.
+    bad_gate = [] if a.force else bad_gate_clauses(a.gate)
+    if bad_gate:
+        print(f"REFUSED: --gate clause(s) not an absolute or ~ path: {', '.join(bad_gate)} (wq#3033)")
+        print("wq gate is an enforced file-path precondition (comma list of path[:exists|missing]), "
+              "not acceptance prose -- a non-path clause can never resolve, so claim --id would be "
+              "refused forever. Put prose in --detail, a checkable probe in --liveness, or "
+              "--force to override (discouraged).")
+        sys.exit(1)
     c = conn()
     if not a.force:
         nt = norm_title(a.title)
@@ -3390,6 +3411,16 @@ def cmd_edit(a):
     # --detail that carries (or edits) a Liveness: line
     if a.detail is not None:
         _reject_liveness_grep_invert(a.detail)
+    # wq#3033: same --gate path guard as cmd_add -- free-text acceptance prose in --gate
+    # parses as a path that never exists and claim --id is refused forever (wq#2844, wq#2484).
+    bad_gate = [] if a.force else bad_gate_clauses(a.gate)
+    if bad_gate:
+        print(f"REFUSED: --gate clause(s) not an absolute or ~ path: {', '.join(bad_gate)} (wq#3033)")
+        print("wq gate is an enforced file-path precondition (comma list of path[:exists|missing]), "
+              "not acceptance prose -- a non-path clause can never resolve, so claim --id would be "
+              "refused forever. Put prose in --detail, a checkable probe in --liveness, or "
+              "--force to override (discouraged).")
+        c.close(); sys.exit(1)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
