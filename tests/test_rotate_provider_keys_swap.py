@@ -14,7 +14,7 @@ old = rpk.swap(new)
 after = [rpk.read_env(f) for f in rpk.ENV_FILES]
 res = []
 def ok(name, c): res.append(c); print(('PASS ' if c else 'FAIL ') + name)
-ok('old gemini set had 2 distinct values (agent/.env + litellm-master.env)', len(old['GEMINI']) == 2)
+ok('old gemini set had 2 distinct values (agent/.env + gemini.env, wq#2902)', len(old['GEMINI']) == 2)
 for i, f in enumerate(rpk.ENV_FILES):
     for var, prov in (('GEMINI_API_KEY', 'GEMINI'), ('DEEPSEEK_API_KEY', 'DEEPSEEK')):
         if var in before[i]: ok(f'{os.path.basename(f)} {var} swapped', after[i][var] == new[prov])

@@ -7,12 +7,12 @@ alias's budget/duration), writes it under the ORIGINAL alias's file paths (so
 EnvironmentFile= consumers don't need path changes), then deletes the old key.
 """
 import json, os, sys, urllib.request, urllib.error, pathlib, datetime, argparse
+from lumen_env import env_value, mask   # wq#2902: keyed parser + mask boundary (shared with budget-alert / vw-migrate-secrets)
 
 LITELLM = "http://localhost:4000"
-# wq#1747: the file holds more than one line since 2026-09-25 (GEMINI_API_KEY). split("=",1) on the whole file
-# took the master key PLUS every later line, so every call failed with an invalid header (and the traceback printed it).
-MASTER_KEY = next(l.split("=", 1)[1].strip() for l in pathlib.Path("/home/lumen/.secrets/litellm-master.env").read_text().splitlines()
-                  if l.startswith("LITELLM_MASTER_KEY="))
+# wq#1747/wq#2902: parsed BY KEY NAME. A positional read once pulled a second line into the master key value,
+# the request header carried both secrets and the traceback printed them. Never read it any other way.
+MASTER_KEY = env_value("/home/lumen/.secrets/litellm-master.env", "LITELLM_MASTER_KEY")
 SECRETS_DIR = pathlib.Path("/home/lumen/.secrets/litellm-service-keys")
 SECRETS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -79,7 +79,7 @@ def gen_key(alias: str, max_budget: float, budget_duration: str, description: st
         body = e.read().decode()
         # If key alias already exists, fetch it
         if "already exists" in body.lower() or e.code == 400:
-            print(f"  WARN: {alias} may already exist: {body[:200]}", file=sys.stderr)
+            print(f"  WARN: {alias} may already exist: {mask(body[:200])}", file=sys.stderr)
             return None
         raise
 
@@ -99,7 +99,7 @@ def delete_key(key: str):
             resp.read()
             return True
     except urllib.error.HTTPError as e:
-        print(f"  WARN: delete failed: {e.read().decode()[:200]}", file=sys.stderr)
+        print(f"  WARN: delete failed: {mask(e.read().decode()[:200])}", file=sys.stderr)
         return False
 
 def save_key(alias: str, key: str):

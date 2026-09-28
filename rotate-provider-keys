@@ -21,7 +21,8 @@ PROVIDERS = {
     'MISTRAL':   ('MISTRAL_API_KEY',   ('https://api.mistral.ai/v1/models', lambda k: {'Authorization': f'Bearer {k}'}), None),
     'OPENROUTER':('OPENROUTER_API_KEY',('https://openrouter.ai/api/v1/key', lambda k: {'Authorization': f'Bearer {k}'}), 'openrouter-free'),
 }
-ENV_FILES = ['/home/lumen/agent/.env', '/home/lumen/.secrets/litellm-master.env', '/home/lumen/.secrets/mailbot-deepseek.env']
+LITELLM_ENV_FILES = ['/home/lumen/agent/.env', '/home/lumen/.secrets/litellm-master.env', '/home/lumen/.secrets/gemini.env']  # compose env_file order: later wins (wq#2902)
+ENV_FILES = LITELLM_ENV_FILES + ['/home/lumen/.secrets/mailbot-deepseek.env']
 RAW_FILES = ['/home/lumen/.secrets/gemini-ai-studio.key']  # single raw value; swapped only if it equals an old value
 DROP = '/home/lumen/.secrets/provider-keys.new'
 COMPOSE = ['docker', 'compose', '-f', '/home/lumen/docker/docker-compose.yml']
@@ -216,8 +217,10 @@ def main():
         else: say(f'{DROP} kept for retry')
         sys.exit(rc)
     if mode == 'selftest':
-        # what each provider actually runs on today: litellm-master.env overrides agent/.env (compose env_file order)
-        cur = {**read_env(ENV_FILES[0]), **read_env(ENV_FILES[1])}
+        # what each provider actually runs on today: compose env_file order, later file overrides (wq#2902: gemini.env last)
+        cur = {}
+        for f in LITELLM_ENV_FILES:
+            if os.path.exists(f): cur.update(read_env(f))
         sys.exit(run({p: cur[v[0]] for p, v in PROVIDERS.items() if cur.get(v[0])}, selftest=True))
     sys.exit(__doc__)
 
