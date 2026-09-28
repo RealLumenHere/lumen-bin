@@ -1,0 +1,128 @@
+#!/bin/bash
+# litellm-upgrade - maintenance-window op for the LiteLLM patch upgrade (wq#2989 / wq#2990).
+# Modes: --precheck | --apply | --verify | --rollback
+# Runs locally on Lumen. Embeds its own rollback: lumen-window halts on failure but never rolls back.
+# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (CRITICAL) | 3 precheck abort
+# Never prints keys, master key or DSNs.
+set -u
+COMPOSE_FILE=${COMPOSE_FILE:-/home/lumen/docker/docker-compose.yml}
+SERVICE=${SERVICE:-litellm}
+CONTAINER=${CONTAINER:-litellm}
+PORT=${PORT:-4000}
+PROJECT=${PROJECT:-}
+IMAGE_REPO=ghcr.io/berriai/litellm
+TARGET_DIGEST=${TARGET_DIGEST:-sha256:e29d25e1952337eb7c9b605213865ae935c60f1689ad465cb5fc940b598174c9}
+SMOKE_KEY_FILE=${SMOKE_KEY_FILE:-/home/lumen/secrets/maint_smoke_key.json}
+STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}
+PGDUMP=${PGDUMP:-1}
+FORCE_VERIFY_FAIL=${FORCE_VERIFY_FAIL:-0}
+HEALTH_WAIT=${HEALTH_WAIT:-180}
+mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/litellm-$CONTAINER.state"
+
+log() { echo "[litellm-upgrade $(date -u +%H:%M:%S)Z] $*"; }
+DC() { if [ -n "$PROJECT" ]; then docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"; else docker compose -f "$COMPOSE_FILE" "$@"; fi; }
+cur_digest() { grep -m1 -oE "$IMAGE_REPO@sha256:[0-9a-f]{64}" "$COMPOSE_FILE" | cut -d@ -f2; }
+
+wait_healthy() {
+  local i code
+  for i in $(seq 1 $((HEALTH_WAIT/5))); do
+    code=$(curl -s -o /tmp/lu_ready.$$ -w '%{http_code}' -m 4 "http://127.0.0.1:$PORT/health/readiness")
+    if [ "$code" = "200" ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("status")=="healthy" and d.get("db")=="connected" else 1)' /tmp/lu_ready.$$ 2>/dev/null; then rm -f /tmp/lu_ready.$$; return 0; fi
+    sleep 5
+  done
+  rm -f /tmp/lu_ready.$$; return 1
+}
+
+# verify <expect_digest> <expect_patched:0|1> <inject:0|1>
+verify() {
+  local want="$1" patched="$2" inject="$3" have
+  have=$(docker inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null | grep -oE 'sha256:[0-9a-f]{64}')
+  [ "$have" = "$want" ] || { log "VERIFY FAIL: running image $have != expected $want"; return 1; }
+  wait_healthy || { log "VERIFY FAIL: readiness not healthy+db connected within ${HEALTH_WAIT}s"; return 1; }
+  if [ "$patched" = "1" ]; then
+    docker exec "$CONTAINER" grep -q 'request.scope' /app/litellm/proxy/auth/auth_utils.py 2>/dev/null \
+      || { log "VERIFY FAIL: host-header fix marker (request.scope) missing in running code"; return 1; }
+  fi
+  python3 - "$PORT" "$SMOKE_KEY_FILE" <<'PY' || return 1
+import json, sys, urllib.request, urllib.error
+port, keyfile = sys.argv[1], sys.argv[2]
+key = json.load(open(keyfile))["key"]
+def call(m, p, b=None):
+    r = urllib.request.Request(f"http://127.0.0.1:{port}{p}", data=json.dumps(b).encode() if b is not None else None, method=m,
+                               headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(r, timeout=60) as x: return x.status, json.loads(x.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+    except Exception as e:
+        return 0, {"err": type(e).__name__}
+ok = True
+st, r = call("GET", "/v1/models"); n = len(r.get("data", [])) if st == 200 else 0
+print(f"  /v1/models http={st} models={n}"); ok &= (st == 200 and n >= 1)
+st, r = call("POST", "/v1/chat/completions", {"model": "deepseek-v4-flash", "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]})
+txt = ""
+try: txt = r["choices"][0]["message"]["content"]
+except Exception: pass
+print(f"  completion http={st} reply_len={len(txt)}"); ok &= (st == 200 and len(txt) > 0)
+st, r = call("POST", "/v1/chat/completions", {"model": "kimi-k3", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
+print(f"  out-of-scope model http={st} (want 401/403)"); ok &= (st in (401, 403))
+sys.exit(0 if ok else 1)
+PY
+  [ "$inject" = "1" ] && [ "$FORCE_VERIFY_FAIL" = "1" ] && { log "VERIFY FAIL: injected failure (FORCE_VERIFY_FAIL=1)"; return 1; }
+  log "verify PASS"; return 0
+}
+
+precheck() {
+  local avail cur
+  avail=$(df --output=avail -k /var/lib/docker 2>/dev/null | tail -1); [ "${avail:-0}" -gt 8000000 ] || { log "PRECHECK FAIL: <8GB free"; return 3; }
+  [ -r "$COMPOSE_FILE" ] || { log "PRECHECK FAIL: compose file unreadable"; return 3; }
+  cur=$(cur_digest); [ -n "$cur" ] || { log "PRECHECK FAIL: no digest-pinned $IMAGE_REPO line in compose"; return 3; }
+  [ "$(docker inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null)" = "running" ] || { log "PRECHECK FAIL: $CONTAINER not running"; return 3; }
+  [ -r "$SMOKE_KEY_FILE" ] || { log "PRECHECK FAIL: smoke key file missing"; return 3; }
+  wait_healthy || { log "PRECHECK FAIL: current instance not healthy"; return 3; }
+  timeout 600 docker pull -q "$IMAGE_REPO@$TARGET_DIGEST" >/dev/null 2>&1 || { log "PRECHECK FAIL: cannot pull target digest"; return 3; }
+  log "PRECHECK OK: current=$cur target=$TARGET_DIGEST"
+  # the current instance must also pass the smoke checks, or a post-upgrade failure would be ambiguous
+  verify "$cur" 0 0 >/dev/null 2>&1 || { log "PRECHECK FAIL: smoke checks do not pass on the CURRENT instance"; return 3; }
+  return 0
+}
+
+rollback() {
+  local bak old
+  bak=$(grep '^BACKUP=' "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-); old=$(grep '^OLD=' "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-)
+  [ -f "$bak" ] && [ -n "$old" ] || { log "ROLLBACK IMPOSSIBLE: no backup recorded in $STATE"; return 2; }
+  log "ROLLING BACK to $old using $bak"
+  cp -a "$bak" "$COMPOSE_FILE" && DC up -d --no-deps "$SERVICE" >/dev/null 2>&1
+  if verify "$old" 0 0; then log "ROLLED BACK cleanly to $old"; return 1; fi
+  log "CRITICAL: rollback did not verify - gateway needs a human"; return 2
+}
+
+apply() {
+  local old bak
+  old=$(cur_digest)
+  if [ "$old" = "$TARGET_DIGEST" ]; then log "already at target; verifying only"; verify "$TARGET_DIGEST" 1 0 && return 0 || return 1; fi
+  precheck || return 3
+  if [ "$PGDUMP" = "1" ]; then
+    local dump="/home/lumen/backups/litellm_db_pre_upgrade_$(date -u +%Y%m%d_%H%M%S).sql.gz"
+    docker exec lumen-pgvector pg_dump -U lumen -d litellm 2>/dev/null | gzip > "$dump"
+    if ! gzip -t "$dump" 2>/dev/null || [ "$(stat -c %s "$dump")" -lt 1000000 ]; then log "ABORT: db dump failed/too small ($dump)"; return 3; fi
+    chmod 600 "$dump"; log "db dump ok: $dump"
+  fi
+  bak="$COMPOSE_FILE.bak.$(date -u +%Y%m%d_%H%M%S).wq2990"
+  cp -a "$COMPOSE_FILE" "$bak" || { log "ABORT: cannot back up compose"; return 3; }
+  printf 'OLD=%s\nNEW=%s\nBACKUP=%s\nAT=%s\n' "$old" "$TARGET_DIGEST" "$bak" "$(date -u +%FT%TZ)" >> "$STATE"
+  sed -i "s#$IMAGE_REPO@$old#$IMAGE_REPO@$TARGET_DIGEST#" "$COMPOSE_FILE"
+  grep -q "$IMAGE_REPO@$TARGET_DIGEST" "$COMPOSE_FILE" || { log "compose edit failed"; rollback; return $?; }
+  log "recreating $SERVICE only (no-deps) on $TARGET_DIGEST"
+  DC up -d --no-deps "$SERVICE" >/dev/null 2>&1 || { log "compose up failed"; rollback; return $?; }
+  if verify "$TARGET_DIGEST" 1 1; then log "UPGRADE OK"; return 0; fi
+  rollback; return $?
+}
+
+case "${1:-}" in
+  --precheck) precheck; exit $? ;;
+  --apply)    apply; exit $? ;;
+  --verify)   verify "$(cur_digest)" 1 0; exit $? ;;
+  --rollback) rollback; exit $? ;;
+  *) echo "usage: litellm-upgrade --precheck|--apply|--verify|--rollback"; exit 64 ;;
+esac
