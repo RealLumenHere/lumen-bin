@@ -21,3 +21,14 @@ apt runs detached on the node (systemd-run --wait). Precheck requires the target
 downgrade rollback exists). Refuses Thor. Never reboots. Test to failure with `tests/tailscale_canary.sh` on an idle node (default wadjet):
 Thor refusal, rollback with no state, forced verify failure that must downgrade, real upgrade, idempotent re-run. 9 checks.
 Vault-adjacent nodes (maat, sobek), Lumen and cloudflared hosts are control-plane: queue them with `--tags control-plane`, Frank drives.
+
+## ha-upgrade
+`--precheck | --apply | --verify | --rollback`. Home Assistant container on Bes (default 2026.7.2 -> 2026.9.4), driven over Bes's LAN ip.
+Order: precheck (registry tag, disk, no influx in HA YAML, live E-plug baseline) -> pull (no downtime) -> tag the old image `ha-rollback:<ver>-<ts>` ->
+`check_config` with the NEW image on a copy of the config (bad config aborts with rc 3, nothing changed) -> stop only homeassistant -> tar the config ->
+pin compose to the target tag -> `up -d --no-deps --pull never` -> verify (HTTP 200, running version, real E-plug read via eplug-fetch.py).
+Any failure restores config from the tar (failed config kept as `homeassistant.failed-<ts>`), compose from its `.bak`, and the old image, then verifies the old version.
+Kept afterwards: `_ha_backups/ha-config-<ts>.tar.gz`, the rollback image tag, `compose.yaml.bak.<ts>.ha` (prune by hand after a week).
+Test to failure with `tests/ha_canary.sh` (throwaway `ha-canary` on Bes :18123, own compose project; asserts prod HA start time and image unchanged; 21 checks:
+no-state rollback, precheck, broken-config gate, forced verify failure with config/compose restore, real upgrade, idempotent re-apply, manual rollback).
+Est ~4 min for prod (894 MB config). HA is the plug controller: run it in a fleet window, never mid-experiment.

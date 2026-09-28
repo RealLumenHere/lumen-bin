@@ -1,0 +1,133 @@
+#!/bin/bash
+# ha-upgrade - Home Assistant container on Bes, one op (wq#2989 / wq#1402 item 4).
+# usage: ha-upgrade --precheck|--apply|--verify|--rollback
+# Driven from Lumen over Bes's LAN ip. Remote steps that must not die with the ssh session run detached (systemd-run --wait).
+# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (needs a human) | 3 precheck abort (nothing user-visible changed)
+# Never reboots. Only the homeassistant service is stopped/recreated; mosquitto, victorialogs, nolongerevil are not touched.
+set -u
+MODE="${1:-}"
+HOST_USER=${HOST_USER:-bes}; HOST_LAN=${HOST_LAN:-192.168.8.177}
+STACK=${STACK:-/home/bes/stack}
+SERVICE=${SERVICE:-homeassistant}; CNAME=${CNAME:-homeassistant}
+HA_PORT=${HA_PORT:-8123}; HTTP_PATH=${HTTP_PATH:-/}
+IMG_REPO=${IMG_REPO:-ghcr.io/home-assistant/home-assistant}
+OLD_TAG=${OLD_TAG:-stable}
+TARGET_VERSION=${TARGET_VERSION:-2026.9.4}
+RB_REPO=${RB_REPO:-ha-rollback}
+E_PLUG_CHECK=${E_PLUG_CHECK:-1}
+FORCE_VERIFY_FAIL=${FORCE_VERIFY_FAIL:-0}
+VERIFY_TIMEOUT=${VERIFY_TIMEOUT:-480}
+MIN_FREE_KB=${MIN_FREE_KB:-15000000}
+BKDIR=${BKDIR:-$STACK/_ha_backups}
+STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}; STATE_NAME=${STATE_NAME:-ha-bes}
+mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/$STATE_NAME.state"
+log() { echo "[ha-upgrade $(date -u +%H:%M:%S)Z] $*"; }
+R()  { ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$HOST_USER@$HOST_LAN" "$@"; }
+RD() { local n="$1" c="$2"; R "sudo -n systemd-run --unit=ha-up-$n-\$(date +%s) --wait --collect -q bash -c $(printf %q "$c")" >/dev/null 2>&1; }
+sget() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+sset() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
+running_version() { R "docker exec $CNAME python3 -c 'import homeassistant.const as c;print(c.__version__)'" 2>/dev/null | tr -d '\r'; }
+http_code()       { R "curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:$HA_PORT$HTTP_PATH" 2>/dev/null; }
+eplug_ok()        { python3 /home/lumen/bin/eplug-fetch.py 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d else 1)' 2>/dev/null; }
+
+verify() {   # verify <want_version> <inject:0|1>
+  local want="$1" inject="$2" t0 now have code=""
+  t0=$(date +%s)
+  while :; do   # HA takes a while to come up (recorder migration after a jump)
+    now=$(date +%s); [ $((now - t0)) -gt "$VERIFY_TIMEOUT" ] && { log "VERIFY FAIL: HTTP not 200 within ${VERIFY_TIMEOUT}s (last '$code')"; return 1; }
+    code=$(http_code); [ "$code" = "200" ] && break; sleep 5
+  done
+  [ "$(R "docker inspect -f '{{.State.Status}}' $CNAME" 2>/dev/null)" = "running" ] || { log "VERIFY FAIL: container not running"; return 1; }
+  have=$(running_version); [ "$have" = "$want" ] || { log "VERIFY FAIL: version '$have' != '$want'"; return 1; }
+  if [ "$E_PLUG_CHECK" = "1" ]; then   # real read through HA REST -> ESPHome; entities load after HTTP is up
+    while :; do
+      eplug_ok && break
+      now=$(date +%s); [ $((now - t0)) -gt "$VERIFY_TIMEOUT" ] && { log "VERIFY FAIL: eplug-fetch returned no plug data"; return 1; }
+      sleep 5
+    done
+  fi
+  [ "$inject" = "1" ] && [ "$FORCE_VERIFY_FAIL" = "1" ] && { log "VERIFY FAIL: injected (FORCE_VERIFY_FAIL=1)"; return 1; }
+  log "verify PASS ($have, HTTP 200$( [ "$E_PLUG_CHECK" = "1" ] && echo ', eplug read ok'))"; return 0
+}
+
+precheck() {
+  local cur n
+  R true 2>/dev/null || { log "PRECHECK FAIL: LAN ssh to $HOST_USER@$HOST_LAN"; return 3; }
+  R 'sudo -n docker info >/dev/null' 2>/dev/null || { log "PRECHECK FAIL: sudo -n docker"; return 3; }
+  R "[ -f $STACK/compose.yaml ]" 2>/dev/null || { log "PRECHECK FAIL: $STACK/compose.yaml missing"; return 3; }
+  cur=$(running_version); [ -n "$cur" ] || { log "PRECHECK FAIL: cannot read running HA version (container $CNAME down?)"; return 3; }
+  if [ "$cur" != "$TARGET_VERSION" ]; then
+    n=$(R "grep -c 'image: $IMG_REPO:$OLD_TAG\$' $STACK/compose.yaml" 2>/dev/null)
+    [ "$n" = "1" ] || { log "PRECHECK FAIL: expected exactly 1 'image: $IMG_REPO:$OLD_TAG' line in compose, found '$n'"; return 3; }
+  fi
+  [ "$(http_code)" = "200" ] || { log "PRECHECK FAIL: HA not answering 200 before change"; return 3; }
+  [ "$E_PLUG_CHECK" = "1" ] && { eplug_ok || { log "PRECHECK FAIL: eplug-fetch baseline returns no data"; return 3; }; }
+  R "docker manifest inspect $IMG_REPO:$TARGET_VERSION >/dev/null 2>&1" || { log "PRECHECK FAIL: registry has no tag $IMG_REPO:$TARGET_VERSION"; return 3; }
+  R "[ \$(df --output=avail -k $STACK | tail -1) -gt $MIN_FREE_KB ]" 2>/dev/null || { log "PRECHECK FAIL: <$MIN_FREE_KB KB free on $STACK"; return 3; }
+  # 2026.9 ends InfluxDB YAML config (issue thread, source C in the manifest): refuse if any YAML mentions it
+  R "sudo -n grep -rIil influx $STACK/homeassistant --include='*.yaml' --exclude='*.bak*' --exclude-dir=deps --exclude-dir=.storage --exclude-dir=blueprints" 2>/dev/null | grep -q . \
+    && { log "PRECHECK FAIL: influx referenced in HA YAML config (removed in 2026.9)"; return 3; }
+  n=$(R "grep -c device_id $STACK/homeassistant/automations.yaml $STACK/homeassistant/scripts.yaml 2>/dev/null | awk -F: '{s+=\$2} END{print s+0}'" 2>/dev/null)
+  [ "${n:-0}" != "0" ] && log "WARN: $n device_id refs in automations/scripts (2026.8 splits merged devices per integration)"
+  log "PRECHECK OK: $cur -> $TARGET_VERSION, LAN path $HOST_LAN, http 200$( [ "$E_PLUG_CHECK" = "1" ] && echo ", eplug baseline ok")"; return 0
+}
+
+rollback() {
+  local oldid oldver bak cbak ts cur
+  oldid=$(sget OLDID); oldver=$(sget OLDVER); bak=$(sget BACKUP); cbak=$(sget COMPOSE_BAK)
+  [ -n "$oldid" ] && [ -n "$oldver" ] || { log "ROLLBACK IMPOSSIBLE: no previous state recorded in $STATE"; return 2; }
+  ts=$(date +%Y%m%d_%H%M%S)
+  log "ROLLING BACK to HA $oldver (image $oldid)"
+  RD stop "cd $STACK && docker compose stop $SERVICE" || { log "ROLLBACK: stop failed"; return 2; }
+  if [ -n "$bak" ]; then
+    log "restoring config from $bak (current config kept at $STACK/homeassistant.failed-$ts)"
+    RD restore "set -e; mv $STACK/homeassistant $STACK/homeassistant.failed-$ts; tar --numeric-owner -xzpf $bak -C $STACK; [ -d $STACK/homeassistant ]" \
+      || { log "CRITICAL: config restore failed; tar is $bak on $HOST_LAN, failed config at $STACK/homeassistant.failed-$ts"; return 2; }
+  fi
+  if [ -n "$cbak" ]; then R "cp -a $cbak $STACK/compose.yaml" || { log "CRITICAL: compose restore failed ($cbak)"; return 2; }; fi
+  cur=$(R "docker image inspect -f '{{.Id}}' $IMG_REPO:$OLD_TAG" 2>/dev/null)
+  [ "$cur" = "$oldid" ] || R "docker tag $oldid $IMG_REPO:$OLD_TAG" || { log "CRITICAL: cannot retag old image"; return 2; }
+  RD up "cd $STACK && docker compose up -d --no-deps --pull never $SERVICE" || { log "CRITICAL: compose up failed on rollback"; return 2; }
+  if verify "$oldver" 0; then log "ROLLED BACK cleanly to $oldver"; return 1; fi
+  log "CRITICAL: rollback did not verify - $CNAME needs a human (ssh $HOST_USER@$HOST_LAN; backup $bak; compose bak $cbak)"; return 2
+}
+
+apply() {
+  local cur ts oldid newid lbl
+  cur=$(running_version)
+  if [ "$cur" = "$TARGET_VERSION" ]; then log "already at $TARGET_VERSION; verifying only"; verify "$TARGET_VERSION" 0 && return 0 || return 1; fi
+  precheck || return 3
+  ts=$(date +%Y%m%d_%H%M%S)
+  oldid=$(R "docker inspect -f '{{.Image}}' $CNAME" 2>/dev/null)
+  [ -n "$oldid" ] || { log "ABORT: cannot read current image id"; return 3; }
+  # new run of the op: forget any earlier BACKUP/COMPOSE_BAK so a rollback never restores a stale tar
+  printf 'RUN=%s\nOLDVER=%s\nOLDID=%s\nBACKUP=\nCOMPOSE_BAK=\n' "$ts" "$cur" "$oldid" >> "$STATE"
+  log "pulling $IMG_REPO:$TARGET_VERSION (no downtime)"
+  RD pull "docker pull $IMG_REPO:$TARGET_VERSION" || { log "ABORT: pull failed; nothing changed"; return 3; }
+  newid=$(R "docker image inspect -f '{{.Id}}' $IMG_REPO:$TARGET_VERSION" 2>/dev/null)
+  lbl=$(R "docker image inspect -f '{{index .Config.Labels \"org.opencontainers.image.version\"}}' $IMG_REPO:$TARGET_VERSION" 2>/dev/null)
+  [ -n "$newid" ] && [ "$lbl" = "$TARGET_VERSION" ] || { log "ABORT: pulled image label '$lbl' != $TARGET_VERSION; nothing changed"; return 3; }
+  R "docker tag $oldid $RB_REPO:$cur-$ts" || { log "ABORT: cannot tag rollback image"; return 3; }
+  log "config check with the NEW image against a copy of the config (no downtime)"
+  RD chk "set -eo pipefail; rm -rf /tmp/ha-cfgcheck; mkdir /tmp/ha-cfgcheck; tar -C $STACK/homeassistant --exclude='home-assistant_v2.db*' --exclude='*.log*' --exclude=./deps --exclude=./tts -cf - . | tar -C /tmp/ha-cfgcheck -xf -; rc=0; docker run --rm -v /tmp/ha-cfgcheck:/config $IMG_REPO:$TARGET_VERSION python3 -m homeassistant --script check_config -c /config || rc=\$?; rm -rf /tmp/ha-cfgcheck; exit \$rc" \
+    || { log "ABORT: check_config failed under $TARGET_VERSION; nothing changed (prod still on $cur)"; return 3; }
+  log "stopping $SERVICE, taking consistent config tar"
+  RD stop "cd $STACK && docker compose stop $SERVICE" || { log "stop failed; restarting old"; rollback; return $?; }
+  RD tar "set -e; mkdir -p $BKDIR; tar --numeric-owner -I 'gzip -1' -cpf $BKDIR/ha-config-$ts.tar.gz -C $STACK homeassistant; tar -tzf $BKDIR/ha-config-$ts.tar.gz >/dev/null; [ \$(stat -c %s $BKDIR/ha-config-$ts.tar.gz) -gt 10000 ]" \
+    || { log "tar failed; restarting old without touching config"; rollback; return $?; }
+  sset BACKUP "$BKDIR/ha-config-$ts.tar.gz"
+  R "cp -a $STACK/compose.yaml $STACK/compose.yaml.bak.$ts.ha" && sset COMPOSE_BAK "$STACK/compose.yaml.bak.$ts.ha" || { log "compose backup failed"; rollback; return $?; }
+  R "sed -i 's#image: $IMG_REPO:$OLD_TAG\$#image: $IMG_REPO:$TARGET_VERSION#' $STACK/compose.yaml && [ \$(grep -c 'image: $IMG_REPO:$TARGET_VERSION\$' $STACK/compose.yaml) = 1 ]" || { log "compose pin failed"; rollback; return $?; }
+  log "recreating only $SERVICE on $TARGET_VERSION"
+  RD up "cd $STACK && docker compose up -d --no-deps --pull never $SERVICE" || { log "compose up failed"; rollback; return $?; }
+  if verify "$TARGET_VERSION" 1; then log "UPGRADE OK ($cur -> $TARGET_VERSION); backup $(sget BACKUP), rollback image $RB_REPO:$cur-$ts kept"; return 0; fi
+  rollback; return $?
+}
+
+case "$MODE" in
+  --precheck) precheck; exit $? ;;
+  --apply)    apply; exit $? ;;
+  --verify)   verify "$TARGET_VERSION" 0; exit $? ;;
+  --rollback) rollback; exit $? ;;
+  *) echo "usage: ha-upgrade --precheck|--apply|--verify|--rollback"; exit 64 ;;
+esac
