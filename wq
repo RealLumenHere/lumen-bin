@@ -2747,6 +2747,121 @@ def ops_deploy_check(abs_path, deployed_target, deploy_verify=None):
     return "undeployed", (f"--deployed {deployed_target} matches no file shipped in {art_dir} — "
                           f"install.sh landed but its target does not carry the artifact's bytes")
 
+# wq#2943: the gate above only ever ran on a kind=="path" citation, so a ticket that cited its
+# PR URL — the natural shape for PR-landed work — skipped it entirely. wq#2910 closed green
+# that way over an ops bundle that never reached the box, and sat ABSENT 0/2 until wq#2932's
+# verify-pass found it (reports/wq2932_verify_wq2910_undeployed_ops_bundle.md). The fix drives
+# the same fact off the bundles the cited PR itself touched.
+OPS_VERIFY_TIMEOUT = float(os.environ.get("WQ_OPS_VERIFY_TIMEOUT", "60"))
+PR_FILES_MAX_PAGES = 5
+
+def _ops_bundle_has_verify(install_path):
+    """wq#1696 contract marker (ops/VERIFY_CONTRACT.md). Without it `--verify` is NEVER run:
+    a script that does not know the flag would ignore it and INSTALL. Same test
+    /home/lumen/bin/ops-deploy-drift makes, so both tools agree on which bundles are checkable."""
+    try:
+        with open(install_path) as fh:
+            head = fh.read(20000)
+    except OSError:
+        return False
+    return ("= --verify ]" in head) or ("--verify)" in head)
+
+def ops_verify_handler(install_path):
+    """Run a bundle's own read-only --verify handler. Returns (verdict, why) with verdict
+    'ok' (the bundle says it is live), 'fail' (it says it is not), or 'none' (no handler, or
+    the check itself could not run — never a reason to block a close on its own)."""
+    if not _ops_bundle_has_verify(install_path):
+        return "none", f"{install_path} ships no --verify handler (ops/VERIFY_CONTRACT.md)"
+    try:
+        p = subprocess.run(["bash", install_path, "--verify"], capture_output=True, text=True,
+                           timeout=OPS_VERIFY_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "none", f"{install_path} --verify could not run: {str(e)[:80]}"
+    misses = [l for l in (p.stdout or "").splitlines() if l.startswith(("MISS", "ERR"))]
+    if p.returncode == 0:
+        return "ok", f"{install_path} --verify says live"
+    if p.returncode == 1:
+        return "fail", f"{install_path} --verify FAIL: {'; '.join(misses[:4]) or 'no detail'}"
+    return "none", f"{install_path} --verify exited {p.returncode} — the check could not run"
+
+def pr_changed_files(url):
+    """Repo-relative paths the PR's diff touches, via the forge's own file list. Returns
+    (paths, why); (None, why) means the forge could not tell us, and every caller fails open
+    on that the way the wq#899 merge-state gate does — forge trouble is not a ticket's fault."""
+    m = PR_URL_RE.search(url or "")
+    if not m:
+        return None, "not a pull-request URL"
+    host, owner, repo, num = m.group(1), m.group(2), m.group(3), m.group(4)
+    token = _forge_token(host, f"{owner}/{repo}")
+    if not token:
+        return None, f"no forge token for {host}"
+    out, page = [], 1
+    while page <= PR_FILES_MAX_PAGES:
+        # limit= is Gitea's page-size param, per_page= is GitHub's; each ignores the other.
+        batch = _forge_get(host, f"/repos/{owner}/{repo}/pulls/{num}/files"
+                                 f"?limit=100&per_page=100&page={page}", token)
+        if isinstance(batch, dict) and "_error" in batch:
+            return None, f"{host} refused the file list: {batch['_error']}"
+        if not isinstance(batch, list):
+            return None, f"{host} returned no file list for {owner}/{repo}#{num}"
+        out += [f.get("filename") for f in batch if isinstance(f, dict) and f.get("filename")]
+        if len(batch) < 100:
+            break
+        page += 1
+    return out, ""
+
+def _local_bundle_installs(rel_paths):
+    """Map repo-relative ops/wqNNNN-*/install.sh paths from a PR diff onto this box. A primary
+    checkout wins over a linked worktree (`.git` is a directory there, a file in a worktree):
+    ops/VERIFY_CONTRACT.md has the liveness probe run the primary tree's copy, never a
+    worktree's, and a worktree is deleted at the end of its run."""
+    roots = _sha_repo_candidates()
+    out = []
+    for rel in rel_paths:
+        hit = None
+        for root in roots:
+            cand = os.path.join(root, rel)
+            if not os.path.exists(cand):
+                continue
+            if os.path.isdir(os.path.join(root, ".git")):
+                hit = cand
+                break
+            hit = hit or cand
+        if hit and hit not in out:
+            out.append(hit)
+    return out
+
+def pr_ops_deploy_check(url, deployed_target=None, deploy_verify=None):
+    """wq#2943: the kind=="url" mirror of ops_deploy_check. Every ops/wqNNNN-*/install.sh the
+    cited PR touches must be provably LIVE, not merely merged — its own `--verify` handler
+    says so (ops/VERIFY_CONTRACT.md: "merged is not live"), or the caller supplies the
+    wq#1724/wq#2762 --deployed + --deploy-verify proof for it. Returns (verdict, why):
+    'none' when the PR touches no bundle or the forge could not say (fail open), 'deployed'
+    when every touched bundle is proven live, 'undeployed' when at least one is not."""
+    rels, why = pr_changed_files(url)
+    if rels is None:
+        return "none", why
+    bundles = _local_bundle_installs([r for r in rels if OPS_INSTALL_RE.search("/" + r)])
+    if not bundles:
+        return "none", ""
+    proofs, misses = [], []
+    for b in bundles:
+        name = os.path.basename(os.path.dirname(b))
+        hv, hwhy = ops_verify_handler(b)
+        if hv == "ok":
+            proofs.append(f"{name}: --verify OK")
+            continue
+        dv, dwhy = ops_deploy_check(b, deployed_target, deploy_verify)
+        if dv == "deployed":
+            proofs.append(f"{name}: {dwhy}")
+        elif hv == "fail":
+            misses.append(f"{name}: {hwhy}")
+        else:
+            misses.append(f"{name}: not proven live ({hwhy}; {dwhy})")
+    if misses:
+        return "undeployed", "; ".join(misses[:3])
+    return "deployed", "; ".join(proofs[:3])
+
 def cmd_done(a):
     notes = getattr(a, "notes", "") or ""
     no_artifact = getattr(a, "no_artifact", None)
@@ -2802,6 +2917,34 @@ def cmd_done(a):
                 _aq_unverified(a.id, why)
             elif verdict == "landed":
                 print(f"note: {why} — accepting as landed.")
+            # wq#2943: the PR landed, so now the same question the path branch asks — did the
+            # ops bundles it carries actually reach the box? A merged install.sh is not a
+            # deployed one (wq#1632, wq#2910). Skipped when --unmerged is on the record:
+            # nothing landed, so there is nothing to have deployed.
+            if not unmerged:
+                pv, pwhy = pr_ops_deploy_check(detail, getattr(a, "deployed", None),
+                                               getattr(a, "deploy_verify", None))
+                if pv == "undeployed" and not getattr(a, "no_deploy_needed", None):
+                    eprint(f"REFUSED: wq#2943 ops-deploy gate — task {a.id} not closed. The PR "
+                          f"you cited ships an ops bundle that is not live on this box: {pwhy}. "
+                          f"Merged is not live (ops/VERIFY_CONTRACT.md) — wq#2910 closed green "
+                          f"this way and its bundle sat ABSENT for a day. Run the bundle's "
+                          f"install.sh, then prove it: give the bundle a `--verify` handler per "
+                          f"ops/VERIFY_CONTRACT.md (best — ops-deploy-drift can then page on it "
+                          f"too), or pass --deployed \"<live target path>\" plus "
+                          f"--deploy-verify \"premise: <re-check> probe: <dry-run>\" "
+                          f"(wq#1724/wq#2762). If no deploy applies, record why with "
+                          f"--no-deploy-needed \"<reason>\".")
+                    sys.exit(9)
+                if pv == "deployed":
+                    print(f"note: wq#2943 ops-deploy gate — {pwhy}.")
+                    a.notes = _stamp(a.notes, f"[OPS-DEPLOYED: {pwhy}]")
+                elif pv == "undeployed":
+                    a.notes = _stamp(a.notes, f"[NO-DEPLOY-NEEDED: {a.no_deploy_needed}]")
+                elif pwhy:
+                    print(f"WARNING: wq#2943 ops-deploy gate could not list the files in "
+                          f"{detail} ({pwhy}). Closing anyway — the gate does not block on "
+                          f"forge trouble.")
         # wq#1673: the artifact is a path, so where it resolved is part of the evidence.
         elif kind == "path":
             abs_path = os.path.realpath(detail)
