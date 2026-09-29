@@ -228,12 +228,17 @@ def apply(files, confirm):
             else:
                 os.remove(p)
         r = subprocess.run([LUMEN_PR, "ffprimary", REPO], capture_output=True, text=True)
+        ff_out = ((r.stdout or "") + (r.stderr or "")).strip()
         if r.returncode:
-            raise RuntimeError(f"ffprimary failed: {(r.stderr or r.stdout).strip()[-200:]}")
+            raise RuntimeError(f"ffprimary failed: {ff_out[-200:]}")
         for f in todo:
             now_blob = git(REPO, "hash-object", "--", f["path"]).stdout.strip() if os.path.isfile(os.path.join(REPO, f["path"])) else None
             if now_blob != f["blob"]:
-                raise RuntimeError(f"{f['path']} is not byte-identical to the landed file after ffprimary")
+                # first live run false-failed here with no evidence kept (wq#2973): say what the tree looked like
+                head_now = git(REPO, "rev-parse", "--short", "HEAD").stdout.strip()
+                raise RuntimeError(f"{f['path']} is not byte-identical to the landed file after ffprimary "
+                                   f"(exists={os.path.isfile(os.path.join(REPO, f['path']))} now_blob={(now_blob or 'none')[:12]} "
+                                   f"want={f['blob'][:12]} HEAD={head_now} ffprimary rc={r.returncode} out={ff_out[-300:]!r})")
         print("RESCUED:", ", ".join(f["path"] for f in todo)); return 0
     except Exception as e:
         print(f"FAILED: {e}\nrestoring backed-up files ...", file=sys.stderr)
