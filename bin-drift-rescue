@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""bin-drift-rescue (wq#3095): find and rescue ops-deployed files that sit uncommitted in a git-tracked primary tree.
+
+CLASS: foreman ops/wq*/install.sh bundles copy files straight into /home/lumen/bin (a git repo) with no landing step,
+so the primary tree is dirty from the moment of deploy. That blocks `lumen-pr ffprimary`/sync-live and the wq#2943
+ops-deploy gate until someone rescues it by hand (wq#2973 twice in 9 hours). primary_tree_guard only pages at 24h and
+wq-drift-guard watches the single file `wq`.
+
+PROVENANCE is the safety rule. A drifted file is PROVEN only if its git blob id equals a blob under ops/ on the
+provenance repo's origin/main (foreman): the bytes on disk are then exactly reviewed, landed source. Anything else
+(hand edits like wq#2759's session-handoff, files with no backing copy, deletes, renames) is UNPROVEN: this tool never
+touches it, it only raises an aq row.
+
+  bin-drift-rescue              report (read-only). exit 0 clean | 1 drift, all proven | 2 drift incl. unproven | 4 still being written
+  bin-drift-rescue --aq         report + one keyed aq row per drifted file older than ALERT_AFTER_S; resolves rows for files that cleared
+  bin-drift-rescue --apply      dry-run plan for the PROVEN, quiet files
+  bin-drift-rescue --apply --confirm   land them via a lumen-pr worktree, then bring the primary tree to origin/main.
+                                Every touched file is backed up first and restored if the primary does not end up
+                                byte-identical to what was landed.
+  --auto                        with --apply: only when the AUTO flag file exists (timer use; absent by default)
+Env overrides exist for tests (BDR_*). Never prints file contents.
+"""
+import argparse, json, os, re, shutil, subprocess, sys, time
+
+REPO = os.environ.get("BDR_REPO", "/home/lumen/bin")
+SRC_REPO = os.environ.get("BDR_SRC_REPO", "/home/lumen/foreman")
+SRC_REF = os.environ.get("BDR_SRC_REF", "origin/main")
+SRC_PREFIX = os.environ.get("BDR_SRC_PREFIX", "ops/")
+STATE = os.environ.get("BDR_STATE", "/home/lumen/.maint-ops/bin-drift.state.json")
+BACKUP_ROOT = os.environ.get("BDR_BACKUP_ROOT", "/home/lumen/backups/bin-drift-rescue")
+AUTO_FLAG = os.environ.get("BDR_AUTO_FLAG", "/home/lumen/.maint-ops/bin-drift.auto")
+LUMEN_PR = os.environ.get("BDR_LUMEN_PR", "/home/lumen/bin/lumen-pr")
+AQ = os.environ.get("BDR_AQ", "/home/lumen/bin/aq")
+QUIET_S = int(os.environ.get("BDR_QUIET_S", "600"))
+ALERT_AFTER_S = int(os.environ.get("BDR_ALERT_AFTER_S", "1800"))
+AQ_SOURCE = "bin-drift"
+
+
+def git(repo, *args, check=False):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"git {' '.join(args[:3])} failed rc={r.returncode}: {r.stderr.strip()[:200]}")
+    return r
+
+
+def provenance_index():
+    """blob id -> [ops paths] at SRC_REF. Empty (and a note) if the ref cannot be read: then nothing is PROVEN."""
+    git(SRC_REPO, "fetch", "-q", "origin")  # best effort; a stale ref only makes files look UNPROVEN, never wrongly PROVEN
+    r = subprocess.run(["git", "-C", SRC_REPO, "ls-tree", "-r", "-z", SRC_REF, "--", SRC_PREFIX], capture_output=True)
+    if r.returncode:
+        return {}, f"cannot read {SRC_REF} in {SRC_REPO}"
+    idx = {}
+    for ent in r.stdout.split(b"\0"):
+        if not ent:
+            continue
+        meta, _, path = ent.partition(b"\t")
+        mode, typ, blob = meta.decode().split()
+        if typ == "blob":
+            idx.setdefault(blob, []).append(path.decode())
+    return idx, None
+
+
+def drifted():
+    out = subprocess.run(["git", "-C", REPO, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                         capture_output=True).stdout.split(b"\0")
+    files, i = [], 0
+    while i < len(out):
+        e = out[i]; i += 1
+        if len(e) < 4:
+            continue
+        xy, path = e[:2].decode(), e[3:].decode()
+        if xy[0] in "RC":
+            i += 1  # skip the origin path field
+        kind = "untracked" if xy == "??" else ("modified" if xy == " M" else "other")  # staged/deleted/renamed = other, never auto-handled
+        files.append({"path": path, "xy": xy, "kind": kind})
+    return files
+
+
+def classify(files, idx):
+    now = time.time()
+    for f in files:
+        full = os.path.join(REPO, f["path"])
+        f["age_s"] = int(now - os.lstat(full).st_mtime) if os.path.lexists(full) else 0
+        f["proven"], f["source"] = False, None
+        if f["kind"] == "other" or os.path.islink(full) or not os.path.isfile(full):
+            f["why"] = f"status {f['xy']!r} (delete/rename/staged/symlink): never auto-handled"
+            continue
+        blob = git(REPO, "hash-object", "--", f["path"]).stdout.strip()
+        f["blob"] = blob
+        if blob in idx:
+            f["proven"], f["source"] = True, idx[blob][0]
+        else:
+            f["why"] = "no byte-identical file under ops/ on origin/main (hand edit or unlanded source)"
+    return files
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    json.dump(st, open(tmp, "w"))
+    os.replace(tmp, STATE)
+
+
+def report():
+    idx, note = provenance_index()
+    files = classify(drifted(), idx)
+    st = load_state()
+    now = time.time()
+    seen = {f["path"]: st.get(f["path"], now) for f in files}  # first_seen survives across runs while the file stays drifted
+    for f in files:
+        f["seen_s"] = int(now - seen[f["path"]])
+    save_state(seen)
+    return files, note
+
+
+def print_report(files, note):
+    if note:
+        print(f"NOTE: {note}; nothing can be PROVEN this run")
+    if not files:
+        print("CLEAN: no drift in", REPO)
+        return
+    for f in files:
+        tag = f"PROVEN via {f['source']}" if f["proven"] else f"UNPROVEN ({f['why']})"
+        print(f"  {f['xy']} {f['path']}  mtime-age={f['age_s']}s  seen={f['seen_s']}s  {tag}")
+
+
+def exit_code(files):
+    if not files:
+        return 0
+    if any(not f["proven"] for f in files):
+        return 2
+    if min(f["age_s"] for f in files) < QUIET_S:
+        return 4
+    return 1
+
+
+def aq(*args):
+    return subprocess.run([AQ, *args], capture_output=True, text=True)
+
+
+def do_aq(files):
+    open_rows = aq("list", "open").stdout.splitlines()
+    live = {f"{AQ_SOURCE}/{f['path']}" for f in files}
+    for line in open_rows:  # resolve rows for files that cleared
+        m = re.match(r"\[\s*(\d+)\]\s+\S+\s+\S+\s+" + re.escape(AQ_SOURCE) + r"\s+(\S+)", line)
+        if m and m.group(2) not in live:
+            aq("resolve", m.group(1), "file no longer drifted")
+    for f in files:
+        if f["seen_s"] < ALERT_AFTER_S:
+            continue
+        if f["proven"]:
+            msg = (f"{f['path']} in {REPO} is uncommitted but byte-identical to {f['source']} on {SRC_REF} (deployed by an ops install.sh). "
+                   f"It blocks lumen-pr ffprimary/sync-live. Fix: bin-drift-rescue --apply --confirm")
+        else:
+            msg = (f"{f['path']} in {REPO} is uncommitted and has NO backing copy ({f['why']}). Do NOT discard it. "
+                   f"Land it via a lumen-pr worktree as an explicit rescue commit (wq#2973 precedent), then ffprimary.")
+        aq("add", AQ_SOURCE, f"{AQ_SOURCE}/{f['path']}", f"lumen-bin primary drift: {f['path']} ({'proven' if f['proven'] else 'UNPROVEN'}) {f['seen_s']//60}m", msg)
+
+
+def apply(files, confirm):
+    todo = [f for f in files if f["proven"]]
+    skipped = [f for f in files if not f["proven"]]
+    if not todo:
+        print("nothing PROVEN to rescue"); return 0
+    if min(f["age_s"] for f in todo) < QUIET_S:
+        print(f"REFUSED: newest proven file changed {min(f['age_s'] for f in todo)}s ago (< {QUIET_S}s): a writer may still be active"); return 4
+    print("plan: land", ", ".join(f["path"] for f in todo), "| untouched (unproven):", ", ".join(f["path"] for f in skipped) or "none")
+    if not confirm:
+        print("dry-run: add --confirm to execute"); return 0
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    bdir = os.path.join(BACKUP_ROOT, ts); os.makedirs(bdir, exist_ok=True)
+    for f in todo:
+        d = os.path.join(bdir, f["path"]); os.makedirs(os.path.dirname(d), exist_ok=True)
+        shutil.copy2(os.path.join(REPO, f["path"]), d)
+    print("backup:", bdir)
+    wt = None
+    try:
+        r = subprocess.run([LUMEN_PR, "start", REPO, f"chore/bin-drift-rescue-{ts}", "--worktree"], capture_output=True, text=True)
+        wt = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else None
+        if not wt:
+            raise RuntimeError(f"lumen-pr start failed: {r.stderr.strip()[-200:]}")
+        for f in todo:
+            dst = os.path.join(wt, f["path"]); os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(REPO, f["path"]), dst)
+            git(wt, "add", "--", f["path"], check=True)
+        body = os.path.join(bdir, "pr-body.md")
+        names = ", ".join(f["path"] for f in todo)
+        lines = ["## What", f"rescue, not reviewed/landed yet: {names} were deployed straight into the live tree by an ops install.sh and are byte-identical to reviewed source on {SRC_REF} of the provenance repo.", "",
+                 "## Why", "Uncommitted deploys dirty the primary tree and block lumen-pr ffprimary/sync-live (wq#2973 class, wq#3095).", ""]
+        lines += [f"- {f['path']} <- {f['source']} (blob {f['blob'][:12]})" for f in todo]
+        lines += ["", "## How", "bin-drift-rescue copied the live bytes into a worktree of origin/main; provenance is git blob id equality with the ops source above.", "",
+                  "## Testing", "Blob provenance match; landed blob compared to the live file before the primary is touched; bytes re-checked after ffprimary.", "",
+                  "## Risk / rollback", f"Files with no backing copy were not touched. Every file was backed up to {bdir} and is restored automatically on any failure; or revert this commit."]
+        open(body, "w").write("\n".join(lines) + "\n")
+        subject = "chore(bin): rescue ops-deployed live drift (" + ", ".join(os.path.basename(f["path"]) for f in todo)[:80] + ")"
+        for step in ([LUMEN_PR, "commit", wt, subject, "--refs", "wq#3095", "--body-file", body],
+                     [LUMEN_PR, "open", wt, "--title", subject, "--body-file", body]):
+            r = subprocess.run(step, capture_output=True, text=True)
+            if r.returncode:
+                raise RuntimeError(f"{step[1]} failed: {(r.stderr or r.stdout).strip()[-200:]}")
+        pr = re.findall(r"(?:#|/pulls?/|PR\s+)(\d+)", r.stdout + r.stderr)
+        if not pr:
+            raise RuntimeError("could not read the PR number from `lumen-pr open`")
+        r = subprocess.run([LUMEN_PR, "land", wt, pr[-1]], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"land failed: {(r.stderr or r.stdout).strip()[-200:]}")
+        # the landed bytes must equal what is on disk, or we would be swapping in something different
+        git(REPO, "fetch", "-q", "origin", check=True)
+        for f in todo:
+            landed = git(REPO, "rev-parse", f"origin/main:{f['path']}").stdout.strip()
+            if landed != f["blob"]:
+                raise RuntimeError(f"landed blob for {f['path']} differs from the live file; leaving the primary alone")
+        # clear the overlap ffprimary refuses on: tracked -> restore HEAD copy, untracked -> remove; both backed up above
+        for f in todo:
+            p = os.path.join(REPO, f["path"])
+            if f["kind"] == "modified":
+                git(REPO, "checkout", "--", f["path"], check=True)
+            else:
+                os.remove(p)
+        r = subprocess.run([LUMEN_PR, "ffprimary", REPO], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"ffprimary failed: {(r.stderr or r.stdout).strip()[-200:]}")
+        for f in todo:
+            now_blob = git(REPO, "hash-object", "--", f["path"]).stdout.strip() if os.path.isfile(os.path.join(REPO, f["path"])) else None
+            if now_blob != f["blob"]:
+                raise RuntimeError(f"{f['path']} is not byte-identical to the landed file after ffprimary")
+        print("RESCUED:", ", ".join(f["path"] for f in todo)); return 0
+    except Exception as e:
+        print(f"FAILED: {e}\nrestoring backed-up files ...", file=sys.stderr)
+        for f in todo:
+            src, dst = os.path.join(bdir, f["path"]), os.path.join(REPO, f["path"])
+            if not os.path.isfile(dst) or git(REPO, "hash-object", "--", f["path"]).stdout.strip() != f["blob"]:
+                os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copy2(src, dst)
+        print("restored; live files are byte-identical to before. backup kept at", bdir, file=sys.stderr)
+        return 3
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--aq", action="store_true"); ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--confirm", action="store_true"); ap.add_argument("--auto", action="store_true")
+    a = ap.parse_args()
+    files, note = report()
+    print_report(files, note)
+    if a.aq:
+        do_aq(files)
+    if a.apply:
+        if a.auto and not os.path.exists(AUTO_FLAG):
+            print(f"auto-apply disabled (no {AUTO_FLAG}); report only"); return exit_code(files)
+        return apply(files, a.confirm or a.auto)
+    return exit_code(files)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
