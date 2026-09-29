@@ -1,12 +1,23 @@
 #!/bin/bash
 # Test-to-failure harness for litellm-upgrade. Throwaway compose project on 127.0.0.1:4002 + scratch DB. Prod untouched.
+# wq#3097: OLD/NEW are now parameterized (were hardcoded to the wq#2989 CRITICAL-patch pair) so
+# the same harness re-runs against the GHSA-3cv6-jpf6-8222 upgrade: OLD=current prod digest,
+# NEW=v1.96.2 (litellm-upgrade's TARGET_DIGEST default). Override both to test any other pair,
+# e.g. the v1.88.6 FALLBACK_DIGEST if v1.96.2 fails precheck/verify in a window.
+# item (d) note: this does NOT add a DB-dump-RESTORE rollback path. litellm-upgrade's rollback()
+# is image-only and was rehearsed OK against a DB already 26 migrations ahead (old image boots on
+# the migrated schema). A restore-from-dump rollback would be new, untested, destructive database
+# code (DROP/RENAME against a live postgres) that this worker cannot exercise (docker is
+# guard.sh-restricted to ps/logs), so it was deliberately not built blind — see step E2 instead,
+# which does add the concrete, testable half of (d): the old image's smoke suite is now checked as
+# its own harness assertion after rollback, not only trusted via rollback()'s internal verify().
 export WQ_AGENT=deps-drain-98190c
 SCRIPT=${SCRIPT:-$(cd "$(dirname "$0")/.." && pwd)/litellm-upgrade}
 DUMP=${DUMP:-$(ls -t /home/lumen/backups/litellm_db_pre_*.sql.gz | head -1)}
 SCRATCH=litellm_canary2
 H=/tmp/harness_wq2989
-OLD=sha256:6c82d338a60e7b273ae46bf1d8db814d2856ae010f96c44eeadde574d3893f76
-NEW=sha256:e29d25e1952337eb7c9b605213865ae935c60f1689ad465cb5fc940b598174c9
+OLD=${OLD:-sha256:e29d25e1952337eb7c9b605213865ae935c60f1689ad465cb5fc940b598174c9}
+NEW=${NEW:-sha256:154e23bb5f31b1f10e16392a8ef299bd2cde08de3a64a6849002cfcc25ce3c63}
 DCH() { docker compose -p litellm-harness -f $H/compose.yml "$@"; }
 psqlc() { docker exec lumen-pgvector psql -U lumen -d "$1" -tA -c "$2" 2>&1; }
 cleanup() {
@@ -82,7 +93,10 @@ bash $SCRIPT --rollback 2>&1 | sed 's/^/    /'; RC=${PIPESTATUS[0]}
 check "E rc" "$RC" 1; check "E running image is OLD" "$(running)" "$OLD"
 echo; echo "== F. no backup recorded -> rollback must refuse loudly (want rc 2)"
 STATE_DIR=$H/state_empty bash $SCRIPT --rollback 2>&1 | sed 's/^/    /'; check "F rc" "${PIPESTATUS[0]}" 2
+echo; echo "== E2. independent --verify after E's rollback (want rc 0): item (d)'s smoke-suite-on-OLD-after-rollback,"
+echo "        checked as its own harness assertion instead of only trusting rollback()'s internal verify() call"
+bash $SCRIPT --verify 2>&1 | sed 's/^/    /'; check "E2 rc" "${PIPESTATUS[0]}" 0
 echo; echo "== prod after (must be unchanged)"; docker inspect litellm --format 'litellm started={{.State.StartedAt}} health={{.State.Health.Status}}'
-grep -c "sha256:6c82d338" /home/lumen/docker/docker-compose.yml | sed 's/^/prod compose still pins old digest lines=/'
+grep -c "$OLD" /home/lumen/docker/docker-compose.yml | sed 's/^/prod compose still pins old digest lines=/'
 echo; echo "SUMMARY pass=$PASS fail=$FAIL"
 echo "=== DONE ==="

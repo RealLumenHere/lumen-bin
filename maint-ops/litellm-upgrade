@@ -1,5 +1,9 @@
 #!/bin/bash
 # litellm-upgrade - maintenance-window op for the LiteLLM patch upgrade (wq#2989 / wq#2990).
+# wq#3097: step 2 of wq#1402's LiteLLM batch — GHSA-3cv6-jpf6-8222 (CVE-2026-84377, Moderate,
+# authenticated credential exfil/SSRF via upstream PR 36011) fixed >=1.96.2. TARGET_DIGEST now
+# points at v1.96.2; FALLBACK_DIGEST is v1.88.6 (also carries the fix) for use if v1.96.2 fails
+# precheck/verify in a window and a same-day retry is needed without waiting on a new rehearsal.
 # Modes: --precheck | --apply | --verify | --rollback
 # Runs locally on Lumen. Embeds its own rollback: lumen-window halts on failure but never rolls back.
 # Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (CRITICAL) | 3 precheck abort
@@ -11,7 +15,8 @@ CONTAINER=${CONTAINER:-litellm}
 PORT=${PORT:-4000}
 PROJECT=${PROJECT:-}
 IMAGE_REPO=ghcr.io/berriai/litellm
-TARGET_DIGEST=${TARGET_DIGEST:-sha256:e29d25e1952337eb7c9b605213865ae935c60f1689ad465cb5fc940b598174c9}
+TARGET_DIGEST=${TARGET_DIGEST:-sha256:154e23bb5f31b1f10e16392a8ef299bd2cde08de3a64a6849002cfcc25ce3c63}
+FALLBACK_DIGEST=${FALLBACK_DIGEST:-sha256:0c73da8d132b893bfa037511553bafbc9e2ff6abe9b474a66e0e9a354c0be064}
 SMOKE_KEY_FILE=${SMOKE_KEY_FILE:-/home/lumen/secrets/maint_smoke_key.json}
 STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}
 PGDUMP=${PGDUMP:-1}
@@ -45,6 +50,15 @@ verify() {
   if [ "$patched" = "1" ]; then
     docker exec "$CONTAINER" grep -q 'request.scope' /app/litellm/proxy/auth/auth_utils.py 2>/dev/null \
       || { log "VERIFY FAIL: host-header fix marker (request.scope) missing in running code"; return 1; }
+  fi
+  # wq#3097 / GHSA-3cv6-jpf6-8222: version string isn't reported by the API, so the running code
+  # is the only observable proof the fix landed. Gated on $want (not $patched) because $patched=1
+  # is also used by --verify against whatever is CURRENTLY running, which after this PR merges but
+  # before the window op applies TARGET_DIGEST/FALLBACK_DIGEST, does not have this fix yet — gating
+  # on $patched alone would make routine --verify calls fail before the upgrade even runs.
+  if [ "$want" = "$TARGET_DIGEST" ] || [ "$want" = "$FALLBACK_DIGEST" ]; then
+    docker exec "$CONTAINER" grep -rq 'reject_url_valued_destination' /app/litellm/proxy/ 2>/dev/null \
+      || { log "VERIFY FAIL: GHSA-3cv6-jpf6-8222 fix marker (reject_url_valued_destination) missing in running code"; return 1; }
   fi
   NEG_CONTROL="$NEG_CONTROL" python3 - "$PORT" "$SMOKE_KEY_FILE" <<'PY' || return 1
 import json, os, sys, urllib.request, urllib.error
