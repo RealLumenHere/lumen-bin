@@ -33,13 +33,12 @@ for i in $(seq 1 6); do
   sleep 5
   active=$(systemctl is-active desktop-commander-mcp 2>/dev/null)
   listen=$(ss -ltn 2>/dev/null | grep -c ':3100 ')
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST \
-    http://localhost:3100/mcp \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"hc","version":"1"}}}' 2>/dev/null)
-  echo "try $i: active=$active listen=$listen mcp_code=$code"
-  if [ "$active" = "active" ] && [ "$listen" -ge 1 ] && [ "${code:0:1}" = "2" ]; then
+  # Health = unit active + port listening + GET /health 200. NOT an anonymous MCP initialize: with the wq#3103
+  # Access guard on :3100 that returns 403 by design, and a 2xx requirement would auto-roll-back a healthy unit.
+  # (Real end-to-end proof is the mcpw path: mcpw_diag.py / the pool probe, run by whoever is driving.)
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://localhost:3100/health 2>/dev/null)
+  echo "try $i: active=$active listen=$listen health_code=$code"
+  if [ "$active" = "active" ] && [ "$listen" -ge 1 ] && [ "$code" = "200" ]; then
     healthy=1; break
   fi
 done
