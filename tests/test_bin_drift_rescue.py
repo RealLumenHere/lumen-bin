@@ -22,8 +22,12 @@ STUB_PR = textwrap.dedent('''\
               printf '%s' "$br" | grep -qE "$STUB_BRANCH_RE" || { echo "lumen-pr: branch name violates §2: got : $br" >&2; exit 1; }
               wt="$STUB_WT_ROOT/$(echo $br | tr / -)"; git -C $repo fetch -q origin
               git -C $repo worktree add -q -b $br $wt origin/main; echo "created worktree" >&2; echo $wt ;;
-      commit) wt=$1; git -C $wt commit -q -m "$2" ;;
-      open)   bf=""; while [ $# -gt 0 ]; do [ "$1" = --body-file ] && bf=$2; shift; done
+      commit) printf '%s' "$2" | grep -qiE 'wq#|board:' && { echo "lumen-pr: subject contains an internal ticket/board marker: $2" >&2; exit 1; }
+              printf '%s' "$2" | grep -qE "$STUB_SUBJECT_RE" || { echo "lumen-pr: subject is not a Conventional Commit (<=60 chars): got : $2" >&2; exit 1; }
+              wt=$1; git -C $wt commit -q -m "$2" ;;
+      open)   bf=""; ti=""; wt=$1; while [ $# -gt 0 ]; do [ "$1" = --body-file ] && bf=$2; [ "$1" = --title ] && ti=$2; shift; done
+              printf '%s' "$ti" | grep -qiE 'wq#|board:' && { echo "lumen-pr: title contains an internal ticket/board marker: $ti" >&2; exit 1; }
+              printf '%s' "$ti" | grep -qE "$STUB_SUBJECT_RE" || { echo "lumen-pr: title is not a Conventional Commit (<=60 chars): got : $ti" >&2; exit 1; }
               for h in "## What" "## Why" "## How" "## Testing" "## Risk / rollback"; do
                 grep -qF "$h" "$bf" || { echo "lumen-pr: PR body is missing required section: $h" >&2; exit 1; }
               done; echo "opened PR #7" >&2 ;;
@@ -67,8 +71,15 @@ def env(tmp_path):
     e = {"BDR_REPO": str(t / "bin"), "BDR_SRC_REPO": str(t / "foreman"), "BDR_STATE": str(t / "state.json"),
          "BDR_BACKUP_ROOT": str(t / "backups"), "BDR_AUTO_FLAG": str(t / "auto.flag"), "BDR_LUMEN_PR": str(t / "lumen-pr"),
          "BDR_AQ": str(t / "aq"), "STUB_WT_ROOT": str(t / "wt"), "STUB_AQ_LOG": str(t / "aq.log"), "STUB_AQ_ROWS": str(t / "aq.rows"),
-         "BDR_QUIET_S": "60", "BDR_ALERT_AFTER_S": "0", "STUB_BRANCH_RE": real_branch_re()}
+         "BDR_QUIET_S": "60", "BDR_ALERT_AFTER_S": "0", "STUB_BRANCH_RE": real_branch_re(), "STUB_SUBJECT_RE": real_subject_re()}
     return t, e
+
+def real_subject_re():
+    """SUBJECT_RE of the real lumen-pr, expanded, for the same no-drift reason as the branch lint."""
+    src = open(os.path.join(os.path.dirname(TOOL), "lumen-pr")).read()
+    types = re.search(r"^CONV_TYPES='([^']+)'", src, re.M).group(1)
+    tail = re.search(r'^SUBJECT_RE="\^\(\$\{CONV_TYPES\}\)(.+)"$', src, re.M).group(1)
+    return "^(" + types + ")" + tail
 
 def real_branch_re():
     """The branch lint of the real lumen-pr next to the tool, so the stub cannot drift from it (wq#3095 first live run failed on this)."""
@@ -177,3 +188,19 @@ def test_stub_branch_lint_matches_real_lumen_pr():
     rx = re.compile(real_branch_re())
     assert rx.match("chore/bin-drift-rescue-20260929-043223")
     assert not rx.match("chore/bin-drift-rescue-20260929_043223")
+
+
+def test_stub_subject_lint_matches_real_lumen_pr():
+    rx = re.compile(real_subject_re())
+    assert rx.match("chore(bin): rescue ops-deployed live drift")
+    assert not rx.match("chore(bin): rescue ops-deployed live drift (" + "x" * 60 + ")")
+
+
+def test_real_long_filenames_pass_the_subject_lint(env):
+    """First live --apply (wq#2973 recurrence): real names access-jwt-guard.cjs + commander-preload.cjs pushed the old
+    file-list subject past lumen-pr's 60-char cap. Short fixture names hid it; this pins the real ones."""
+    t, e = env
+    (t / "bin/access-jwt-guard.cjs").write_text("print('reviewed v2')\n"); age(t / "bin/access-jwt-guard.cjs")
+    (t / "bin/commander-preload.cjs").write_text("echo reviewed other\n"); age(t / "bin/commander-preload.cjs")
+    r = run(e, "--apply", "--confirm"); assert r.returncode == 0 and "RESCUED" in r.stdout, r.stdout + r.stderr
+    assert status(t) == ""

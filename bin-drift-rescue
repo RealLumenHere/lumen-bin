@@ -201,7 +201,8 @@ def apply(files, confirm):
                   "## Testing", "Blob provenance match; landed blob compared to the live file before the primary is touched; bytes re-checked after ffprimary.", "",
                   "## Risk / rollback", f"Files with no backing copy were not touched. Every file was backed up to {bdir} and is restored automatically on any failure; or revert this commit."]
         open(body, "w").write("\n".join(lines) + "\n")
-        subject = "chore(bin): rescue ops-deployed live drift (" + ", ".join(os.path.basename(f["path"]) for f in todo)[:80] + ")"
+        # lumen-pr SUBJECT_RE caps the description at 60 chars and bans wq#: keep it fixed, the file list is in the body
+        subject = "chore(bin): rescue ops-deployed live drift"
         for step in ([LUMEN_PR, "commit", wt, subject, "--refs", "wq#3095", "--body-file", body],
                      [LUMEN_PR, "open", wt, "--title", subject, "--body-file", body]):
             r = subprocess.run(step, capture_output=True, text=True)
