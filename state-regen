@@ -1,6 +1,22 @@
 #!/bin/bash
 # Regenerate the never-stale live fleet-state block from the bi-temporal store.
-cd /home/lumen/minerva && python3 lumen_state_gen.py > /home/lumen/minerva/context/LIVE_FLEET_STATE.md && python3 lumen_state_gen.py --full > /home/lumen/minerva/context/LIVE_FLEET_STATE_FULL.md && echo regenerated
+# wq#1633: dirty-flag gated (MINERVA_PIPELINE_MAP.md §4.4/§5#5). `--if-dirty` skips
+# the regen when nothing in state_facts changed since the last one; plain `state-regen`
+# (no flag) always runs, unchanged from before this ticket.
+cd /home/lumen/minerva || exit 1
+if [ "$1" = "--if-dirty" ]; then
+    if ! python3 projection_state.py is-dirty live_fleet_state lumen_state_txt; then
+        echo "state-regen: clean, skipping (wq#1633 --if-dirty)"
+        exit 0
+    fi
+fi
+python3 lumen_state_gen.py > context/LIVE_FLEET_STATE.md \
+    && python3 lumen_state_gen.py --full > context/LIVE_FLEET_STATE_FULL.md \
+    && python3 lumen_state_gen.py --proposal-digest \
+    && python3 projection_state.py stamp live_fleet_state context/LIVE_FLEET_STATE.md context/LIVE_FLEET_STATE_FULL.md \
+    && python3 projection_state.py stamp lumen_state_txt lumen_state.txt \
+    && python3 projection_state.py clear live_fleet_state lumen_state_txt \
+    && echo regenerated
 # Memory V3 P2: keep the recall edge-graph fresh (incremental; only un-edged notes)
 python3 /home/lumen/minerva/lumen_edges.py >/dev/null 2>&1 &
 /home/lumen/bin/system-map-update &
