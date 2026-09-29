@@ -8,7 +8,8 @@
 # tarball (checksum-verified, "Manual install" / "Updating" section of docs.ollama.com/linux), diff the
 # unit after to prove it was never touched. Mutating remote steps run detached (systemd-run --wait) as
 # root via one sudo'd systemd-run, so nothing inside them needs its own sudo.
-# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (needs a human) | 3 precheck abort
+# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (needs a human) | 3 aborted with NOTHING changed
+#       (precheck failure, or already at target but the running instance fails verify - nothing to roll back)
 # Never reboots. Thor is refused outright (no ollama in the batch, but the fleet rule is unconditional).
 set -u
 MODE="${1:-}"; NAME="${2:-}"; USR="${3:-}"; LAN="${4:-}"
@@ -115,7 +116,7 @@ rollback() {
 apply() {
   local cur ts tarball oldunitsha newunitsha backup_cmd
   cur=$(api_version)
-  if [ "$cur" = "$TARGET_VERSION" ]; then log "already at $TARGET_VERSION; verifying only"; verify "$TARGET_VERSION" 0 && return 0 || return 1; fi
+  if [ "$cur" = "$TARGET_VERSION" ]; then log "already at $TARGET_VERSION; verifying only"; verify "$TARGET_VERSION" 0 && return 0; log "already at $TARGET_VERSION but verify FAILED; nothing was changed, nothing to roll back"; return 3; fi
   precheck || return 3
   ts=$(date +%Y%m%d_%H%M%S)
   tarball="$CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst"

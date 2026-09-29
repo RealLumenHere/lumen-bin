@@ -14,6 +14,12 @@ OLD_VERSION=0.32.6
 OLD_SHA256=dec2fa50d24e6868ca3c4c977d69d059399372105f951a9acc320a5a79aadcfc
 TARGET_VERSION=0.34.4
 [ "$PREFIX" = "/usr/local" ] && { echo "REFUSED: harness must never target the real prefix"; exit 9; }
+# wq#3107: fixed shared paths on wadjet (/tmp/ollama-canary-old.tar.zst, /opt/ollama-canary, unit, port) mean two
+# runs, or any teardown, corrupt each other (2026-09-28: two of three live runs died in setup). One run at a time.
+HOLDER="${WQ_AGENT:-ollama-canary}-canary-$$"
+/home/lumen/bin/slock acquire fleet-node-wadjet --holder "$HOLDER" --ttl 30 --note "ollama canary harness" >/dev/null 2>&1 \
+  || { echo "REFUSED: slock fleet-node-wadjet is held (slock who fleet-node-wadjet); another canary or wadjet op is running"; exit 9; }
+trap '/home/lumen/bin/slock release fleet-node-wadjet --holder "$HOLDER" >/dev/null 2>&1' EXIT
 PASS=0; FAIL=0
 check() { if [ "$2" = "$3" ]; then echo "  PASS $1 (got $2)"; PASS=$((PASS+1)); else echo "  FAIL $1 (want $3 got $2)"; FAIL=$((FAIL+1)); fi; }
 RB() { ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$B" "$@"; }
