@@ -15,7 +15,7 @@ case "$NAME:$TSIP" in thor:*|*:100.112.151.100) echo "REFUSED: Thor is never tou
 R() { ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$USR@$LAN" "$@"; }
 short_ver() { R 'tailscale version 2>/dev/null | head -1' 2>/dev/null | tr -d '\r'; }
 pkg_ver()   { R "dpkg-query -W -f='\${Version}' tailscale" 2>/dev/null; }
-apt_run()   { R "sudo -n systemd-run --unit=ts-upgrade-\$(date +%s) --wait --collect -q -E DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold $1" >/dev/null 2>&1; }
+apt_run()   { R "sudo -n systemd-run --unit=ts-upgrade --wait --collect -q -E DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold $1" >/dev/null 2>&1; }
 
 tailnet_ok() {   # tailnet reachability from Lumen, retried while tailscaled settles
   local i
