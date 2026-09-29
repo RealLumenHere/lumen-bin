@@ -182,7 +182,9 @@ def apply(files, confirm):
     print("backup:", bdir)
     wt = None
     try:
-        r = subprocess.run([LUMEN_PR, "start", REPO, f"chore/bin-drift-rescue-{ts}", "--worktree"], capture_output=True, text=True)
+        # lumen-pr BRANCH_RE is kebab only: no underscore (the raw ts has one)
+        branch = "chore/bin-drift-rescue-" + ts.replace("_", "-")
+        r = subprocess.run([LUMEN_PR, "start", REPO, branch, "--worktree"], capture_output=True, text=True)
         wt = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else None
         if not wt:
             raise RuntimeError(f"lumen-pr start failed: {r.stderr.strip()[-200:]}")

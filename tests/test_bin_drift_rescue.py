@@ -1,5 +1,5 @@
 """wq#3095 test-to-failure for bin-drift-rescue: throwaway repos + a stub lumen-pr, never touches the real tree."""
-import os, stat, subprocess, textwrap, time
+import os, re, stat, subprocess, textwrap, time
 import pytest
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin-drift-rescue")
@@ -18,7 +18,9 @@ STUB_PR = textwrap.dedent('''\
     set -e
     cmd=$1; shift
     case $cmd in
-      start)  repo=$1; br=$2; wt="$STUB_WT_ROOT/$(echo $br | tr / -)"; git -C $repo fetch -q origin
+      start)  repo=$1; br=$2
+              printf '%s' "$br" | grep -qE "$STUB_BRANCH_RE" || { echo "lumen-pr: branch name violates §2: got : $br" >&2; exit 1; }
+              wt="$STUB_WT_ROOT/$(echo $br | tr / -)"; git -C $repo fetch -q origin
               git -C $repo worktree add -q -b $br $wt origin/main; echo "created worktree" >&2; echo $wt ;;
       commit) wt=$1; git -C $wt commit -q -m "$2" ;;
       open)   bf=""; while [ $# -gt 0 ]; do [ "$1" = --body-file ] && bf=$2; shift; done
@@ -65,8 +67,15 @@ def env(tmp_path):
     e = {"BDR_REPO": str(t / "bin"), "BDR_SRC_REPO": str(t / "foreman"), "BDR_STATE": str(t / "state.json"),
          "BDR_BACKUP_ROOT": str(t / "backups"), "BDR_AUTO_FLAG": str(t / "auto.flag"), "BDR_LUMEN_PR": str(t / "lumen-pr"),
          "BDR_AQ": str(t / "aq"), "STUB_WT_ROOT": str(t / "wt"), "STUB_AQ_LOG": str(t / "aq.log"), "STUB_AQ_ROWS": str(t / "aq.rows"),
-         "BDR_QUIET_S": "60", "BDR_ALERT_AFTER_S": "0"}
+         "BDR_QUIET_S": "60", "BDR_ALERT_AFTER_S": "0", "STUB_BRANCH_RE": real_branch_re()}
     return t, e
+
+def real_branch_re():
+    """The branch lint of the real lumen-pr next to the tool, so the stub cannot drift from it (wq#3095 first live run failed on this)."""
+    src = open(os.path.join(os.path.dirname(TOOL), "lumen-pr")).read()
+    types = re.search(r"^CONV_TYPES='([^']+)'", src, re.M).group(1)
+    tail = re.search(r'^BRANCH_RE="\^\(\$\{CONV_TYPES\}\)(.+)"$', src, re.M).group(1)
+    return "^(" + types + ")" + tail
 
 def age(path, secs=3600):
     old = time.time() - secs; os.utime(path, (old, old))
@@ -162,3 +171,9 @@ def test_landed_bytes_differ_leaves_live_file_alone(env, kind):
     r = run(e, "--apply", "--confirm", extra={"STUB_LAND_ALTER": "1"})
     assert r.returncode == 3 and "differs from the live file" in r.stderr, r.stdout + r.stderr
     assert (t / "bin" / name).read_text() == body
+
+
+def test_stub_branch_lint_matches_real_lumen_pr():
+    rx = re.compile(real_branch_re())
+    assert rx.match("chore/bin-drift-rescue-20260929-043223")
+    assert not rx.match("chore/bin-drift-rescue-20260929_043223")
