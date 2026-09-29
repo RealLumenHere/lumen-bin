@@ -32,3 +32,19 @@ Kept afterwards: `_ha_backups/ha-config-<ts>.tar.gz`, the rollback image tag, `c
 Test to failure with `tests/ha_canary.sh` (throwaway `ha-canary` on Bes :18123, own compose project; asserts prod HA start time and image unchanged; 21 checks:
 no-state rollback, precheck, broken-config gate, forced verify failure with config/compose restore, real upgrade, idempotent re-apply, manual rollback).
 Est ~4 min for prod (894 MB config). HA is the plug controller: run it in a fleet window, never mid-experiment.
+
+## ollama-upgrade
+`--precheck | --apply | --verify | --rollback <name> <user> <lan_ip>`, one op per node, so a rolling upgrade is one queued op per node
+(lumen, isis, nephthys 0.32.6 -> 0.34.4; hathor 0.30.7 -> 0.34.4). Controls the node over its LAN ip; restarting `ollama.service` never touches
+the ssh session or the tailnet, unlike tailscaled.
+Never runs the vendor `install.sh` (it rewrites the systemd unit and can drop our OLLAMA_MODELS/KEEP_ALIVE/MAX_LOADED_MODELS/NUM_PARALLEL env
+overrides - manifest gap G6, wq#2992). Instead follows docs.ollama.com/linux's "Manual install"/"Updating" path: precheck downloads and
+sha256-verifies the pinned release tarball (`ollama-linux-amd64.tar.zst`) into a node-local cache; apply backs up the binary, `lib/ollama`, the
+unit and any drop-ins into one tar, stops the service, wipes the old libs and extracts the new tarball (never touching `/etc/systemd`), diffs the
+unit's sha256 before/after to prove it was untouched, starts the service, then verifies with a REAL generation (`/api/generate`, not just
+`/api/version`) against a pulled model - `first_model` skips embedding-only models (e.g. `nomic-embed-text`) by checking `/api/show`'s
+`capabilities` for `completion`. Any failure restores the backup tar (also wiping libs first) and verifies the old version.
+Kept afterwards: `/var/backups/ollama-upgrade/ollama-<name>-<ts>.tar.gz` per run (prune by hand), `/tmp/ollama-upgrade-cache` (reused across runs).
+Test to failure with `tests/ollama_canary.sh` (throwaway `ollama-canary` on wadjet :11435, own prefix `/opt/ollama-canary`, starts on real 0.32.6):
+no-state rollback, precheck, forced verify failure rolls back, real upgrade to 0.34.4 with a real generation, idempotent re-apply, manual rollback.
+Hathor had model pulls a few hours before the manifest probe (wq#1402): check idle before touching it, same as HA's fleet-window rule.

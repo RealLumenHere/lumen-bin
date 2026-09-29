@@ -1,0 +1,147 @@
+#!/bin/bash
+# ollama-upgrade - one node, one op (wq#3096 / wq#2989, vendor procedure confirmed wq#2992 + docs.ollama.com/linux).
+# usage: ollama-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>
+# Rolling upgrades = one queued op per node (lumen, isis, nephthys, hathor).
+# Always controls the node over its LAN ip. Never runs the vendor install.sh: it rewrites the systemd
+# unit and can drop our OLLAMA_MODELS/KEEP_ALIVE/MAX_LOADED_MODELS/NUM_PARALLEL env overrides (manifest
+# gap G6). Instead: back up binary + lib dir + unit + drop-ins, swap the binary from the pinned release
+# tarball (checksum-verified, "Manual install" / "Updating" section of docs.ollama.com/linux), diff the
+# unit after to prove it was never touched. Mutating remote steps run detached (systemd-run --wait) as
+# root via one sudo'd systemd-run, so nothing inside them needs its own sudo.
+# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (needs a human) | 3 precheck abort
+# Never reboots. Thor is refused outright (no ollama in the batch, but the fleet rule is unconditional).
+set -u
+MODE="${1:-}"; NAME="${2:-}"; USR="${3:-}"; LAN="${4:-}"
+PREFIX=${PREFIX:-/usr/local}
+SERVICE=${SERVICE:-ollama}
+API_PORT=${API_PORT:-11434}
+MODEL=${MODEL:-}
+TARGET_VERSION=${TARGET_VERSION:-0.34.4}
+DL_URL=${DL_URL:-https://github.com/ollama/ollama/releases/download/v$TARGET_VERSION/ollama-linux-amd64.tar.zst}
+TARGET_SHA256=${TARGET_SHA256:-c238986e61d40c0cc5f4a9b9e40b9eea104350b77efa34741fc134e105cb9533}
+CACHE=${CACHE:-/tmp/ollama-upgrade-cache}
+BKDIR=${BKDIR:-/var/backups/ollama-upgrade}
+GEN_TIMEOUT=${GEN_TIMEOUT:-120}
+FORCE_VERIFY_FAIL=${FORCE_VERIFY_FAIL:-0}
+STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}; STATE_NAME=${STATE_NAME:-ollama-$NAME}
+mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/$STATE_NAME.state"
+log() { echo "[ollama-upgrade $NAME $(date -u +%H:%M:%S)Z] $*"; }
+[ -n "$NAME" ] && [ -n "$USR" ] && [ -n "$LAN" ] || { echo "usage: ollama-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>"; exit 64; }
+case "$NAME" in thor) echo "REFUSED: Thor is never touched"; exit 3 ;; esac
+R()  { ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$USR@$LAN" "$@"; }
+RD() { local n="$1" c="$2"; R "sudo -n systemd-run --unit=oll-up-$n-\$(date +%s) --wait --collect -q bash -c $(printf %q "$c")" >/dev/null 2>&1; }
+sget() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+sset() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
+api_version() { R "curl -s -m 5 http://127.0.0.1:$API_PORT/api/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null; }
+unit_sha() { R "cat /etc/systemd/system/$SERVICE.service; [ -d /etc/systemd/system/$SERVICE.service.d ] && cat /etc/systemd/system/$SERVICE.service.d/*.conf 2>/dev/null; true" 2>/dev/null | sha256sum | cut -d' ' -f1; }
+api_show_caps() {   # api_show_caps <model> -> comma-joined capabilities list (e.g. "completion,tools")
+  local model="$1" body
+  body="{\"model\":\"$model\"}"
+  R "curl -s -m 5 http://127.0.0.1:$API_PORT/api/show -d $(printf %q "$body")" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    print(",".join(json.load(sys.stdin).get("capabilities", [])))
+except Exception:
+    pass' 2>/dev/null
+}
+first_model() {   # first pulled model whose capabilities include "completion" - embedding-only models (e.g. nomic-embed-text) cannot answer /api/generate
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case ",$(api_show_caps "$name")," in *,completion,*) echo "$name"; return 0 ;; esac
+  done < <(R "curl -s -m 5 http://127.0.0.1:$API_PORT/api/tags" 2>/dev/null | python3 -c 'import json,sys
+for m in json.load(sys.stdin).get("models", []):
+    print(m["name"])' 2>/dev/null)
+  return 1
+}
+
+# real_generate <model> -> 0 if a non-empty completion comes back
+real_generate() {
+  local model="$1" body
+  body="{\"model\":\"$model\",\"prompt\":\"reply with the single word: ok\",\"stream\":false}"
+  R "curl -s -m $GEN_TIMEOUT http://127.0.0.1:$API_PORT/api/generate -d $(printf %q "$body")" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("response", "").strip() else 1)' 2>/dev/null
+}
+
+verify() {   # verify <want_version> <inject:0|1>
+  local want="$1" inject="$2" have model
+  have=$(api_version); [ "$have" = "$want" ] || { log "VERIFY FAIL: version '$have' != '$want'"; return 1; }
+  [ "$(R "systemctl is-active $SERVICE" 2>/dev/null)" = "active" ] || { log "VERIFY FAIL: $SERVICE not active"; return 1; }
+  model=${MODEL:-$(first_model)}
+  [ -n "$model" ] || { log "VERIFY FAIL: no pulled model to run a real generation against"; return 1; }
+  real_generate "$model" || { log "VERIFY FAIL: real generation against '$model' returned no response"; return 1; }
+  [ "$inject" = "1" ] && [ "$FORCE_VERIFY_FAIL" = "1" ] && { log "VERIFY FAIL: injected (FORCE_VERIFY_FAIL=1)"; return 1; }
+  log "verify PASS ($have, $SERVICE active, real generation ok via '$model')"; return 0
+}
+
+precheck() {
+  local cur sha
+  R true 2>/dev/null || { log "PRECHECK FAIL: LAN ssh to $USR@$LAN"; return 3; }
+  R 'sudo -n true' 2>/dev/null || { log "PRECHECK FAIL: sudo -n"; return 3; }
+  R 'command -v zstd >/dev/null' 2>/dev/null || { log "PRECHECK FAIL: zstd not on PATH (needed to unpack the release tarball)"; return 3; }
+  cur=$(api_version); [ -n "$cur" ] || { log "PRECHECK FAIL: cannot read running Ollama version ($SERVICE down?)"; return 3; }
+  verify "$cur" 0 || { log "PRECHECK FAIL: current instance does not pass its own verify (real generation)"; return 3; }
+  R "[ -x $PREFIX/bin/ollama ]" 2>/dev/null || { log "PRECHECK FAIL: $PREFIX/bin/ollama missing"; return 3; }
+  R "[ -f /etc/systemd/system/$SERVICE.service ]" 2>/dev/null || { log "PRECHECK FAIL: /etc/systemd/system/$SERVICE.service missing"; return 3; }
+  R "[ \$(df --output=avail -k $PREFIX | tail -1) -gt 2000000 ]" 2>/dev/null || { log "PRECHECK FAIL: <2GB free on $PREFIX"; return 3; }
+  R "mkdir -p $CACHE" 2>/dev/null
+  sha=$(R "sha256sum $CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst 2>/dev/null" | cut -d' ' -f1)
+  if [ "$sha" != "$TARGET_SHA256" ]; then
+    R "curl -fsSL -m 300 -o $CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst.part $(printf %q "$DL_URL") && mv $CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst.part $CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst" 2>/dev/null \
+      || { log "PRECHECK FAIL: cannot download $DL_URL"; return 3; }
+    sha=$(R "sha256sum $CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst" | cut -d' ' -f1)
+  fi
+  [ "$sha" = "$TARGET_SHA256" ] || { log "PRECHECK FAIL: downloaded tarball sha256 '$sha' != pinned $TARGET_SHA256; nothing changed"; return 3; }
+  log "PRECHECK OK: $cur -> $TARGET_VERSION, LAN path $LAN, tarball verified"; return 0
+}
+
+rollback() {
+  local oldver bak
+  oldver=$(sget OLDVER); bak=$(sget BACKUP)
+  [ -n "$oldver" ] && [ -n "$bak" ] || { log "ROLLBACK IMPOSSIBLE: no previous state recorded in $STATE"; return 2; }
+  log "ROLLING BACK to Ollama $oldver using $bak"
+  RD stop "systemctl stop $SERVICE" || { log "ROLLBACK: stop failed"; return 2; }
+  RD restore "rm -rf $PREFIX/lib/ollama; tar -xzpf $bak -C /" || { log "CRITICAL: restore from $bak failed; $SERVICE stopped on $NAME, needs a human"; return 2; }
+  RD start "systemctl start $SERVICE" || { log "CRITICAL: service start failed after restore"; return 2; }
+  if verify "$oldver" 0; then log "ROLLED BACK cleanly to $oldver"; return 1; fi
+  log "CRITICAL: rollback did not verify - $NAME needs a human (ssh $USR@$LAN; backup $bak)"; return 2
+}
+
+apply() {
+  local cur ts tarball oldunitsha newunitsha backup_cmd
+  cur=$(api_version)
+  if [ "$cur" = "$TARGET_VERSION" ]; then log "already at $TARGET_VERSION; verifying only"; verify "$TARGET_VERSION" 0 && return 0 || return 1; fi
+  precheck || return 3
+  ts=$(date +%Y%m%d_%H%M%S)
+  tarball="$CACHE/ollama-linux-amd64-$TARGET_VERSION.tar.zst"
+  oldunitsha=$(unit_sha)
+  # new run of the op: forget any earlier BACKUP so a rollback never restores a stale tar
+  printf 'RUN=%s\nOLDVER=%s\nBACKUP=\n' "$ts" "$cur" >> "$STATE"
+  log "backing up $PREFIX/bin/ollama, $PREFIX/lib/ollama, unit + drop-ins"
+  backup_cmd="set -e; mkdir -p $BKDIR; p='${PREFIX#/}/bin/ollama ${PREFIX#/}/lib/ollama etc/systemd/system/$SERVICE.service'; [ -d /etc/systemd/system/$SERVICE.service.d ] && p=\"\$p etc/systemd/system/$SERVICE.service.d\"; tar -czpf $BKDIR/ollama-$NAME-$ts.tar.gz -C / \$p; tar -tzf $BKDIR/ollama-$NAME-$ts.tar.gz >/dev/null; [ \$(stat -c %s $BKDIR/ollama-$NAME-$ts.tar.gz) -gt 100000 ]"
+  RD backup "$backup_cmd" || { log "ABORT: backup tar failed; nothing changed"; return 3; }
+  sset BACKUP "$BKDIR/ollama-$NAME-$ts.tar.gz"
+  log "stopping $SERVICE"
+  RD stop "systemctl stop $SERVICE" || { log "stop failed; restarting old"; rollback; return $?; }
+  log "swapping binary+libs from the pinned release tarball (never runs install.sh; old libs wiped first per vendor doc)"
+  RD swap "rm -rf $PREFIX/lib/ollama; zstd -dc $tarball | tar -x -C $PREFIX" || { log "swap failed; restoring"; rollback; return $?; }
+  newunitsha=$(unit_sha)
+  [ "$newunitsha" = "$oldunitsha" ] || { log "ABORT: systemd unit changed by the swap (want untouched); restoring"; rollback; return $?; }
+  log "starting $SERVICE on $TARGET_VERSION"
+  RD start "systemctl start $SERVICE" || { log "start failed"; rollback; return $?; }
+  if verify "$TARGET_VERSION" 1; then log "UPGRADE OK ($cur -> $TARGET_VERSION); backup $(sget BACKUP) kept, unit sha unchanged ($newunitsha)"; return 0; fi
+  rollback; return $?
+}
+
+case "$MODE" in
+  --precheck) precheck; exit $? ;;
+  --apply)    apply; exit $? ;;
+  --verify)   verify "$TARGET_VERSION" 0; exit $? ;;
+  --rollback) rollback; exit $? ;;
+  *) echo "usage: ollama-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>"; exit 64 ;;
+esac
