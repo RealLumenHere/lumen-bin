@@ -3,7 +3,7 @@
 
 Baseline = fleet unit files + drop-ins + enable-state under a git repo.
 The reconciler is READ-ONLY: it reports drift (added/removed/modified units,
-enable-state changes) and exits 1 on drift. It never applies or restarts.
+enable-state changes) and exits 1 on drift, 3 on a crash (wq#3099). It never applies or restarts.
 
   unit-drift snapshot          rebuild baseline from /etc, git commit
   unit-drift check [--digest]  read-only diff; exit 1 on drift;
@@ -20,7 +20,7 @@ plaintext secrets ever entering the repo.
 """
 import os, sys, json, hashlib, subprocess, re, datetime
 
-SYS  = "/etc/systemd/system"
+SYS  = os.environ.get("UNIT_DRIFT_SYS", "/etc/systemd/system")  # env override is for tests
 REPO = "/home/lumen/fleet-units"
 UNITS_DIR  = os.path.join(REPO, "units")
 DROPIN_DIR = os.path.join(REPO, "dropins")
@@ -62,20 +62,35 @@ def read_bytes(p):
 def base_unit_exists(base):
     return any(os.path.exists(os.path.join(d, base)) for d in SEARCH_PATHS)
 
+def list_dir(p):
+    """os.listdir with the same sudo fallback read_bytes() has (wq#3099). A root-only drop-in dir (mcp-gateway.service.d,
+    0700 on purpose) used to crash the whole scan. Returns (names, readable); unreadable is reported, never raised."""
+    try:
+        return sorted(os.listdir(p)), True
+    except PermissionError:
+        r = subprocess.run(["sudo", "-n", "ls", "-1", p], capture_output=True, text=True)
+        if r.returncode == 0:
+            return sorted(l for l in r.stdout.splitlines() if l), True
+        return [], False
+
 def scan():
     units, dropins, enable = {}, {}, {}
     for name in sorted(os.listdir(SYS)):
         full = os.path.join(SYS, name)
         if name.endswith((".wants", ".requires")) and os.path.isdir(full):
-            for lnk in sorted(os.listdir(full)):
+            for lnk in list_dir(full)[0]:
                 lp = os.path.join(full, lnk)
                 if os.path.islink(lp):
                     enable[name + "/" + lnk] = os.readlink(lp)
             continue
         if name.endswith(".d") and os.path.isdir(full):
-            for conf in sorted(os.listdir(full)):
+            names, readable = list_dir(full)
+            if not readable:
+                dropins[name + "/<UNREADABLE>"] = "unreadable"  # visible as drift, not a crash
+                continue
+            for conf in names:
                 cp = os.path.join(full, conf)
-                if conf.endswith(".conf") and os.path.isfile(cp):
+                if conf.endswith(".conf") and (os.path.isfile(cp) or not os.access(full, os.R_OK | os.X_OK)):
                     dropins[name + "/" + conf] = sha(read_bytes(cp))
             continue
         if not SUF_RE.search(name):
@@ -245,5 +260,17 @@ def main():
     if a[0] == "show-baseline": return cmd_show()
     print(__doc__); return 2
 
+def run():
+    """wq#3099: a crash is not a finding. Exit 1 means drift (whitelisted in SuccessExitStatus), so a traceback that
+    also exited 1 read as 'drift found' and hid a 3-day outage of this guard. Exit 3 is outside the whitelist,
+    so OnFailure= fires."""
+    try:
+        return main() or 0
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        print("unit-drift: CRASH (%s: %s) -- exit 3, this is NOT a drift finding" % (type(exc).__name__, exc), file=sys.stderr)
+        return 3
+
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    sys.exit(run())
