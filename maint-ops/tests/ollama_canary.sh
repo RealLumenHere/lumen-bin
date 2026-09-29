@@ -9,6 +9,7 @@ B=wadjet@192.168.8.173
 NAME=wadjet; USR=wadjet; LAN=192.168.8.173
 CPREFIX=/opt/ollama-canary
 export PREFIX=$CPREFIX SERVICE=ollama-canary API_PORT=11435 MODEL=smollm2:135m
+export BKDIR=/var/backups/ollama-upgrade-canary   # harness-only: each apply writes a ~1.6G tarball, teardown must remove it
 export STATE_DIR=/tmp/ollama_test_state_wq3096; rm -rf "$STATE_DIR"
 OLD_VERSION=0.32.6
 OLD_SHA256=dec2fa50d24e6868ca3c4c977d69d059399372105f951a9acc320a5a79aadcfc
@@ -51,7 +52,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ollama-canary"
 }
 
 teardown() {
-  RB "sudo systemctl stop ollama-canary 2>/dev/null; sudo systemctl disable ollama-canary 2>/dev/null; sudo rm -f /etc/systemd/system/ollama-canary.service; sudo systemctl daemon-reload; sudo rm -rf $CPREFIX /tmp/ollama-canary-old.tar.zst /tmp/ollama-upgrade-cache; systemctl list-units --all 2>/dev/null | grep -c ollama-canary" 2>&1
+  RB "sudo systemctl stop ollama-canary 2>/dev/null; sudo systemctl disable ollama-canary 2>/dev/null; sudo rm -f /etc/systemd/system/ollama-canary.service; sudo systemctl daemon-reload; sudo rm -rf $CPREFIX /tmp/ollama-canary-old.tar.zst /tmp/ollama-upgrade-cache $BKDIR; systemctl list-units --all 2>/dev/null | grep -c ollama-canary" 2>&1
 }
 
 echo "== start $(date -u +%H:%M:%SZ)"
