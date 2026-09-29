@@ -30,13 +30,21 @@ STUB_PR = textwrap.dedent('''\
               printf '%s' "$ti" | grep -qE "$STUB_SUBJECT_RE" || { echo "lumen-pr: title is not a Conventional Commit (<=60 chars): got : $ti" >&2; exit 1; }
               for h in "## What" "## Why" "## How" "## Testing" "## Risk / rollback"; do
                 grep -qF "$h" "$bf" || { echo "lumen-pr: PR body is missing required section: $h" >&2; exit 1; }
-              done; echo "opened PR #7" >&2 ;;
+              done; [ "${STUB_OPEN_FAIL:-0}" = 1 ] && { echo "open refused" >&2; exit 1; }; echo "opened PR #7" >&2 ;;
       land)   [ "${STUB_LAND_FAIL:-0}" = 1 ] && { echo "land refused" >&2; exit 1; }
               if [ "${STUB_LAND_ALTER:-0}" = 1 ]; then
                 for f in $(git -C $1 diff-tree --no-commit-id --name-only -r HEAD); do echo altered >> $1/$f; done
                 git -C $1 commit -qa --amend --no-edit
               fi
-              git -C $1 push -q origin HEAD:main ;;
+              git -C $1 push -q origin HEAD:main
+              # like the real land from a linked worktree (wq#1536/wq#1490): stage the byte-identical overlap in the
+              # primary and fast-forward it; a refusal there is not a land failure
+              [ "${STUB_LAND_NO_FF:-0}" = 1 ] && exit 0
+              p=$(dirname "$(git -C $1 rev-parse --path-format=absolute --git-common-dir)"); git -C $p fetch -q origin
+              for f in $(git -C $p diff --name-only HEAD origin/main); do
+                [ -f $p/$f ] && [ "$(git -C $p hash-object -- $f)" = "$(git -C $p rev-parse origin/main:$f)" ] && git -C $p add -- $f
+              done
+              git -C $p merge -q --ff-only origin/main 2>/dev/null || true ;;
       ffprimary) [ "${STUB_FF_FAIL:-0}" = 1 ] && { echo "ffprimary refused" >&2; exit 1; }
               git -C $1 fetch -q origin; git -C $1 merge -q --ff-only origin/main ;;
     esac
@@ -97,25 +105,39 @@ def run(e, *args, extra=None):
 def status(t):
     return sh("git", "status", "--porcelain", cwd=t / "bin").stdout.rstrip("\n")
 
+def assert_no_leftovers(t):
+    """wq#3119: every failed live --apply left its lumen-pr worktree and local rescue branch behind."""
+    assert sh("git", "worktree", "list", "--porcelain", cwd=t / "bin").stdout.count("worktree ") == 1
+    assert sh("git", "branch", "--list", "chore/bin-drift-rescue-*", cwd=t / "bin").stdout == ""
+    assert not list((t / "wt").iterdir())
+
 def test_clean(env):
     t, e = env; r = run(e); assert r.returncode == 0 and "CLEAN" in r.stdout
 
-def test_proven_modified_rescued(env):
+# the real land fast-forwards the primary itself; LAND_NO_FF is the shape where that ff was refused
+LAND_SHAPES = pytest.mark.parametrize("land", [{}, {"STUB_LAND_NO_FF": "1"}], ids=["land-ffs-primary", "land-no-ff"])
+
+@LAND_SHAPES
+def test_proven_modified_rescued(env, land):
     t, e = env
     (t / "bin/mytool").write_text("print('reviewed v2')\n"); age(t / "bin/mytool")  # same bytes as ops/wq1-x/tool.py, different name
     r = run(e); assert r.returncode == 1 and "PROVEN via ops/wq1-x/tool.py" in r.stdout, r.stdout
     r = run(e, "--apply"); assert "dry-run" in r.stdout and status(t) == " M mytool"
-    r = run(e, "--apply", "--confirm"); assert r.returncode == 0 and "RESCUED" in r.stdout, r.stdout + r.stderr
+    r = run(e, "--apply", "--confirm", extra=land); assert r.returncode == 0 and "RESCUED" in r.stdout, r.stdout + r.stderr
     assert status(t) == "" and (t / "bin/mytool").read_text() == "print('reviewed v2')\n"
     assert "reviewed v2" in sh("git", "show", "origin/main:mytool", cwd=t / "bin").stdout
     assert list((t / "backups").glob("*/mytool"))
+    assert_no_leftovers(t)
     assert run(e).returncode == 0  # idempotent
 
-def test_proven_untracked_rescued(env):
+@LAND_SHAPES
+def test_proven_untracked_rescued(env, land):
+    """wq#3119 third live run: an untracked file the land had already fast-forwarded in was removed, then false-failed."""
     t, e = env
     (t / "bin/newtool").write_text("echo reviewed other\n"); age(t / "bin/newtool")
-    r = run(e, "--apply", "--confirm"); assert r.returncode == 0 and "RESCUED" in r.stdout, r.stdout + r.stderr
+    r = run(e, "--apply", "--confirm", extra=land); assert r.returncode == 0 and "RESCUED" in r.stdout, r.stdout + r.stderr
     assert status(t) == "" and (t / "bin/newtool").read_text() == "echo reviewed other\n"
+    assert_no_leftovers(t)
 
 def test_unproven_never_touched(env):
     t, e = env
@@ -139,7 +161,7 @@ def test_active_writer_refused(env):
     r = run(e, "--apply", "--confirm"); assert r.returncode == 4 and "may still be active" in r.stdout
     assert (t / "bin/mytool").read_text() == "print('reviewed v2')\n" and not list((t / "backups").glob("*")) 
 
-@pytest.mark.parametrize("fail", ["STUB_FF_FAIL", "STUB_LAND_FAIL"])
+@pytest.mark.parametrize("fail", ["STUB_FF_FAIL", "STUB_LAND_FAIL", "STUB_OPEN_FAIL"])
 @pytest.mark.parametrize("kind", ["modified", "untracked"])
 def test_failure_restores_byte_identical(env, fail, kind):
     t, e = env
@@ -149,6 +171,7 @@ def test_failure_restores_byte_identical(env, fail, kind):
     r = run(e, "--apply", "--confirm", extra={fail: "1"}); assert r.returncode == 3, r.stdout + r.stderr
     assert (t / "bin" / name).read_text() == body            # the live file is exactly what it was
     assert "FAILED" in r.stderr and list((t / "backups").glob("*/" + name))
+    assert_no_leftovers(t)
 
 def test_unreadable_provenance_proves_nothing(env):
     t, e = env
@@ -182,6 +205,7 @@ def test_landed_bytes_differ_leaves_live_file_alone(env, kind):
     r = run(e, "--apply", "--confirm", extra={"STUB_LAND_ALTER": "1"})
     assert r.returncode == 3 and "differs from the live file" in r.stderr, r.stdout + r.stderr
     assert (t / "bin" / name).read_text() == body
+    assert_no_leftovers(t)
 
 
 def test_stub_branch_lint_matches_real_lumen_pr():

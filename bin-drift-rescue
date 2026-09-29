@@ -181,9 +181,9 @@ def apply(files, confirm):
         shutil.copy2(os.path.join(REPO, f["path"]), d)
     print("backup:", bdir)
     wt = None
+    # lumen-pr BRANCH_RE is kebab only: no underscore (the raw ts has one)
+    branch = "chore/bin-drift-rescue-" + ts.replace("_", "-")
     try:
-        # lumen-pr BRANCH_RE is kebab only: no underscore (the raw ts has one)
-        branch = "chore/bin-drift-rescue-" + ts.replace("_", "-")
         r = subprocess.run([LUMEN_PR, "start", REPO, branch, "--worktree"], capture_output=True, text=True)
         wt = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else None
         if not wt:
@@ -220,9 +220,13 @@ def apply(files, confirm):
             landed = git(REPO, "rev-parse", f"origin/main:{f['path']}").stdout.strip()
             if landed != f["blob"]:
                 raise RuntimeError(f"landed blob for {f['path']} differs from the live file; leaving the primary alone")
-        # clear the overlap ffprimary refuses on: tracked -> restore HEAD copy, untracked -> remove; both backed up above
+        # clear the overlap ffprimary refuses on: tracked -> restore HEAD copy, untracked -> remove; both backed up above.
+        # A --worktree land already fast-forwards the primary (staging the byte-identical overlap), so a path that is
+        # clean now is the landed file under HEAD: removing it left it deleted with nothing left to restore (wq#3119).
         for f in todo:
             p = os.path.join(REPO, f["path"])
+            if not git(REPO, "status", "--porcelain", "--", f["path"]).stdout.strip():
+                continue
             if f["kind"] == "modified":
                 git(REPO, "checkout", "--", f["path"], check=True)
             else:
@@ -248,6 +252,12 @@ def apply(files, confirm):
                 os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copy2(src, dst)
         print("restored; live files are byte-identical to before. backup kept at", bdir, file=sys.stderr)
         return 3
+    finally:
+        # the rescue worktree + local branch are ours alone and hold nothing that is not in the backup or on origin;
+        # every failed live run left both behind (wq#3119)
+        if wt:
+            git(REPO, "worktree", "remove", "--force", wt)
+            git(REPO, "branch", "-D", branch)
 
 
 def main():
