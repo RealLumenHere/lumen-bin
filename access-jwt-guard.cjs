@@ -6,9 +6,13 @@
 // GET on ACCESS_GUARD_OPEN_PATHS (default /health) stays open for local liveness probes.
 // Load with NODE_OPTIONS=--require=<this file>. Bad config = exit 78 at startup (fail closed).
 // ACCESS_GUARD_MODE=shadow logs verdicts but lets requests through (rollout step only).
+// ACCESS_GUARD_MODE_FILE=<path> (optional, wq#3103): re-read at most once a second, holds 'shadow' or 'enforce', so the
+// mode flips without restarting the process (Commander restarts drop every session). Missing file = ACCESS_GUARD_MODE;
+// unreadable or any other content = enforce (fail closed). Keep the file root-owned.
 // Logs one JSON line per verdict to stderr; never logs the token or any header value.
 'use strict';
 const http = require('http');
+const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 
@@ -23,6 +27,19 @@ if (!/^[0-9]{1,5}$/.test(process.env.ACCESS_GUARD_PORT || '') || PORT < 1 || POR
 if (!/^[a-z0-9-]+$/.test(TEAM)) die('ACCESS_GUARD_TEAM missing or malformed');
 if (AUDS.length === 0 || !AUDS.every(a => /^[a-f0-9]{64}$/.test(a))) die('ACCESS_GUARD_AUD missing or malformed');
 if (!['enforce', 'shadow'].includes(MODE)) die('ACCESS_GUARD_MODE must be enforce or shadow');
+const MODE_FILE = process.env.ACCESS_GUARD_MODE_FILE || '';
+let modeAt = 0, modeCache = MODE;
+function currentMode() {
+  if (!MODE_FILE) return MODE;
+  const now = Date.now();
+  if (now - modeAt < 1000) return modeCache;
+  modeAt = now;
+  try {
+    const v = fs.readFileSync(MODE_FILE, 'utf8').trim();
+    modeCache = (v === 'shadow' || v === 'enforce') ? v : 'enforce';
+  } catch (e) { modeCache = e && e.code === 'ENOENT' ? MODE : 'enforce'; }
+  return modeCache;
+}
 const ISS = process.env.ACCESS_GUARD_ISS || `https://${TEAM}.cloudflareaccess.com`;
 const CERTS_URL = process.env.ACCESS_GUARD_CERTS_URL || `${ISS}/cdn-cgi/access/certs`;
 const LEEWAY = 30;            // seconds of clock skew allowed on exp/nbf
@@ -33,7 +50,7 @@ let keys = new Map();
 let lastFetch = 0;
 let inflight = null;
 
-function log(o) { process.stderr.write(JSON.stringify({ guard: 'access', port: PORT, mode: MODE, ts: new Date().toISOString(), ...o }) + '\n'); }
+function log(o) { process.stderr.write(JSON.stringify({ guard: 'access', port: PORT, mode: currentMode(), ts: new Date().toISOString(), ...o }) + '\n'); }
 
 function b64url(s) { return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64'); }
 
@@ -111,7 +128,7 @@ http.Server.prototype.emit = function (ev, req, res) {
     .then(v => {
       // via = whether cloudflared forwarded it (cf-ray present) or it came straight to the loopback port
       log({ event: 'verdict', ok: v.ok, reason: v.reason, who: v.who, via: req.headers['cf-ray'] ? 'tunnel' : 'local', method: req.method, path });
-      if (v.ok || MODE === 'shadow') { origEmit.apply(self, args); return; }
+      if (v.ok || currentMode() === 'shadow') { origEmit.apply(self, args); return; }
       if (!res.headersSent) res.writeHead(v.code, { 'content-type': 'text/plain' });
       res.end(v.code === 503 ? 'access guard: signing keys unavailable\n' : 'forbidden\n');
     });
