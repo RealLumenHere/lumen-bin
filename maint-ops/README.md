@@ -6,10 +6,13 @@ and halts on failure without rolling back, so each op here carries its own prech
 Exit codes: 0 ok, 1 failed and rolled back cleanly, 2 failed and rollback failed (needs a human), 3 precheck abort.
 
 ## litellm-upgrade
-`--precheck | --apply | --verify | --rollback`. Pins the digest of the LiteLLM patch release in the compose file
-(default: v1.83.10-stable.patch.3, fixes GHSA-4xpc-pv4p-pm3w), dumps the litellm DB, recreates only the litellm service,
+`--precheck | --apply | --verify | --rollback`. Pins the digest of the target LiteLLM release in the compose file
+(default TARGET_DIGEST: v1.96.2, fixes GHSA-3cv6-jpf6-8222; FALLBACK_DIGEST: v1.88.6, also carries the fix; prod is
+already on v1.83.10-stable.patch.3 which fixed GHSA-4xpc-pv4p-pm3w), dumps the litellm DB, recreates only the litellm service,
 then verifies with the maint-smoke key (models, a real completion, an out-of-scope model must be refused) and the
-host-header fix marker in the running code. The patch reports version 1.83.10, so the version string is not a check.
+fix markers in the running code (host-header `request.scope`; `reject_url_valued_destination` for the target). The API does not
+report the version, so the running code is the check. The package path differs by image (`/app/litellm` on patch.3, a venv
+under `/app/.venv/...` on v1.96.x), so verify asks the container (`pkg_dir`) instead of hardcoding it.
 Test to failure with `tests/harness_litellm.sh` (throwaway compose project on 127.0.0.1:4002 and a scratch DB copy; never touches prod).
 
 Note: verify never makes a deliberate 401 on prod (NEG_CONTROL=0). litellm-auth-alert pages at 5 auth_401 in 10 minutes, and an early run of this op tripped it. The harness sets NEG_CONTROL=1 (its port is not monitored) to keep the scope-enforcement assertion.

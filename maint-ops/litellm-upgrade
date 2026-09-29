@@ -41,14 +41,25 @@ wait_healthy() {
   rm -f /tmp/lu_ready.$$; return 1
 }
 
+# Where the litellm package lives differs by image: patch.3 ships it at /app/litellm, v1.96.x installs into a
+# venv (/app/.venv/lib/python3.13/site-packages/litellm). Ask the running container instead of hardcoding, or
+# the fix-marker greps below fail on a good image (seen in the wq#3097 harness run, both markers present).
+pkg_dir() {
+  local d
+  d=$(docker exec "$CONTAINER" python -c 'import litellm,os;print(os.path.dirname(litellm.__file__))' 2>/dev/null | tail -1)
+  if [ -n "$d" ] && docker exec "$CONTAINER" sh -c '[ -d "$0" ]' "$d" 2>/dev/null; then echo "$d"; return 0; fi
+  echo /app/litellm
+}
+
 # verify <expect_digest> <expect_patched:0|1> <inject:0|1>
 verify() {
-  local want="$1" patched="$2" inject="$3" have
+  local want="$1" patched="$2" inject="$3" have pkg
+  pkg=$(pkg_dir)
   have=$(docker inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null | grep -oE 'sha256:[0-9a-f]{64}')
   [ "$have" = "$want" ] || { log "VERIFY FAIL: running image $have != expected $want"; return 1; }
   wait_healthy || { log "VERIFY FAIL: readiness not healthy+db connected within ${HEALTH_WAIT}s"; return 1; }
   if [ "$patched" = "1" ]; then
-    docker exec "$CONTAINER" grep -q 'request.scope' /app/litellm/proxy/auth/auth_utils.py 2>/dev/null \
+    docker exec "$CONTAINER" grep -q 'request.scope' "$pkg/proxy/auth/auth_utils.py" 2>/dev/null \
       || { log "VERIFY FAIL: host-header fix marker (request.scope) missing in running code"; return 1; }
   fi
   # wq#3097 / GHSA-3cv6-jpf6-8222: version string isn't reported by the API, so the running code
@@ -57,7 +68,7 @@ verify() {
   # before the window op applies TARGET_DIGEST/FALLBACK_DIGEST, does not have this fix yet — gating
   # on $patched alone would make routine --verify calls fail before the upgrade even runs.
   if [ "$want" = "$TARGET_DIGEST" ] || [ "$want" = "$FALLBACK_DIGEST" ]; then
-    docker exec "$CONTAINER" grep -rq 'reject_url_valued_destination' /app/litellm/proxy/ 2>/dev/null \
+    docker exec "$CONTAINER" grep -rq 'reject_url_valued_destination' "$pkg/proxy/" 2>/dev/null \
       || { log "VERIFY FAIL: GHSA-3cv6-jpf6-8222 fix marker (reject_url_valued_destination) missing in running code"; return 1; }
   fi
   NEG_CONTROL="$NEG_CONTROL" python3 - "$PORT" "$SMOKE_KEY_FILE" <<'PY' || return 1
