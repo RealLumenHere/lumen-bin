@@ -93,7 +93,21 @@ for name in "${!REPOS[@]}"; do
   # github url may rotate independently of the initial clone; keep it current.
   git -C "$bare" remote set-url github "$github_url" 2>/dev/null || true
 
-  if git -C "$bare" -c credential.helper=store push --prune --quiet github "${PUSH_REFSPECS[@]}" 2>"$errlog"; then
+  # GitHub refuses to delete its current (default) branch, so a default branch that
+  # is gone from origin would fail the whole push under --prune. Leave it out of the
+  # prune and raise a row: the fix is pointing GitHub's default at origin's HEAD.
+  refspecs=("${PUSH_REFSPECS[@]}")
+  gh_head=$(git -C "$bare" -c credential.helper=store ls-remote --symref github HEAD 2>/dev/null \
+    | sed -n 's|^ref: refs/heads/\(.*\)\tHEAD$|\1|p')
+  if [ -n "$gh_head" ] && ! git -C "$bare" show-ref --verify --quiet "refs/heads/$gh_head"; then
+    refspecs+=("^refs/heads/$gh_head")
+    origin_head=$(git -C "$bare" symbolic-ref --short HEAD 2>/dev/null)
+    echo "$name: WARN github default branch '$gh_head' is not on origin; kept it" >&2
+    aq_fail "$name-default-branch" "github-mirror-sync: $name github default branch not on origin" \
+      "GitHub default branch '$gh_head' does not exist on origin (HEAD '$origin_head'); it is kept out of the prune. Set the GitHub default branch to '$origin_head'."
+  fi
+
+  if git -C "$bare" -c credential.helper=store push --prune --quiet github "${refspecs[@]}" 2>"$errlog"; then
     echo "$name: mirrored to GitHub"
   else
     tail=$(err_tail)

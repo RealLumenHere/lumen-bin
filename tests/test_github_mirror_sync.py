@@ -92,6 +92,24 @@ def test_sync_mirrors_heads_and_tags_past_pr_refs(tmp_path):
     assert rev(github, "refs/pull/1/head") is None
 
 
+def test_github_default_branch_missing_on_origin_is_kept(tmp_path):
+    """mission-control's GitHub default was a branch Gitea never had; pruning it failed the push."""
+    origin, github, primary = build(tmp_path)
+    # GitHub refuses to delete its default branch; a non-bare repo refuses to delete its
+    # checked-out branch the same way.
+    gh = tmp_path / "gh-checkout"
+    git("clone", "-q", "-b", "stale", str(github), str(gh))
+    git("-C", str(gh), "config", "receive.hideRefs", "refs/pull")
+    git("-C", str(primary), "remote", "set-url", "github", str(gh))
+    r, aq = run_sync(tmp_path, primary)
+    assert r.returncode == 0, r.stderr
+    assert "demo: WARN github default branch 'stale' is not on origin" in r.stderr
+    assert rev(gh, "refs/heads/stale"), "the default branch must survive the prune"
+    assert rev(gh, "refs/heads/main") == rev(origin, "refs/heads/main")
+    assert "demo-default-branch|" in aq
+    assert "Set the GitHub default branch to 'main'" in aq
+
+
 def test_push_failure_reports_stderr_tail_and_owner(tmp_path):
     _, _, primary = build(tmp_path, github_url=str(tmp_path / "no-such-github.git"))
     r, aq = run_sync(tmp_path, primary)
