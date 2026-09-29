@@ -10,7 +10,9 @@ enable-state changes) and exits 1 on drift, 3 on a crash (wq#3099). It never app
                                --digest emits an info-class ntfy on drift;
                                also lints for dangling After/Wants/Requires
                                targets (wq#1659) and the guard exit-code
-                               contract (wq#1657 GEL1/GEL2 via guard_exit_lint.py)
+                               contract (wq#1657 GEL1/GEL2 via guard_exit_lint.py);
+                               advises on masked units with no entry in
+                               docs/fleet/retired_services.yaml (wq#2218)
   unit-drift apply --dry-run   show disk<-baseline plan (manual, no write)
   unit-drift show-baseline     list tracked files in the baseline
 
@@ -27,6 +29,7 @@ DROPIN_DIR = os.path.join(REPO, "dropins")
 MANIFEST   = os.path.join(REPO, "MANIFEST.json")
 ENABLE_TSV = os.path.join(REPO, "enable-state.tsv")
 KNOWN_RM   = os.path.join(REPO, "known-removed.txt")
+RETIRED_YAML = "/home/lumen/foreman/docs/fleet/retired_services.yaml"
 NTFY  = "/home/lumen/bin/ntfy-send"
 TOPIC = "lumen-alerts"
 SEARCH_PATHS = ("/etc/systemd/system","/run/systemd/system",
@@ -190,6 +193,37 @@ def guard_lint():
     except Exception:
         return []
 
+def masked_units(units):
+    """Units masked via a symlink to /dev/null."""
+    return sorted(n for n, m in units.items()
+                  if m.get("kind") == "symlink" and m.get("target") == "/dev/null")
+
+def retired_names():
+    """Unit names (with and without suffix) that retired_services.yaml records.
+    None when the file cannot be read, so the lint stays silent."""
+    try:
+        import yaml
+        with open(RETIRED_YAML) as f:
+            doc = yaml.safe_load(f)
+        names = set()
+        for e in doc:
+            for u in e.get("units", []):
+                names.add(u); names.add(SUF_RE.sub("", u))
+        return names
+    except Exception:
+        return None
+
+def unexplained_masks(units):
+    """wq#2218: a mask with no retired_services.yaml entry reads as an unexplained
+    leftover (wq#2073: lumen-pokemon-live was masked with the reason recorded
+    nowhere and unmasked in good faith five days later). Fail-open: an unreadable
+    record means no lint."""
+    known = retired_names()
+    if known is None:
+        return []
+    return [n for n in masked_units(units)
+            if n not in known and SUF_RE.sub("", n) not in known]
+
 def _diff(kind, base, cur, known_rm=None):
     d = []
     for n in sorted(set(cur) - set(base)):
@@ -201,6 +235,13 @@ def _diff(kind, base, cur, known_rm=None):
         if base[n] != cur[n]: d.append(("MODIFIED " + kind, n))
     return d
 
+def print_mask_advisory(masks):
+    """Advisory only: never changes the exit code or the digest."""
+    if masks:
+        print("  advisory: masked with no entry in %s — a mask is deliberate, "
+              "not a leftover; find why before unmasking (wq#2073): %s"
+              % (RETIRED_YAML, ", ".join(masks)))
+
 def cmd_check(digest=False):
     base = load_manifest(); cur = scan(); known = load_known_removed()
     drift  = _diff("unit",   base["units"],   cur["units"], known)
@@ -210,12 +251,14 @@ def cmd_check(digest=False):
                       if not base_unit_exists(rel.split("/")[0][:-2])})
     dangling = dangling_target_lint()
     lint = guard_lint()
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    masks = unexplained_masks(cur["units"])
+    ts =datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     counts = "%d units, %d drop-ins, %d enable-links" % (
         len(cur["units"]), len(cur["dropins"]), len(cur["enable"]))
     if not drift and not dangling and not lint:
         print("[%s] unit-drift: CLEAN (%s)" % (ts, counts))
         if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
+        print_mask_advisory(masks)
         return 0
     print("[%s] unit-drift: DRIFT — %d change(s) vs git baseline, %d dangling target(s), %d guard-lint violation(s)"
           % (ts, len(drift), len(dangling), len(lint)))
@@ -223,6 +266,7 @@ def cmd_check(digest=False):
     for v in dangling: print("  %-16s %s" % ("DANGLING-TARGET", v))
     for v in lint: print("  %-16s %s" % ("GUARD-LINT", v))
     if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
+    print_mask_advisory(masks)
     if digest:
         items = [k + " " + n for k, n in drift] + dangling + [v.split(":")[0] for v in lint]
         summ = "; ".join(items[:12])
