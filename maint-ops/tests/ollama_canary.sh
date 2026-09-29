@@ -34,6 +34,7 @@ After=network-online.target
 ExecStart=$CPREFIX/bin/ollama serve
 Environment=\"OLLAMA_HOST=127.0.0.1:11435\"
 Environment=\"OLLAMA_MODELS=$CPREFIX/models\"
+Environment=\"HOME=$CPREFIX\"
 Restart=always
 RestartSec=3
 
@@ -54,6 +55,11 @@ for i in $(seq 1 20); do [ -n "$(cver)" ] && break; sleep 3; done
 pull_body="{\"model\":\"smollm2:135m\",\"stream\":false}"
 RB "curl -s -m 300 http://127.0.0.1:11435/api/pull -d $(printf %q "$pull_body")" >/dev/null 2>&1
 check "canary up on old version" "$(cver)" "$OLD_VERSION"
+if [ "$(cver)" != "$OLD_VERSION" ]; then
+  echo "SETUP INVALID: canary not serving $OLD_VERSION, aborting (later cases would be meaningless)"
+  RB "sudo journalctl -u ollama-canary --no-pager -n 15 2>&1" 2>&1 | sed "s/^/    /"
+  teardown; rm -rf "$STATE_DIR"; echo "SUMMARY pass=$PASS fail=$FAIL (aborted at setup)"; exit 1
+fi
 
 echo "== 1. rollback with no state must refuse loudly (want rc 2)"
 bash "$S" --rollback $NAME $USR $LAN 2>&1 | sed 's/^/    /'; check "no-state rollback rc" "${PIPESTATUS[0]}" 2
