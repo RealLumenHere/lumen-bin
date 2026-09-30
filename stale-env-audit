@@ -10,13 +10,22 @@ each process actually holds (/proc/<pid>/environ) with what its EnvironmentFile 
 
   stale-env-audit            report, exit 0 clean / 1 drift / 2 could not read anything
   stale-env-audit --json     machine-readable
+  stale-env-audit --aq       also keep the alert queue in step (wq#3215): one aq row per
+                             drifting unit (source stale-env, key = unit, deduped by aq),
+                             resolved automatically once the unit is clean. Resolves nothing
+                             after an incomplete scan (units unreadable, or the alert DB
+                             unreadable), so a partial view can never clear a real row.
 Run it as root (sudo) to cover units that run under another uid; as lumen it only sees
 lumen-owned processes and says how many it could not read.
 
 Ignored on purpose: variables whose file value is empty (systemd never exports them, e.g.
 ssh.service SSHD_OPTS=).
 """
-import json, os, re, shlex, subprocess, sys
+import json, os, re, shlex, sqlite3, subprocess, sys
+
+ALERTS_DB = os.environ.get("STALE_ENV_ALERTS_DB", "/home/lumen/agents/alert-queue/alerts.db")
+AQ_BIN = os.environ.get("STALE_ENV_AQ_BIN", "/home/lumen/bin/aq")
+AQ_SOURCE = "stale-env"
 
 
 def sh(*a):
@@ -93,6 +102,51 @@ def audit():
     return {"clean": clean, "drift": rows, "unreadable": unreadable}
 
 
+def plan_aq(drift, open_rows, complete):
+    """Pure: which aq rows to add and which to resolve. `open_rows` is {unit: aq id} for open
+    stale-env rows. Rows are only ever resolved on a COMPLETE scan."""
+    drifting = {r["unit"] for r in drift}
+    to_add = list(drift)
+    to_resolve = [(i, k) for k, i in sorted(open_rows.items()) if k not in drifting] if complete else []
+    return to_add, to_resolve
+
+
+def open_aq_rows():
+    """{unit: aq id} of open stale-env rows, or None when the alert DB cannot be read."""
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % ALERTS_DB, uri=True, timeout=10)
+        try:
+            return {k: i for i, k in c.execute(
+                "select id, key from alerts where source=? and status='open'", (AQ_SOURCE,))}
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
+
+def _aq(*args):
+    cmd = [AQ_BIN, *args]
+    if os.geteuid() == 0:   # never let root create root-owned files inside the alert-queue dir
+        cmd = ["runuser", "-u", "lumen", "--"] + cmd
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+
+def sync_aq(res):
+    """-> (added, resolved). Names only, never values."""
+    rows = open_aq_rows()
+    complete = (res["unreadable"] == 0 and rows is not None and (res["clean"] > 0 or bool(res["drift"])))
+    to_add, to_resolve = plan_aq(res["drift"], rows or {}, complete)
+    for r in to_add:
+        names = ", ".join(r["differs"] + r["missing"])
+        _aq("add", AQ_SOURCE, r["unit"],
+            "stale env: %s runs on values its EnvironmentFile no longer has" % r["unit"],
+            "variables: %s. file newer than process: %s. Fix: systemctl restart %s, then re-run "
+            "`sudo stale-env-audit`. (wq#3211/wq#3215)" % (names, ", ".join(r["file_newer_than_process"]) or "no", r["unit"]))
+    for i, k in to_resolve:
+        _aq("resolve", str(i), "stale-env-audit: %s is clean now" % k)
+    return len(to_add), len(to_resolve)
+
+
 def main(argv):
     res = audit()
     if "--json" in argv:
@@ -109,6 +163,9 @@ def main(argv):
             print("    file newer than process: %s" % (", ".join(r["file_newer_than_process"]) or "no"))
             if r["also_set_inline"]:
                 print("    also set via Environment= (may be an intentional override): %s" % ", ".join(r["also_set_inline"]))
+    if "--aq" in argv:
+        added, resolved = sync_aq(res)
+        print("aq: %d row(s) opened/refreshed, %d resolved" % (added, resolved))
     if res["clean"] == 0 and not res["drift"]:
         return 2
     return 1 if res["drift"] else 0
