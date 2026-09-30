@@ -51,3 +51,14 @@ Kept afterwards: `/var/backups/ollama-upgrade/ollama-<name>-<ts>.tar.gz` per run
 Test to failure with `tests/ollama_canary.sh` (throwaway `ollama-canary` on wadjet :11435, own prefix `/opt/ollama-canary`, starts on real 0.32.6):
 no-state rollback, precheck, forced verify failure rolls back, real upgrade to 0.34.4 with a real generation, idempotent re-apply, manual rollback.
 Hathor had model pulls a few hours before the manifest probe (wq#1402): check idle before touching it, same as HA's fleet-window rule.
+
+## dc-upgrade
+`--precheck | --apply | --verify | --rollback <n> <user> <lan_ip>` (wq#1509). Upgrades @wonderwhy-er/desktop-commander on a `<node>-mcp-failover` host (bes today; nephthys's unit is deliberately stopped+disabled, so its precheck refuses).
+Refuses lumen (the primary gateway Commander rides, Frank-driven via dc-narrow-deploy) and thor. `TARGET_VERSION` (default 0.2.46) selects a bundle in `bin/maint-ops/dc-upgrade.d/<version>/`
+(Lumen's live patched dist files: command-manager sudo-unwrap, config-manager atomic write, terminal-manager + handle-store detach, plus manifest.env with pristine and patched sha256).
+Flow: precheck (node>=22.5 for node:sqlite, service healthy, registry has the version, disk) -> `npm install -g --prefix stage --ignore-scripts` (skips DC's telemetry postinstall; ripgrep comes from the
+`@vscode/ripgrep-linux-x64` optional dep) -> REFUSE unless the staged pristine files match the bundle's recorded sha256 (the patches are line-number diffs, only valid on that exact base) -> overlay the four
+files -> throwaway supergateway on :3199 with a real MCP round trip (`dc_mcp_probe.py`: initialize, tools/list, start_process echo nonce) -> swap module dir, restart the service, re-probe on :3100.
+Any failure after the swap restores the old module dir and re-verifies it. Old module kept at `~/.dc-upgrade/backup-<ts>` on the node (prune by hand after a week).
+Proven on bes 2026-09-30: forced verify failure (`FORCE_VERIFY_FAIL=1`) rolled back cleanly to 0.2.40 with a real round trip, then the real 0.2.40 -> 0.2.46 apply passed.
+To support a new DC version: add a bundle dir (re-cut the patches against that version's pristine files, record shas), test it on Lumen scratch with `staged_canary.sh`, and Lumen goes before any failover.

@@ -1,0 +1,118 @@
+#!/bin/bash
+# dc-upgrade - one node, one op (wq#1509). Upgrades @wonderwhy-er/desktop-commander on a <node>-mcp-failover host.
+# usage: dc-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>
+# Patch model: the versioned bundle in $BUNDLE/<version>/ holds Lumen's live patched dist files (command-manager: sudo-unwrap
+# tier-1; config-manager: dc-config-atomic; terminal-manager + handle-store: handle-store+detach). apply installs the target
+# into a STAGE dir (--ignore-scripts: skips DC's telemetry postinstall), refuses unless the staged PRISTINE files match the
+# bundle's recorded sha256 (line-number diffs are only safe on the exact base), overlays the four files, runs the staged build
+# behind a throwaway supergateway on $CANARY_PORT with a real MCP round trip, and only then swaps it in, restarts the
+# service and re-probes. Any failure after the swap restores the previous module dir.
+# Exit: 0 ok | 1 failed, rolled back cleanly | 2 failed AND rollback failed (needs a human) | 3 aborted with NOTHING live changed
+# Never reboots. Refuses lumen (the primary gateway Commander rides: Frank-driven via dc-narrow-deploy) and thor.
+set -u
+MODE="${1:-}"; NAME="${2:-}"; USR="${3:-}"; LAN="${4:-}"
+TARGET_VERSION=${TARGET_VERSION:-0.2.46}
+BUNDLE=${BUNDLE:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/dc-upgrade.d}; BDIR="$BUNDLE/$TARGET_VERSION"
+SERVICE=${SERVICE:-$NAME-mcp-failover.service}
+PORT=${PORT:-3100}; CANARY_PORT=${CANARY_PORT:-3199}
+FORCE_VERIFY_FAIL=${FORCE_VERIFY_FAIL:-0}
+STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}; mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/dc-$NAME.state"
+MOD='$HOME/.npm-global/lib/node_modules/@wonderwhy-er/desktop-commander'   # literal $HOME: expanded on the node
+DCU='$HOME/.dc-upgrade'
+log() { echo "[dc-upgrade $NAME $(date -u +%H:%M:%S)Z] $*"; }
+[ -n "$NAME" ] && [ -n "$USR" ] && [ -n "$LAN" ] || { echo "usage: dc-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>"; exit 64; }
+case "$NAME" in thor|lumen) echo "REFUSED: $NAME is never touched by this op (lumen = primary gateway, Frank-driven)"; exit 3 ;; esac
+R()  { ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$USR@$LAN" "$@"; }
+sget() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+sset() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
+m() { grep "^$1=" "$BDIR/manifest.env" | cut -d= -f2-; }
+cur_ver() { R "sed -n 's/.*\"version\": *\"\\([^\"]*\\)\".*/\\1/p' $MOD/package.json | head -1" 2>/dev/null | tr -d '\r'; }
+wait_healthy() { local i; for i in $(seq 1 30); do
+    [ "$(R "systemctl is-active $SERVICE" 2>/dev/null)" = "active" ] && R "curl -s -m 3 http://127.0.0.1:$PORT/health | grep -q ok" 2>/dev/null && return 0; sleep 2; done; return 1; }
+live_shas_ok() {  # live_shas_ok -> 0 when the four patched files on the node match the bundle
+  local f want have
+  for f in command-manager config-manager terminal-manager handle-store; do
+    want=$(m PATCHED_${f//-/_}); have=$(R "sha256sum $MOD/dist/$f.js 2>/dev/null | cut -d' ' -f1" 2>/dev/null)
+    [ "$want" = "$have" ] || return 1; done; return 0; }
+push_helpers() {
+  R "mkdir -p $DCU/bundle/$TARGET_VERSION" || return 1
+  scp -q -o BatchMode=yes "$BUNDLE/dc_mcp_probe.py" "$BUNDLE/staged_canary.sh" "$USR@$LAN:.dc-upgrade/" || return 1
+  scp -q -o BatchMode=yes "$BDIR"/*.js "$BDIR/manifest.env" "$USR@$LAN:.dc-upgrade/bundle/$TARGET_VERSION/" || return 1; }
+probe_live() { R "python3 $DCU/dc_mcp_probe.py $PORT --expect-version $1" 2>&1 | tail -1; return ${PIPESTATUS[0]}; }
+
+verify() {   # verify <want_version> <inject:0|1> <check_patched:0|1>
+  local want="$1" inject="$2" patched="$3" have out
+  have=$(cur_ver); [ "$have" = "$want" ] || { log "VERIFY FAIL: module version '$have' != '$want'"; return 1; }
+  wait_healthy || { log "VERIFY FAIL: $SERVICE not active/healthy on :$PORT"; return 1; }
+  if [ "$patched" = "1" ]; then live_shas_ok || { log "VERIFY FAIL: patched dist files on node do not match bundle"; return 1; }; fi
+  out=$(probe_live "$want") || { log "VERIFY FAIL: live MCP probe: $out"; return 1; }
+  R "python3 -c 'import json,os;json.load(open(os.path.expanduser(\"~/.claude-server-commander/config.json\")))'" 2>/dev/null || { log "VERIFY FAIL: config.json not valid JSON"; return 1; }
+  [ "$inject" = "1" ] && [ "$FORCE_VERIFY_FAIL" = "1" ] && { log "VERIFY FAIL: injected (FORCE_VERIFY_FAIL=1)"; return 1; }
+  log "verify PASS ($have, $SERVICE healthy, MCP round trip ok: $out)"; return 0; }
+
+precheck() {
+  local f want have cand
+  [ -f "$BDIR/manifest.env" ] || { log "PRECHECK FAIL: no bundle for $TARGET_VERSION at $BDIR"; return 3; }
+  for f in command-manager config-manager terminal-manager handle-store; do
+    want=$(m PATCHED_${f//-/_}); have=$(sha256sum "$BDIR/$f.js" 2>/dev/null | cut -d' ' -f1)
+    [ "$want" = "$have" ] || { log "PRECHECK FAIL: bundle file $f.js sha mismatch"; return 3; }; done
+  R true 2>/dev/null || { log "PRECHECK FAIL: LAN ssh to $USR@$LAN"; return 3; }
+  R 'sudo -n true' 2>/dev/null || { log "PRECHECK FAIL: sudo -n"; return 3; }
+  R "node -e 'const [a,b]=process.versions.node.split(\".\").map(Number);process.exit(a>22||(a===22&&b>=5)?0:1)' && command -v npm >/dev/null && command -v python3 >/dev/null && command -v curl >/dev/null" 2>/dev/null || { log "PRECHECK FAIL: node>=22.5 (node:sqlite), npm, python3, curl required"; return 3; }
+  R "systemctl cat $SERVICE >/dev/null 2>&1" || { log "PRECHECK FAIL: unit $SERVICE not found"; return 3; }
+  wait_healthy || { log "PRECHECK FAIL: $SERVICE not healthy before change"; return 3; }
+  R "command -v supergateway >/dev/null || test -x \$HOME/.npm-global/bin/supergateway" 2>/dev/null || { log "PRECHECK FAIL: supergateway missing"; return 3; }
+  R "[ \$(df --output=avail -k \$HOME | tail -1) -gt 1500000 ]" 2>/dev/null || { log "PRECHECK FAIL: <1.5GB free in \$HOME"; return 3; }
+  cand=$(R "npm view @wonderwhy-er/desktop-commander@$TARGET_VERSION version 2>/dev/null" | tr -d '\r')
+  [ "$cand" = "$TARGET_VERSION" ] || { log "PRECHECK FAIL: registry has no '$TARGET_VERSION' (got '$cand')"; return 3; }
+  R "test -d $MOD/dist" || { log "PRECHECK FAIL: module dir missing"; return 3; }
+  log "PRECHECK OK: $(cur_ver) -> $TARGET_VERSION, $SERVICE healthy, LAN path $LAN"; return 0; }
+
+rollback() {
+  local bk ts; bk=$(sget BACKUP); ts=$(date +%Y%m%d_%H%M%S)
+  [ -n "$bk" ] || { log "ROLLBACK IMPOSSIBLE: no backup recorded in $STATE"; return 2; }
+  R "test -d $bk/desktop-commander" || { log "ROLLBACK IMPOSSIBLE: $bk/desktop-commander missing"; return 2; }
+  local oldv; oldv=$(sget OLDVER); log "ROLLING BACK to $oldv from $bk"
+  R "set -e; mkdir -p $bk/failed-$ts; mv $MOD $bk/failed-$ts/desktop-commander; mv $bk/desktop-commander $MOD; sudo -n systemctl restart $SERVICE" \
+    || { log "CRITICAL: rollback swap failed - $NAME needs a human (LAN ssh: $USR@$LAN)"; return 2; }
+  if verify "$oldv" 0 0; then log "ROLLED BACK cleanly to $oldv"; return 1; fi
+  log "CRITICAL: rollback did not verify - $NAME needs a human (LAN ssh: $USR@$LAN)"; return 2; }
+
+apply() {
+  local cur ts stg f want have out; cur=$(cur_ver)
+  if [ "$cur" = "$TARGET_VERSION" ] && live_shas_ok; then log "already at $TARGET_VERSION with bundle patches; verifying only"; verify "$TARGET_VERSION" 0 1 && return 0 || return 1; fi
+  precheck || return 3
+  ts=$(date +%Y%m%d_%H%M%S); stg="$DCU/stage/lib/node_modules/@wonderwhy-er/desktop-commander"
+  push_helpers || { log "ABORT (nothing changed): could not push helpers"; return 3; }
+  log "staging $TARGET_VERSION (npm install -g --prefix stage --ignore-scripts)"
+  R "rm -rf $DCU/stage && mkdir -p $DCU/stage && PUPPETEER_SKIP_DOWNLOAD=1 npm install -g --prefix $DCU/stage --ignore-scripts --no-audit --no-fund @wonderwhy-er/desktop-commander@$TARGET_VERSION >$DCU/stage.log 2>&1" \
+    || { log "ABORT (nothing changed): npm stage install failed (see $DCU/stage.log on node)"; return 3; }
+  [ "$(R "sed -n 's/.*\"version\": *\"\\([^\"]*\\)\".*/\\1/p' $stg/package.json | head -1" | tr -d '\r')" = "$TARGET_VERSION" ] || { log "ABORT (nothing changed): staged version != $TARGET_VERSION"; return 3; }
+  for f in command-manager config-manager terminal-manager; do
+    want=$(m PRISTINE_${f//-/_}); have=$(R "sha256sum $stg/dist/$f.js | cut -d' ' -f1" | tr -d '\r')
+    [ "$want" = "$have" ] || { log "ABORT (nothing changed): pristine $f.js sha $have != bundle base $want - patch stack not valid for this build"; return 3; }; done
+  R "for r in $stg/node_modules/@vscode/ripgrep-*/bin/rg $stg/node_modules/@vscode/ripgrep/bin/rg; do [ -x \$r ] && \$r --version >/dev/null 2>&1 && exit 0; done; exit 1" \
+    || { log "ABORT (nothing changed): ripgrep binary unavailable in stage"; return 3; }
+  R "cd $DCU/bundle/$TARGET_VERSION && cp -f command-manager.js config-manager.js terminal-manager.js handle-store.js $stg/dist/ && for f in command-manager config-manager terminal-manager handle-store; do node --check $stg/dist/\$f.js || exit 1; done" \
+    || { log "ABORT (nothing changed): overlay/syntax check failed"; return 3; }
+  for f in command-manager config-manager terminal-manager handle-store; do
+    want=$(m PATCHED_${f//-/_}); have=$(R "sha256sum $stg/dist/$f.js | cut -d' ' -f1" | tr -d '\r')
+    [ "$want" = "$have" ] || { log "ABORT (nothing changed): staged $f.js != bundle after overlay"; return 3; }; done
+  log "isolated canary of the staged build on :$CANARY_PORT (live service untouched)"
+  out=$(R "bash $DCU/staged_canary.sh $stg $CANARY_PORT $TARGET_VERSION $DCU/dc_mcp_probe.py" 2>&1 | tail -1) || { log "ABORT (nothing changed): staged canary failed: $out"; return 3; }
+  log "canary pass: $out"
+  sset OLDVER "$cur"; sset BACKUP "\$HOME/.dc-upgrade/backup-$ts"; sset NEW "$TARGET_VERSION"; sset AT "$(date -u +%FT%TZ)"
+  local bk; bk=$(sget BACKUP)
+  log "swapping module dir (old kept at $bk) and restarting $SERVICE"
+  R "set -e; mkdir -p $bk; mv $MOD $bk/desktop-commander; mv $stg $MOD; sudo -n systemctl restart $SERVICE" \
+    || { log "swap/restart command failed"; rollback; return $?; }
+  if verify "$TARGET_VERSION" 1 1; then log "UPGRADE OK ($cur -> $TARGET_VERSION); previous module kept at $bk on the node"; return 0; fi
+  rollback; return $?; }
+
+case "$MODE" in
+  --precheck) precheck; exit $? ;;
+  --apply)    apply; exit $? ;;
+  --verify)   verify "$TARGET_VERSION" 0 1; exit $? ;;
+  --rollback) rollback; exit $? ;;
+  *) echo "usage: dc-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>"; exit 64 ;;
+esac
