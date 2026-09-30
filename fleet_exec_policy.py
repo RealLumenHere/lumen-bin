@@ -274,6 +274,70 @@ def check_bench(node, tool, policy):
     return True, "policy:bench_tools", tool
 
 
+# --- peer verb (wq#3200): the ONE reviewed path to start a process on a second ---
+# node. `fleet-exec peer <node> <name>` runs EXACTLY policy.peer_cmds[node][name].argv
+# — no worker argv reaches the remote node at all, which is why this needs no change
+# to _SHELL_ESCAPE_BASENAMES (that set guards worker-chosen argv[0]; a peer entry's
+# argv is authored in fleet-exec-policy.yaml, PR-reviewed entry by entry) and no
+# weakening of THOR_HARDLOCK (same carve-out shape check_bench() already has: thor
+# stays fully denied unless the exact name was reviewed into peer_cmds[thor]).
+
+_PEER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _peer_entry_error(node, entry, policy):
+    """One reason string if the reviewed entry is malformed or violates an invariant,
+    else None. Fail closed: a bad entry is a deny, never a best-effort run."""
+    if not isinstance(entry, dict):
+        return "peer entry must be a mapping with argv + sha256"
+    argv = entry.get("argv")
+    if not isinstance(argv, list) or not argv or not all(
+            isinstance(a, str) and a for a in argv):
+        return "peer entry argv must be a non-empty list of non-empty strings"
+    for tok in argv:
+        if _METACHAR_RE.search(tok):
+            return f"peer entry argv element {tok!r} contains a shell metacharacter"
+    if not argv[0].startswith("/"):
+        return f"peer entry point {argv[0]!r} must be an absolute path"
+    if _basename(argv[0]) in _SHELL_ESCAPE_BASENAMES:
+        return (f"peer entry point basename {_basename(argv[0])!r} is an interpreter "
+                f"— pin a wrapper script instead; the sha256 must cover what runs")
+    for d in policy.get("copy_dirs", {}).get(node, []):
+        if argv[0] == d or argv[0].startswith(d.rstrip("/") + "/"):
+            return (f"peer entry point {argv[0]!r} is inside worker-writable "
+                    f"copy_dirs[{node}] ({d}) — a worker could copy over it")
+    sha = entry.get("sha256")
+    if not isinstance(sha, str) or not _PEER_SHA256_RE.match(sha):
+        return "peer entry sha256 must be 64 lowercase hex chars (sha256sum of argv[0])"
+    return None
+
+
+def check_peer(node, name, policy):
+    """(ok, rule, reason) — same tuple shape as every other check_*."""
+    entries = policy.get("peer_cmds", {}).get(node, {})
+    if not isinstance(entries, dict):
+        return False, "policy:peer_entry_invalid", f"peer_cmds[{node}] is not a mapping"
+    if (node in THOR_HARDLOCK or node in policy.get("never", {}).get("nodes", [])) \
+            and name not in entries:
+        return False, "policy:never_nodes", f"{node} allows no peer verb outside peer_cmds"
+    if name not in entries:
+        return False, "policy:peer_not_allowed", f"{name!r} not in peer_cmds[{node}]"
+    err = _peer_entry_error(node, entries[name], policy)
+    if err:
+        return False, "policy:peer_entry_invalid", err
+    return True, "policy:peer_cmds", name
+
+
+def peer_entry(node, name, policy):
+    """The validated entry dict for an ALLOWED (node, name), else None. The CLI calls
+    this only after check_peer() said yes; re-running the check here keeps a
+    time-of-check/time-of-use gap from ever executing an unvalidated entry."""
+    ok, _, _ = check_peer(node, name, policy)
+    if not ok:
+        return None
+    return policy["peer_cmds"][node][name]
+
+
 def audit_record(*, ticket, attempt, worker, node, verb, argv, decision, rule,
                   exit_code=None, elapsed_s=None, out_sha256=None, out_head=None,
                   ts=None, before=None, after=None, verified=None, grant_sha=None):

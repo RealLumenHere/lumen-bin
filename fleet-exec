@@ -5,11 +5,18 @@ foreman/research/WORKER_EXEC_CAPABILITY_GAP.md §2.4).
   fleet-exec run     <node> -- <cmd> [args...]
   fleet-exec copy    <node> <local-path> <remote-dir>
   fleet-exec restart <node> <unit> [restart|reload|start]   # default: restart
+  fleet-exec peer    <node> <name> [--timeout SEC]          # wq#3200 fixed-argv exec
   fleet-exec grant                                          # print this worker's grant
 
-v1 verbs only: run, copy, restart. sudo/bench/power are v2 (fleet_exec_policy.py
+v1 verbs: run, copy, restart, peer. sudo/bench/power are v2 (fleet_exec_policy.py
 already has their check_* functions so the policy matrix is provable now; this CLI
 just doesn't expose the subcommands yet).
+
+peer (wq#3200) is the one reviewed path to START a process on a second node: it
+executes EXACTLY policy.peer_cmds[<node>][<name>].argv — worker argv never reaches
+the remote node — and only after the entry-point file's sha256sum on the node
+matches the sha256 pinned in the policy entry. A replaced/tampered entry point is
+a deny before anything runs.
 
 Every verb: (1) grant file present/readable/sha256 matches FOREMAN_GRANT_SHA/not
 expired/ticket matches WQ_AGENT's claim; (2) node is a known fleet subject; (3)
@@ -439,6 +446,49 @@ def cmd_restart(args, grant, ticket, attempt, worker):
     sys.exit(1)
 
 
+def cmd_peer(args, grant, ticket, attempt, worker):
+    node, name = args.node, args.name
+    argv = [name]
+    policy = load_policy_or_die(ticket, attempt, worker, node, "peer", argv)
+    check_node_known(ticket, attempt, worker, node, "peer", argv)
+    ssh_grants = P.find_grants(grant, "ssh", node)
+    if not any("peer" in g.get("verbs", []) and name in g.get("peers", [])
+               for g in ssh_grants):
+        deny(ticket, attempt, worker, node, "peer", argv, "grant:no_ssh_peer",
+             f"no ssh grant for {node} with verb peer and peer name {name!r}")
+    ok, rule, reason = P.check_peer(node, name, policy)
+    if not ok:
+        deny(ticket, attempt, worker, node, "peer", argv, rule, reason)
+    entry = P.peer_entry(node, name, policy)
+    if entry is None:
+        deny(ticket, attempt, worker, node, "peer", argv, "policy:peer_entry_invalid",
+             f"peer entry for {name!r} failed re-validation")
+    remote_argv = entry["argv"]
+    t0 = time.time()
+    ssh = transport_guard(ticket, attempt, worker, node, "peer", argv, t0)
+    # Content pin: the sha256 in the reviewed entry must match what is on the node
+    # RIGHT NOW, or nothing runs. sha256sum here is broker-emitted argv (like
+    # restart's systemctl show), never worker argv.
+    probe = ssh(["sha256sum", remote_argv[0]], timeout=30)
+    actual = (probe.stdout or "").split()[0] if probe.stdout else ""
+    if probe.returncode != 0 or actual != entry["sha256"]:
+        deny(ticket, attempt, worker, node, "peer", argv, "peer:sha256_mismatch",
+             f"{remote_argv[0]} on {node}: sha256sum exited {probe.returncode}, "
+             f"got {actual[:16]!r}…, pinned {entry['sha256'][:16]!r}… — entry point "
+             f"absent or not the reviewed content")
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="peer", argv=remote_argv, decision="allow", rule=rule))
+    p = ssh(remote_argv, timeout=max(1, min(args.timeout, 3600)))
+    out = (p.stdout or "") + (p.stderr or "")
+    audit(P.audit_record(ticket=ticket, attempt=attempt, worker=worker, node=node,
+                          verb="peer", argv=remote_argv, decision="allow", rule=rule,
+                          exit_code=p.returncode, elapsed_s=time.time() - t0,
+                          out_sha256=P.sha256_bytes(out.encode()), out_head=out[:240]))
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    sys.exit(p.returncode)
+
+
 def cmd_grant(args, grant, ticket, attempt, worker):
     import json
     print(json.dumps(grant, indent=2, sort_keys=True))
@@ -462,6 +512,13 @@ def build_parser():
     rs.add_argument("unit")
     rs.add_argument("action", nargs="?", default="restart", choices=["restart", "reload", "start"])
 
+    pe = sub.add_parser("peer")
+    pe.add_argument("node")
+    pe.add_argument("name")
+    # A peer that must outlive this budget daemonizes in its own reviewed wrapper
+    # (setsid + exit 0); the broker never holds an unbounded ssh session open.
+    pe.add_argument("--timeout", type=int, default=90, metavar="SEC")
+
     sub.add_parser("grant")
     return ap
 
@@ -476,6 +533,7 @@ def main(argv=None):
         "run": cmd_run,
         "copy": cmd_copy,
         "restart": cmd_restart,
+        "peer": cmd_peer,
         "grant": cmd_grant,
     }[args.verb](args, grant, ticket, attempt, worker)
 

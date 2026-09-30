@@ -394,6 +394,105 @@ def test_bench_undeclared_node_denied():
 
 
 # ---------------------------------------------------------------------------
+# peer — wq#3200: fixed reviewed argv, sha256-pinned entry point, no worker argv
+# ---------------------------------------------------------------------------
+
+_SHA_OK = "ab" * 32  # shape-valid pin; the CLI compares it against sha256sum output
+
+PEER_POLICY = dict(POLICY, peer_cmds={
+    "thor": {
+        "bgblink-peer": {"argv": ["/home/thor/peers/bgblink/run.sh", "--port", "7777"],
+                         "sha256": _SHA_OK},
+        "bad-interp": {"argv": ["/usr/bin/node", "/home/thor/peers/x.js"],
+                       "sha256": _SHA_OK},
+        "bad-drop": {"argv": ["/home/thor/lumen-drop/run.sh"], "sha256": _SHA_OK},
+        "bad-relative": {"argv": ["run.sh"], "sha256": _SHA_OK},
+        "bad-meta": {"argv": ["/home/thor/peers/run.sh", "a;b"], "sha256": _SHA_OK},
+        "bad-sha": {"argv": ["/home/thor/peers/run.sh"], "sha256": "not-hex"},
+        "bad-shape": ["not", "a", "mapping"],
+    },
+    "isis": {
+        "ollama-peer": {"argv": ["/home/isis/peers/ollama/run.sh"], "sha256": _SHA_OK},
+    },
+})
+
+
+def test_peer_thor_allows_reviewed_entry():
+    ok, rule, _ = P.check_peer("thor", "bgblink-peer", PEER_POLICY)
+    assert ok, rule
+    assert rule == "policy:peer_cmds"
+
+
+def test_peer_thor_denies_unlisted_name():
+    ok, rule, _ = P.check_peer("thor", "anything-else", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:never_nodes"
+
+
+def test_peer_nonthor_denies_unlisted_name():
+    ok, rule, _ = P.check_peer("isis", "bgblink-peer", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_not_allowed"
+
+
+def test_peer_nonthor_allows_reviewed_entry():
+    ok, rule, _ = P.check_peer("isis", "ollama-peer", PEER_POLICY)
+    assert ok, rule
+
+
+def test_peer_no_section_denies_everything():
+    ok, rule, _ = P.check_peer("isis", "ollama-peer", POLICY)
+    assert not ok
+
+
+def test_peer_interpreter_entry_point_denied():
+    ok, rule, reason = P.check_peer("thor", "bad-interp", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_entry_invalid"
+    assert "interpreter" in reason
+
+
+def test_peer_entry_point_in_copy_dir_denied():
+    # copy_dirs is worker-writable staging; a peer rooted there would let a worker
+    # copy over the pinned file between review and run.
+    ok, rule, reason = P.check_peer("thor", "bad-drop", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_entry_invalid"
+    assert "copy_dirs" in reason
+
+
+def test_peer_relative_entry_point_denied():
+    ok, rule, _ = P.check_peer("thor", "bad-relative", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_entry_invalid"
+
+
+def test_peer_metachar_in_argv_denied():
+    ok, rule, _ = P.check_peer("thor", "bad-meta", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_entry_invalid"
+
+
+def test_peer_bad_sha_denied():
+    ok, rule, _ = P.check_peer("thor", "bad-sha", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_entry_invalid"
+
+
+def test_peer_nonmapping_entry_denied():
+    ok, rule, _ = P.check_peer("thor", "bad-shape", PEER_POLICY)
+    assert not ok
+    assert rule == "policy:peer_entry_invalid"
+
+
+def test_peer_entry_returns_validated_entry_or_none():
+    entry = P.peer_entry("thor", "bgblink-peer", PEER_POLICY)
+    assert entry["argv"][0] == "/home/thor/peers/bgblink/run.sh"
+    assert P.peer_entry("thor", "bad-interp", PEER_POLICY) is None
+    assert P.peer_entry("thor", "unlisted", PEER_POLICY) is None
+
+
+# ---------------------------------------------------------------------------
 # load_policy — fail-closed on unreadable/malformed file
 # ---------------------------------------------------------------------------
 

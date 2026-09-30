@@ -434,3 +434,88 @@ def test_every_audit_line_carries_the_grant_sha(env, monkeypatch, tmp_path, loca
         fleet_exec.main(["restart", "isis", "ollama"])
     records = read_jsonl(env["audit_path"])
     assert records and all(r["grant_sha"] == sha for r in records)
+
+
+# ---------------------------------------------------------------------------
+# peer — wq#3200: fixed reviewed argv, sha256-pinned entry point
+# ---------------------------------------------------------------------------
+
+PEER_SHA = "ab" * 32
+PEER_ARGV = ["/home/thor/peers/bgblink/run.sh", "--port", "7777"]
+PEER_POLICY_YAML = POLICY_YAML + (
+    "peer_cmds:\n"
+    "  thor:\n"
+    "    bgblink-peer:\n"
+    "      argv: [/home/thor/peers/bgblink/run.sh, --port, \"7777\"]\n"
+    "      sha256: " + PEER_SHA + "\n"
+)
+
+
+def peer_policy(env):
+    (env["tmp_path"] / "policy.yaml").write_text(PEER_POLICY_YAML)
+
+
+def peer_grant(monkeypatch, tmp_path, node="thor", peers=("bgblink-peer",)):
+    return set_grant_env(monkeypatch, tmp_path, grants=[
+        {"kind": "ssh", "node": node, "verbs": ["peer"], "peers": list(peers)}])
+
+
+def fake_peer_node(*, sha=PEER_SHA, sha_rc=0, exec_rc=0, exec_out="peer up\n"):
+    calls = []
+
+    def fake_run_ssh(node, remote_argv, **kw):
+        calls.append(remote_argv)
+        if remote_argv[:1] == ["sha256sum"]:
+            return Result(returncode=sha_rc, stdout=f"{sha}  {remote_argv[1]}\n")
+        return Result(returncode=exec_rc, stdout=exec_out)
+
+    return fake_run_ssh, calls
+
+
+def test_peer_denied_without_peer_grant(env, monkeypatch, tmp_path):
+    peer_policy(env)
+    set_grant_env(monkeypatch, tmp_path)  # run-only grant for isis
+    with pytest.raises(SystemExit) as e:
+        fleet_exec.main(["peer", "thor", "bgblink-peer"])
+    assert e.value.code == 2
+    records = read_jsonl(env["audit_path"])
+    assert records[-1]["rule"] == "grant:no_ssh_peer"
+
+
+def test_peer_thor_unlisted_name_denied_by_policy(env, monkeypatch, tmp_path):
+    peer_policy(env)
+    peer_grant(monkeypatch, tmp_path, peers=("some-other-peer",))
+    with pytest.raises(SystemExit) as e:
+        fleet_exec.main(["peer", "thor", "some-other-peer"])
+    assert e.value.code == 2
+    records = read_jsonl(env["audit_path"])
+    assert records[-1]["rule"] == "policy:never_nodes"
+
+
+def test_peer_sha_mismatch_denies_before_exec(env, monkeypatch, tmp_path):
+    peer_policy(env)
+    peer_grant(monkeypatch, tmp_path)
+    ssh, calls = fake_peer_node(sha="cd" * 32)
+    monkeypatch.setattr(fleet_exec, "run_ssh", ssh)
+    with pytest.raises(SystemExit) as e:
+        fleet_exec.main(["peer", "thor", "bgblink-peer"])
+    assert e.value.code == 2
+    records = read_jsonl(env["audit_path"])
+    assert records[-1]["rule"] == "peer:sha256_mismatch"
+    assert calls == [["sha256sum", PEER_ARGV[0]]]  # probe only, never the entry point
+
+
+def test_peer_success_runs_exactly_the_pinned_argv(env, monkeypatch, tmp_path, capsys):
+    peer_policy(env)
+    peer_grant(monkeypatch, tmp_path)
+    ssh, calls = fake_peer_node()
+    monkeypatch.setattr(fleet_exec, "run_ssh", ssh)
+    with pytest.raises(SystemExit) as e:
+        fleet_exec.main(["peer", "thor", "bgblink-peer"])
+    assert e.value.code == 0
+    assert calls == [["sha256sum", PEER_ARGV[0]], PEER_ARGV]
+    assert "peer up" in capsys.readouterr().out
+    records = read_jsonl(env["audit_path"])
+    allows = [r for r in records if r["decision"] == "allow" and r["verb"] == "peer"]
+    assert len(allows) == 2  # §2.4.6 style: one line before exec, one after
+    assert allows[-1]["exit"] == 0 and allows[-1]["argv"] == PEER_ARGV
