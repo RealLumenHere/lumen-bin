@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""litellm-completion-probe (wq#3169) — send one real chat completion per
+api_base host in litellm_config.yaml, so a dead rung or a key/quota failure
+pages before a real request hits it, instead of only after.
+
+WHY THIS EXISTS: lumen-model-check (wq#2903-era) only checks that a model ID
+is present in /v1/models — it never sends a completion. That misses a rung
+whose api_base is unreachable, whose upstream key expired, or whose quota is
+exhausted; those stay invisible until a live caller gets the failure. This
+is the completion-level probe that was missing, productionized from the
+one-shot audit script at /home/lumen/scratch/audit_20260929/probe2.py.
+
+DESIGN:
+  - ONE model probed per api_base host (not every model — a dead host fails
+    every model on it identically, so probing more just burns quota).
+  - Embed/rerank/whisper/tts deployments are skipped: chat completions is
+    the wrong call shape for them.
+  - Master key is read from agent/.env with a regex, used only in the
+    Authorization header, never printed or logged (instinct 4).
+  - Edge-triggered alerting, same contract as litellm-auth-alert (wq#911)
+    and health_check_failure_alert (wq#1295): aq add + urgent ntfy on
+    clear->breach, aq bump (no re-ntfy) while the breach persists, low-pri
+    ntfy on breach->clear. Constant re-alerting trains you to ignore pages.
+  - Nothing is printed on a normal run; --print emits a one-line summary
+    (for manual/test invocation).
+
+Deploy: see install.sh (script -> /home/lumen/bin, units -> systemd, timer
+runs this every 30 min). The .service's ExecStartPost writes the
+lumen-cron-stamp dead-man's-switch file so a stopped timer alarms sideways
+via lumen-cron-deadman instead of silently going stale.
+"""
+import argparse
+import collections
+import concurrent.futures as cf
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from urllib.parse import urlparse
+
+import yaml
+
+ENV_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_ENV", "/home/lumen/agent/.env")
+CONFIG_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_CONFIG", "/home/lumen/agent/litellm_config.yaml")
+GATEWAY_URL = os.environ.get("LITELLM_COMPLETION_PROBE_URL", "http://localhost:4000/v1/chat/completions")
+STATE_DIR = pathlib.Path(os.environ.get("LITELLM_COMPLETION_PROBE_STATE_DIR", "/home/lumen/agents/litellm-completion-probe"))
+NTFY = os.environ.get("LITELLM_COMPLETION_PROBE_NTFY", "/home/lumen/bin/ntfy-send")
+NTFY_TOPIC = os.environ.get("LITELLM_COMPLETION_PROBE_TOPIC", "lumen-alerts")
+AQ = os.environ.get("LITELLM_COMPLETION_PROBE_AQ", "/home/lumen/bin/aq")
+TIMEOUT_S = int(os.environ.get("LITELLM_COMPLETION_PROBE_TIMEOUT_S", "60"))
+MAX_TOKENS = int(os.environ.get("LITELLM_COMPLETION_PROBE_MAX_TOKENS", "300"))
+WORKERS = int(os.environ.get("LITELLM_COMPLETION_PROBE_WORKERS", "6"))
+SKIP_SUBSTRINGS = ("embed", "rerank", "whisper", "tts")
+
+Rung = collections.namedtuple("Rung", "host model_name")
+
+
+def read_master_key(env_path: str) -> str:
+    text = pathlib.Path(env_path).read_text()
+    m = re.search(r"LITELLM_MASTER_KEY=(sk-[A-Za-z0-9_-]+)", text)
+    if not m:
+        raise RuntimeError("LITELLM_MASTER_KEY not found in " + env_path)
+    return m.group(1)
+
+
+def one_rung_per_host(config_path: str) -> list:
+    """One (host, model_name) per distinct api_base host, skipping deployments
+    a chat-completion probe can't exercise. Host falls back to the model's
+    provider prefix for models with no explicit api_base (matches
+    /home/lumen/scratch/audit_20260929/probe2.py's grouping)."""
+    cfg = yaml.safe_load(pathlib.Path(config_path).read_text())
+    by_host = collections.OrderedDict()
+    for m in cfg.get("model_list", []):
+        lp = m.get("litellm_params", {}) or {}
+        model_id = str(lp.get("model", ""))
+        if any(s in model_id for s in SKIP_SUBSTRINGS):
+            continue
+        host = urlparse(str(lp.get("api_base", ""))).netloc or model_id.split("/")[0]
+        by_host.setdefault(host, m["model_name"])
+    return [Rung(host, name) for host, name in by_host.items()]
+
+
+def probe_one(key: str, rung: Rung) -> dict:
+    body = json.dumps({
+        "model": rung.model_name,
+        "messages": [{"role": "user", "content": "Reply with the single word: pong"}],
+        "max_tokens": MAX_TOKENS,
+    }).encode()
+    req = urllib.request.Request(
+        GATEWAY_URL, body,
+        {"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+            json.load(resp)
+        return {"host": rung.host, "model": rung.model_name, "ok": True,
+                "elapsed_s": round(time.time() - t0, 1), "reason": ""}
+    except Exception as e:  # noqa: BLE001 - report any failure shape as a probe FAIL
+        detail = ""
+        try:
+            detail = e.read().decode()[:200]  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        reason = (str(e)[:120] + " " + detail).strip().replace("\n", " ")
+        return {"host": rung.host, "model": rung.model_name, "ok": False,
+                "elapsed_s": round(time.time() - t0, 1), "reason": reason}
+
+
+def run_probes(key: str, rungs: list) -> list:
+    with cf.ThreadPoolExecutor(WORKERS) as ex:
+        return [f.result() for f in cf.as_completed([ex.submit(probe_one, key, r) for r in rungs])]
+
+
+def _state_path() -> pathlib.Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return STATE_DIR / "state.json"
+
+
+def _load_state(path: pathlib.Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _notify(priority: str, title: str, message: str) -> None:
+    if not os.path.exists(NTFY):
+        return
+    try:
+        subprocess.run([NTFY, "-t", NTFY_TOPIC, "-p", priority, "-T", title, "--quiet", message],
+                        timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _aq_add(key: str, title: str, message: str) -> None:
+    if not os.path.exists(AQ):
+        return
+    try:
+        subprocess.run([AQ, "add", "litellm-completion", key, title, message],
+                        timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def apply_results(results: list) -> dict:
+    """Edge-triggered aq/ntfy: alert once per host on clear->breach, bump
+    (no re-ntfy) while breached, low-pri notice on breach->clear. Returns the
+    new state dict (caller persists it)."""
+    path = _state_path()
+    state = _load_state(path)
+    now_failed = {r["host"]: r for r in results if not r["ok"]}
+    for host, r in now_failed.items():
+        was_failed = state.get(host, {}).get("failed", False)
+        title = f"LiteLLM completion probe: {host} unreachable"
+        msg = f"model={r['model']} elapsed={r['elapsed_s']}s reason={r['reason']}"
+        _aq_add(host, title, msg)
+        if not was_failed:
+            _notify("urgent", title, msg)
+    for r in results:
+        host = r["host"]
+        if r["ok"] and state.get(host, {}).get("failed", False):
+            _notify("low", f"LiteLLM completion probe: {host} recovered",
+                     f"model={r['model']} elapsed={r['elapsed_s']}s")
+    new_state = {r["host"]: {"failed": not r["ok"], "checked_at": int(time.time())} for r in results}
+    return new_state
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--print", action="store_true", dest="do_print")
+    args = parser.parse_args()
+
+    key = read_master_key(ENV_PATH)
+    rungs = one_rung_per_host(CONFIG_PATH)
+    results = run_probes(key, rungs)
+    new_state = apply_results(results)
+    path = _state_path()
+    try:
+        path.write_text(json.dumps(new_state))
+    except Exception:
+        pass
+
+    if args.do_print:
+        fails = [r for r in results if not r["ok"]]
+        print(f"probed {len(results)} hosts, {len(fails)} failing: "
+              + ",".join(r["host"] for r in fails))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
