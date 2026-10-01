@@ -1,6 +1,8 @@
 #!/bin/bash
 # rotate-fleet-pw.sh — serialized fleet sudo-password rotation (wq#304 plan section 2, staged wq#305).
-# FRANK RUNS THIS. Invocation:  bash /home/lumen/bin/rotate-fleet-pw.sh [--include-bench] [--revert NODE] [--list]
+# FRANK RUNS THIS. Invocation:  bash /home/lumen/bin/rotate-fleet-pw.sh [--include-bench] [--only N[,N]] [--new-file F] [--old-file F] [--revert NODE] [--list]
+# Catch-up for stragglers (wq#2474): --only khepri,wadjet --new-file /home/lumen/.fleet_pw --old-file /home/lumen/secrets/.fleet_pw.old-pending
+#   --only/--old-file runs NEVER overwrite the old-pw file at the end (other nodes may still need it).
 # Reads NEW pw from /home/lumen/secrets/.new_fleet_pw, OLD from /home/lumen/.fleet_pw.
 # The password value NEVER appears in argv, xtrace, or any echoed command line:
 #  - set +x enforced; values live only in shell variables inside this process
@@ -29,14 +31,28 @@ FLEET_INV=${FLEET_INV:-/home/lumen/bin/fleet-inv}
 # Bench boxes (khepri) join only with --include-bench (alias --include-khepri; wq#304 section
 # 1.2: excluded until audited).   --list prints the resolved table and exits (no secrets read).
 STATUSES=active,standby
-case "${1:-}" in
-  --include-khepri|--include-bench) STATUSES=active,standby,bench; shift ;;
-esac
+ONLY=""; CATCHUP=0
+while :; do
+  case "${1:-}" in
+    --include-khepri|--include-bench) STATUSES=active,standby,bench; shift ;;
+    --only)     ONLY="${2:?usage: --only NODE[,NODE...]}"; CATCHUP=1; shift 2 ;;
+    --new-file) NEW_F="${2:?usage: --new-file FILE}"; shift 2 ;;
+    --old-file) OLD_F="${2:?usage: --old-file FILE}"; CATCHUP=1; shift 2 ;;
+    *) break ;;
+  esac
+done
 ROSTER=$("$FLEET_INV" ssh-list --all --status "$STATUSES" --order maint --self LOCAL --fields name,user,host,ssh_key) \
   || { echo "FATAL: fleet-inv ssh-list failed (inventory unreadable?) — no node table, nothing flipped"; exit 1; }
 [ -n "$ROSTER" ] || { echo "FATAL: empty roster from inventory — nothing flipped"; exit 1; }
 # node table: name|user|host|keyfile
 NODES=$(printf '%s\n' "$ROSTER" | awk -F'\t' -v k="$KEY" '{ kf=($4=="-")?k:$4; print $1"|"$2"|"$3"|"kf }')
+if [ -n "$ONLY" ]; then  # keep roster (blast-radius) order; every requested name must resolve or nothing runs
+  for w in ${ONLY//,/ }; do
+    printf '%s\n' "$NODES" | awk -F'|' -v n="$w" '$1==n{f=1} END{exit !f}' \
+      || { echo "FATAL: --only node '$w' not in resolved roster (statuses=$STATUSES) — nothing flipped"; exit 1; }
+  done
+  NODES=$(printf '%s\n' "$NODES" | awk -F'|' -v want=",${ONLY}," 'index(want, "," $1 ",")')
+fi
 if [ "${1:-}" = "--list" ]; then printf '%s\n' "$NODES"; exit 0; fi
 
 [ -r "$NEW_F" ] || { echo "FATAL: $NEW_F missing/unreadable"; exit 1; }
@@ -110,8 +126,12 @@ EOF2
 if [ -z "$REVERT_NODE" ]; then
   echo ""
   echo "ALL GREEN:$FLIPPED"
-  echo "Finalizing: /home/lumen/.fleet_pw <- new value (feeds fleet-provision-ssh)"
-  ( umask 077; printf '%s' "$NEW" > "$OLD_F" )
-  echo "DONE. Next (manual, per plan): leak scrub (section 3), VW seed (section 4), creds-file + state updates (section 5)."
-  echo "Do NOT shred $NEW_F until the VW cipher is confirmed (wq#306)."
+  if [ "$CATCHUP" = 1 ]; then
+    echo "catch-up run: $OLD_F left untouched (nodes outside --only may still hold it); shred it only after the last straggler is done"
+  else
+    echo "Finalizing: /home/lumen/.fleet_pw <- new value (feeds fleet-provision-ssh)"
+    ( umask 077; printf '%s' "$NEW" > "$OLD_F" )
+    echo "DONE. Next (manual, per plan): leak scrub (section 3), VW seed (section 4), creds-file + state updates (section 5)."
+    echo "Do NOT shred $NEW_F until the VW cipher is confirmed (wq#306)."
+  fi
 fi
