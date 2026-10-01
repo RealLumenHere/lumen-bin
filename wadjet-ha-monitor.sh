@@ -162,12 +162,47 @@ if [ "$CUR_PRIMARY" = "wadjet" ]; then
 fi
 
 # ---- normal: primary is maat ----
+# wq#2956 fix 2: primary=maat while the standby target is READ-WRITE means two writable primaries (the
+# 2026-08-31 / ISSUE-LOG 847 class). Read-only check every 5 min; alert once per episode, clear on recovery.
+SB_STAMP="$HA_DIR/.splitbrain_check"
+SB_ALERT="$HA_DIR/.splitbrain_alerted"
+check_split_brain(){
+  if [ -e "$SB_STAMP" ] && [ $(( $(date +%s) - $(stat -c %Y "$SB_STAMP") )) -lt 300 ]; then return 0; fi
+  touch "$SB_STAMP"
+  local out
+  out=$(timeout 8 ssh "${SSH_OPTS[@]}" "$WADJET_SSH" \
+        "sudo -n runuser -u postgres -- psql -tAc 'SELECT pg_is_in_recovery()'" 2>/dev/null | tr -d '[:space:]')
+  case "$out" in
+    f) if [ ! -e "$SB_ALERT" ]; then
+         if [ "$MODE" = "--dry-run" ]; then log "DRY-RUN: WOULD alert split-brain (standby target reads pg_is_in_recovery=f while primary=maat)"; return 0; fi
+         date +%s > "$SB_ALERT"
+         log "SPLIT-BRAIN: primary=maat but standby target $WADJET_SSH reports pg_is_in_recovery=f"
+         notify "VAULT SPLIT-BRAIN" "urgent" "primary=maat but the standby target is read-write (pg_is_in_recovery=f). Do not fail over; investigate."
+         "${AQ_BIN:-/home/lumen/bin/aq}" add vault-ha splitbrain "Vault split-brain: standby read-write while primary=maat" "pg_is_in_recovery=f on $WADJET_SSH" >/dev/null 2>&1 || true
+       fi ;;
+    t) if [ -e "$SB_ALERT" ]; then rm -f "$SB_ALERT"; log "split-brain cleared: standby back in recovery"; fi ;;
+    *) : ;;  # unreachable/unknown is not evidence either way
+  esac
+}
 if probe_maat_ok; then
   echo 0 > "$COUNT_FILE"
+  check_split_brain
   exit 0
 fi
 
-N=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+# Failures must be CONSECUTIVE probes. COUNT_FILE's mtime is the last probe time (written on every
+# probe, ok or fail); a counter older than 4 timer intervals is a previous incident's residue. 2026-08-31
+# (ISSUE-LOG 847): the counter sat at 14 across a 4h40m monitor gap, 3 fresh failures made it 17, and a
+# healthy Ma'at was failed over. Reset instead of carrying it.
+N_PREV=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+if [ -e "$COUNT_FILE" ]; then
+  AGE=$(( $(date +%s) - $(stat -c %Y "$COUNT_FILE") ))
+  if [ "$AGE" -gt 120 ]; then
+    log "stale fail counter (${N_PREV}, ${AGE}s old) discarded; counting this probe as 1"
+    N_PREV=0
+  fi
+fi
+N=$(( N_PREV + 1 ))
 echo "$N" > "$COUNT_FILE"
 log "Ma'at probe FAIL ($N/$FAIL_THRESHOLD)"
 
