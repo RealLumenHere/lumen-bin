@@ -19,6 +19,11 @@ prerelease GitHub Release (bNNNN) and has no real release since v0.2.0, so
 /releases/latest (which filters out prereleases) fell back to that stale
 v0.2.0 tag; gh_latest_tag() reads /releases (newest-first, prereleases
 included) and matches the bNNNN pattern instead.
+
+wq#3282: also flags enabled services that are plain INACTIVE. `systemctl --failed` is blind to a
+unit that was stopped cleanly (a BindsTo= unit whose dependency restarted): thoth's sonarr, radarr
+and prowlarr sat down for three weeks because only bazarr, which timed out stopping, went failed.
+See enabled_inactive() for what is excluded and known-idle.json for the per-node allowlist.
 """
 import json, os, re, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone
@@ -125,6 +130,60 @@ def gh_latest_tag(repo, pattern=None):
         return name
     return None
 
+# wq#3282: enabled service units that are not running and not failed.
+ENABLED_INACTIVE_CMD = (
+    "en=$(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null"
+    " | awk '{print $1}' | grep -v '@'); "
+    "trig=$(systemctl list-unit-files --type=timer,socket --state=enabled --no-legend 2>/dev/null"
+    " | awk '{print $1}' | sed 's/\\.\\(timer\\|socket\\)$//' | sort -u | tr '\\n' ' '); "
+    "echo \"#TRIGGERS $trig\"; "
+    "[ -n \"$en\" ] && systemctl show $en --no-pager "
+    "-p Id -p LoadState -p ActiveState -p Type -p RemainAfterExit -p ConditionResult 2>/dev/null; true")
+KNOWN_IDLE_F = os.path.join(OUT_DIR, "known-idle.json")  # {"<node>": ["unit.service", ...], "*": [...]}
+
+
+def load_known_idle():
+    try:
+        return json.load(open(KNOWN_IDLE_F))
+    except Exception:
+        return {}
+
+
+def enabled_inactive(raw, idle=()):
+    """Parse ENABLED_INACTIVE_CMD output -> sorted unit names that are enabled but sitting
+    inactive. Left out on purpose: failed units (item 6 owns those), oneshots without
+    RemainAfterExit (inactive is their normal state), units a timer or socket starts on demand,
+    units whose Condition* check says skip (ConditionResult=no), and the known-idle allowlist."""
+    triggered, blocks, cur = set(), [], {}
+    for line in raw.splitlines():
+        if line.startswith("#TRIGGERS"):
+            triggered = set(line.split()[1:])
+            continue
+        if not line.strip():
+            if cur:
+                blocks.append(cur)
+                cur = {}
+            continue
+        k, _, v = line.partition("=")
+        cur[k] = v
+    if cur:
+        blocks.append(cur)
+    out = []
+    for b in blocks:
+        uid = b.get("Id", "")
+        if not uid or b.get("LoadState") != "loaded" or b.get("ActiveState") != "inactive":
+            continue
+        if b.get("Type") == "oneshot" and b.get("RemainAfterExit") != "yes":
+            continue
+        if b.get("ConditionResult") == "no":
+            continue
+        base = uid[:-len(".service")] if uid.endswith(".service") else uid
+        if base in triggered or uid in idle:
+            continue
+        out.append(uid)
+    return sorted(out)
+
+
 def probe_node(node):
     """All read-only per-node probes. Returns dict; 'unreachable' on SSH fail."""
     d = {"node": node}
@@ -177,6 +236,14 @@ def probe_node(node):
         if toks:
             fails.append(toks[0])
     d["failed_units"] = fails
+    # 7. wq#3282 enabled-but-inactive (the stopped-by-dependency class that --failed cannot see)
+    idle_all = load_known_idle()
+    idle = set(idle_all.get("*", [])) | set(idle_all.get(node, []))
+    rc, out = node_sh(node, ENABLED_INACTIVE_CMD, 60)
+    if rc == 0 and "#TRIGGERS" in out:
+        d["enabled_inactive"] = enabled_inactive(out, idle)
+    else:
+        d["enabled_inactive_err"] = (out or f"rc={rc}")[:120]
     return d
 
 def probe_apps():
@@ -263,12 +330,12 @@ def build_report(nodes, apps, drift, prev):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent, action = [], []
     L = [f"# Fleet update check — {now}", ""]
-    L.append("| node | apt sec | apt other | reboot debt | stuck pkg | fwupd | failed units |")
-    L.append("|---|---|---|---|---|---|---|")
+    L.append("| node | apt sec | apt other | reboot debt | stuck pkg | fwupd | failed units | enabled-but-inactive |")
+    L.append("|---|---|---|---|---|---|---|---|")
     for n in sorted(nodes):
         d = nodes[n]
         if "unreachable" in d:
-            L.append(f"| {n} | UNREACHABLE | | | | | |")
+            L.append(f"| {n} | UNREACHABLE | | | | | | |")
             action.append(f"{n}: unreachable")
             continue
         stuck = ",".join(d.get("stuck_pkg_procs", [])) or "-"
@@ -280,13 +347,23 @@ def build_report(nodes, apps, drift, prev):
         new_fu = set(d.get("failed_units", [])) - prev_fu
         if new_fu:
             urgent.append(f"{n}: NEW failed units: {','.join(new_fu)}")
+        ei = d.get("enabled_inactive")
+        ei_s = ",".join(ei) if ei else ("PROBE-FAILED" if "enabled_inactive_err" in d else "-")
+        if "enabled_inactive_err" in d:
+            action.append(f"{n}: enabled-but-inactive probe failed: {d['enabled_inactive_err']}")
+        prev_ei = set(prev.get("nodes", {}).get(n, {}).get("enabled_inactive", []))
+        new_ei = set(ei or []) - prev_ei
+        if new_ei:
+            urgent.append(f"{n}: NEW enabled-but-inactive units: {','.join(sorted(new_ei))}")
+        for u in sorted(set(ei or []) - new_ei):
+            action.append(f"{n}: {u} enabled but inactive (add to known-idle.json if intended)")
         if d.get("apt_security", 0) > 0:
             action.append(f"{n}: {d['apt_security']} security pkgs "
                           f"({','.join(d.get('apt_sec_pkgs', [])[:5])})")
         if isinstance(rb, float) and rb > 14:
             action.append(f"{n}: reboot debt {rb}d")
         L.append(f"| {n} | {d.get('apt_security',0)} | {d.get('apt_other',0)} "
-                 f"| {rb} | {stuck} | {d.get('fwupd_pending','-')} | {fu} |")
+                 f"| {rb} | {stuck} | {d.get('fwupd_pending','-')} | {fu} | {ei_s} |")
     # app drift table (rank 1-4 gaps escalate)
     L += ["", "## App versions vs upstream latest", ""]
     lat = apps.get("latest", {})
