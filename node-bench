@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""node-bench: llama-bench a fleet node over SSH, collect, and ingest into lumen_state.
+
+wq#3255. Built for the M70q Gen 5 bench-on-arrival (16GB single stick vs 2x16 dual
+channel) but works for any provisioned node that is in lumen_state.
+
+  node-bench <node> run     --tag single16 [--dry-run] [--force-busy] [--models qwen3-8b,qwen3-30b-a3b]
+  node-bench <node> status  --tag single16
+  node-bench <node> collect --tag single16 [--ingest]
+  node-bench selftest
+
+Rules baked in:
+  * user and tailscale ip come from lumen_state, never hardcoded. A node that is not in
+    lumen_state is refused (provision it first).
+  * never runs on lumen itself.
+  * refuses a busy node (load1 > 2.0) unless --force-busy.
+  * skips a model that cannot fit in RAM (30B-A3B Q4_K_M is 18.6GB, so it is skipped on a 16GB box).
+  * the benchmark runs detached on the node; run/status/collect each return in seconds.
+  * results land in /home/lumen/scratch/bench/<node>/<tag>/ ; ingest is explicit (--ingest).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+STATE = "/home/lumen/minerva/lumen_state.py"
+REGEN = "/home/lumen/bin/state-regen"
+OUT_ROOT = Path("/home/lumen/scratch/bench")
+LLAMA_REPO = "https://github.com/ggml-org/llama.cpp"
+BUSY_LOAD1 = 2.0
+
+# Sizes and sha256 checked against the Hugging Face API on 2026-09-30.
+MODELS = {
+    "qwen3-8b": {
+        "repo": "Qwen/Qwen3-8B-GGUF",
+        "file": "Qwen3-8B-Q4_K_M.gguf",
+        "size": 5027783488,
+        "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+        "threads": [6, 14],
+        "short": "qwen3_8b_q4km",
+    },
+    "qwen3-30b-a3b": {
+        "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+        "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+        "size": 18556685824,
+        "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+        "threads": [14],
+        "short": "qwen3_30b_a3b_q4km",
+    },
+}
+
+
+def die(msg, code=2):
+    print(f"node-bench: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- node resolution
+def parse_state(text, node):
+    got = {}
+    for line in text.splitlines():
+        m = re.match(rf"^\s*{re.escape(node)}\.(user|tailscale_ip)\s*=\s*(\S+)", line)
+        if m:
+            got[m.group(1)] = m.group(2)
+    return got
+
+
+def resolve(node):
+    if node.lower() == "lumen":
+        die("refusing to benchmark lumen: it is the production control plane")
+    out = subprocess.run(["python3", STATE, "current", node], capture_output=True, text=True, timeout=60).stdout
+    got = parse_state(out, node)
+    if "user" not in got or "tailscale_ip" not in got:
+        die(f"{node} has no user/tailscale_ip in lumen_state. Provision it first (lumen-fleet-provisioning SOP).")
+    return got["user"], got["tailscale_ip"]
+
+
+def ssh(user, ip, script, timeout=60):
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes",
+           f"{user}@{ip}", "bash", "-s"]
+    return subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=timeout)
+
+
+# ---------------------------------------------------------------- probe
+PROBE = r"""
+echo "MEMKB=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+echo "LOAD1=$(cut -d' ' -f1 /proc/loadavg)"
+echo "NPROC=$(nproc)"
+echo "DISKFREE_GB=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc 0-9)"
+echo "CPU=$(lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2);print $2}')"
+echo "AVX2=$(grep -c -w avx2 /proc/cpuinfo | head -1)"
+echo "AVX512=$(grep -c -w avx512f /proc/cpuinfo | head -1)"
+if sudo -n true 2>/dev/null; then
+  echo "DIMMS=$(sudo -n dmidecode -t memory | grep -E '^\s+Size: [0-9]' | wc -l)"
+  echo "DIMM_SPEED=$(sudo -n dmidecode -t memory | awk -F: '/^[ \t]+Configured Memory Speed: [0-9]/{gsub(/^ +/,"",$2);print $2}' | sort -u | tr '\n' ',' )"
+else
+  echo "DIMMS=unknown"
+  echo "DIMM_SPEED=unknown"
+fi
+for t in git cmake g++ curl sha256sum; do command -v $t >/dev/null || echo "MISSING=$t"; done
+[ -x "$HOME/llama.cpp/build/bin/llama-bench" ] && echo "LLAMA=present" || echo "LLAMA=absent"
+for f in @FILES@; do [ -f "$HOME/models/$f" ] && echo "HAVE=$f"; done
+"""
+
+
+def probe(user, ip):
+    files = " ".join(m["file"] for m in MODELS.values())
+    r = ssh(user, ip, PROBE.replace("@FILES@", files))
+    if r.returncode != 0:
+        return None, r.stderr.strip()[-300:]
+    info = {"missing": [], "have": []}
+    for line in r.stdout.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k == "MISSING":
+            info["missing"].append(v)
+        elif k == "HAVE":
+            info["have"].append(v)
+        else:
+            info[k] = v.strip()
+    return info, ""
+
+
+# ---------------------------------------------------------------- planning
+def plan(info, wanted, threads_override=None, assume_mem_gb=None):
+    """Return (items, skipped, warnings). Pure function so it can be tested without a node."""
+    mem_kb = int(info["MEMKB"]) if info.get("MEMKB") else int(assume_mem_gb * 1024 * 1024)
+    nproc = int(info.get("NPROC", 0) or 0)
+    items, skipped, warns = [], [], []
+    for key in wanted:
+        m = MODELS[key]
+        need = m["size"] * 1.15 + 1.5 * 1024**3
+        if need > mem_kb * 1024:
+            skipped.append((key, f"needs ~{need / 1024**3:.1f} GiB, node has {mem_kb / 1024 / 1024:.1f} GiB"))
+            continue
+        threads = threads_override or m["threads"]
+        if nproc:
+            kept = [t for t in threads if t <= nproc]
+            if len(kept) != len(threads):
+                warns.append(f"{key}: dropped thread counts above nproc={nproc}")
+            threads = kept
+        if not threads:
+            skipped.append((key, "no usable thread count"))
+            continue
+        items.append({"key": key, "threads": threads, **m})
+    return items, skipped, warns
+
+
+def tag_warning(tag, dimms):
+    if dimms in (None, "unknown"):
+        return "could not read dmidecode (sudo -n failed); channel config is unverified"
+    n = int(dimms)
+    if re.search(r"single|1x|one", tag, re.I) and n > 1:
+        return f"tag says single but {n} DIMMs are populated"
+    if re.search(r"dual|2x|two", tag, re.I) and n < 2:
+        return f"tag says dual but only {n} DIMM populated"
+    return None
+
+
+# ---------------------------------------------------------------- remote runner
+RUNNER = r"""#!/usr/bin/env bash
+set -u
+D="$HOME/bench/@TAG@"
+mkdir -p "$D" "$HOME/models"
+cd "$D" || exit 1
+exec >>run.log 2>&1
+trap 'echo "FAILED $(date -u +%FT%TZ)" > FAILED; exit 1' ERR
+set -e
+echo "START $(date -u +%FT%TZ)"
+rm -f DONE FAILED
+{ lscpu; echo; free -b; echo; sudo -n dmidecode -t memory 2>/dev/null | grep -E 'Size|Speed|Locator|Part' | grep -v Unknown; } > inventory.txt || true
+if [ ! -x "$HOME/llama.cpp/build/bin/llama-bench" ]; then
+  [ -d "$HOME/llama.cpp" ] || git clone --depth 1 @LLAMA_REF@ @LLAMA_REPO@ "$HOME/llama.cpp"
+  cd "$HOME/llama.cpp"
+  cmake -B build -DGGML_NATIVE=ON -DLLAMA_CURL=OFF
+  nice -n 10 cmake --build build -j"$(nproc)" --target llama-bench
+  cd "$D"
+fi
+git -C "$HOME/llama.cpp" rev-parse HEAD > llama_rev.txt
+@FETCH@
+@BENCH@
+echo "END $(date -u +%FT%TZ)"
+touch DONE
+"""
+
+FETCH_T = r"""if [ ! -f "$HOME/models/{file}" ]; then
+  curl -fL -C - --retry 5 -o "$HOME/models/{file}.part" "https://huggingface.co/{repo}/resolve/main/{file}"
+  [ "$(stat -c %s "$HOME/models/{file}.part")" = "{size}" ]
+  echo "{sha256}  $HOME/models/{file}.part" | sha256sum -c -
+  mv "$HOME/models/{file}.part" "$HOME/models/{file}"
+fi"""
+
+BENCH_T = r"""echo "BENCH {key} t={threads} $(date -u +%FT%TZ)"
+"$HOME/llama.cpp/build/bin/llama-bench" -m "$HOME/models/{file}" -t {threads} -p 512 -n 128 -r 3 -o json > "$D/{key}.json" """
+
+
+def build_runner(tag, items, llama_ref=None):
+    fetch = "\n".join(FETCH_T.format(**m) for m in items)
+    bench = "\n".join(
+        BENCH_T.format(key=m["key"], file=m["file"], threads=",".join(map(str, m["threads"]))) for m in items
+    )
+    ref = f"--branch {llama_ref}" if llama_ref else ""
+    return (RUNNER.replace("@TAG@", tag).replace("@LLAMA_REPO@", LLAMA_REPO)
+            .replace("@LLAMA_REF@", ref).replace("@FETCH@", fetch).replace("@BENCH@", bench))
+
+
+def launch_script(tag, runner):
+    return (f"mkdir -p ~/bench/{tag} && cat > ~/bench/{tag}/run.sh <<'NODEBENCH_EOF'\n{runner}\nNODEBENCH_EOF\n"
+            f"chmod +x ~/bench/{tag}/run.sh\n"
+            f"if [ -f ~/bench/{tag}/RUNNING ] && kill -0 $(cat ~/bench/{tag}/RUNNING) 2>/dev/null; then echo ALREADY_RUNNING; exit 0; fi\n"
+            f"setsid nohup ~/bench/{tag}/run.sh >/dev/null 2>&1 < /dev/null & echo $! > ~/bench/{tag}/RUNNING; echo LAUNCHED $!\n")
+
+
+# ---------------------------------------------------------------- results
+def summarize(entries):
+    """llama-bench -o json -> {(threads): {'pp': tok/s, 'tg': tok/s}} """
+    out = {}
+    for e in entries:
+        t = int(e["n_threads"])
+        slot = out.setdefault(t, {})
+        if e.get("n_prompt", 0) > 0 and e.get("n_gen", 0) == 0:
+            slot["pp"] = round(float(e["avg_ts"]), 2)
+            slot["pp_n"] = int(e["n_prompt"])
+        elif e.get("n_gen", 0) > 0 and e.get("n_prompt", 0) == 0:
+            slot["tg"] = round(float(e["avg_ts"]), 2)
+            slot["tg_n"] = int(e["n_gen"])
+    return out
+
+
+def fact_value(res, rev, dimms, speed):
+    parts = []
+    for t in sorted(res):
+        r = res[t]
+        parts.append(f"t={t}: pp{r.get('pp_n', '?')}={r.get('pp', '?')} tok/s, tg{r.get('tg_n', '?')}={r.get('tg', '?')} tok/s")
+    return f"{'; '.join(parts)}. llama.cpp {rev[:10]}; dimms={dimms}; ram_speed={speed}"
+
+
+def parse_inventory(path):
+    txt = path.read_text() if path.exists() else ""
+    sizes = re.findall(r"^\s+Size: (\d+) GB", txt, re.M)
+    speeds = sorted(set(re.findall(r"Configured Memory Speed: (\d+ \w+/s)", txt)))
+    return len(sizes) or "unknown", ",".join(speeds) or "unknown"
+
+
+def collect_facts(node, tag, d):
+    rev = (d / "llama_rev.txt").read_text().strip() if (d / "llama_rev.txt").exists() else "unknown"
+    dimms, speed = parse_inventory(d / "inventory.txt")
+    facts = []
+    for key, m in MODELS.items():
+        jf = d / f"{key}.json"
+        if not jf.exists():
+            continue
+        res = summarize(json.loads(jf.read_text()))
+        facts.append((f"bench_{m['short']}_{tag}", fact_value(res, rev, dimms, speed)))
+    return facts
+
+
+# ---------------------------------------------------------------- commands
+def cmd_run(a):
+    user, ip = resolve(a.node)
+    wanted = a.models.split(",") if a.models else list(MODELS)
+    for k in wanted:
+        if k not in MODELS:
+            die(f"unknown model '{k}'. Known: {', '.join(MODELS)}")
+    info, err = probe(user, ip)
+    if info is None:
+        if not (a.dry_run and a.assume_mem_gb):
+            die(f"cannot reach {user}@{ip}: {err or 'ssh failed'}", 3)
+        print(f"WARN unreachable ({err}); planning offline with --assume-mem-gb {a.assume_mem_gb}")
+        info = {"missing": [], "have": []}
+    else:
+        print(f"node {a.node}: {info.get('CPU')} nproc={info.get('NPROC')} mem={int(info['MEMKB'])/1024/1024:.1f}GiB "
+              f"dimms={info.get('DIMMS')} speed={info.get('DIMM_SPEED')} load1={info.get('LOAD1')} avx2={info.get('AVX2')} avx512={info.get('AVX512')}")
+        if info["missing"]:
+            die(f"missing on node: {', '.join(info['missing'])} (apt install them first)")
+        if float(info["LOAD1"]) > BUSY_LOAD1 and not a.force_busy:
+            die(f"node is busy (load1={info['LOAD1']}). A bench on a loaded box measures the load. Use --force-busy to override.")
+        w = tag_warning(a.tag, info.get("DIMMS"))
+        if w:
+            print(f"WARN {w}")
+    items, skipped, warns = plan(info, wanted, a.threads, a.assume_mem_gb)
+    for w in warns:
+        print(f"WARN {w}")
+    for k, why in skipped:
+        print(f"SKIP {k}: {why}")
+    if not items:
+        die("nothing to run on this node", 4)
+    need_gb = sum(m["size"] for m in items if m["file"] not in info.get("have", [])) / 1024**3 + 3
+    if info.get("DISKFREE_GB") and int(info["DISKFREE_GB"]) < need_gb:
+        die(f"need ~{need_gb:.0f} GB free in $HOME, node has {info['DISKFREE_GB']} GB")
+    for m in items:
+        print(f"PLAN {m['key']}: threads {m['threads']}, p512 n128 r3, {m['file']} ({m['size']/1024**3:.1f} GiB)")
+    runner = build_runner(a.tag, items, a.llama_ref)
+    if a.dry_run:
+        print("--- dry run: runner script that would be sent ---")
+        print(runner)
+        return 0
+    launch = launch_script(a.tag, runner)
+    r = ssh(user, ip, launch)
+    print(r.stdout.strip() or r.stderr.strip())
+    print(f"next: node-bench {a.node} status --tag {a.tag}")
+    return 0 if r.returncode == 0 else 1
+
+
+def cmd_status(a):
+    user, ip = resolve(a.node)
+    s = (f"cd ~/bench/{a.tag} 2>/dev/null || {{ echo NOT_STARTED; exit 0; }}\n"
+         "[ -f DONE ] && echo STATE=DONE\n[ -f FAILED ] && echo STATE=FAILED\n"
+         "[ ! -f DONE ] && [ ! -f FAILED ] && echo STATE=RUNNING\ntail -n 8 run.log\n")
+    r = ssh(user, ip, s)
+    print(r.stdout.strip() or r.stderr.strip())
+    return 0
+
+
+def cmd_collect(a):
+    user, ip = resolve(a.node)
+    d = OUT_ROOT / a.node / a.tag
+    d.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-r",
+                        f"{user}@{ip}:bench/{a.tag}/.", str(d)], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"scp failed: {r.stderr.strip()[-200:]}", 3)
+    if not (d / "DONE").exists():
+        die(f"run is not DONE (see {d}/run.log). Nothing ingested.", 4)
+    facts = collect_facts(a.node, a.tag, d)
+    if not facts:
+        die("DONE but no result JSON found", 4)
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    cmds = []
+    for pred, val in facts:
+        print(f"{a.node}.{pred} = {val}")
+        cmds.append(["python3", STATE, "ingest", a.node, pred, val, "--valid-from", today,
+                     "--source", f"node-bench wq#3255 tag={a.tag}"])
+    if not a.ingest:
+        print("\n(not ingested; re-run with --ingest, or run:)")
+        for c in cmds:
+            print("  " + " ".join(f"'{x}'" if " " in x else x for x in c))
+        return 0
+    for c in cmds:
+        subprocess.run(c, check=True)
+    subprocess.run([REGEN], check=False)
+    return 0
+
+
+def cmd_selftest(_a):
+    fixture = [
+        {"n_threads": 14, "n_prompt": 512, "n_gen": 0, "avg_ts": 71.234},
+        {"n_threads": 14, "n_prompt": 0, "n_gen": 128, "avg_ts": 11.5},
+        {"n_threads": 6, "n_prompt": 512, "n_gen": 0, "avg_ts": 40.0},
+        {"n_threads": 6, "n_prompt": 0, "n_gen": 128, "avg_ts": 10.9},
+    ]
+    r = summarize(fixture)
+    assert r[14] == {"pp": 71.23, "pp_n": 512, "tg": 11.5, "tg_n": 128}, r
+    assert r[6]["tg"] == 10.9
+    items, skipped, _ = plan({"MEMKB": str(16 * 1024 * 1024 - 400000), "NPROC": "20"}, list(MODELS))
+    assert [i["key"] for i in items] == ["qwen3-8b"] and skipped[0][0] == "qwen3-30b-a3b", (items, skipped)
+    items, skipped, _ = plan({"MEMKB": str(32 * 1024 * 1024 - 800000), "NPROC": "20"}, list(MODELS))
+    assert len(items) == 2 and not skipped
+    assert parse_state("  m70q.user = frank\n  m70q.tailscale_ip = 100.1.2.3  (since x)\n  m70q.user_note = x", "m70q") == {
+        "user": "frank", "tailscale_ip": "100.1.2.3"}
+    assert tag_warning("single16", "2") and tag_warning("dual32", "1") and not tag_warning("dual32", "2")
+    print("selftest OK")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("node")
+    p.add_argument("cmd", nargs="?", choices=["run", "status", "collect"])
+    p.add_argument("--tag", help="label for this run, e.g. single16 or dual32")
+    p.add_argument("--models")
+    p.add_argument("--threads", type=lambda s: [int(x) for x in s.split(",")])
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force-busy", action="store_true")
+    p.add_argument("--assume-mem-gb", type=float)
+    p.add_argument("--llama-ref", help="llama.cpp tag/branch to clone for reproducibility")
+    p.add_argument("--ingest", action="store_true")
+    a = p.parse_args()
+    if a.node == "selftest":
+        return cmd_selftest(a)
+    if not a.cmd or not a.tag:
+        die("usage: node-bench <node> run|status|collect --tag <label>")
+    if not re.match(r"^[A-Za-z0-9_.-]+$", a.tag):
+        die("tag must match [A-Za-z0-9_.-]+")
+    return {"run": cmd_run, "status": cmd_status, "collect": cmd_collect}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
