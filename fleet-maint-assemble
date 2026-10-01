@@ -3,7 +3,7 @@
 assembler for the monthly maintenance window. Wraps fleet-update-check; does
 not replace it. Report: reports/opsaudit_a11_maintenance_window.md.
 
-1. Reads /home/lumen/.secrets/github-lumen.token and runs fleet-update-check
+1. Reads /home/lumen/.secrets/github-reallumenhere.token and runs fleet-update-check
    with it exported as GH_TOKEN (raises the GitHub lookup budget past the
    60/hr unauthenticated ceiling that produced the all-'?' silent-failure
    run in A11 §3c).
@@ -24,7 +24,7 @@ re-runs/testing) --dry-run (skip wq ticket + ntfy, still writes batch files)
 import json, os, re, subprocess, sys
 from datetime import datetime, timezone
 
-GH_TOKEN_FILE = "/home/lumen/.secrets/github-lumen.token"
+GH_TOKEN_FILE = "/home/lumen/.secrets/github-reallumenhere.token"
 FLEET_UPDATE_CHECK = "/home/lumen/bin/fleet-update-check"
 STATE_F = "/home/lumen/maint/update-check/state.json"
 WINDOWS_DIR = "/home/lumen/maint/windows"

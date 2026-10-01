@@ -6,7 +6,7 @@ failed units. Sinks: maint report + ntfy digest + deduped user-lane wq ticket.
 NEVER applies anything. Flags: --no-ntfy --no-ticket --nodes a,b,c
 
 wq#852: GitHub lookups use the GH_TOKEN env var when set (caller's job to
-read /home/lumen/.secrets/github-lumen.token and export it — this script
+read /home/lumen/.secrets/github-reallumenhere.token and export it — this script
 never reads secrets itself). Unauthenticated (60/hr) when unset, unchanged
 from v1. state.json now also persists the app-version snapshot ('apps' key)
 so a wrapper (fleet-maint-assemble) can classify drift without re-probing.
