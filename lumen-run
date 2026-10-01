@@ -54,7 +54,9 @@ usage:
       --root  run the unit as root (default: run as lumen)
   lumen-run status UNIT     -> RUNNING | DONE:0 | FAILED:<code> | GONE
   lumen-run log    UNIT     -> full journal for the unit
-  lumen-run wait   UNIT [S] -> poll until terminal or S seconds (default 3600)
+  lumen-run wait   UNIT [S] -> poll until terminal or S seconds; each call is clamped to
+                               LUMEN_RUN_WAIT_CAP (default 55) so it answers inside a Commander
+                               call window -- on exit 124 just call it again
   lumen-run list            -> active lumen-job-* units
 USAGE
   exit 64
@@ -127,9 +129,27 @@ case "$cmd" in
   log)   unit="${1:?unit required}"; journalctl -u "$unit" --no-pager -o cat 2>/dev/null;;
   wait)
     unit="${1:?unit required}"; budget="${2:-3600}"; waited=0
+    # wq#3265: a Commander call is killed by the Worker's 70s abort, so a wait longer than
+    # that never returns an answer (6 of 31 cut calls in 24h were exactly `wait <unit> 840`).
+    # Clamp each call and let the caller re-poll. LUMEN_RUN_WAIT_CAP is the knob for callers
+    # that are NOT inside a Commander call (a detached script may set it high).
+    cap="${LUMEN_RUN_WAIT_CAP:-55}"
+    case "$budget" in ''|*[!0-9]*) budget=3600;; esac
+    clamped=0
+    if [ "$budget" -gt "$cap" ]; then
+      echo "NOTE: wait clamped to ${cap}s (Commander call window ~68s); re-poll"
+      budget="$cap"; clamped=1
+    fi
     while systemctl is-active --quiet "$unit"; do
       sleep 3; waited=$((waited+3))
-      [ "$waited" -ge "$budget" ] && { echo "TIMEOUT after ${budget}s (still RUNNING)"; exit 124; }
+      if [ "$waited" -ge "$budget" ]; then
+        if [ "$clamped" = 1 ]; then
+          echo "TIMEOUT after ${budget}s (still RUNNING), re-poll with: lumen-run wait $unit"
+        else
+          echo "TIMEOUT after ${budget}s (still RUNNING)"
+        fi
+        exit 124
+      fi
     done
     line=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null | grep -aE '^LUMEN_JOB_EXIT=[0-9]+$' | tail -1 || true)
     rc="${line##*LUMEN_JOB_EXIT=}"; [ -n "$line" ] || rc="?"
