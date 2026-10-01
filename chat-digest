@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""chat-digest - turn claude.ai conversation_search / read_conversation output into a structured digest.
+
+Input is the tool output text on stdin (or --file): a series of
+  <chat url="https://claude.ai/chat/<uuid>" updated_at="..." kind="summary|conversation" ...> body </chat>
+blocks. Lumen cannot log in to claude.ai, so this CLI does not fetch chats itself: the browser Claude
+runs conversation_search / read_conversation and pipes the result here. A chat URL or UUID argument
+selects which chat(s) of the input to digest (exit 3 if it is not in the input).
+
+  chat-digest < search_output.txt
+  chat-digest 6fc048d0-3175-41ae-be15-5ba347c2f90a --file out.txt --json
+
+Extracted per chat: tickets (wq#/aq#), episode ids, commands, files, decisions, outcomes, open items.
+Decisions/outcomes/open items are keyword heuristics over sentences; commands and files come from
+backticks (summaries) or fenced blocks (raw conversations). They are leads for a human or for the
+memory-extraction step, not ground truth.
+
+Anything shaped like a credential (cf*_ tokens, github_pat_, sk-..., Bearer, long hex/base64, JWT,
+password= values) is replaced by <redacted> in every output field.
+
+Exit: 0 ok, 2 usage / no input, 3 ref not found in input.
+"""
+import argparse
+import datetime as dt
+import html
+import json
+import re
+import sys
+from zoneinfo import ZoneInfo
+
+PT = ZoneInfo("America/Los_Angeles")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+CHAT_RE = re.compile(r"<chat\s+([^>]*)>(.*?)</chat>", re.S)
+ATTR_RE = re.compile(r"(\w+)\s*=\s*([\"'])(.*?)\2", re.S)
+
+SECRET_RES = [
+    re.compile(r"\bcf[a-z]{2}_[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    re.compile(r"\b[0-9a-f]{40,}\b"),
+    # long mixed letter+digit blob that is not part of a path or filename
+    re.compile(r"(?<![\w/.-])(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{40,}={0,2}(?![\w/.-])"),
+]
+KV_RE = re.compile(r"(?i)\b(password|passwd|pw|secret|token|api[_-]?key)(\s*[=:]\s*)\S+")
+CMD_VERBS = {
+    "python3", "python", "bash", "sh", "ssh", "sudo", "systemctl", "journalctl", "wq", "aq", "git", "lumen-pr",
+    "lumen-run", "curl", "rsync", "docker", "pip", "pipx", "apt", "apt-get", "state-regen", "fleet-inv",
+    "fleet-exec", "fleet-status", "fleet-ssh-check", "re-inventory", "token-mint", "chat-digest", "pytest",
+    "tailscale", "sqlite3", "jq", "grep", "sed", "awk", "cat", "ls", "cp", "mv", "rm", "chmod", "make",
+    "npm", "node", "kill", "restic", "slock", "pt", "binwalk", "ghidra",
+}
+FILE_EXT = r"(?:py|sh|md|json|ya?ml|conf|service|timer|txt|db|sql|toml|env|log|cfg|ini|html|js|ts|bin|img)"
+PATH_RE = re.compile(r"^(?:~|\.{0,2})/[\w.@+~/-]+$|^[\w.-]+(?:/[\w.@+-]+)+$|^[\w.-]+\.%s$" % FILE_EXT)
+TICKET_RE = re.compile(r"\b(wq|aq|fq)#(\d+)")
+EPISODE_RE = re.compile(r"[Ee]pisode\s+[`'\"]?([0-9a-f]{12})\b")
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*(\[])")
+
+DECISION_KW = re.compile(r"\b(decid|determin|chose|chosen|reject|opted|approved|instead of|rather than|justif|"
+                         r"went with|going with|settled on|recommend|follow(?:ed|ing) (?:frank|the))", re.I)
+OUTCOME_KW = re.compile(r"\b(verif|confirm|closed|landed|shipped|install|committed|completed|passed|failed|"
+                        r"killed|applied|ingested|resolved|fixed|created|written|wrote|filed|merged|"
+                        r"smoke-tested|released|restored|rolled back)", re.I)
+OPEN_KW = re.compile(r"\b(remain|pending|gated|not yet|awaiting|still (?:needs|open)|blocked|for frank|"
+                     r"next step|left to|to do\b|unresolved|follow-up)", re.I)
+HUMAN_DIRECTIVE = re.compile(r"(?i)\b(use|don'?t|do not|never|always|keep|ship|go ahead|approved?|only|must|"
+                             r"should|instead|rather)\b")
+CAP = 14
+
+
+def mask(s):
+    s = KV_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", s)
+    for rx in SECRET_RES:
+        s = rx.sub("<redacted>", s)
+    return s
+
+
+def parse_blocks(text):
+    blocks = []
+    for m in CHAT_RE.finditer(text):
+        attrs = {k: v for k, _q, v in ATTR_RE.findall(m.group(1))}
+        url = attrs.get("url", "")
+        u = UUID_RE.search(url)
+        blocks.append({"id": u.group(0).lower() if u else "", "url": url, "updated_at": attrs.get("updated_at", ""),
+                       "kind": attrs.get("kind", "conversation"), "body": m.group(2).strip("\n")})
+    if not blocks and text.strip():
+        blocks.append({"id": "", "url": "", "updated_at": "", "kind": "conversation", "body": text.strip("\n")})
+    return blocks
+
+
+def sentences(prose):
+    flat = re.sub(r"\s+", " ", re.sub(r"\*+", "", re.sub(r"(?m)^#+\s*", "", prose)))
+    return [s.strip() for s in SENT_SPLIT.split(flat) if len(s.strip()) > 25]
+
+
+def is_command(tok):
+    parts = tok.strip().split()
+    if not parts:
+        return False
+    v = parts[0].lstrip("$").strip()
+    if v in ("$",) and len(parts) > 1:
+        v = parts[1]
+    base = v.rsplit("/", 1)[-1]
+    return (base in CMD_VERBS and (len(parts) > 1 or "/" in v)) or v.startswith("./") or v.startswith("/home/lumen/bin/")
+
+
+def classify_token(tok):
+    tok = tok.strip()
+    if not tok or len(tok) > 220:
+        return None
+    if is_command(tok):
+        return "command"
+    if " " not in tok and PATH_RE.match(tok) and not tok.startswith("http"):
+        return "file"
+    return None
+
+
+def from_summary(body):
+    cmds, files = [], []
+    for tok in re.findall(r"`([^`\n]{2,220})`", body):
+        k = classify_token(tok)
+        if k == "command":
+            cmds.append(tok.strip())
+        elif k == "file":
+            files.append(tok.strip())
+    return cmds, files
+
+
+def from_conversation(body):
+    cmds, files = [], []
+    for blk in re.findall(r"```[^\n]*\n(.*?)```", body, re.S):
+        for ln in blk.splitlines():
+            ln = ln.strip().lstrip("$ ").strip()
+            if ln and not ln.startswith("#") and is_command(ln):
+                cmds.append(ln[:220])
+    c2, f2 = from_summary(re.sub(r"```.*?```", " ", body, flags=re.S))
+    cmds += c2
+    files += f2
+    for ab in re.findall(r"(?<![\w/])(/(?:home|opt|etc|data|var|usr|mnt)/[\w.@+/-]{3,})", body):
+        files.append(ab.rstrip(".,;:)"))
+    return cmds, files
+
+
+def turn_lines(body):
+    """(human_sentences, assistant_sentences) for raw conversations; summaries return prose only."""
+    parts = re.split(r"(?m)^(Human|Assistant|User):\s*", body)
+    human, asst = [], []
+    for i in range(1, len(parts) - 1, 2):
+        who, txt = parts[i], parts[i + 1]
+        txt = re.sub(r"```.*?```", " ", txt, flags=re.S)
+        (asst if who == "Assistant" else human).extend(sentences(txt))
+    if len(parts) == 1:
+        return [], sentences(body)
+    return human, asst
+
+
+def uniq(seq, cap=None):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out[:cap] if cap else out
+
+
+def digest_block(b):
+    body = html.unescape(b["body"])
+    title = ""
+    m = re.match(r"\s*Title:\s*(.+)", body)
+    if m:
+        title = m.group(1).strip()
+    if b["kind"] == "summary":
+        cmds, files = from_summary(body)
+        sents = sentences(re.sub(r"</?chat_summary>", " ", body))
+        human_s = []
+    else:
+        cmds, files = from_conversation(body)
+        human_s, sents = turn_lines(body)
+    pool = human_s + sents
+    tickets = uniq(["%s#%s" % (a, n) for a, n in TICKET_RE.findall(body)])
+    episodes = EPISODE_RE.findall(body)
+    if re.search(r"episode", body, re.I):  # "the episode was committed ... as `8a69ebd02c1f`"
+        episodes += re.findall(r"`([0-9a-f]{12})`", body)
+    episodes = uniq(episodes)
+    dec = [s for s in human_s if HUMAN_DIRECTIVE.search(s) or re.match(r"(?i)^(yes|go|do it)\b", s)]
+    dec += [s for s in pool if DECISION_KW.search(s)]
+    out = [s for s in sents if OUTCOME_KW.search(s)]
+    opn = [s for s in pool if OPEN_KW.search(s)]
+    upd = ""
+    if b["updated_at"]:
+        try:
+            upd = dt.datetime.fromisoformat(b["updated_at"]).astimezone(PT).strftime("%Y-%m-%d %H:%M %Z")
+        except ValueError:
+            upd = b["updated_at"]
+    r = {"id": b["id"], "url": b["url"], "kind": b["kind"], "title": title, "updated_pt": upd,
+         "tickets": tickets, "episodes": episodes,
+         "commands": uniq(cmds, CAP), "files": uniq(files, CAP * 2),
+         "decisions": uniq(dec, CAP), "outcomes": uniq(out, CAP), "open_items": uniq(opn, CAP)}
+    return mask_obj(r)
+
+
+def mask_obj(o):
+    if isinstance(o, str):
+        return mask(o)
+    if isinstance(o, list):
+        return [mask_obj(x) for x in o]
+    if isinstance(o, dict):
+        return {k: mask_obj(v) for k, v in o.items()}
+    return o
+
+
+def render_md(chats):
+    out = ["# chat-digest: %d chat%s" % (len(chats), "" if len(chats) == 1 else "s")]
+    for c in chats:
+        out.append("\n## %s" % (c["title"] or c["id"] or "(untitled)"))
+        meta = [x for x in (c["kind"], c["updated_pt"], c["url"]) if x]
+        out.append("_" + " | ".join(meta) + "_")
+        if c["tickets"]:
+            out.append("Tickets: " + ", ".join(c["tickets"]))
+        if c["episodes"]:
+            out.append("Episodes: " + ", ".join(c["episodes"]))
+        for label, key in (("Decisions", "decisions"), ("Outcomes", "outcomes"), ("Open", "open_items")):
+            if c[key]:
+                out.append("\n### " + label)
+                out += ["- " + s for s in c[key]]
+        if c["commands"]:
+            out.append("\n### Commands")
+            out += ["- `%s`" % s for s in c["commands"]]
+        if c["files"]:
+            out.append("\n### Files")
+            out += ["- `%s`" % s for s in c["files"]]
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="digest conversation_search output", epilog=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ref", nargs="?", help="claude.ai chat URL or UUID to select from the input")
+    ap.add_argument("--file", "-f", help="read input from this file instead of stdin")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    if a.file:
+        text = open(a.file, errors="replace").read()
+    elif sys.stdin.isatty():
+        print("chat-digest: no input. Pipe conversation_search/read_conversation output on stdin or use --file "
+              "(Lumen cannot fetch claude.ai chats itself).", file=sys.stderr)
+        return 2
+    else:
+        text = sys.stdin.read()
+    blocks = parse_blocks(text)
+    if not blocks:
+        print("chat-digest: empty input", file=sys.stderr)
+        return 2
+    if a.ref:
+        m = UUID_RE.search(a.ref)
+        want = (m.group(0).lower() if m else a.ref.lower())
+        blocks = [b for b in blocks if want in b["url"].lower() or want == b["id"]]
+        if not blocks:
+            print("chat-digest: %s is not in the input" % a.ref, file=sys.stderr)
+            return 3
+    chats = [digest_block(b) for b in blocks]
+    if a.json:
+        print(json.dumps({"chats": chats}, indent=2))
+    else:
+        print(render_md(chats))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

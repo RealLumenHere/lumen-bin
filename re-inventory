@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""re-inventory - manifest of every RE project in /home/lumen/re (the canonical store).
+
+Per project: size, file count, newest file, and sync status against the edge boxes (Thor, Maksoor).
+Sync status is derived from the same LEGS array bin/re-sync uses plus its log and state file, so it
+cannot drift from what the timer really does. Read-only; nothing is written unless --out is given.
+
+  re-inventory                 human table (times in Pacific)
+  re-inventory --json          JSON manifest on stdout
+  re-inventory --out F.json    write the JSON manifest atomically to F.json
+  re-inventory --live          also rsync dry-run each reachable leg and count pending files (slow)
+
+Project units: each top-level dir of the store, except container dirs (>=2 sync legs strictly inside
+and not a leg destination themselves, e.g. miko/, common/) which split into their subdirs.
+
+Sync status per project (worst leg wins):
+  synced        every leg's last run was OK within --stale-hours
+  stale         last OK is older than --stale-hours
+  host-offline  edge host skipped by re-sync (state file counts consecutive offline runs)
+  fail          last run of a leg on a reachable host failed
+  never-synced  leg exists but the log has no OK for it
+  lumen-only    no edge leg maps to this project
+
+Exit 0 always unless the tool itself breaks (exit 2).
+Env overrides (tests): RI_ROOT RI_LINK RI_SYNC_SCRIPT RI_SYNC_LOG RI_SYNC_STATE RI_NOW
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ROOT = os.environ.get("RI_ROOT", "/home/lumen/re")
+LINK = os.environ.get("RI_LINK", "/home/lumen/re").rstrip("/")  # the path the re-sync LEGS use for dst
+SYNC_SCRIPT = os.environ.get("RI_SYNC_SCRIPT", "/home/lumen/bin/re-sync")
+SYNC_LOG = os.environ.get("RI_SYNC_LOG", "/home/lumen/logs/re-sync.log")
+SYNC_STATE = os.environ.get("RI_SYNC_STATE", "/home/lumen/logs/re-sync.state")
+PT = ZoneInfo("America/Los_Angeles")
+LEG_RE = re.compile(r'^\s*"([^"|]*)\|([^"|]*)\|([^"|]*)\|([^"|]*)\|([^"]*)"\s*$')
+LOG_RE = re.compile(r"^(\S+)\s+(OK|FAIL)\s+rc=(\d+)\s+(\S+?):(\S+)\s+->\s+(\S+)")
+RANK = {"fail": 5, "never-synced": 4, "host-offline": 3, "stale": 2, "synced": 1}
+
+
+def now():
+    v = os.environ.get("RI_NOW")
+    return dt.datetime.fromisoformat(v.replace("Z", "+00:00")) if v else dt.datetime.now(dt.timezone.utc)
+
+
+def parse_legs(path=None):
+    legs = []
+    with open(path or SYNC_SCRIPT) as f:
+        for ln in f:
+            m = LEG_RE.match(ln)
+            if m:
+                name, host, src, dst, rpath = m.groups()
+                legs.append({"name": name, "host": host, "src": src, "dst": dst.rstrip("/"), "rpath": rpath})
+    return legs
+
+
+def rel_of(dst):
+    if dst == LINK:
+        return ""
+    if dst.startswith(LINK + "/"):
+        return dst[len(LINK) + 1:]
+    return None
+
+
+def parse_log(path=None):
+    ev = {}
+    try:
+        f = open(path or SYNC_LOG, errors="replace")
+    except OSError:
+        return ev
+    with f:
+        for ln in f:
+            m = LOG_RE.match(ln)
+            if not m:
+                continue
+            ts, res, rc, _host, _src, dst = m.groups()
+            try:
+                t = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+            except ValueError:
+                continue
+            e = ev.setdefault(dst.rstrip("/"), {})
+            e["last"] = res
+            e["last_ts"] = t
+            if res == "OK":
+                e["ok"] = t
+            else:
+                e["fail"] = t
+                e["fail_rc"] = int(rc)
+    return ev
+
+
+def parse_state(path=None):
+    st = {}
+    try:
+        with open(path or SYNC_STATE) as f:
+            for ln in f:
+                if "=" in ln:
+                    k, v = ln.strip().split("=", 1)
+                    try:
+                        st[k] = int(v)
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return st
+
+
+def walk(path):
+    files = size = errors = links = 0
+    newest = (0.0, "")
+    stack = [path]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            errors += 1
+            continue
+        with it:
+            for e in it:
+                try:
+                    if e.is_symlink():
+                        links += 1
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                        continue
+                    s = e.stat(follow_symlinks=False)
+                except OSError:
+                    errors += 1
+                    continue
+                files += 1
+                size += s.st_size
+                if s.st_mtime > newest[0]:
+                    newest = (s.st_mtime, os.path.relpath(e.path, path))
+    return {"files": files, "bytes": size, "newest_mtime": newest[0], "newest_file": newest[1],
+            "errors": errors, "symlinks": links}
+
+
+def plan_units(root, legs):
+    leg_rels = [rel_of(l["dst"]) for l in legs]
+    leg_rels = [r for r in leg_rels if r]
+    units = []
+    for e in sorted(os.scandir(root), key=lambda x: x.name):
+        if not e.is_dir(follow_symlinks=False):
+            continue
+        t = e.name
+        inside = [r for r in leg_rels if r.startswith(t + "/")]
+        if t not in leg_rels and len(inside) >= 2:
+            loose = 0
+            for c in sorted(os.scandir(e.path), key=lambda x: x.name):
+                if c.is_dir(follow_symlinks=False):
+                    units.append(t + "/" + c.name)
+                else:
+                    loose += 1
+            if loose:
+                units.append(t + "/")  # loose files directly in the container
+        else:
+            units.append(t)
+    return units
+
+
+def walk_unit(root, unit):
+    if unit.endswith("/"):  # container's own loose files only
+        base = os.path.join(root, unit.rstrip("/"))
+        files = size = 0
+        newest = (0.0, "")
+        for c in os.scandir(base):
+            if c.is_file(follow_symlinks=False):
+                s = c.stat(follow_symlinks=False)
+                files += 1
+                size += s.st_size
+                if s.st_mtime > newest[0]:
+                    newest = (s.st_mtime, c.name)
+        return {"files": files, "bytes": size, "newest_mtime": newest[0], "newest_file": newest[1],
+                "errors": 0, "symlinks": 0}
+    return walk(os.path.join(root, unit))
+
+
+def unit_legs(unit, legs):
+    u = unit.rstrip("/")
+    out = []
+    for l in legs:
+        r = rel_of(l["dst"])
+        if r is None:
+            continue
+        if unit.endswith("/"):
+            if os.path.dirname(r) == u:  # leg whose dst is a direct child file target of the container
+                out.append(l)
+            continue
+        if r == u or r.startswith(u + "/") or u.startswith(r + "/") and r:
+            out.append(l)
+    return out
+
+
+def leg_status(leg, ev, offl, t_now, stale_s):
+    runs = offl.get(leg["name"], 0)
+    e = ev.get(leg["dst"], {})
+    if runs > 0:
+        return "host-offline"
+    if e.get("last") == "FAIL":
+        return "fail"
+    ok = e.get("ok")
+    if ok is None:
+        return "never-synced"
+    return "synced" if (t_now - ok).total_seconds() <= stale_s else "stale"
+
+
+def live_pending(leg, timeout):
+    """rsync dry-run, same flags as re-sync. Returns (count, sample) or (None, reason)."""
+    args = ["rsync", "-an", "--checksum", "--update", "--timeout=60", "-i",
+            "-e", "ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new"]
+    if leg["rpath"]:
+        args.append("--rsync-path=" + leg["rpath"])
+    args += ["%s:%s" % (leg["host"], leg["src"]), leg["dst"] + "/"]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    if r.returncode not in (0, 24):
+        return None, (r.stderr.strip().splitlines() or ["rc=%d" % r.returncode])[-1][:120]
+    pend = [ln[12:] for ln in r.stdout.splitlines() if ln.startswith(">f")]
+    return len(pend), pend[:3]
+
+
+def build(args):
+    root = os.path.realpath(ROOT)
+    legs = parse_legs()
+    ev, offl = parse_log(), parse_state()
+    t_now = now()
+    stale_s = args.stale_hours * 3600
+    projects = []
+    for unit in plan_units(root, legs):
+        w = walk_unit(root, unit)
+        ul = unit_legs(unit, legs)
+        leg_out = []
+        for l in ul:
+            st = leg_status(l, ev, offl, t_now, stale_s)
+            e = ev.get(l["dst"], {})
+            lo = {"host": l["name"], "src": l["src"], "dst": l["dst"], "status": st,
+                  "last_ok": e["ok"].isoformat() if e.get("ok") else None,
+                  "host_offline_runs": offl.get(l["name"], 0)}
+            if args.live and st != "host-offline":
+                n, extra = live_pending(l, args.live_timeout)
+                lo["pending_files"] = n
+                lo["pending_sample" if n is not None else "live_error"] = extra
+            leg_out.append(lo)
+        status = max((x["status"] for x in leg_out), key=lambda s: RANK[s]) if leg_out else "lumen-only"
+        projects.append({
+            "name": unit, "path": os.path.join(root, unit.rstrip("/")), "bytes": w["bytes"], "files": w["files"],
+            "newest_mtime": dt.datetime.fromtimestamp(w["newest_mtime"], dt.timezone.utc).isoformat() if w["newest_mtime"] else None,
+            "newest_file": w["newest_file"], "read_errors": w["errors"], "symlinks": w["symlinks"],
+            "sync": {"status": status, "legs": leg_out}})
+    mapped = {l["dst"] for l in legs if rel_of(l["dst"]) is not None}
+    return {"generated_at": t_now.isoformat(), "root": ROOT, "real_root": root,
+            "total_bytes": sum(p["bytes"] for p in projects), "total_files": sum(p["files"] for p in projects),
+            "project_count": len(projects), "stale_hours": args.stale_hours,
+            "unmapped_legs": [l["dst"] for l in legs if l["dst"] not in mapped],
+            "projects": projects}
+
+
+def human_bytes(n):
+    for u in ("B", "K", "M", "G", "T"):
+        if n < 1024 or u == "T":
+            return ("%d%s" % (n, u)) if u == "B" else ("%.1f%s" % (n, u))
+        n /= 1024.0
+
+
+def sync_detail(p):
+    bits = []
+    for l in p["sync"]["legs"]:
+        if l["status"] == "host-offline":
+            bits.append("%s offline %d runs (~%dh)" % (l["host"], l["host_offline_runs"], l["host_offline_runs"] // 2))
+        elif l["status"] in ("synced", "stale", "fail", "never-synced"):
+            if l["last_ok"]:
+                t = dt.datetime.fromisoformat(l["last_ok"]).astimezone(PT).strftime("%m-%d %H:%M")
+                bits.append("%s ok %s" % (l["host"], t))
+            else:
+                bits.append("%s no ok in log" % l["host"])
+        if "pending_files" in l and l["pending_files"] is not None:
+            bits.append("%d pending" % l["pending_files"])
+    seen, out = set(), []
+    for b in bits:
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+    return "; ".join(out)
+
+
+def render(m):
+    rows = [("PROJECT", "SIZE", "FILES", "LAST MODIFIED (PT)", "SYNC", "DETAIL")]
+    for p in m["projects"]:
+        lm = "-"
+        if p["newest_mtime"]:
+            lm = dt.datetime.fromisoformat(p["newest_mtime"]).astimezone(PT).strftime("%Y-%m-%d %H:%M")
+        rows.append((p["name"], human_bytes(p["bytes"]), str(p["files"]), lm, p["sync"]["status"], sync_detail(p)))
+    w = [max(len(r[i]) for r in rows) for i in range(5)]
+    body = "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(r[:5])) + "  " + r[5] for r in rows)
+    return "%s  (%s)\n%d projects, %s, %d files\n\n%s" % (
+        m["root"], m["real_root"], m["project_count"], human_bytes(m["total_bytes"]), m["total_files"], body)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="manifest of /home/lumen/re", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--out", help="write JSON manifest to this file (atomic)")
+    ap.add_argument("--stale-hours", type=float, default=3.0)
+    ap.add_argument("--live", action="store_true", help="rsync dry-run each reachable leg (slow)")
+    ap.add_argument("--live-timeout", type=int, default=180)
+    a = ap.parse_args(argv)
+    try:
+        m = build(a)
+    except OSError as e:
+        print("re-inventory: %s" % e, file=sys.stderr)
+        return 2
+    if a.out:
+        d = os.path.dirname(os.path.abspath(a.out))
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".re-inv.")
+        with os.fdopen(fd, "w") as f:
+            json.dump(m, f, indent=2)
+        os.replace(tmp, a.out)
+    if a.json:
+        print(json.dumps(m, indent=2))
+    elif not a.out:
+        print(render(m))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

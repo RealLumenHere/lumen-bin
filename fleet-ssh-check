@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""fleet-ssh-check - sweep every ssh-managed fleet node and say what is broken.
+
+Roster comes from `fleet-inv ssh-list --all` (no hardcoded node list). Per node: a TCP probe of
+the ssh port, then a real BatchMode key-auth ssh running `hostname`. Each node lands in one state:
+
+  ok               key auth works
+  key-rejected     sshd answered, our key was refused
+  ssh-refused      host is up but nothing listens on the ssh port
+  offline          no route / timeout (tailnet last-seen shown when tailscale knows the peer)
+  hostkey-changed  host key differs from known_hosts (reinstall or MITM: verify, never auto-clear)
+  ts-check         Tailscale SSH wants an interactive re-auth
+  ssh-hung         tcp connects but ssh never finished
+  error            anything else (first stderr line shown)
+  self             this box (tcp probe only)
+  n/a              inventory says not ssh-reachable by design, or has no ssh target
+
+Read-only on the nodes: the only remote command is `hostname`.
+
+  fleet-ssh-check                    table, exit 1 if any finding
+  fleet-ssh-check --json             machine-readable
+  fleet-ssh-check --nodes thor,isis  subset
+  fleet-ssh-check --file-tickets     open one wq ticket per broken active/standby node
+                                     (deduped on the '[fleet-ssh] <node>:' title prefix)
+  fleet-ssh-check --file-tickets --dry-run
+
+Exit: 0 clean, 1 findings, 2 tool error.
+Env overrides (tests): FSC_FLEET_INV FSC_SSH FSC_WQ FSC_TAILSCALE
+"""
+import argparse
+import concurrent.futures as cf
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+FLEET_INV = os.environ.get("FSC_FLEET_INV") or shutil.which("fleet-inv") or "/home/lumen/bin/fleet-inv"
+SSH = os.environ.get("FSC_SSH", "ssh")
+WQ = os.environ.get("FSC_WQ") or shutil.which("wq") or "/home/lumen/bin/wq"
+TAILSCALE = os.environ.get("FSC_TAILSCALE", "tailscale")
+
+BAD = {"key-rejected", "ssh-refused", "offline", "hostkey-changed", "ts-check", "ssh-hung", "error"}
+TICKET_INV_STATUS = {"active", "standby"}
+TICKET_PRI = {"key-rejected": 2, "hostkey-changed": 2, "ts-check": 2, "ssh-refused": 2,
+              "ssh-hung": 3, "error": 3, "offline": 3}
+CLOSED_WQ = {"done", "closed", "cancelled", "dropped", "wontfix"}
+
+
+def classify(stderr):
+    s = stderr or ""
+    if re.search(r"REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed", s):
+        return "hostkey-changed"
+    if re.search(r"Permission denied", s):
+        return "key-rejected"
+    if re.search(r"login\.tailscale\.com|Tailscale SSH requires|check mode", s, re.I):
+        return "ts-check"
+    if re.search(r"Connection refused", s):
+        return "ssh-refused"
+    if re.search(r"timed out|No route to host|Network is unreachable|Name or service not known", s, re.I):
+        return "offline"
+    return "error"
+
+
+def first_line(s):
+    for ln in (s or "").splitlines():
+        if ln.strip():
+            return ln.strip()[:160]
+    return ""
+
+
+def load_roster():
+    r = subprocess.run([FLEET_INV, "ssh-list", "--all", "--fields", "name,user,tailscale_ip,lan_ip,status"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise SystemExit("fleet-ssh-check: fleet-inv ssh-list failed rc=%d: %s" % (r.returncode, first_line(r.stderr)))
+    nodes = []
+    for line in (r.stdout + "\n" + r.stderr).splitlines():
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        if line.startswith("#"):
+            m = re.match(r"#\s*([^:\s]+):\s*(.*)", line)
+            if m:
+                name, why = m.groups()
+                state = "n/a"
+                nodes.append({"name": name, "user": "", "ip": "", "lan_ip": "", "inv_status": "",
+                              "state": state, "detail": why[:160]})
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        parts += [""] * (5 - len(parts))
+        nodes.append({"name": parts[0], "user": parts[1], "ip": parts[2], "lan_ip": parts[3],
+                      "inv_status": parts[4], "state": None, "detail": ""})
+    # an entry can show up as a comment on stderr and not on stdout; keep first of each name
+    seen, out = set(), []
+    for n in nodes:
+        if n["name"] in seen:
+            continue
+        seen.add(n["name"])
+        out.append(n)
+    return out
+
+
+def tcp_probe(ip, port, timeout):
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True, int((time.monotonic() - t0) * 1000), ""
+    except OSError as e:
+        return False, None, (e.strerror or str(e))
+
+
+def ssh_probe(user, ip, port, timeout):
+    cmd = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % timeout,
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
+           "-p", str(port), "%s@%s" % (user, ip), "hostname"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 12)
+    except subprocess.TimeoutExpired:
+        return "ssh-hung", "ssh did not finish"
+    if r.returncode == 0:
+        return "ok", first_line(r.stdout)
+    return classify(r.stderr), first_line(r.stderr)
+
+
+def tailnet_index():
+    try:
+        r = subprocess.run([TAILSCALE, "status", "--json"], capture_output=True, text=True, timeout=15)
+        d = json.loads(r.stdout)
+    except Exception:
+        return {}
+    idx = {}
+    for p in list((d.get("Peer") or {}).values()) + [d.get("Self") or {}]:
+        for ip in p.get("TailscaleIPs") or []:
+            idx[ip] = {"online": p.get("Online"), "last_seen": p.get("LastSeen")}
+    return idx
+
+
+def check_node(n, port, timeout, tnet, selfname):
+    if n["state"] == "n/a":
+        return n
+    n["tailnet"] = tnet.get(n["ip"])
+    ok, ms, err = tcp_probe(n["ip"], port, min(timeout, 5))
+    n["tcp_ms"] = ms
+    if n["name"] == selfname:
+        n["state"], n["detail"] = ("self", "") if ok else ("ssh-refused", err)
+        return n
+    if not ok:
+        n["state"] = "ssh-refused" if "refused" in err.lower() else "offline"
+        n["detail"] = err
+        return n
+    n["state"], n["detail"] = ssh_probe(n["user"], n["ip"], port, timeout)
+    return n
+
+
+def pt_stamp(iso):
+    """Tailscale LastSeen (UTC, nanosecond fraction) -> 'YYYY-MM-DD HH:MM' Pacific, or '' if unusable."""
+    if not iso or iso.startswith("0001"):
+        return ""
+    try:
+        t = dt.datetime.fromisoformat(re.sub(r"\.\d+", "", iso).replace("Z", "+00:00"))
+        return t.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ""
+
+
+def fmt_tailnet(t):
+    if not t:
+        return "-"
+    if t.get("online"):
+        return "up"
+    ls = pt_stamp(t.get("last_seen") or "")
+    return "down" + (" (seen %s PT)" % ls if ls else "")
+
+
+def render_table(results):
+    rows = [("NODE", "TARGET", "STATE", "TCP", "TAILNET", "DETAIL")]
+    for r in results:
+        tgt = "%s@%s" % (r["user"], r["ip"]) if r["ip"] else "-"
+        tcp = "%dms" % r["tcp_ms"] if r.get("tcp_ms") is not None else "-"
+        rows.append((r["name"], tgt, r["state"], tcp, fmt_tailnet(r.get("tailnet")), r["detail"][:70]))
+    w = [max(len(row[i]) for row in rows) for i in range(5)]
+    return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(row[:5])) + "  " + row[5] for row in rows)
+
+
+def open_wq_titles():
+    r = subprocess.run([WQ, "list"], capture_output=True, text=True, timeout=60)
+    titles = []
+    for ln in r.stdout.splitlines():
+        m = re.match(r"^\[(\d+)\]\s+\S+\s+p\d+\s+(\S+)\s+(.*)$", ln)
+        if m and m.group(2) not in CLOSED_WQ:
+            titles.append(m.group(3))
+    return titles
+
+
+def file_tickets(results, dry):
+    existing = open_wq_titles()
+    made, skipped = [], []
+    for r in results:
+        if r["state"] not in BAD or r["inv_status"] not in TICKET_INV_STATUS:
+            continue
+        prefix = "[fleet-ssh] %s:" % r["name"]
+        if any(prefix in t for t in existing):
+            skipped.append(r["name"])
+            continue
+        title = "%s %s (%s@%s)" % (prefix, r["state"], r["user"], r["ip"])
+        extra = ""
+        if r["state"] == "hostkey-changed":
+            extra = " Do NOT clear known_hosts blindly: confirm the node was reinstalled first."
+        if r["state"] == "offline" and r.get("tailnet"):
+            extra += " Tailnet: %s." % fmt_tailnet(r["tailnet"])
+        detail = ("fleet-ssh-check %s: state=%s inventory_status=%s. ssh detail: %s.%s Recheck: fleet-ssh-check --nodes %s"
+                  % (dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), r["state"], r["inv_status"],
+                     r["detail"] or "none", extra, r["name"]))
+        cmd = [WQ, "add", "--lane", "build", "--pri", str(TICKET_PRI.get(r["state"], 3)),
+               "--title", title, "--detail", detail,
+               "--liveness", "fleet-ssh-check --quiet --nodes %s" % r["name"]]
+        if dry:
+            made.append((r["name"], title))
+            continue
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        made.append((r["name"], first_line(p.stdout + p.stderr)))
+    return made, skipped
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="sweep fleet ssh reachability", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--nodes", help="comma-separated subset")
+    ap.add_argument("--port", type=int, default=22)
+    ap.add_argument("--timeout", type=int, default=8, help="ssh ConnectTimeout seconds")
+    ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--quiet", action="store_true", help="no output, exit code only")
+    ap.add_argument("--file-tickets", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="with --file-tickets: show, do not file")
+    a = ap.parse_args(argv)
+
+    roster = load_roster()
+    if a.nodes:
+        want = set(a.nodes.split(","))
+        missing = want - {n["name"] for n in roster}
+        if missing:
+            print("fleet-ssh-check: unknown node(s): %s" % ",".join(sorted(missing)), file=sys.stderr)
+            return 2
+        roster = [n for n in roster if n["name"] in want]
+    tnet = tailnet_index()
+    selfname = socket.gethostname().split(".")[0]
+    with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
+        results = list(ex.map(lambda n: check_node(n, a.port, a.timeout, tnet, selfname), roster))
+    results.sort(key=lambda r: r["name"])
+    summary = {}
+    for r in results:
+        summary[r["state"]] = summary.get(r["state"], 0) + 1
+    findings = [r for r in results if r["state"] in BAD]
+
+    tickets = None
+    if a.file_tickets:
+        tickets = file_tickets(results, a.dry_run)
+
+    if not a.quiet:
+        if a.json:
+            out = {"checked_at": dt.datetime.now(dt.timezone.utc).isoformat(), "summary": summary, "nodes": results}
+            if tickets is not None:
+                out["tickets"] = {"filed": tickets[0], "already_open": tickets[1]}
+            print(json.dumps(out, indent=2))
+        else:
+            print(render_table(results))
+            print("\n" + "  ".join("%s=%d" % kv for kv in sorted(summary.items())))
+            if tickets is not None:
+                for name, what in tickets[0]:
+                    print("ticket%s: %s -> %s" % (" (dry)" if a.dry_run else "", name, what))
+                if tickets[1]:
+                    print("already open: %s" % ", ".join(tickets[1]))
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

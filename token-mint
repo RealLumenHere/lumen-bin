@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""token-mint - mint, rotate, verify and revoke scoped Cloudflare account API tokens.
+
+Uses the token-admin credential (default /home/lumen/.secrets/cf-token-admin.token, needs
+Account > Account API Tokens > Edit) against the account-owned tokens API:
+  POST/GET/DELETE /accounts/{id}/tokens, GET .../tokens/permission_groups, GET .../tokens/verify
+
+  token-mint groups [--filter dns]
+  token-mint list
+  token-mint mint --name NAME --perm "DNS Write" [--perm ...] [--zone-id ID | --zone-id-file F]
+                  [--ttl-days N] [--out PATH] [--overwrite] [--confirm]
+  token-mint rotate NAME [--revoke-old] [--ttl-days N] [--out PATH] [--confirm]
+  token-mint verify NAME | --file PATH
+  token-mint revoke --id TOKEN_ID --confirm
+
+Safety rails:
+  * mint / rotate / revoke only act with --confirm; without it they validate against the API (read-only)
+    and print what they would do.
+  * The token VALUE is written to a 0600 file (default /home/lumen/.secrets/NAME.token) and never printed,
+    logged, or put in an error. Output shows id + sha256 fingerprint. --print-value opts in (the value then
+    lands wherever stdout goes, e.g. a chat transcript; treat that as burned).
+  * Every policy is scoped to this account (and one zone for zone permissions). No wildcards.
+  * Children may not hold "API Tokens" permissions unless --allow-token-admin.
+  * rotate: create new -> write file (old one backed up to <dir>/bak/) -> verify the NEW token works ->
+    only then, with --revoke-old, delete the old token. A failed verify leaves the old token alive.
+  * Audit trail (no values): /home/lumen/logs/token-mint.jsonl
+  * Account id: --account-id, $CF_ACCOUNT_ID, --account-id-file, or /home/lumen/mailbot/.cf_account_id.
+
+Fleet policy: Cloudflare-resource rotation is Frank-gated (hold 2026-09-25, rule c). Run mint/rotate
+only on rows Frank released. After a rotation run `sudo stale-env-audit` and restart drifting consumers.
+
+Exit: 0 ok, 1 operation failed / verification failed, 2 usage or refused by a guard.
+Env overrides (tests): TOKEN_MINT_API_BASE TOKEN_MINT_SECRETS TOKEN_MINT_LOG TOKEN_MINT_ACCOUNT_FILE
+TOKEN_MINT_VERIFY_RETRIES
+"""
+import argparse
+import datetime as dt
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = os.environ.get("TOKEN_MINT_API_BASE", "https://api.cloudflare.com/client/v4").rstrip("/")
+SECRETS = os.environ.get("TOKEN_MINT_SECRETS", "/home/lumen/.secrets")
+LOG = os.environ.get("TOKEN_MINT_LOG", "/home/lumen/logs/token-mint.jsonl")
+ACCOUNT_FILE = os.environ.get("TOKEN_MINT_ACCOUNT_FILE", "/home/lumen/mailbot/.cf_account_id")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
+
+
+class MintError(Exception):
+    """operation failed (exit 1)"""
+
+
+class Refused(Exception):
+    """a guard or bad usage stopped us (exit 2)"""
+
+
+def call(method, path, token, body=None, query=None):
+    url = API + path + (("?" + urllib.parse.urlencode(query)) if query else "")
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, method=method)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "lumen-token-mint/1")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            payload = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode() or "{}")
+        except Exception:
+            payload = {}
+        raise MintError(fmt_err(method, path, e.code, payload))
+    except (urllib.error.URLError, OSError) as e:
+        raise MintError("%s %s: network error: %s" % (method, path, getattr(e, "reason", e)))
+    if not payload.get("success", False):
+        raise MintError(fmt_err(method, path, 200, payload))
+    return payload
+
+
+def fmt_err(method, path, code, payload):
+    errs = payload.get("errors") or []
+    msg = "; ".join("[%s] %s" % (e.get("code"), e.get("message")) for e in errs if isinstance(e, dict)) or "no error detail"
+    return "%s %s: HTTP %s: %s" % (method, path, code, msg)
+
+
+def read_secret(path):
+    try:
+        v = open(path).read().strip()
+    except OSError as e:
+        raise Refused("cannot read %s: %s" % (path, e.strerror))
+    if not v:
+        raise Refused("empty secret file: %s" % path)
+    return v
+
+
+def resolve_account(a):
+    if getattr(a, "account_id", None):
+        return a.account_id.strip()
+    if os.environ.get("CF_ACCOUNT_ID"):
+        return os.environ["CF_ACCOUNT_ID"].strip()
+    f = getattr(a, "account_id_file", None) or ACCOUNT_FILE
+    if os.path.exists(f):
+        v = open(f).read().strip()
+        if v:
+            return v
+    raise Refused("no account id: pass --account-id / --account-id-file or set CF_ACCOUNT_ID")
+
+
+def fingerprint(value):
+    return hashlib.sha256(value.encode()).hexdigest()[:12]
+
+
+def audit(rec):
+    rec = dict(rec, ts=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), user=getpass.getuser())
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError as e:
+        print("token-mint: warning: audit log not written (%s)" % e.strerror, file=sys.stderr)
+
+
+def scope_kind(g):
+    sc = g.get("scopes") or []
+    if "com.cloudflare.api.account.zone" in sc:
+        return "zone"
+    if "com.cloudflare.api.account" in sc:
+        return "account"
+    if any(".user" in s for s in sc):
+        return "user"
+    return "unknown"
+
+
+def is_token_admin(name):
+    return "api tokens" in (name or "").lower()
+
+
+def resolve_perms(names, groups, allow_token_admin):
+    by = {}
+    for g in groups:
+        by.setdefault(g["name"].lower(), []).append(g)
+    out = []
+    for n in names:
+        cand = by.get(n.lower())
+        if not cand:
+            raise Refused('unknown permission group "%s" (see: token-mint groups --filter %s)' % (n, n.split()[0]))
+        usable = [g for g in cand if scope_kind(g) in ("zone", "account")]
+        if not usable:
+            raise Refused('permission group "%s" cannot be used on an account-owned token (scope %s)' % (n, scope_kind(cand[0])))
+        if len(usable) > 1:
+            raise Refused('permission group name "%s" is ambiguous (%d matches)' % (n, len(usable)))
+        g = usable[0]
+        if is_token_admin(g["name"]) and not allow_token_admin:
+            raise Refused('refusing child token with "%s": it could mint further tokens (use --allow-token-admin)' % g["name"])
+        out.append((g, scope_kind(g)))
+    return out
+
+
+def build_policies(resolved, acct, zone_id):
+    acct_ids = [{"id": g["id"]} for g, k in resolved if k == "account"]
+    zone_ids = [{"id": g["id"]} for g, k in resolved if k == "zone"]
+    pol = []
+    if acct_ids:
+        pol.append({"effect": "allow", "resources": {"com.cloudflare.api.account.%s" % acct: "*"}, "permission_groups": acct_ids})
+    if zone_ids:
+        if not zone_id:
+            raise Refused("zone-scoped permission requested: pass --zone-id (or --zone-id-file)")
+        pol.append({"effect": "allow", "resources": {"com.cloudflare.api.account.zone.%s" % zone_id: "*"}, "permission_groups": zone_ids})
+    return pol
+
+
+def zone_id_from(a):
+    if a.zone_id:
+        return a.zone_id.strip()
+    if a.zone_id_file:
+        return open(a.zone_id_file).read().strip()
+    return None
+
+
+def expires(days):
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def preflight_out(path, overwrite):
+    d = os.path.dirname(os.path.abspath(path))
+    if os.path.exists(path) and not overwrite:
+        raise Refused("%s exists (use --overwrite; the old file is backed up first)" % path)
+    probe = d if os.path.isdir(d) else os.path.dirname(d)
+    if not os.access(probe, os.W_OK):
+        raise Refused("cannot write to %s" % d)
+
+
+def write_secret(path, value, overwrite):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    backup = None
+    if os.path.exists(path):
+        if not overwrite:
+            raise MintError("%s exists" % path)
+        bdir = os.path.join(d, "bak")
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        backup = os.path.join(bdir, os.path.basename(path) + ".bak." + time.strftime("%Y%m%d_%H%M%S"))
+        shutil.copy2(path, backup)
+        os.chmod(backup, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tm.")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(value + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return backup
+
+
+def verify_token(acct, tok):
+    tries = int(os.environ.get("TOKEN_MINT_VERIFY_RETRIES", "3"))
+    last = None
+    for i in range(max(1, tries)):
+        try:
+            r = call("GET", "/accounts/%s/tokens/verify" % acct, tok)["result"]
+            if r.get("status") == "active":
+                return r
+            last = MintError("token status is %s" % r.get("status"))
+        except MintError as e:
+            last = e
+        if i + 1 < tries:
+            time.sleep(1)
+    raise last
+
+
+def create_and_store(acct, admin, body, out, overwrite, label):
+    """POST the token, store the value, return (result, backup). Deletes the orphan if the value cannot be stored."""
+    res = call("POST", "/accounts/%s/tokens" % acct, admin, body)["result"]
+    value, tid = res.get("value"), res.get("id")
+    if not value or not tid:
+        raise MintError("create returned no token value/id")
+    try:
+        backup = write_secret(out, value, overwrite)
+    except BaseException as e:
+        note = ""
+        try:
+            call("DELETE", "/accounts/%s/tokens/%s" % (acct, tid), admin)
+            note = "; the new token %s was deleted again" % tid
+        except MintError as e2:
+            note = "; ALSO failed to delete orphan token %s: %s" % (tid, e2)
+        audit({"action": label + "-failed", "token_id": tid, "reason": "write"})
+        raise MintError("could not store the token at %s (%s)%s" % (out, getattr(e, "strerror", None) or e, note))
+    return res, backup
+
+
+def summarize(res, out, backup, ver, names):
+    return {"id": res.get("id"), "name": res.get("name"), "file": out, "fingerprint": fingerprint(res["value"]),
+            "permissions": names, "expires_on": res.get("expires_on"), "verified": ver.get("status"),
+            "backup": backup}
+
+
+def emit(a, rec, res, extra=None):
+    if a.json:
+        print(json.dumps(dict(rec, **(extra or {})), indent=2))
+    else:
+        print("%s %s id=%s file=%s fp=%s expires=%s verified=%s" % (
+            rec.get("action", "done"), rec["name"], rec["id"], rec["file"], rec["fingerprint"],
+            rec.get("expires_on") or "never", rec.get("verified")))
+        if rec.get("backup"):
+            print("old file backed up to %s" % rec["backup"])
+    if getattr(a, "print_value", False):
+        print("token-mint: --print-value: the value below is exposed to whatever captures stdout; treat as burned there",
+              file=sys.stderr)
+        print(res["value"])
+
+
+# ---- commands --------------------------------------------------------------------------------------------
+
+def cmd_groups(a, acct, admin):
+    groups = call("GET", "/accounts/%s/tokens/permission_groups" % acct, admin)["result"]
+    f = (a.filter or "").lower()
+    for g in sorted(groups, key=lambda g: g["name"].lower()):
+        if f in g["name"].lower():
+            print("%-48s %-8s %s" % (g["name"], scope_kind(g), g["id"]))
+    return 0
+
+
+def list_all(acct, admin):
+    out, page = [], 1
+    while True:
+        r = call("GET", "/accounts/%s/tokens" % acct, admin, query={"page": page, "per_page": 50})
+        out += r.get("result") or []
+        total = (r.get("result_info") or {}).get("total_pages") or 1
+        if page >= total:
+            return out
+        page += 1
+
+
+def cmd_list(a, acct, admin):
+    toks = list_all(acct, admin)
+    if a.json:
+        print(json.dumps(toks, indent=2))
+        return 0
+    for t in sorted(toks, key=lambda t: (t.get("name") or "").lower()):
+        print("%-34s %-34s %-9s expires=%s last_used=%s" % (t.get("name"), t.get("id"), t.get("status"),
+                                                           t.get("expires_on") or "never", t.get("last_used_on") or "-"))
+    return 0
+
+
+def cmd_mint(a, acct, admin):
+    if not NAME_RE.match(a.name):
+        raise Refused("bad --name (letters, digits, . _ - ; 2-64 chars)")
+    groups = call("GET", "/accounts/%s/tokens/permission_groups" % acct, admin)["result"]
+    resolved = resolve_perms(a.perm, groups, a.allow_token_admin)
+    policies = build_policies(resolved, acct, zone_id_from(a))
+    body = {"name": a.name, "policies": policies}
+    if a.ttl_days:
+        body["expires_on"] = expires(a.ttl_days)
+    out = a.out or os.path.join(SECRETS, a.name + ".token")
+    preflight_out(out, a.overwrite)
+    names = [g["name"] for g, _ in resolved]
+    if not a.confirm:
+        print("dry run (no token created). Would POST /accounts/<acct>/tokens:")
+        print(json.dumps(body, indent=2))
+        print("and store the value at %s (0600). Re-run with --confirm." % out)
+        return 0
+    res, backup = create_and_store(acct, admin, body, out, a.overwrite, "mint")
+    try:
+        ver = verify_token(acct, res["value"])
+    except MintError as e:
+        audit({"action": "mint", "name": a.name, "token_id": res["id"], "file": out, "fp": fingerprint(res["value"]),
+               "perms": names, "verified": False})
+        print("token-mint: minted %s (id %s, file %s) but verification FAILED: %s" % (a.name, res["id"], out, e), file=sys.stderr)
+        return 1
+    rec = summarize(dict(res, name=res.get("name") or a.name), out, backup, ver, names)
+    rec["action"] = "minted"
+    audit({"action": "mint", "name": a.name, "token_id": res["id"], "file": out, "fp": rec["fingerprint"],
+           "perms": names, "expires_on": res.get("expires_on"), "verified": True})
+    emit(a, rec, res)
+    return 0
+
+
+def cmd_rotate(a, acct, admin):
+    toks = [t for t in list_all(acct, admin) if t.get("name") == a.name]
+    if a.old_id:
+        toks = [t for t in toks if t.get("id") == a.old_id]
+    if not toks:
+        raise Refused('no token named "%s" in the account' % a.name)
+    if len(toks) > 1:
+        raise Refused('%d tokens are named "%s" (%s); pass --old-id' % (len(toks), a.name, ", ".join(t["id"] for t in toks)))
+    old_id = toks[0]["id"]
+    adm = call("GET", "/accounts/%s/tokens/verify" % acct, admin)["result"]
+    if adm.get("id") == old_id:
+        raise Refused("refusing to rotate the token-admin credential itself with itself; mint a new admin token by hand")
+    old = call("GET", "/accounts/%s/tokens/%s" % (acct, old_id), admin)["result"]
+    body = {"name": a.name, "policies": []}
+    names = []
+    for p in old.get("policies") or []:
+        pg = p.get("permission_groups") or []
+        for g in pg:
+            names.append(g.get("name") or g.get("id"))
+            if is_token_admin(g.get("name")) and not a.allow_token_admin:
+                raise Refused('old token holds "%s"; rotating it would copy that power (use --allow-token-admin)' % g.get("name"))
+        body["policies"].append({"effect": p.get("effect", "allow"), "resources": p.get("resources"),
+                                 "permission_groups": [{"id": g["id"]} for g in pg]})
+    if old.get("condition"):
+        body["condition"] = old["condition"]
+    if a.ttl_days:
+        body["expires_on"] = expires(a.ttl_days)
+    out = a.out or os.path.join(SECRETS, a.name + ".token")
+    if not os.path.exists(out) and not a.out:
+        raise Refused("%s does not exist; pass --out for where the new value goes" % out)
+    preflight_out(out, True)
+    if not a.confirm:
+        print("dry run. Would mint a replacement for %s (old id %s) with %d polic%s, store at %s%s."
+              % (a.name, old_id, len(body["policies"]), "y" if len(body["policies"]) == 1 else "ies", out,
+                 ", then revoke the old token" if a.revoke_old else ", leaving the old token alive"))
+        print("Re-run with --confirm.")
+        return 0
+    res, backup = create_and_store(acct, admin, body, out, True, "rotate")
+    try:
+        ver = verify_token(acct, res["value"])
+    except MintError as e:
+        audit({"action": "rotate", "name": a.name, "old_id": old_id, "token_id": res["id"], "file": out,
+               "fp": fingerprint(res["value"]), "verified": False, "old_revoked": False})
+        print("token-mint: new token %s written to %s but verification FAILED (%s). Old token %s NOT revoked; "
+              "restore the old file from %s if consumers break." % (res["id"], out, e, old_id, backup), file=sys.stderr)
+        return 1
+    revoked = False
+    if a.revoke_old:
+        call("DELETE", "/accounts/%s/tokens/%s" % (acct, old_id), admin)
+        revoked = True
+    rec = summarize(dict(res, name=res.get("name") or a.name), out, backup, ver, names)
+    rec.update({"action": "rotated", "old_id": old_id, "old_revoked": revoked})
+    audit({"action": "rotate", "name": a.name, "old_id": old_id, "token_id": res["id"], "file": out,
+           "fp": rec["fingerprint"], "verified": True, "old_revoked": revoked})
+    emit(a, rec, res)
+    if not revoked:
+        print("old token %s is still live: revoke it with  token-mint revoke --id %s --confirm" % (old_id, old_id))
+    print("next: sudo stale-env-audit  (restart any consumer it flags)")
+    return 0
+
+
+def cmd_verify(a, acct, admin):
+    path = a.file or os.path.join(SECRETS, (a.name or "") + ".token")
+    if not a.file and not a.name:
+        raise Refused("pass NAME or --file PATH")
+    r = verify_token(acct, read_secret(path))
+    print("%s id=%s status=%s expires=%s" % (path, r.get("id"), r.get("status"), r.get("expires_on") or "never"))
+    return 0
+
+
+def cmd_revoke(a, acct, admin):
+    adm = call("GET", "/accounts/%s/tokens/verify" % acct, admin)["result"]
+    if adm.get("id") == a.id:
+        raise Refused("refusing to revoke the token-admin credential this command is using")
+    if not a.confirm:
+        print("dry run. Would DELETE token %s. Re-run with --confirm." % a.id)
+        return 0
+    call("DELETE", "/accounts/%s/tokens/%s" % (acct, a.id), admin)
+    audit({"action": "revoke", "token_id": a.id})
+    print("revoked %s" % a.id)
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="token-mint", description="scoped Cloudflare account token tool",
+                                 epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--account-id")
+    ap.add_argument("--account-id-file")
+    ap.add_argument("--admin-token-file", default=os.path.join(SECRETS, "cf-token-admin.token"))
+    ap.add_argument("--json", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("groups")
+    g.add_argument("--filter")
+    sub.add_parser("list")
+    m = sub.add_parser("mint")
+    m.add_argument("--name", required=True)
+    m.add_argument("--perm", action="append", required=True, help='permission group name, repeatable (e.g. "DNS Write")')
+    m.add_argument("--zone-id")
+    m.add_argument("--zone-id-file")
+    m.add_argument("--ttl-days", type=int)
+    m.add_argument("--out")
+    m.add_argument("--overwrite", action="store_true")
+    m.add_argument("--allow-token-admin", action="store_true")
+    m.add_argument("--print-value", action="store_true")
+    m.add_argument("--confirm", action="store_true")
+    r = sub.add_parser("rotate")
+    r.add_argument("name")
+    r.add_argument("--old-id")
+    r.add_argument("--ttl-days", type=int)
+    r.add_argument("--out")
+    r.add_argument("--revoke-old", action="store_true")
+    r.add_argument("--allow-token-admin", action="store_true")
+    r.add_argument("--print-value", action="store_true")
+    r.add_argument("--confirm", action="store_true")
+    v = sub.add_parser("verify")
+    v.add_argument("name", nargs="?")
+    v.add_argument("--file")
+    rv = sub.add_parser("revoke")
+    rv.add_argument("--id", required=True)
+    rv.add_argument("--confirm", action="store_true")
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    try:
+        acct = resolve_account(a)
+        admin = None if a.cmd == "verify" else read_secret(a.admin_token_file)
+        return {"groups": cmd_groups, "list": cmd_list, "mint": cmd_mint, "rotate": cmd_rotate,
+                "verify": cmd_verify, "revoke": cmd_revoke}[a.cmd](a, acct, admin)
+    except Refused as e:
+        print("token-mint: %s" % e, file=sys.stderr)
+        return 2
+    except MintError as e:
+        print("token-mint: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
