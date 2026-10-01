@@ -3,7 +3,11 @@
 
   rotate-provider-keys enter      prompt (hidden) for each new key, blank = skip, then apply
   rotate-provider-keys apply      read /home/lumen/.secrets/provider-keys.new (PROVIDER_API_KEY=value lines)
-  rotate-provider-keys selftest   full pipeline with the CURRENT keys as "new" (proves backup/swap/recreate/verify/restart)
+  rotate-provider-keys selftest --yes-recreate-litellm
+                                  full pipeline with the CURRENT keys as "new". NOT read-only: it force-recreates the production
+                                  litellm container. Run it detached (lumen-run), never under a short timeout.
+  rotate-provider-keys recover    restore the files from an interrupted run (journal) and verify
+  flags: --keep-backups           keep the *.bak.*_rotate copies (default: shredded once verified; they hold the OLD keys)
 
 Minting the new key happens at each provider's dashboard (no provisioning API on this fleet). Everything after that is here:
 preflight every new key against the provider before touching anything, back up every file, replace by old VALUE in every
@@ -11,7 +15,7 @@ registered file (so a key kept in two files moves in both), recreate the litellm
 /health?model= and a real chat completion per provider, restart the systemd services that load agent/.env, and print the
 sha12 of each old key to revoke. Any failed check restores the backups and recreates litellm again. Never prints a value.
 """
-import getpass, glob, hashlib, json, os, shutil, subprocess, sys, time, urllib.request, urllib.error
+import base64, datetime, getpass, glob, hashlib, json, os, shutil, signal, subprocess, sys, time, urllib.request, urllib.error
 
 PROVIDERS = {
     #            env var               preflight (method, url, header-builder)                               litellm alias
@@ -28,6 +32,16 @@ DROP = '/home/lumen/.secrets/provider-keys.new'
 COMPOSE = ['docker', 'compose', '-f', '/home/lumen/docker/docker-compose.yml']
 LOG = '/home/lumen/logs/provider-key-rotation.log'
 LITELLM = 'http://127.0.0.1:4000'
+JOURNAL = '/home/lumen/.secrets/.rotate-provider-keys.inprogress'   # present only while backups are the sole copy of the old keys
+LOCK_PATH = '/tmp/rotate-provider-keys.lock'
+STALE_AUDIT = ['sudo', '-n', '/home/lumen/bin/stale-env-audit']     # not on sudo's secure_path: absolute path required
+GUARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+class Interrupted(BaseException):   # BaseException so no `except Exception` in here can swallow it
+    pass
+def _on_signal(signum, frame): raise Interrupted(signal.Signals(signum).name)
+def install_signal_handlers():
+    for s_ in GUARDED: signal.signal(s_, _on_signal)
 
 def sha12(v): return hashlib.sha256(v.encode()).hexdigest()[:12]
 def say(msg):
@@ -67,12 +81,23 @@ def preflight(new):
         say(f'preflight {prov} new={sha12(key)} http={st}'); ok &= (st == 200)
     return ok
 
-def backup(ts):
+def backup(ts, provs=(), selftest=False):
     saved = []
     for f in ENV_FILES + RAW_FILES:
         if os.path.exists(f):
             b = f'{f}.bak.{ts}_rotate'; shutil.copy2(f, b); os.chmod(b, 0o600); saved.append((f, b))
-    say(f'backup: {len(saved)} files -> *.bak.{ts}_rotate'); return saved
+    fd = os.open(JOURNAL, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, json.dumps({'ts': ts, 'pid': os.getpid(), 'selftest': selftest, 'provs': list(provs), 'saved': saved}).encode()); os.close(fd)
+    say(f'backup: {len(saved)} files -> *.bak.{ts}_rotate (journal written)'); return saved
+
+def drop_backups(saved, keep=False):
+    """Backups hold the OLD keys; once the new state is verified they are only residue. Shred them and the journal."""
+    if keep: say(f'backups kept (--keep-backups): {len(saved)} files')
+    else:
+        for _, b in saved:
+            if os.path.exists(b): subprocess.run(['shred', '-u', b])
+        say(f'backups shredded: {len(saved)} files')
+    if os.path.exists(JOURNAL): os.remove(JOURNAL)
 
 def restore(saved):
     for f, b in saved: shutil.copy2(b, f)
@@ -175,34 +200,98 @@ def restart_consumers():
     say(f'restarted {len(units)} consumer services; not active after restart: {bad or "none"}')
     return not bad
 
-def run(new, selftest=False):
+def stale_env_gate():
+    """wq#3211: a rotation that edits env files but leaves a consumer on the old process env is unfinished work."""
+    r = subprocess.run(STALE_AUDIT, capture_output=True, text=True)
+    say(f'stale-env-audit rc={r.returncode}: ' + ' '.join(r.stdout.split())[:300])   # unit + variable NAMES only
+    return r.returncode == 0
+
+def langfuse_trace_landed(since, wait=45):
+    """True: a Langfuse trace newer than `since` exists. False: none within `wait`s (callback may have dropped,
+    the recurring failure after a litellm recreate, aq#2492). None: could not check."""
+    try:
+        env = read_env('/home/lumen/agent/.env')
+        pk, sk = env['LANGFUSE_PUBLIC_KEY'], env['LANGFUSE_SECRET_KEY']
+        port = subprocess.run(['docker', 'port', 'langfuse-web', '3000/tcp'], capture_output=True, text=True).stdout.split('\n')[0].rsplit(':', 1)[1].strip()
+    except Exception: return None
+    auth = base64.b64encode(f'{pk}:{sk}'.encode()).decode()
+    end = time.time() + wait
+    while time.time() < end:
+        st, body = http(f'http://127.0.0.1:{port}/api/public/traces?limit=5&orderBy=timestamp.desc', {'Authorization': 'Basic ' + auth}, timeout=15)
+        if st == 200:
+            try:
+                for t in json.loads(body).get('data', []):
+                    if datetime.datetime.fromisoformat(t['timestamp'].replace('Z', '+00:00')).timestamp() >= since - 2: return True
+            except Exception: return None
+        time.sleep(5)
+    return False
+
+def recover():
+    if not os.path.exists(JOURNAL): say('recover: no interrupted run on record'); return 0
+    j = json.load(open(JOURNAL)); saved = [tuple(x) for x in j['saved']]
+    gone = [b for _, b in saved if not os.path.exists(b)]
+    if gone: say(f'recover: {len(gone)} backup file(s) missing; journal kept, restore by hand'); return 4
+    say(f'recover: restoring {len(saved)} files from interrupted run {j["ts"]}')
+    restore(saved)
+    ok = recreate_litellm() and verify(j['provs'])
+    say(f'recover {"verified" if ok else "NOT verified - litellm needs attention"}')
+    if ok: drop_backups(saved)
+    return 0 if ok else 3
+
+def run(new, selftest=False, keep_backups=False):
     if not new: sys.exit('nothing to rotate')
     ts = time.strftime('%Y%m%d_%H%M%S')
     say(f'=== rotate {"SELFTEST " if selftest else ""}{sorted(new)} ===')
     if not preflight(new): say('ABORT: a new key failed preflight at the provider; nothing was changed'); return 2
-    saved = backup(ts)
-    # selftest swaps nothing: values differ per file today (two Gemini keys), so re-writing "current" would change them
-    old = {p: set() for p in new} if selftest else swap(new)
-    if not (recreate_litellm() and verify(sorted(new))):
-        say('FAIL: rolling back'); restore(saved)
+    saved = backup(ts, sorted(new), selftest)
+    t0, interrupted, old = time.time(), None, {p: set() for p in new}
+    try:
+        # selftest swaps nothing: values differ per file today (two Gemini keys), so re-writing "current" would change them
+        if not selftest: old = swap(new)
+        good = recreate_litellm() and verify(sorted(new))
+    except Interrupted as e:
+        interrupted, good = str(e), False
+    if not good:
+        for s_ in GUARDED: signal.signal(s_, signal.SIG_IGN)   # nothing may interrupt the rollback itself
+        say(f'{"INTERRUPTED by " + interrupted if interrupted else "FAIL"}: rolling back'); restore(saved)
         ok = recreate_litellm() and verify(sorted(new))
-        say(f'rollback {"verified" if ok else "NOT verified - litellm needs attention"}'); return 3
+        if ok: say('rollback verified'); drop_backups(saved, keep_backups)
+        else: say('rollback NOT verified - litellm needs attention; backups + journal kept, then run: rotate-provider-keys recover')
+        return 3
+    drift_ok = True
     if selftest:
         units = consumer_units()
         say(f'selftest: would restart {len(units)} consumer services: {" ".join(units)}')
-    elif not restart_consumers(): say('WARN: some consumer services not active after restart (keys are swapped and verified)')
+    else:
+        if not restart_consumers(): say('WARN: some consumer services not active after restart (keys are swapped and verified)')
+        drift_ok = stale_env_gate()
+    lf = langfuse_trace_landed(t0)
+    say({True: 'langfuse: trace landed after recreate', False: 'WARN: no Langfuse trace within 45s of the recreate - litellm callback may have dropped (aq#2492 class); check docker logs litellm',
+         None: 'langfuse: could not check (no keys/port)'}[lf])
     for prov in sorted(new):
         stale = sorted(sha12(v) for v in old[prov] if v != new[prov])
         say(f'REVOKE at {prov} dashboard: old key sha12 {stale or "(none - selftest/no change)"}')
+    drop_backups(saved, keep_backups)
+    if not drift_ok: say('UNFINISHED: consumers still on the old env (see stale-env-audit line above); restart them, rerun stale-env-audit'); return 5
     say('=== done ==='); return 0
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ''
+    flags = set(sys.argv[2:])
     # one run at a time: two overlapping runs recreate litellm under each other's verify (seen in selftest 2026-09-28)
     import fcntl
-    lock = open('/tmp/rotate-provider-keys.lock', 'w')
+    lock = open(LOCK_PATH, 'w')
     try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError: sys.exit('another rotate-provider-keys run is in progress')
+    if mode == 'selftest' and '--yes-recreate-litellm' not in flags:
+        print('selftest is NOT read-only: it force-recreates the production litellm container and verifies against it.\n'
+              'Run it detached: lumen-run start --name rpk-selftest -- python3 /home/lumen/bin/rotate-provider-keys selftest --yes-recreate-litellm', file=sys.stderr)
+        sys.exit(2)
+    if mode == 'recover': install_signal_handlers(); sys.exit(recover())
+    if mode in ('enter', 'apply', 'selftest') and os.path.exists(JOURNAL):
+        sys.exit('an earlier run was interrupted (journal present). Run: rotate-provider-keys recover')
+    install_signal_handlers()   # a dropped ssh/timeout after the swap must roll back, not strand half-rotated files
+    keep = '--keep-backups' in flags
     if mode == 'enter':
         vals = {}
         for prov, (var, _, _) in PROVIDERS.items():
@@ -212,8 +301,8 @@ def main():
         os.write(fd, ''.join(f'{k}={v}\n' for k, v in vals.items()).encode()); os.close(fd); mode = 'apply'
     if mode == 'apply':
         if not os.path.exists(DROP): sys.exit(f'no {DROP}')
-        rc = run(parse_drop(DROP))
-        if rc == 0: subprocess.run(['shred', '-u', DROP])
+        rc = run(parse_drop(DROP), keep_backups=keep)
+        if rc in (0, 5): subprocess.run(['shred', '-u', DROP])
         else: say(f'{DROP} kept for retry')
         sys.exit(rc)
     if mode == 'selftest':
@@ -221,7 +310,7 @@ def main():
         cur = {}
         for f in LITELLM_ENV_FILES:
             if os.path.exists(f): cur.update(read_env(f))
-        sys.exit(run({p: cur[v[0]] for p, v in PROVIDERS.items() if cur.get(v[0])}, selftest=True))
+        sys.exit(run({p: cur[v[0]] for p, v in PROVIDERS.items() if cur.get(v[0])}, selftest=True, keep_backups=keep))
     sys.exit(__doc__)
 
 if __name__ == '__main__':

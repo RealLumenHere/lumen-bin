@@ -43,6 +43,7 @@ ALLOW = {
     "llama-3.1-8b-instant",             # Groq API direct (agent/lumen_research_agent.py)
     "llama-3.3-70b-versatile",          # Groq API direct (agent/lumen_deep_research_orchestrator.py)
     "gpt-oss-120b",                     # Cerebras API direct (foreman/harness/liveness.py)
+    "mistral-small-latest",             # Mistral API direct, api.mistral.ai (bin/rotate-provider-keys verify; not a gateway alias)
     "nomic-embed-text", "minicpm-v4.6", # Ollama native API (minerva verify, vision-eval)
     "recorded-rung",                    # fixture row in bin/minerva-presentation-stability
     "llama33-local",                    # retired-rung registry tuple, minerva/lumen_state_single_owner_migrate.py
