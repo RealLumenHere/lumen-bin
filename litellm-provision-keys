@@ -178,7 +178,15 @@ def rotate(alias: str, new_alias: str = None):
         print("  -> WARN: no prior key on file; nothing to delete", file=sys.stderr)
 
     print(f"NOTE: restart consumers of {keyfile} / {ENV_DIR / (alias + '.env')} to pick up the new key.")
-    return 0
+    # wq#3281: a rotation is not finished until every consumer runs the new env. Restart the
+    # drifted systemd consumers (workers first, user-facing last), re-audit, and fail loudly.
+    if os.environ.get("LPK_SKIP_CONSUMER_RESTART") == "1":
+        return 0
+    import subprocess
+    rc = subprocess.run(["/home/lumen/bin/rotate-consumers-restart", "--vars", "LITELLM_MASTER_KEY"]).returncode
+    if rc:
+        print(f"ERROR: rotation incomplete, consumers still on the old key (rotate-consumers-restart rc={rc})", file=sys.stderr)
+    return rc
 
 def parse_args():
     p = argparse.ArgumentParser()

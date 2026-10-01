@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""rotate-consumers-restart - one-line closer for a rotation (wq#3281).
+
+A rotation that edits an env file but leaves a consumer on the old process env is
+unfinished work: wq#2975 rotated the Langfuse keys and five units ran the revoked pair for
+an hour. This runs the stale-env audit, restarts the SYSTEMD units that drifted on the
+rotated variables (workers first, user-facing last), then re-audits.
+
+  rotate-consumers-restart --vars LANGFUSE_PUBLIC_KEY,LANGFUSE_SECRET_KEY [--dry-run]
+
+Prints unit names and variable NAMES only, never values.
+
+Exit: 0 clean | 1 still drifting after restart | 2 audit inconclusive
+      3 a control-plane unit drifted: REFUSED, Frank drives that restart (rule 3)
+      4 docker container drifted: needs a compose recreate, not done here
+"""
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+AUDIT = ["sudo", "-n", "/home/lumen/bin/stale-env-audit", "--docker", "--json"]
+# Control plane (Frank 2026-09-25 rule 3): never restarted by a script.
+CONTROL_PLANE = ("desktop-commander", "supergateway", "cloudflared", "mcp-", "mcpw", "dc-gateway")
+# Restarted last, in this order of appearance: things a person is talking to.
+USER_FACING = ("messenger", "dashboard", "powerdash", "mission-control", "proposals-ui", "cord", "copilot-status")
+
+
+def run_audit():
+    r = subprocess.run(AUDIT, capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        return None
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return None
+
+
+def affected(report, wanted):
+    """-> drift rows touching `wanted` (all drift rows when `wanted` is empty)."""
+    out = []
+    for row in report.get("drift", []):
+        names = set(row.get("differs", [])) | set(row.get("missing", []))
+        if not wanted or names & wanted:
+            out.append(row)
+    return out
+
+
+def order(units):
+    def key(u):
+        for i, tag in enumerate(USER_FACING):
+            if tag in u:
+                return (1, i, u)
+        return (0, 0, u)
+    return sorted(units, key=key)
+
+
+def is_control_plane(unit):
+    return any(tag in unit for tag in CONTROL_PLANE)
+
+
+def restart(unit):
+    r = subprocess.run(["sudo", "-n", "systemctl", "restart", unit], capture_output=True, text=True)
+    time.sleep(3)
+    st = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True).stdout.strip()
+    return r.returncode == 0 and st == "active", st
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--vars", default="", help="comma-separated variable NAMES the rotation changed")
+    p.add_argument("--dry-run", action="store_true")
+    a = p.parse_args(argv)
+    wanted = {v for v in a.vars.split(",") if v}
+
+    rep = run_audit()
+    if rep is None:
+        print("rotate-consumers-restart: audit inconclusive", file=sys.stderr)
+        return 2
+    rows = affected(rep, wanted)
+    sysd = [r["unit"] for r in rows if r.get("kind") == "systemd"]
+    dock = [r["unit"] for r in rows if r.get("kind") == "docker"]
+    cp = [u for u in sysd if is_control_plane(u)]
+    todo = order([u for u in sysd if not is_control_plane(u)])
+    print(f"drift on {sorted(wanted) or 'any var'}: systemd={len(sysd)} docker={len(dock)} control-plane={len(cp)}")
+    for u in todo:
+        print(f"  restart {u}")
+    if a.dry_run:
+        return 3 if cp else (4 if dock else 0)
+    bad = []
+    for u in todo:
+        ok, st = restart(u)
+        print(f"  {u}: {st}")
+        if not ok:
+            bad.append(u)
+    if cp:
+        print("REFUSED control-plane units (Frank drives): " + ", ".join(cp), file=sys.stderr)
+        return 3
+    rep2 = run_audit()
+    if rep2 is None:
+        return 2
+    left = affected(rep2, wanted)
+    if dock:
+        print("docker containers need a compose recreate (not done here): " + ", ".join(dock), file=sys.stderr)
+        return 4
+    if bad or left:
+        print("STILL DRIFTING: " + ", ".join(sorted({r["unit"] for r in left} | set(bad))), file=sys.stderr)
+        return 1
+    print("clean")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
