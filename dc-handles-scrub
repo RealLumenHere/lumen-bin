@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""dc-handles-scrub - keep credentials out of the Desktop Commander handle store (~/.dc-handles.db).
+
+The store keeps every tool call's command and output so a recycled DC can hand output back. Anything
+a tool printed, secrets included, lands in it. This redacts credential-shaped strings in proc.cmd and
+proc.output in place, with the fingerprint convention the rotate tools use (sha256[:12] of the token
+body without its prefix):
+
+    cfat_<40+8 chars>   ->   <redacted fp=0123456789ab>
+
+Why this is more than an UPDATE: SQLite leaves the old bytes in freed pages and in the WAL. So it sets
+secure_delete, checkpoints the WAL, then looks at the RAW file bytes; if token-shaped strings are still
+there it VACUUMs (about 0.2 s on the real store) and checks again. Success is judged on raw bytes.
+
+Scope: unmistakable token formats only (cf*_ , github_pat_, gh?_, sk-ant-, AKIA, JWT, Bearer). It is a
+strict subset of harness/masking.py, so it can under-mask but never invents a false positive. It does
+NOT stop a secret reaching a chat transcript; only the output path can (wq#3249 follow-up).
+
+  dc-handles-scrub              scrub, vacuum if raw bytes are still dirty, exit 0 clean / 3 still dirty
+  dc-handles-scrub --check      read-only; counts only; exit 1 if anything token-shaped is found
+  dc-handles-scrub --db PATH    other store (default ~/.dc-handles.db)
+
+Never prints a token. Exit: 0 clean, 1 --check found hits, 2 error, 3 dirty after scrub+vacuum.
+"""
+import argparse
+import hashlib
+import os
+import re
+import sqlite3
+import sys
+
+DEFAULT_DB = os.path.expanduser("~/.dc-handles.db")
+PREFIXES = ("cfat_", "cfut_", "cfk_", "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-ant-")
+PATTERNS = [
+    r"\bcf(?:at|ut|k)_[A-Za-z0-9_-]{20,}",
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+    r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+    r"\bsk-ant-[A-Za-z0-9_-]{16,}",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+]
+RXS = [re.compile(p) for p in PATTERNS]
+RAW_RXS = [re.compile(p.encode()) for p in PATTERNS[:4]]   # same patterns as the redactor, or dirty never converges
+BEARER = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{20,}")
+LIKE_TERMS = ("cfat_", "cfut_", "cfk_", "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-ant-", "AKIA", "eyJ", "Bearer ")
+WHERE = " or ".join("%s like '%%%s%%'" % (c, t) for c in ("output", "cmd") for t in LIKE_TERMS)
+
+
+def fp(tok):
+    body = tok
+    for p in PREFIXES:
+        if tok.startswith(p):
+            body = tok[len(p):]
+            break
+    return hashlib.sha256(body.encode()).hexdigest()[:12]
+
+
+def scrub_text(s):
+    if not s:
+        return s, 0
+    n = 0
+
+    def rep(m):
+        nonlocal n
+        n += 1
+        return "<redacted fp=%s>" % fp(m.group(0))
+
+    for rx in RXS:
+        s = rx.sub(rep, s)
+
+    def rb(m):
+        nonlocal n
+        n += 1
+        return m.group(1) + "<redacted>"
+    return BEARER.sub(rb, s), n
+
+
+def raw_hits(path):
+    """token-shaped strings in the db file and its WAL, by raw bytes (chunked, overlap-safe)."""
+    total = 0
+    for f in (path, path + "-wal"):
+        if not os.path.exists(f):
+            continue
+        tail = b""
+        with open(f, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 22)
+                if not chunk:
+                    break
+                buf = tail + chunk
+                for rx in RAW_RXS:
+                    total += sum(1 for _ in rx.finditer(buf))
+                tail = buf[-256:]
+    return total
+
+
+def row_hits(con):
+    n = 0
+    for cmd, out in con.execute("select cmd, output from proc where " + WHERE):
+        n += scrub_text(cmd)[1] + scrub_text(out)[1]
+    return n
+
+
+def connect(path):
+    con = sqlite3.connect(path, timeout=30, isolation_level=None)
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def scrub(path):
+    con = connect(path)
+    try:
+        con.execute("PRAGMA secure_delete=ON")
+        ids = [r[0] for r in con.execute("select id from proc where " + WHERE)]
+        changed = repl = 0
+        for i in range(0, len(ids), 20):
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                for rid in ids[i:i + 20]:
+                    cmd, out = con.execute("select cmd, output from proc where id=?", (rid,)).fetchone()
+                    c2, n1 = scrub_text(cmd)
+                    o2, n2 = scrub_text(out)
+                    if n1 + n2:
+                        con.execute("update proc set cmd=?, output=? where id=?", (c2, o2, rid))
+                        changed += 1
+                        repl += n1 + n2
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return changed, repl
+    finally:
+        con.close()
+
+
+def vacuum(path):
+    con = connect(path)
+    try:
+        con.execute("PRAGMA secure_delete=ON")
+        con.execute("VACUUM")
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        con.close()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="redact credentials in the DC handle store", epilog=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--check", action="store_true", help="read-only: count hits, exit 1 if any")
+    a = ap.parse_args(argv)
+    if not os.path.exists(a.db):
+        print("dc-handles-scrub: no such db: %s" % a.db, file=sys.stderr)
+        return 2
+    try:
+        if a.check:
+            con = connect(a.db)
+            try:
+                rows = row_hits(con)
+            finally:
+                con.close()
+            raw = raw_hits(a.db)
+            print("check: row_hits=%d raw_hits=%d" % (rows, raw))
+            return 1 if (rows or raw) else 0
+        changed, repl = scrub(a.db)
+        raw = raw_hits(a.db)
+        vac = False
+        if raw:
+            vacuum(a.db)
+            vac = True
+            raw = raw_hits(a.db)
+        print("scrub: rows_changed=%d replacements=%d vacuumed=%s raw_hits_after=%d" % (changed, repl, vac, raw))
+        return 3 if raw else 0
+    except sqlite3.Error as e:
+        print("dc-handles-scrub: sqlite error: %s" % e, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
