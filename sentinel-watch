@@ -17,7 +17,7 @@ when the condition clears. Frank is paged (ntfy lumen-alerts) only for P0/P1 fin
 human-only (key mint, sentinel blind) or that survived enough sweeps that agents evidently did not
 fix them. Everything else is a ticket for the fworker harness.
 
-Exit: 0 clean, 1 findings, 2 tool error. Log: /home/lumen/logs/sentinel-watch.log (Pacific time).
+Exit: 0 clean, 4 findings, 2 tool error. Log: /home/lumen/logs/sentinel-watch.log (Pacific time).
 """
 from __future__ import annotations
 import argparse, concurrent.futures as cf, datetime as dt, json, os, re, shutil, subprocess, sys, time, urllib.request
