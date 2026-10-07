@@ -106,13 +106,54 @@ def resolve(node, host=None):
         die(f"{node} has no --host, tailscale_ip, or lan_ip. Provision it first (lumen-fleet-provisioning SOP).")
     if warn:
         print(f"WARN {warn}")
-    return got["user"], ip
+    # wq#3591: when the primary is tailscale_ip (which may be on file but unreachable),
+    # offer lan_ip as a connection-failure fallback. --host is authoritative (no fallback),
+    # and a lan_ip-primary resolution has nothing further to fall back to.
+    fallback = None
+    if not host and ip == got.get("tailscale_ip"):
+        lan = got.get("lan_ip")
+        if lan and lan != ip:
+            fallback = lan
+    return got["user"], ip, fallback
 
 
 def ssh(user, ip, script, timeout=60):
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes",
            f"{user}@{ip}", "bash", "-s"]
-    return subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # wq#3591: a hung connection is a connection failure, not a crash. Report it as
+        # ssh's own connect-error code (255) so callers' fallback logic treats it uniformly.
+        return subprocess.CompletedProcess(cmd, 255, "", f"ssh timeout after {timeout}s connecting to {ip}")
+
+
+def ssh_fb(user, ip, fallback, script, timeout=60):
+    """ssh to ip; on a connection failure (rc 255: ssh connect error or our own timeout)
+    retry once against fallback with a WARN. wq#3591: a tailscale_ip may be on file but
+    dead, so the retry is keyed on the connection OUTCOME, never on lumen_state field
+    presence or free-text status prose. Returns (result, used_ip)."""
+    r = ssh(user, ip, script, timeout)
+    if r.returncode == 255 and fallback and fallback != ip:
+        print(f"WARN {ip} unreachable (ssh rc 255); retrying on lan_ip {fallback}", file=sys.stderr)
+        return ssh(user, fallback, script, timeout), fallback
+    return r, ip
+
+
+def scp_fb(user, ip, fallback, remote, local, timeout=300):
+    """scp remote->local from ip; on any failure retry once against fallback (wq#3591)."""
+    def _scp(target):
+        cmd = ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-r",
+               f"{user}@{target}:{remote}", local]
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(cmd, 255, "", f"scp timeout after {timeout}s to {target}")
+    r = _scp(ip)
+    if r.returncode != 0 and fallback and fallback != ip:
+        print(f"WARN scp {ip} failed (rc {r.returncode}); retrying on lan_ip {fallback}", file=sys.stderr)
+        return _scp(fallback), fallback
+    return r, ip
 
 
 # ---------------------------------------------------------------- probe
@@ -134,14 +175,17 @@ fi
 for t in git cmake g++ curl sha256sum; do command -v $t >/dev/null || echo "MISSING=$t"; done
 [ -x "$HOME/llama.cpp/build/bin/llama-bench" ] && echo "LLAMA=present" || echo "LLAMA=absent"
 for f in @FILES@; do [ -f "$HOME/models/$f" ] && echo "HAVE=$f"; done
+true  # wq#3591: the HAVE for-loop's final [ -f ] test is false when the last MODELS
+      # file (the 30B quant) is absent -- the normal case on a 3.8GiB P1 board. Without
+      # this, bash -s exits 1 and probe() mistakes a present node for a dead connection.
 """
 
 
-def probe(user, ip):
+def probe(user, ip, fallback=None):
     files = " ".join(m["file"] for m in MODELS.values())
-    r = ssh(user, ip, PROBE.replace("@FILES@", files))
+    r, ip = ssh_fb(user, ip, fallback, PROBE.replace("@FILES@", files))
     if r.returncode != 0:
-        return None, r.stderr.strip()[-300:]
+        return None, r.stderr.strip()[-300:], ip
     info = {"missing": [], "have": []}
     for line in r.stdout.splitlines():
         if "=" not in line:
@@ -153,7 +197,7 @@ def probe(user, ip):
             info["have"].append(v)
         else:
             info[k] = v.strip()
-    return info, ""
+    return info, "", ip
 
 
 # ---------------------------------------------------------------- planning
@@ -292,12 +336,12 @@ def collect_facts(node, tag, d):
 
 # ---------------------------------------------------------------- commands
 def cmd_run(a):
-    user, ip = resolve(a.node, a.host)
+    user, ip, fb = resolve(a.node, a.host)
     wanted = a.models.split(",") if a.models else list(MODELS)
     for k in wanted:
         if k not in MODELS:
             die(f"unknown model '{k}'. Known: {', '.join(MODELS)}")
-    info, err = probe(user, ip)
+    info, err, ip = probe(user, ip, fb)
     if info is None:
         if not (a.dry_run and a.assume_mem_gb):
             die(f"cannot reach {user}@{ip}: {err or 'ssh failed'}", 3)
@@ -338,21 +382,20 @@ def cmd_run(a):
 
 
 def cmd_status(a):
-    user, ip = resolve(a.node, a.host)
+    user, ip, fb = resolve(a.node, a.host)
     s = (f"cd ~/bench/{a.tag} 2>/dev/null || {{ echo NOT_STARTED; exit 0; }}\n"
          "[ -f DONE ] && echo STATE=DONE\n[ -f FAILED ] && echo STATE=FAILED\n"
          "[ ! -f DONE ] && [ ! -f FAILED ] && echo STATE=RUNNING\ntail -n 8 run.log\n")
-    r = ssh(user, ip, s)
+    r, ip = ssh_fb(user, ip, fb, s)
     print(r.stdout.strip() or r.stderr.strip())
     return 0
 
 
 def cmd_collect(a):
-    user, ip = resolve(a.node, a.host)
+    user, ip, fb = resolve(a.node, a.host)
     d = OUT_ROOT / a.node / a.tag
     d.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-r",
-                        f"{user}@{ip}:bench/{a.tag}/.", str(d)], capture_output=True, text=True)
+    r, ip = scp_fb(user, ip, fb, f"bench/{a.tag}/.", str(d))
     if r.returncode != 0:
         die(f"scp failed: {r.stderr.strip()[-200:]}", 3)
     if not (d / "DONE").exists():

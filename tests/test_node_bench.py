@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -76,6 +77,58 @@ class StubNode(unittest.TestCase):
         d = self.run_launch([m])
         self.assertTrue((d / "FAILED").exists())
         self.assertFalse((d / "DONE").exists())
+
+
+class ProbeAndFallback(unittest.TestCase):
+    """wq#3591: PROBE must not exit nonzero just because the last MODELS file is absent, and
+    ssh()/resolve() must fall back from a dead tailscale_ip to lan_ip on the connection outcome."""
+
+    def test_probe_tail_exits_0_when_models_absent(self):
+        files = " ".join(m["file"] for m in nb.MODELS.values())
+        home = tempfile.mkdtemp()
+        try:
+            (Path(home) / "models").mkdir()  # empty: no model file present
+            r = subprocess.run(["bash", "-s"], input=nb.PROBE.replace("@FILES@", files),
+                               env=dict(os.environ, HOME=home), capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, f"PROBE must exit 0 with no model files; stderr={r.stderr}")
+            self.assertNotIn("HAVE=", r.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_ssh_timeout_is_connection_failure(self):
+        with mock.patch.object(nb.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=8)):
+            r = nb.ssh("u", "1.2.3.4", "echo hi", timeout=8)
+        self.assertEqual(r.returncode, 255)
+
+    def test_ssh_fb_retries_lan_on_255(self):
+        calls = []
+        def fake(user, ip, script, timeout=60):
+            calls.append(ip)
+            rc = 255 if ip == "100.1.2.3" else 0
+            return subprocess.CompletedProcess([], rc, "ok" if rc == 0 else "", "")
+        with mock.patch.object(nb, "ssh", side_effect=fake):
+            r, used = nb.ssh_fb("u", "100.1.2.3", "192.168.8.125", "x")
+        self.assertEqual(calls, ["100.1.2.3", "192.168.8.125"])
+        self.assertEqual((used, r.returncode), ("192.168.8.125", 0))
+
+    def test_ssh_fb_no_retry_on_success(self):
+        with mock.patch.object(nb, "ssh",
+                               return_value=subprocess.CompletedProcess([], 0, "ok", "")) as m:
+            r, used = nb.ssh_fb("u", "100.1.2.3", "192.168.8.125", "x")
+        self.assertEqual((used, m.call_count), ("100.1.2.3", 1))
+
+    def test_resolve_offers_lan_fallback_for_tailscale_primary(self):
+        state = "  ptah.user = lumen\n  ptah.lan_ip = 192.168.8.125  (x)\n  ptah.tailscale_ip = 100.78.207.56\n"
+        with mock.patch.object(nb.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, state, "")):
+            self.assertEqual(nb.resolve("ptah"), ("lumen", "100.78.207.56", "192.168.8.125"))
+
+    def test_resolve_host_override_has_no_fallback(self):
+        state = "  ptah.user = lumen\n  ptah.lan_ip = 192.168.8.125\n  ptah.tailscale_ip = 100.78.207.56\n"
+        with mock.patch.object(nb.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, state, "")):
+            self.assertEqual(nb.resolve("ptah", host="10.0.0.9"), ("lumen", "10.0.0.9", None))
 
 
 if __name__ == "__main__":
