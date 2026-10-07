@@ -26,6 +26,8 @@ def load(sysdir):
 def m(tmp_path, monkeypatch):
     (tmp_path / "a.service").write_text("[Unit]\n")
     mod = load(tmp_path)
+    # wq#3509: keep the digest dedup state out of the real ~/.cache
+    monkeypatch.setattr(mod, "DIGEST_STATE", str(tmp_path / "digest.state"))
     calls = []
     def fake(args, **kw):
         calls.append(list(args))
@@ -49,7 +51,7 @@ def test_digest_title_is_count_free(m, monkeypatch):
         assert m.cmd_check(digest=True) == 1
         ntfy = [c for c in m.calls if c[0] == m.NTFY][-1]
         titles.append(ntfy[ntfy.index("-T") + 1])
-        assert ntfy[-1].startswith("%d change(s): " % (n + 1))   # count moved into the body
+        assert ntfy[-1].startswith("%d change(s) [" % (n + 1))   # count in the body; [hash] per wq#3509
     assert titles == ["unit-drift: drift on lumen"] * 2
 
 def test_clean_digest_resolves_only_unit_drift_rows(m, monkeypatch):
