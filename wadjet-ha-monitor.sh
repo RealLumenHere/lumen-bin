@@ -99,12 +99,13 @@ flip_origin_to_wadjet(){
   sed -i "s#$VAULT_ORIGIN_MAAT#$VAULT_ORIGIN_WADJET#g" "$CF_CONFIG"
   if grep -q "$VAULT_ORIGIN_WADJET" "$CF_CONFIG"; then log "flip_origin: vault origin now -> Wadjet"; else log "flip_origin: ERROR origin not updated"; fi
 }
+# wq#3575: never HUP cloudflared (it exits on SIGHUP and Restart=on-failure leaves it
+# down). The actuator serves --kind reload as a cooldown-exempt detached restart.
 reload_cloudflared(){
-  if systemctl kill -s HUP cloudflared.service 2>>"$LOG"; then
-    log "reload_cloudflared: SIGHUP sent"
-  else
-    systemctl restart cloudflared.service && log "reload_cloudflared: restarted (HUP failed)" || log "reload_cloudflared: ERROR"
-  fi
+  /home/lumen/bin/cfd-actuator request --from wadjet-ha --kind reload \
+    --reason "vault failover: CF origin flipped" 2>>"$LOG" \
+    && log "reload_cloudflared: requested via cfd-actuator" \
+    || log "reload_cloudflared: ERROR filing request"
 }
 start_wadjet_vw(){
   if timeout 25 ssh "${SSH_OPTS[@]}" "$WADJET_SSH" "sudo -n docker start vaultwarden" >>"$LOG" 2>&1; then

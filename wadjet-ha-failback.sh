@@ -171,7 +171,9 @@ switchover(){
   echo "[3/6] Flip CF vault origin -> Ma'at + reload"
   cp "$CF_CONFIG" "${CF_CONFIG}.bak.failback.$(date +%Y%m%d_%H%M%S)"
   sed -i "s#$VAULT_ORIGIN_WADJET#$VAULT_ORIGIN_MAAT#g" "$CF_CONFIG"
-  sudo systemctl kill -s HUP cloudflared.service || sudo systemctl restart cloudflared.service
+  # wq#3575: cloudflared exits on SIGHUP; the actuator serves reload as a detached restart.
+  /home/lumen/bin/cfd-actuator request --from wadjet-failback --kind reload \
+    --reason "vault failback: CF origin flipped" || echo "    WARN: cfd-actuator request failed — restart cloudflared by hand"
   echo "[4/6] Start Ma'at Vaultwarden"; maat_root "docker start vaultwarden"; sleep 3
   echo "[5/6] Rebuild Wadjet as standby of Ma'at"
   echo "    pre-scan SOURCE (Ma'at) PGDATA before wiping Wadjet"
