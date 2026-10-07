@@ -265,7 +265,10 @@ def detect(cur, base, live=None, now=None, expl=None):
         # A frozen/contaminated baseline (wq#599 label cutover) is not a yardstick: it
         # holds another machine's watts under this name. Comparing against it manufactures
         # drift out of a relabel. Better to have no drift signal than a fabricated one.
-        if bi is not None and not b.get("baseline_frozen"):
+        # wq#3516: baselines.json is written by a timer and is NOT re-frozen when a re-plug
+        # lands after it was written, while `cur` is computed live and IS. Either side
+        # frozen means one machine is being compared with another: no comparison.
+        if bi is not None and not (b.get("baseline_frozen") or c.get("baseline_frozen")):
             d = idle - bi
             if abs(d) >= max(DRIFT_MIN_W, DRIFT_MIN_FRAC * max(bi, 1)):
                 if _explains(expl.get(n), d):
@@ -281,8 +284,8 @@ def detect(cur, base, live=None, now=None, expl=None):
             continue      # wq#599: cannot call it a mover if we cannot say who "it" is
         if c.get("parked") or b.get("parked"):
             continue      # partial-window mean vs full-window mean is not a mover
-        if b.get("baseline_frozen"):
-            continue      # wq#599: contaminated baseline, a "move" against it is fiction
+        if b.get("baseline_frozen") or c.get("baseline_frozen"):
+            continue      # wq#599/wq#3516: a contaminated window on either side, a "move" is fiction
         if b.get("mean_w") is None or c.get("mean_w") is None:
             continue
         d = c["mean_w"] - b["mean_w"]

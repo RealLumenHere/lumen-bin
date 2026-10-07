@@ -42,6 +42,20 @@ def _parse_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
 
+def _mislabel_overlaps(ev, start, end):
+    """wq#3516: does this event's wq#600 mislabel window overlap [start, end]?
+
+    A label-FIRST event (label changed, box moved later) with cutover < start < move has
+    its cutover outside the window yet leaves mislabelled samples inside it; testing the
+    cutover timestamp alone never sees it. plug_hist.mislabelled() is the single
+    definition of that window, so ask it instead of re-deriving."""
+    try:
+        return any(w["from"] < end and w["to"] > start
+                   for w in ph.mislabelled(ev.get("plug"), [ev]))
+    except Exception:
+        return False
+
+
 def _apply_label_events(nodes, start, end):
     """Mark baselines whose window spans a label cutover.
 
@@ -66,7 +80,7 @@ def _apply_label_events(nodes, start, end):
             continue
     owner = {}
     for cut, moved, ev in sorted(evs):
-        if not (start <= cut <= end):
+        if not (start <= cut <= end or _mislabel_overlaps(ev, start, end)):
             continue
         old, new = ev.get("from_node"), ev.get("to_node")
         owner[ev.get("plug")] = new
@@ -80,7 +94,10 @@ def _apply_label_events(nodes, start, end):
                  "other_node": other})
             d["label_discontinuity"] = {
                 "at": ev["cutover_ts"], "plug": ev.get("plug"), "other_node": other,
-                "contaminated_from": ev.get("physical_move_ts") or ev["cutover_ts"],
+                # contamination opens at whichever came FIRST: the box moving (move-first,
+                # the normal case) or the label changing (label-first, wq#3516).
+                "contaminated_from": (ev["cutover_ts"] if cut < moved else
+                                      (ev.get("physical_move_ts") or ev["cutover_ts"])),
                 "warning": "baseline window spans a plug-label cutover on %s (%s %s at %s). "
                            "It mixes this node's watts with %s's. Do NOT use for drift "
                            "comparison until the cutover ages out of the window."
