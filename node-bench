@@ -10,11 +10,14 @@ channel) but works for any provisioned node that is in lumen_state.
   node-bench selftest
 
 Rules baked in:
-  * user and tailscale ip come from lumen_state, never hardcoded. A node that is not in
-    lumen_state is refused (provision it first).
+  * user and ip come from lumen_state, never hardcoded. A node that is not in lumen_state
+    is refused (provision it first). ip prefers tailscale_ip, falls back to lan_ip if
+    tailscale_ip is absent, and --host overrides both (wq#3496: the P1 SBCs' tailnet
+    reachability is intermittent; --host lets a caller point at lan_ip explicitly).
   * never runs on lumen itself.
   * refuses a busy node (load1 > 2.0) unless --force-busy.
-  * skips a model that cannot fit in RAM (30B-A3B Q4_K_M is 18.6GB, so it is skipped on a 16GB box).
+  * skips a model that cannot fit in RAM (30B-A3B Q4_K_M is 18.6GB, so it is skipped on a 16GB box;
+    8B Q4_K_M is 4.7GB, skipped on the 3.8GiB P1 boards -- use qwen3-1.7b there).
   * the benchmark runs detached on the node; run/status/collect each return in seconds.
   * results land in /home/lumen/scratch/bench/<node>/<tag>/ ; ingest is explicit (--ingest).
 """
@@ -34,8 +37,16 @@ OUT_ROOT = Path("/home/lumen/scratch/bench")
 LLAMA_REPO = "https://github.com/ggml-org/llama.cpp"
 BUSY_LOAD1 = 2.0
 
-# Sizes and sha256 checked against the Hugging Face API on 2026-09-30.
+# Sizes and sha256 checked against the Hugging Face API on 2026-09-30 (qwen3-1.7b: 2026-10-07).
 MODELS = {
+    "qwen3-1.7b": {
+        "repo": "unsloth/Qwen3-1.7B-GGUF",
+        "file": "Qwen3-1.7B-Q4_K_M.gguf",
+        "size": 1107409472,
+        "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+        "threads": [6, 14],
+        "short": "qwen3_1_7b_q4km",
+    },
     "qwen3-8b": {
         "repo": "Qwen/Qwen3-8B-GGUF",
         "file": "Qwen3-8B-Q4_K_M.gguf",
@@ -64,20 +75,38 @@ def die(msg, code=2):
 def parse_state(text, node):
     got = {}
     for line in text.splitlines():
-        m = re.match(rf"^\s*{re.escape(node)}\.(user|tailscale_ip)\s*=\s*(\S+)", line)
+        m = re.match(rf"^\s*{re.escape(node)}\.(user|tailscale_ip|lan_ip)\s*=\s*(\S+)", line)
         if m:
             got[m.group(1)] = m.group(2)
     return got
 
 
-def resolve(node):
+def select_ip(got, host=None):
+    """Pick the address to ssh to. --host wins outright; otherwise tailscale_ip is
+    preferred and lan_ip is the fallback (wq#3496: tailnet reachability to the P1 SBCs
+    is intermittent; lan_ip is the wired-LAN address lumen_state also records)."""
+    if host:
+        return host, None
+    if got.get("tailscale_ip"):
+        return got["tailscale_ip"], None
+    if got.get("lan_ip"):
+        return got["lan_ip"], f"no tailscale_ip for this node; falling back to lan_ip {got['lan_ip']}"
+    return None, None
+
+
+def resolve(node, host=None):
     if node.lower() == "lumen":
         die("refusing to benchmark lumen: it is the production control plane")
     out = subprocess.run(["python3", STATE, "current", node], capture_output=True, text=True, timeout=60).stdout
     got = parse_state(out, node)
-    if "user" not in got or "tailscale_ip" not in got:
-        die(f"{node} has no user/tailscale_ip in lumen_state. Provision it first (lumen-fleet-provisioning SOP).")
-    return got["user"], got["tailscale_ip"]
+    if "user" not in got:
+        die(f"{node} has no user in lumen_state. Provision it first (lumen-fleet-provisioning SOP).")
+    ip, warn = select_ip(got, host)
+    if ip is None:
+        die(f"{node} has no --host, tailscale_ip, or lan_ip. Provision it first (lumen-fleet-provisioning SOP).")
+    if warn:
+        print(f"WARN {warn}")
+    return got["user"], ip
 
 
 def ssh(user, ip, script, timeout=60):
@@ -148,7 +177,7 @@ def plan(info, wanted, threads_override=None, assume_mem_gb=None):
         if not threads:
             skipped.append((key, "no usable thread count"))
             continue
-        items.append({"key": key, "threads": threads, **m})
+        items.append({**m, "key": key, "threads": threads})
     return items, skipped, warns
 
 
@@ -263,7 +292,7 @@ def collect_facts(node, tag, d):
 
 # ---------------------------------------------------------------- commands
 def cmd_run(a):
-    user, ip = resolve(a.node)
+    user, ip = resolve(a.node, a.host)
     wanted = a.models.split(",") if a.models else list(MODELS)
     for k in wanted:
         if k not in MODELS:
@@ -309,7 +338,7 @@ def cmd_run(a):
 
 
 def cmd_status(a):
-    user, ip = resolve(a.node)
+    user, ip = resolve(a.node, a.host)
     s = (f"cd ~/bench/{a.tag} 2>/dev/null || {{ echo NOT_STARTED; exit 0; }}\n"
          "[ -f DONE ] && echo STATE=DONE\n[ -f FAILED ] && echo STATE=FAILED\n"
          "[ ! -f DONE ] && [ ! -f FAILED ] && echo STATE=RUNNING\ntail -n 8 run.log\n")
@@ -319,7 +348,7 @@ def cmd_status(a):
 
 
 def cmd_collect(a):
-    user, ip = resolve(a.node)
+    user, ip = resolve(a.node, a.host)
     d = OUT_ROOT / a.node / a.tag
     d.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-r",
@@ -359,11 +388,31 @@ def cmd_selftest(_a):
     assert r[14] == {"pp": 71.23, "pp_n": 512, "tg": 11.5, "tg_n": 128}, r
     assert r[6]["tg"] == 10.9
     items, skipped, _ = plan({"MEMKB": str(16 * 1024 * 1024 - 400000), "NPROC": "20"}, list(MODELS))
-    assert [i["key"] for i in items] == ["qwen3-8b"] and skipped[0][0] == "qwen3-30b-a3b", (items, skipped)
+    assert [i["key"] for i in items] == ["qwen3-1.7b", "qwen3-8b"], items
+    assert [k for k, _ in skipped] == ["qwen3-30b-a3b"], skipped
     items, skipped, _ = plan({"MEMKB": str(32 * 1024 * 1024 - 800000), "NPROC": "20"}, list(MODELS))
-    assert len(items) == 2 and not skipped
-    assert parse_state("  m70q.user = frank\n  m70q.tailscale_ip = 100.1.2.3  (since x)\n  m70q.user_note = x", "m70q") == {
-        "user": "frank", "tailscale_ip": "100.1.2.3"}
+    assert len(items) == 3 and not skipped, (items, skipped)
+    # wq#3496: ptah/sekhmet are 3.8GiB / 6-core P1 boards -- only qwen3-1.7b fits, and the
+    # t=14 thread count is dropped (above nproc) while t=6 survives.
+    items, skipped, warns = plan({"MEMKB": str(int(3.8 * 1024 * 1024)), "NPROC": "6"}, list(MODELS))
+    assert [i["key"] for i in items] == ["qwen3-1.7b"], (items, skipped)
+    assert {k for k, _ in skipped} == {"qwen3-8b", "qwen3-30b-a3b"}, skipped
+    assert items[0]["threads"] == [6] and any("dropped thread counts" in w for w in warns), (items, warns)
+    assert parse_state(
+        "  m70q.user = frank\n  m70q.tailscale_ip = 100.1.2.3  (since x)\n  m70q.user_note = x", "m70q"
+    ) == {"user": "frank", "tailscale_ip": "100.1.2.3"}
+    assert parse_state(
+        "  ptah.user = lumen\n  ptah.lan_ip = 192.168.8.125  (since x)\n  ptah.tailscale_ip = 100.78.207.56", "ptah"
+    ) == {"user": "lumen", "lan_ip": "192.168.8.125", "tailscale_ip": "100.78.207.56"}
+    # select_ip: --host always wins; tailscale_ip is preferred; lan_ip is the fallback
+    # when tailscale_ip is absent (wq#3496: P1 boards' tailnet reachability is
+    # intermittent); with neither available there is nothing to connect to.
+    both = {"tailscale_ip": "100.1.2.3", "lan_ip": "192.168.8.125"}
+    assert select_ip(both, host="10.0.0.9") == ("10.0.0.9", None)
+    assert select_ip(both) == ("100.1.2.3", None)
+    ip, warn = select_ip({"lan_ip": "192.168.8.125"})
+    assert ip == "192.168.8.125" and warn and "lan_ip" in warn
+    assert select_ip({}) == (None, None)
     assert tag_warning("single16", "2") and tag_warning("dual32", "1") and not tag_warning("dual32", "2")
     print("selftest OK")
     return 0
@@ -381,6 +430,7 @@ def main():
     p.add_argument("--assume-mem-gb", type=float)
     p.add_argument("--llama-ref", help="llama.cpp tag/branch to clone for reproducibility")
     p.add_argument("--ingest", action="store_true")
+    p.add_argument("--host", help="override the resolved ip (bypass tailscale_ip/lan_ip from lumen_state)")
     a = p.parse_args()
     if a.node == "selftest":
         return cmd_selftest(a)
