@@ -16,6 +16,8 @@ __pycache__/
 /gatus
 /renode-dist
 /retdec-decompiler
+# built from source by ops/wq1298-gitleaks-detect/install.sh (wq#3611)
+/gitleaks
 # third-party RE checkouts (own .git); the wrappers next to them are tracked (wq#3454)
 /FACT_core/
 /emba-dist/

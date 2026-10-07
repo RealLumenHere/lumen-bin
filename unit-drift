@@ -12,11 +12,16 @@ enable-state changes) and exits 1 on drift, 3 on a crash (wq#3099). It never app
                                units only, git commit carrying the unit list and
                                ticket id. For ops bundle install.sh (UNITS=
                                declaration); anything undeclared still drifts.
-  unit-drift check [--digest]  read-only diff; exit 1 on drift;
+  unit-drift check [--digest] [--quiet|--no-notify]
+                               read-only diff; exit 1 on drift;
                                --digest emits an info-class ntfy on drift
                                under one fixed title (= one aq row), skips the
                                ntfy while the change set is unchanged (wq#3509) and
                                resolves that row once the check is CLEAN (wq#3466);
+                               --quiet (alias --no-notify, wq#3488) runs the
+                               same --digest bookkeeping but never calls ntfy —
+                               use for a by-hand check, which is not read-only
+                               otherwise;
                                also lints for dangling After/Wants/Requires
                                targets (wq#1659) and the guard exit-code
                                contract (wq#1657 GEL1/GEL2 via guard_exit_lint.py);
@@ -351,7 +356,7 @@ def print_mask_advisory(masks):
               "not a leftover; find why before unmasking (wq#2073): %s"
               % (RETIRED_YAML, ", ".join(masks)))
 
-def cmd_check(digest=False):
+def cmd_check(digest=False, quiet=False):
     base = load_manifest(); cur = scan(); known = load_known_removed()
     drift  = _diff("unit",   base["units"],   cur["units"], known)
     drift += _diff("dropin", base["dropins"], cur["dropins"])
@@ -384,6 +389,12 @@ def cmd_check(digest=False):
         h = hashlib.sha256("\n".join(items).encode()).hexdigest()[:12]
         if h == _read_digest_state():
             print("  digest: suppressed, drift unchanged since last ntfy (hash %s)" % h)
+        elif quiet:
+            # wq#3488: --quiet/--no-notify runs the same digest math (so state
+            # files stay consistent) but never calls out — a by-hand check is
+            # not a read-only check otherwise (unit-drift check --digest was
+            # paging ntfy on every manual run).
+            print("  digest: quiet mode, ntfy suppressed (hash %s)" % h)
         else:
             summ = "; ".join(items[:12])
             if len(items) > 12: summ += "; +%d more" % (len(items) - 12)
@@ -454,7 +465,8 @@ def main():
     if not a: print(__doc__); return 2
     if a[0] == "snapshot":      return cmd_snapshot()
     if a[0] == "accept":        return cmd_accept(a[1:])
-    if a[0] == "check":         return cmd_check(digest="--digest" in a)
+    if a[0] == "check":         return cmd_check(digest="--digest" in a,
+                                                   quiet=("--quiet" in a or "--no-notify" in a))
     if a[0] == "apply":         return cmd_apply()
     if a[0] == "show-baseline": return cmd_show()
     print(__doc__); return 2

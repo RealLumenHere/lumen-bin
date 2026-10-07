@@ -1,0 +1,22 @@
+#!/bin/bash
+# fleet-refresh — one-line-per-node tailnet liveness snapshot (read-only).
+# Session pipeline-complete-01cecf 2026-10-07. Run by fleet-refresh.timer every 5 min,
+# appended to /home/lumen/logs/fleet-refresh.log. Authoritative roster stays
+# lumen_state.py current / fleet-status; this is only a cheap online/OFFLINE probe.
+export PATH=/home/lumen/bin:/usr/local/bin:/usr/bin:/bin
+tailscale status --json | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+fleet = ["isis","hathor","khepri","maat","sobek","wadjet","nephthys","ptah","sekhmet",
+         "neith","khnum","horus","thoth","anubis","seshat","bes","thor","maksoor","apep"]
+me = d.get("Self", {})
+rows = [(me.get("HostName",""), (me.get("TailscaleIPs") or ["?"])[0], "online(self)")]
+for peer in d.get("Peer", {}).values():
+    host = peer.get("HostName", "")
+    if host.lower() in fleet:
+        ip = (peer.get("TailscaleIPs") or ["?"])[0]
+        rows.append((host, ip, "online" if peer.get("Online") else "OFFLINE"))
+rows.sort(key=lambda r: r[0].lower())
+for host, ip, st in rows:
+    print(f"{host:<10} {ip:<16} {st}")
+'
