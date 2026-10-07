@@ -18,6 +18,14 @@
 # `UNIT=<name>` on its last stdout line, mirroring lumen-run's own contract.
 set -euo pipefail
 
+# wq#3540: a non-interactive SSH session's PATH never carries /home/lumen/bin (only
+# systemd units and interactive shells do), so line 51's `eval "$cmd_line"` — which
+# text-evals router.py's `lumen-run ...` output — failed with "lumen-run: command not
+# found" under `ssh lumen@<host> dispatch-batch <id>`. Resolve the binary explicitly and
+# widen PATH as a defensive fallback for anything else this script shells out to bare.
+export PATH="/home/lumen/bin:/home/lumen/.npm-global/bin:$PATH"
+LUMEN_RUN="${DISPATCH_BATCH_LUMEN_RUN:-/home/lumen/bin/lumen-run}"
+
 FOREMAN_ROOT="${FOREMAN_ROOT:-/home/lumen/foreman}"
 WQ_BIN="${WQ_BIN:-/home/lumen/bin/wq}"
 ROUTER="${DISPATCH_BATCH_ROUTER:-$FOREMAN_ROOT/orchestrator/router.py}"
@@ -48,6 +56,7 @@ default_spawn() {
   last_line=$(printf '%s\n' "$cmd_line" | tail -1)
   case "$last_line" in
     "lumen-run "*)
+      cmd_line="$LUMEN_RUN ${cmd_line#lumen-run }"
       eval "$cmd_line"
       ;;
     *)
