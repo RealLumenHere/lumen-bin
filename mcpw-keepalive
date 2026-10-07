@@ -1,7 +1,7 @@
 #!/bin/bash
 # Ping mcpw every 30s to prevent CF Workers idle recycle (70s timeout)
 while true; do
-  CODE=$(curl -s -o /dev/null -m5 -w '%{http_code}' https://mcpw.lumennode.uk/.well-known/oauth-protected-resource)
+  CODE=$(curl -s -o /dev/null -m5 -w '%{http_code}' https://mcpw.lumennode.uk/.well-known/oauth-protected-resource/mcp)
   case "$CODE" in
     2??) ;;
     *) echo "$(date -u +%FT%TZ) ERROR mcpw-keepalive: oauth-protected-resource http=$CODE (expected 2xx, worker may be sick)" >&2 ;;
