@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""sentinel-watch (wq#3349): the automated sentinel sweep. Runs 4x/day, files tickets, pages Frank
+only for what an agent cannot fix.
+
+Frank directive 2026-10-01: audits kept finding the same things because nothing watched between
+audits. This sweep checks, read-only:
+  guards    named guard timers installed + active + armed, paired service not failed
+  probes    sentinel probe state: probes currently firing, named probes gone stale
+  aq        alert queue readable; open rows grouped by source (noisy sources become one ticket)
+  services  failed units and restart-looping units (live crash-loop stops belong to fleet-selfheal)
+  disk      local + every ssh-reachable fleet node (unreachable nodes are fleet-ssh-check's job)
+  litellm   container health, completion probe, provider rungs cooled by fleet-selfheal
+  wq        the ticket queue itself is readable (if not, nothing can be filed: page)
+Each finding becomes ONE ticket keyed '[sentinel] <class>/<subject>:' (deduped against every
+non-closed wq ticket). The ticket carries --liveness 'sentinel-watch --check <key>' so it closes
+when the condition clears. Frank is paged (ntfy lumen-alerts) only for P0/P1 findings that are
+human-only (key mint, sentinel blind) or that survived enough sweeps that agents evidently did not
+fix them. Everything else is a ticket for the fworker harness.
+
+Exit: 0 clean, 1 findings, 2 tool error. Log: /home/lumen/logs/sentinel-watch.log (Pacific time).
+"""
+from __future__ import annotations
+import argparse, concurrent.futures as cf, datetime as dt, json, os, re, shutil, subprocess, sys, time, urllib.request
+try:
+    from zoneinfo import ZoneInfo
+    PT = ZoneInfo("America/Los_Angeles")
+except Exception:  # pragma: no cover
+    PT = dt.timezone(dt.timedelta(hours=-7), "PDT")
+
+HOME = "/home/lumen"
+WQ = os.environ.get("SW_WQ") or shutil.which("wq") or f"{HOME}/bin/wq"
+AQ = os.environ.get("SW_AQ") or shutil.which("aq") or f"{HOME}/bin/aq"
+FLEET_INV = os.environ.get("SW_FLEET_INV") or shutil.which("fleet-inv") or f"{HOME}/bin/fleet-inv"
+LOG = os.environ.get("SW_LOG", f"{HOME}/logs/sentinel-watch.log")
+STATE = os.environ.get("SW_STATE", f"{HOME}/agents/sentinel-watch/state.json")
+NTFY = os.environ.get("SW_NTFY", "http://localhost:8080")
+PROBE_STATE = os.environ.get("SW_PROBE_STATE", f"{HOME}/sentinel/probes/state.json")
+COOLDOWN = os.environ.get("SW_COOLDOWN", f"{HOME}/foreman/dispatcher/runtime/backend_cooldown.json")
+SELF = f"{HOME}/bin/sentinel-watch"
+MAX_NEW = int(os.environ.get("SW_MAX_TICKETS", "12"))
+CLOSED = {"done", "closed", "cancelled", "canceled", "rejected", "wontfix", "superseded", "retired"}
+
+GUARDS = [  # (name, timer unit)
+    ("pat-scan", "lumen-pat-scan.timer"), ("mask-at-rest", "lumen-mask-at-rest.timer"),
+    ("wq-drift-guard", "wq-drift-guard.timer"), ("unit-drift-guard", "unit-drift.timer"),
+    ("repo-visibility-sentinel", "repo-visibility-sentinel.timer"), ("sentinel-probes", "sentinel-probes.timer"),
+    ("iptables-drift-guard", "lumen-iptables-drift-guard.timer"), ("bin-drift-rescue", "bin-drift-rescue.timer"),
+    ("fleet-selfheal", "lumen-fleet-selfheal.timer"), ("primary-tree-guard", "primary-tree-guard.timer"),
+    ("dc-config-guard", "dc-config-guard.timer"),
+]
+GUARD_SERVICES = [("leakwatch", "lumen-leakwatch.service"), ("alert-queue", "lumen-alert-queue.service")]
+KNOWN_ABSENT = {"overlay-drift-guard": "never built (wq#3350: no trace in systemd, journal or git); listed, not ticketed"}
+CORE_PROBES = {"probe-storage-integrity", "probe-r4-unticketed-recovery", "probe-credential-expiry"}
+PROBE_MAX_AGE = {"probe-r4-unticketed-recovery": 50 * 3600, "probe-synthetic-llm": 3 * 3600}  # seconds since last run
+
+
+def now_pt() -> str:
+    return dt.datetime.now(PT).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def mk(key, sev, title, detail, human=False):
+    return {"key": key, "sev": sev, "title": title, "detail": detail, "human": human}
+
+
+def show(unit, *props):
+    rc, out, _ = sh(["systemctl", "show", unit, "--no-pager"] + ["-p" + p for p in props], 15)
+    d = {}
+    for ln in out.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            d[k] = v
+    return d
+
+
+def slug(s):
+    return re.sub(r"[^A-Za-z0-9_.:-]+", "-", s).strip("-")[:60]
+
+
+# ---------------------------------------------------------------- collectors
+def c_guards(ctx):
+    out = []
+    for name, unit in GUARDS:
+        d = show(unit, "LoadState", "ActiveState", "NextElapseUSecRealtime", "NextElapseUSecMonotonic")
+        if d.get("LoadState") != "loaded":
+            out.append(mk(f"guard/{name}", 1, f"guard timer {unit} is not installed",
+                          f"systemctl show {unit}: LoadState={d.get('LoadState')!r}. A named guard has no timer. Find or rebuild it, install via an ops bundle, verify it fires."))
+            continue
+        if d.get("ActiveState") != "active":
+            out.append(mk(f"guard/{name}", 1, f"guard timer {unit} is {d.get('ActiveState')}",
+                          f"systemctl show {unit}: {d}. Find why it stopped (journalctl -u {unit}), restart it, confirm it fires."))
+            continue
+        svc = unit[:-len(".timer")] + ".service"
+        s = show(svc, "ActiveState", "Result")
+        armed = any(d.get(k, "") not in ("", "0", "n/a", "infinity") for k in ("NextElapseUSecRealtime", "NextElapseUSecMonotonic"))
+        if not armed and s.get("ActiveState") not in ("activating", "active", "reloading"):
+            out.append(mk(f"guard/{name}", 2, f"guard timer {unit} is active but has no next elapse (stalled)",
+                          f"timer={d} service={s}. It is enabled and 'active' yet will never fire again. Check OnUnitActiveSec/OnCalendar and the last service run (journalctl -u {svc} -n 30)."))
+        if s.get("ActiveState") == "failed":
+            out.append(mk(f"guard/{name}-service", 2, f"guard service {svc} is failed",
+                          f"systemctl show {svc}: {s}. journalctl -u {svc} -n 40."))
+    for name, unit in GUARD_SERVICES:
+        d = show(unit, "LoadState", "ActiveState", "SubState")
+        if d.get("LoadState") != "loaded" or d.get("ActiveState") != "active":
+            out.append(mk(f"guard/{name}", 1, f"{unit} is {d.get('ActiveState') or 'missing'}", f"systemctl show {unit}: {d}."))
+    for n, why in KNOWN_ABSENT.items():
+        ctx["notes"].append(f"known-absent guard {n}: {why}")
+    return out
+
+
+def c_probes(ctx):
+    out = []
+    try:
+        with open(PROBE_STATE) as f:
+            st = json.load(f)
+    except Exception as e:
+        return [mk("probe/state-unreadable", 2, "sentinel probe state.json unreadable", f"{PROBE_STATE}: {e}")]
+    for name, v in (st.get("_fires") or {}).items():
+        since = dt.datetime.fromtimestamp(v.get("since", 0), PT).strftime("%Y-%m-%d %H:%M %Z")
+        out.append(mk(f"probe/{name}", 1 if name in CORE_PROBES else 2, f"{name} has been firing since {since} ({v.get('pages', 0)} pages)",
+                      f"sentinel probe state shows {name} firing continuously since {since}, paged {v.get('pages', 0)}x. Investigate root cause and fix; do not just ack. Run: python3 {HOME}/sentinel/probes/sentinel_probes.py"))
+    for name, limit in PROBE_MAX_AGE.items():
+        ts = st.get(name)
+        if isinstance(ts, (int, float)) and ctx["now"] - ts > limit:
+            out.append(mk(f"probe/{name}-stale", 2, f"{name} has not run for {int((ctx['now'] - ts) / 3600)}h", f"last run epoch {ts}; limit {limit // 3600}h. sentinel-probes.timer may be stalled."))
+    return out
+
+
+AQ_ROW = re.compile(r"^\[(\d+)\]\s+(\w+)\s+x(\d+)\s+(\S+)\s+(.*?)\s+owner=(\S+)\s+(\S+)\s+(.*)$")
+
+
+def parse_aq(text):
+    rows = []
+    for ln in text.splitlines():
+        m = AQ_ROW.match(ln)
+        if m:
+            rows.append({"id": int(m.group(1)), "status": m.group(2), "count": int(m.group(3)), "source": m.group(4),
+                         "key": m.group(5).strip(), "owner": m.group(6), "ts": m.group(7), "title": m.group(8).strip()})
+    return rows
+
+
+def aq_findings(rows, min_rows=10, min_total=100):
+    by = {}
+    for r in rows:
+        by.setdefault(r["source"], []).append(r)
+    out = []
+    for src, rs in sorted(by.items()):
+        total = sum(r["count"] for r in rs)
+        if len(rs) >= min_rows or total >= min_total:
+            top = sorted(rs, key=lambda r: -r["count"])[:5]
+            lines = "; ".join(f"aq#{r['id']} x{r['count']} {r['key'][:50]}" for r in top)
+            out.append(mk(f"aq/{slug(src)}", 2, f"alert source '{src}' has {len(rs)} open rows ({total} total repeats)",
+                          f"Triage the source, fix the root cause, then `aq resolve` the rows. Top rows: {lines}. List: aq list open | grep {src}"))
+    return out
+
+
+def c_aq(ctx):
+    out = []
+    rc, so, se = sh([AQ, "list", "open"], 60)
+    if rc != 0 or "database is locked" in (so + se):
+        out.append(mk("aq/unreadable", 0, "aq (alert queue) is unreadable: database is locked" if "locked" in (so + se) else "aq (alert queue) is unreadable",
+                      f"`aq list open` rc={rc}: {(se or so)[-300:]!r}. While this holds, probe FAILs and pages are not persisted. Known fix pattern (2026-10-06): hot journal + PENDING lock held by lumen-alert-queue.service (leaked sqlite handle, wq#2895 class): back up alerts.db + alerts.db-journal to /home/lumen/backups, restart lumen-alert-queue.service, confirm `aq list open` works."))
+    else:
+        rows = parse_aq(so)
+        ctx["aq_open"] = len(rows)
+        out += aq_findings(rows)
+    rc, so, _ = sh(["journalctl", "-u", "lumen-alert-queue.service", "--since", "-45min", "--no-pager", "-q"], 30)
+    n = so.count("database is locked")
+    if n >= 3:
+        out.append(mk("aq/subscriber-locked", 0, f"lumen-alert-queue dropped its ntfy stream {n}x in 45min: database is locked",
+                      "The subscriber cannot write to alerts.db, so alerts pushed to lumen-alerts are being dropped. See the aq/unreadable fix pattern."))
+    return out
+
+
+def c_services(ctx):
+    out = []
+    rc, so, _ = sh(["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], 30)
+    units, failed = [], []
+    for ln in so.splitlines():
+        p = ln.split()
+        if len(p) >= 4 and p[0].endswith(".service"):
+            units.append(p[0])
+            if p[2] == "failed":
+                failed.append(p[0])
+    for u in failed[:25]:
+        out.append(mk(f"svc/{slug(u)}", 2, f"service {u} is failed", f"journalctl -u {u} -n 40; systemctl status {u}. Fix the cause, then `systemctl reset-failed {u}`."))
+    prev = ctx["state"].get("nrestarts", {})
+    cur = {}
+    for i in range(0, len(units), 120):
+        chunk = units[i:i + 120]
+        rc, so, _ = sh(["systemctl", "show", "--no-pager", "-pId", "-pNRestarts", "-pActiveState", "-pSubState"] + chunk, 60)
+        for blk in so.strip().split("\n\n"):
+            d = dict(ln.split("=", 1) for ln in blk.splitlines() if "=" in ln)
+            u = d.get("Id")
+            if not u:
+                continue
+            n = int(d.get("NRestarts", "0") or 0)
+            if n:
+                cur[u] = n
+            looping = d.get("SubState") == "auto-restart" or (d.get("ActiveState") == "activating" and n > 3)
+            delta = n - prev.get(u, n)
+            if looping or delta >= 20:
+                why = "currently in auto-restart" if looping else f"{delta} restarts since the last sweep"
+                out.append(mk(f"svc/{slug(u)}-loop", 1, f"service {u} is crash-looping ({why})",
+                              f"NRestarts={n} state={d.get('ActiveState')}/{d.get('SubState')}. journalctl -u {u} -n 60. Fix the root cause; systemd restarting forever is not a fix."))
+    ctx["new_state"]["nrestarts"] = cur
+    return out
+
+
+def df_pct(line):
+    p = line.split()
+    return int(p[4].rstrip("%")) if len(p) >= 5 and p[4].rstrip("%").isdigit() else None
+
+
+def c_disk(ctx):
+    out = []
+    for mp in ("/", "/data/lumen"):
+        try:
+            u = shutil.disk_usage(mp)
+        except OSError:
+            continue
+        pct = int(round(100.0 * u.used / u.total))
+        if pct >= 85:
+            out.append(mk(f"disk/lumen:{slug(mp)}", 1 if pct >= 90 else 2, f"disk {mp} on lumen is {pct}% full", "fleet-selfheal class 4 prunes only safe caches; if it stays above 85% find the growth (du -xh --max-depth=2) and fix it."))
+    rc, so, _ = sh([FLEET_INV, "ssh-list"], 30)
+    nodes = [ln.split("\t") for ln in so.splitlines() if ln and not ln.startswith("#") and "\t" in ln]
+    nodes = [(n[0], n[1]) for n in nodes if n[0] not in ("lumen",)]
+    ctx["nodes_total"] = len(nodes)
+
+    def probe(nt):
+        name, target = nt
+        rc, so, se = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", target, "df -Pk /"], 25)
+        if rc != 0:
+            return name, None
+        lines = so.strip().splitlines()
+        return name, (df_pct(lines[-1]) if lines else None)
+    with cf.ThreadPoolExecutor(8) as ex:
+        for name, pct in ex.map(probe, nodes):
+            if pct is None:
+                ctx["unreachable"].append(name)
+            elif pct >= 85:
+                out.append(mk(f"disk/{slug(name)}:root", 1 if pct >= 90 else 2, f"disk / on {name} is {pct}% full", f"ssh {name} 'df -h /; du -xh --max-depth=2 / 2>/dev/null | sort -h | tail -20'. Free space safely (never delete data/backups/state)."))
+    return out
+
+
+def c_litellm(ctx):
+    out = []
+    rc, so, _ = sh(["docker", "ps", "-a", "--filter", "name=litellm", "--format", "{{.Names}}\t{{.Status}}"], 20)
+    for ln in so.splitlines():
+        name, _, status = ln.partition("\t")
+        if not status.startswith("Up") or "unhealthy" in status:
+            out.append(mk("litellm/container", 1, f"LiteLLM container {name}: {status}", "docker logs --tail 80 " + name))
+    d = show("litellm-completion-probe.service", "ActiveState", "Result")
+    if d.get("ActiveState") == "failed" or d.get("Result") not in (None, "", "success"):
+        out.append(mk("litellm/completion-probe", 1, "litellm-completion-probe last run failed", f"{d}. journalctl -u litellm-completion-probe -n 40; a provider rung is likely dead (401/403) or the gateway is down."))
+    try:
+        with open(COOLDOWN) as f:
+            cd = json.load(f)
+        cooled = []
+
+        def walk(node, name=None):
+            if isinstance(node, dict):
+                if node.get("source") == "fleet-selfheal" and name:
+                    cooled.append(name)
+                for k, v in node.items():
+                    walk(v, k if isinstance(v, dict) else name)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v, name)
+        walk(cd)
+        if cooled:
+            out.append(mk("litellm/provider-cooled", 1, f"{len(set(cooled))} LiteLLM rung(s) disabled by fleet-selfheal (provider key dead)", f"Cooled: {sorted(set(cooled))[:10]}. Frank mints the new key; then python3 {HOME}/bin/rotate-provider-keys does the rest.", human=True))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        ctx["notes"].append(f"cooldown file unreadable: {e}")
+    return out
+
+
+COLLECTORS = {"guards": c_guards, "probes": c_probes, "aq": c_aq, "services": c_services, "disk": c_disk, "litellm": c_litellm}
+
+
+# ---------------------------------------------------------------- wq filing / paging
+def parse_wq_titles(text, closed=CLOSED):
+    titles = []
+    for ln in text.splitlines():
+        m = re.match(r"^\[(\d+)\]\s+\S+\s+p\d+\s+(\S+)\s+(.*)$", ln)
+        if m and m.group(2) not in closed:
+            titles.append(m.group(3))
+    return titles
+
+
+def plan_filing(findings, titles, cap):
+    new, skipped, over = [], [], []
+    for f in sorted(findings, key=lambda f: (f["sev"], f["key"])):
+        if any(f"[sentinel] {f['key']}:" in t for t in titles):
+            skipped.append(f)
+        elif len(new) < cap:
+            new.append(f)
+        else:
+            over.append(f)
+    return new, skipped, over
+
+
+def file_ticket(f, run_id):
+    key = f["key"]
+    base = [WQ, "add", "--lane", "fleet", "--pri", str(f["sev"]), "--title", f"[sentinel] {key}: {f['title']}",
+            "--detail", f"{f['detail']}\n\nFiled by sentinel-watch ({run_id}). Verify the fix: {SELF} --check {key}"]
+    for tail in (["--liveness", f"{SELF} --check {key} --quiet"], ["--no-probe", "sentinel finding; verify by re-running sentinel-watch --check"]):
+        rc, so, se = sh(base + tail, 60)
+        m = re.search(r"wq#(\d+)|\[(\d+)\]|\bid[= ](\d+)", so + se)
+        if rc == 0:
+            tid = next((g for g in (m.groups() if m else ()) if g), None)
+            if not tid:  # wq add's output format is not stable: find the ticket we just made by its title prefix
+                _, listing, _ = sh([WQ, "list"], 60)
+                for ln in listing.splitlines():
+                    lm = re.match(r"^\[(\d+)\].*" + re.escape(f"[sentinel] {key}:"), ln)
+                    if lm:
+                        tid = lm.group(1)
+                        break
+            return "wq#" + (tid or "?")
+    return "FILE-FAILED rc=%s %s" % (rc, (se or so).strip()[:120])
+
+
+def page(title, msg):
+    req = urllib.request.Request(f"{NTFY}/lumen-alerts", data=msg.encode("utf-8", "replace"), method="POST",
+                                 headers={"Title": title.encode("ascii", "replace").decode(), "Priority": "high", "Tags": "rotating_light"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+def should_page(f, seen, last_page, now):
+    if f["sev"] > 1:
+        return False
+    if now - last_page.get(f["key"], 0) < 86400:
+        return False
+    runs = seen.get(f["key"], {}).get("runs", 1)
+    return f["human"] or (f["sev"] == 0 and runs >= 2) or (f["sev"] == 1 and runs >= 4)
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(st, fh, indent=1, sort_keys=True)
+    os.replace(tmp, STATE)
+
+
+def collect(only, ctx):
+    findings = []
+    for name, fn in COLLECTORS.items():
+        if only and name not in only:
+            continue
+        try:
+            findings += fn(ctx)
+        except Exception as e:
+            findings.append(mk(f"sentinel/{name}-crashed", 2, f"sentinel-watch collector '{name}' crashed: {type(e).__name__}", f"{e!r}. The watcher itself is broken for this class: fix {SELF}."))
+    return findings
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="sentinel sweep: guards, probes, aq, services, disk, LiteLLM; files tickets, pages for the unfixable",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--dry-run", action="store_true", help="touch nothing: no tickets, no pages, no state, no log")
+    ap.add_argument("--check", metavar="KEY", help="exit 0 if finding KEY is clear, 1 if still present (used as each ticket's liveness probe)")
+    ap.add_argument("--only", help="comma list of: " + ",".join(COLLECTORS))
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args(argv)
+    now = time.time()
+    st = load_state()
+    ctx = {"notes": [], "unreachable": [], "state": st, "new_state": {}, "now": now}
+    only = set(a.only.split(",")) if a.only else None
+    findings = collect(only, ctx)
+
+    if a.check:
+        hit = [f for f in findings if f["key"] == a.check]
+        if not a.quiet:
+            print(("STILL PRESENT: " + hit[0]["title"]) if hit else f"CLEAR: {a.check}")
+        return 1 if hit else 0
+
+    run_id = dt.datetime.now(PT).strftime("%Y%m%dT%H%M%S")
+    rc, so, se = sh([WQ, "list"], 60)
+    wq_ok = rc == 0
+    titles = parse_wq_titles(so) if wq_ok else []
+    if not wq_ok:
+        findings.append(mk("wq/unreadable", 0, "wq (ticket queue) is unreadable: sentinel cannot file tickets", f"`wq list` rc={rc}: {(se or so)[-200:]!r}", human=True))
+    new, skipped, over = plan_filing(findings, titles, MAX_NEW)
+    filed, paged = [], []
+    seen = st.get("seen", {})
+    new_seen = {f["key"]: {"first": seen.get(f["key"], {}).get("first", now), "runs": seen.get(f["key"], {}).get("runs", 0) + 1} for f in findings}
+    last_page = st.get("last_page", {})
+
+    if not a.dry_run:
+        if wq_ok:
+            for f in new:
+                filed.append((f, file_ticket(f, run_id)))
+            if over:
+                ov = [f"{f['key']}: {f['title']}" for f in over]
+                filed.append((mk("sentinel/overflow", 2, f"{len(over)} more findings exceeded the {MAX_NEW}-ticket cap", ""), file_ticket(mk("sentinel/overflow", 2, f"{len(over)} more findings exceeded the per-run ticket cap", "Re-run: sentinel-watch --dry-run\n" + "\n".join(ov[:30])), run_id)))
+        for f in findings:
+            if should_page(f, new_seen, last_page, now):
+                if page(f"SENTINEL {('P%d' % f['sev'])}: {f['key']}", f"{f['title']}\n{f['detail'][:300]}\nTicket/log: {LOG}"):
+                    paged.append(f["key"])
+                    last_page[f["key"]] = now
+        st.update({"seen": new_seen, "last_page": last_page, "nrestarts": ctx["new_state"].get("nrestarts", st.get("nrestarts", {})), "last_run": now})
+        save_state(st)
+
+    ticket_of = {f["key"]: t for f, t in filed}
+    lines = [f"{now_pt()} run={run_id} findings={len(findings)} new_tickets={len(filed)} existing={len(skipped)} over_cap={len(over)} paged={len(paged)} aq_open={ctx.get('aq_open', '?')} nodes_unreachable={len(ctx['unreachable'])}/{ctx.get('nodes_total', '?')}{' DRY-RUN' if a.dry_run else ''}"]
+    for f in sorted(findings, key=lambda f: (f["sev"], f["key"])):
+        disp = "would-file" if a.dry_run and f in new else ticket_of.get(f["key"], "ticket-exists" if f in skipped else "over-cap")
+        lines.append(f"  P{f['sev']} {f['key']}  {f['title']}  -> {disp}")
+    lines += [f"  note: {n}" for n in ctx["notes"]]
+    if ctx["unreachable"]:
+        lines.append("  unreachable (owned by fleet-ssh-check/selfheal class 6): " + ",".join(sorted(ctx["unreachable"])))
+    if a.json:
+        print(json.dumps({"findings": findings, "new": [f["key"] for f in new], "skipped": [f["key"] for f in skipped], "paged": paged}, indent=1))
+    elif not a.quiet:
+        print("\n".join(lines))
+    if not a.dry_run:
+        try:
+            os.makedirs(os.path.dirname(LOG), exist_ok=True)
+            with open(LOG, "a") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as e:
+            print(f"log write failed: {e}", file=sys.stderr)
+            return 2
+    # wq#3483: audit-run exit vocabulary: 0 clean, 4 findings filed/known (unit has SuccessExitStatus=4),
+    # 2 log write failed. Exit 1 is left to mean 'crash' (uncaught exception) so a broken sentinel still
+    # fails the unit loudly. `--check KEY` keeps its probe contract (0 clear / 1 still present) above.
+    return 4 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
