@@ -7,7 +7,9 @@ enable-state changes) and exits 1 on drift, 3 on a crash (wq#3099). It never app
 
   unit-drift snapshot          rebuild baseline from /etc, git commit
   unit-drift check [--digest]  read-only diff; exit 1 on drift;
-                               --digest emits an info-class ntfy on drift;
+                               --digest emits an info-class ntfy on drift
+                               under one fixed title (= one aq row) and
+                               resolves that row once the check is CLEAN (wq#3466);
                                also lints for dangling After/Wants/Requires
                                targets (wq#1659) and the guard exit-code
                                contract (wq#1657 GEL1/GEL2 via guard_exit_lint.py);
@@ -32,6 +34,12 @@ KNOWN_RM   = os.path.join(REPO, "known-removed.txt")
 RETIRED_YAML = "/home/lumen/foreman/docs/fleet/retired_services.yaml"
 NTFY  = "/home/lumen/bin/ntfy-send"
 TOPIC = "lumen-alerts"
+AQ    = os.environ.get("UNIT_DRIFT_AQ", "/home/lumen/bin/aq")  # env override is for tests
+AQ_SOURCE = "ntfy:" + TOPIC
+# wq#3466: the aq ntfy ingest keys a row by its title. A title carrying the change count
+# opened a new row each time the count moved (47 rows / 3064 repeats for one drift stream).
+DIGEST_TITLE = "unit-drift: drift on lumen"
+AQ_ROW_RE = re.compile(r"^\[\s*(\d+)\]\s+open\s+x\d+\s+(\S+)\s+(.*?)\s+owner=")
 SEARCH_PATHS = ("/etc/systemd/system","/run/systemd/system",
                 "/usr/lib/systemd/system","/lib/systemd/system")
 SUFFIXES = ("service","socket","timer","target","path","mount",
@@ -259,6 +267,7 @@ def cmd_check(digest=False):
         print("[%s] unit-drift: CLEAN (%s)" % (ts, counts))
         if orphans: print("  advisory: orphaned drop-in dir(s), base unit absent: " + ", ".join(orphans))
         print_mask_advisory(masks)
+        if digest: resolve_digest_rows()
         return 0
     print("[%s] unit-drift: DRIFT — %d change(s) vs git baseline, %d dangling target(s), %d guard-lint violation(s)"
           % (ts, len(drift), len(dangling), len(lint)))
@@ -271,9 +280,23 @@ def cmd_check(digest=False):
         items = [k + " " + n for k, n in drift] + dangling + [v.split(":")[0] for v in lint]
         summ = "; ".join(items[:12])
         if len(items) > 12: summ += "; +%d more" % (len(items) - 12)
-        subprocess.run([NTFY, "-t", TOPIC, "-p", "low", "-T",
-                        "unit-drift: %d change(s) on lumen" % len(items), summ])
+        subprocess.run([NTFY, "-t", TOPIC, "-p", "low", "-T", DIGEST_TITLE,
+                        "%d change(s): %s" % (len(items), summ)])
     return 1
+
+def resolve_digest_rows():
+    """wq#3466: nothing closed a digest row when drift cleared, so they piled up open until a
+    human resolved them. Matches every 'unit-drift:' key, which also sweeps the old count-keyed rows."""
+    try:
+        r = subprocess.run([AQ, "list", "open"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("  advisory: aq unreadable, digest rows left open (%s)" % exc); return
+    for line in r.stdout.splitlines():
+        m = AQ_ROW_RE.match(line)
+        if m and m.group(2) == AQ_SOURCE and m.group(3).startswith("unit-drift:"):
+            subprocess.run([AQ, "resolve", m.group(1), "auto: unit-drift check CLEAN"],
+                           capture_output=True, timeout=60)
+            print("  resolved aq#%s (%s)" % (m.group(1), m.group(3)))
 
 def cmd_apply():
     base = load_manifest(); cur = scan()
