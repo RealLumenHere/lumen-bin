@@ -52,7 +52,7 @@ def build(tmp_path, github_url=None):
     return origin, github, primary
 
 
-def run_sync(tmp_path, primary):
+def run_sync(tmp_path, primary, **extra_env):
     aq_log = tmp_path / "aq.log"
     aq = tmp_path / "aq"
     aq.write_text('#!/bin/sh\nprintf "%s|" "$@" >> "$AQ_LOG"; echo >> "$AQ_LOG"\n')
@@ -63,6 +63,7 @@ def run_sync(tmp_path, primary):
         GITHUB_MIRROR_ROOT=str(tmp_path / "mirrors"),
         GITHUB_MIRROR_AQ=str(aq),
         AQ_LOG=str(aq_log),
+        **extra_env,
     )
     r = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
     return r, (aq_log.read_text() if aq_log.exists() else "")
@@ -92,22 +93,56 @@ def test_sync_mirrors_heads_and_tags_past_pr_refs(tmp_path):
     assert rev(github, "refs/pull/1/head") is None
 
 
-def test_github_default_branch_missing_on_origin_is_kept(tmp_path):
-    """mission-control's GitHub default was a branch Gitea never had; pruning it failed the push."""
-    origin, github, primary = build(tmp_path)
-    # GitHub refuses to delete its default branch; a non-bare repo refuses to delete its
-    # checked-out branch the same way.
+def github_on_stale_default(tmp_path, primary, github):
+    """GitHub refuses to delete its default branch; a non-bare repo refuses to delete its
+    checked-out branch the same way."""
     gh = tmp_path / "gh-checkout"
     git("clone", "-q", "-b", "stale", str(github), str(gh))
     git("-C", str(gh), "config", "receive.hideRefs", "refs/pull")
     git("-C", str(primary), "remote", "set-url", "github", str(gh))
+    return gh
+
+
+def test_github_default_branch_missing_on_origin_is_kept_when_repoint_fails(tmp_path):
+    """mission-control's GitHub default was a branch Gitea never had; pruning it failed the push.
+    The real repointer refuses a non-github.com url, so this runs the fallback path."""
+    origin, github, primary = build(tmp_path)
+    gh = github_on_stale_default(tmp_path, primary, github)
     r, aq = run_sync(tmp_path, primary)
     assert r.returncode == 0, r.stderr
-    assert "demo: WARN github default branch 'stale' is not on origin" in r.stderr
+    assert "demo: WARN github default branch 'stale' is not on origin; kept it: not a github.com remote" in r.stderr
     assert rev(gh, "refs/heads/stale"), "the default branch must survive the prune"
     assert rev(gh, "refs/heads/main") == rev(origin, "refs/heads/main")
     assert "demo-default-branch|" in aq
+    assert "Repointing it automatically failed: not a github.com remote" in aq
     assert "Set the GitHub default branch to 'main'" in aq
+
+
+def test_github_default_branch_missing_on_origin_is_repointed_then_pruned(tmp_path):
+    """wq#3461: the sync repoints GitHub's default at origin's HEAD itself, so the stale
+    branch prunes and no row is raised."""
+    origin, github, primary = build(tmp_path)
+    gh = github_on_stale_default(tmp_path, primary, github)
+    calls = tmp_path / "set-default.log"
+    fake = tmp_path / "set-default"
+    fake.write_text(
+        '#!/bin/sh\necho "$1 $2" >> "$SET_DEFAULT_LOG"\n'
+        'git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null || { echo "no such branch $2" >&2; exit 1; }\n'
+        'git -C "$1" symbolic-ref HEAD "refs/heads/$2"\n'
+    )
+    fake.chmod(0o755)
+    r, aq = run_sync(tmp_path, primary, GITHUB_MIRROR_SET_DEFAULT=str(fake), SET_DEFAULT_LOG=str(calls))
+    assert r.returncode == 0, r.stderr
+    assert calls.read_text() == f"{gh} main\n"
+    assert "demo: github default branch 'stale' is not on origin; repointed it to 'main'" in r.stdout
+    assert aq == ""
+    assert rev(gh, "refs/heads/stale") is None, "once repointed, the stale default prunes like any branch"
+    assert rev(gh, "refs/heads/main") == rev(origin, "refs/heads/main")
+    assert rev(gh, "refs/tags/v1") == rev(origin, "refs/tags/v1")
+    r, aq = run_sync(tmp_path, primary, GITHUB_MIRROR_SET_DEFAULT=str(fake), SET_DEFAULT_LOG=str(calls))
+    assert r.returncode == 0, r.stderr
+    assert calls.read_text() == f"{gh} main\n", "a healthy default must not be repointed again"
+    assert aq == ""
 
 
 def test_push_failure_reports_stderr_tail_and_owner(tmp_path):
