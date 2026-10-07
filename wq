@@ -2160,7 +2160,9 @@ def _sha_repo_candidates():
     """Repos a fleet sha could plausibly live in: the caller's cwd first, then every git
     checkout directly under /home/lumen and its two repo-holding subdirs."""
     seen, out, kids = set(), [], []
-    for base in ("/home/lumen", "/home/lumen/projects", "/home/lumen/agents"):
+    # wq#3565: wq#3532 migrated project repos to /scratch/fleet/projects; keep the
+    # deprecated root too until every repo has actually moved off it.
+    for base in ("/home/lumen", "/home/lumen/projects", "/home/lumen/agents", "/scratch/fleet/projects"):
         try:
             kids += sorted(os.path.join(base, n) for n in os.listdir(base))
         except OSError:

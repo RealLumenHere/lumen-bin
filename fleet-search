@@ -36,7 +36,11 @@ AGENT_ENV = "/home/lumen/agent/.env"
 # it runs as a subprocess and only a token-file PATH (safe to log) ever comes back to
 # this process, never the token over env/URL/log.
 GITHUB_IDENTITY_LIB = os.environ.get("GITHUB_IDENTITY_LIB", "/home/lumen/bin/lumen-github-identity.sh")
-PROJECTS = "/home/lumen/projects"
+# wq#3565: wq#3532 migrated project dirs to /scratch/fleet/projects; resolve a
+# per-project cache dir there first so --project mkdir never resurrects the
+# deprecated /home/lumen/projects root for a project that already migrated.
+PROJECTS_NEW = "/scratch/fleet/projects"
+PROJECTS_OLD = "/home/lumen/projects"
 CACHE_TTL_DEFAULT = 14 * 86400          # 14 days for volatile web
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 HTTP_TIMEOUT = 20
@@ -174,11 +178,21 @@ def _rate_limit_note(rl):
 
 
 # ---------- per-project cache ----------
+def _project_root(project):
+    """wq#3565: prefer the migrated /scratch/fleet/projects root; fall back to
+    the deprecated /home/lumen/projects root only for a project that still
+    lives there, so mkdir never resurrects the old root."""
+    new_root = os.path.join(PROJECTS_NEW, project)
+    if os.path.isdir(new_root):
+        return new_root
+    return os.path.join(PROJECTS_OLD, project)
+
+
 def _cache_paths(project):
     if not project:
         base = "/home/lumen/agent/research_cache"      # global fallback
     else:
-        base = os.path.join(PROJECTS, project, "research")
+        base = os.path.join(_project_root(project), "research")
     return os.path.join(base, "search_cache.jsonl"), os.path.join(base, "PRIOR_ART.md"), base
 
 

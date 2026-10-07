@@ -29,7 +29,8 @@ CRED=${GITEA_ROTATE_CRED_FILE:-/home/lumen/.git-credentials}
 SECFILE=${GITEA_ROTATE_SEC_FILE:-/home/lumen/.secrets/gitea-lumen.token}
 ENGINE_DIR=${GITEA_ROTATE_ENGINE_DIR:-/var/lib/token-engine/secrets}
 ENGINE_FILE=${GITEA_ROTATE_ENGINE_FILE:-$ENGINE_DIR/gitea-lumen.token}
-REPOS=${GITEA_ROTATE_REPOS:-"/home/lumen/bin /home/lumen/messenger /home/lumen/minerva /home/lumen/projects/lumen-messenger-cc /home/lumen/foreman"}
+# wq#3565: lumen-messenger-cc moved to /scratch/fleet/projects under wq#3532.
+REPOS=${GITEA_ROTATE_REPOS:-"/home/lumen/bin /home/lumen/messenger /home/lumen/minerva /scratch/fleet/projects/lumen-messenger-cc /home/lumen/foreman"}
 LOCK_SCOPE=gitea-lumen-token
 LOCK_TTL=${GITEA_ROTATE_LOCK_TTL:-15}
 HOLDER=${GITEA_ROTATE_HOLDER:-gitea-rotate-finish-$$}
