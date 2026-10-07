@@ -521,6 +521,25 @@ def cmd_close(cfg, a):
         left = [q["id"] for q in state["queue"] if q["window"] == a.window and "control-plane" not in q.get("tags", [])]
         if ended and left and state["drained"].get(a.window) != ended[0].isoformat():
             problems.append(f"window passed without a drain; queued: {', '.join(left)}")
+        # wq#3484: alarm when drain ran but all ops stayed at attempts=0
+        # (everything was skipped — the window achieved nothing useful)
+        elif ended and left:
+            zero_attempt = [q["id"] for q in state["queue"]
+                            if q["window"] == a.window
+                            and "control-plane" not in q.get("tags", [])
+                            and q.get("attempts", 0) == 0]
+            if zero_attempt and len(zero_attempt) == len(left):
+                problems.append(
+                    f"drain ran but ALL {len(zero_attempt)} non-control-plane ops "
+                    f"stayed at attempts=0 (all skipped): {', '.join(zero_attempt)}")
+            # flag any security-tagged ops that were skipped
+            sec_skipped = [q["id"] for q in state["queue"]
+                           if q["window"] == a.window
+                           and "security" in q.get("tags", [])
+                           and q.get("attempts", 0) == 0]
+            if sec_skipped:
+                problems.append(
+                    f"SECURITY ops skipped with 0 attempts: {', '.join(sec_skipped)}")
         save_state(state)
     if problems:
         notify(cfg, f"MAINT WINDOW {a.window} PROBLEM at hard stop", "\n".join(problems), "urgent")

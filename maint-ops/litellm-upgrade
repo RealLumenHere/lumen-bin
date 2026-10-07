@@ -87,11 +87,27 @@ def call(m, p, b=None):
 ok = True
 st, r = call("GET", "/v1/models"); n = len(r.get("data", [])) if st == 200 else 0
 print(f"  /v1/models http={st} models={n}"); ok &= (st == 200 and n >= 1)
-st, r = call("POST", "/v1/chat/completions", {"model": "deepseek-v4-flash", "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]})
-txt = ""
-try: txt = r["choices"][0]["message"]["content"]
-except Exception: pass
-print(f"  completion http={st} reply_len={len(txt)}"); ok &= (st == 200 and len(txt) > 0)
+# wq#3518: try all accessible models instead of only deepseek-v4-flash.
+# The smoke proves the gateway routes a completion; any provider will do.
+# Discover accessible models dynamically from /v1/models (already checked above).
+_accessible = [m["id"] for m in r.get("data", [])] if st == 200 else ["deepseek-v4-flash"]
+# Prefer these first (known cheap/fast), then fall through to the rest
+_preferred = ["qwen36-local", "lumen-lfm2-1b", "deepseek-v4-flash"]
+_ordered = [m for m in _preferred if m in _accessible] + [m for m in _accessible if m not in _preferred]
+_completion_ok = False
+for _sm in _ordered:
+    _st, _r = call("POST", "/v1/chat/completions", {"model": _sm, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]})
+    _txt = ""
+    try: _txt = _r["choices"][0]["message"]["content"]
+    except Exception: pass
+    print(f"  completion {_sm} http={_st} reply_len={len(_txt)}")
+    if _st == 200 and len(_txt) > 0:
+        _completion_ok = True
+        break
+    print(f"    (failed, trying next)")
+if not _completion_ok:
+    print("  completion FAIL: all accessible models failed")
+ok &= _completion_ok
 if os.environ.get("NEG_CONTROL") == "1":
     st, r = call("POST", "/v1/chat/completions", {"model": "kimi-k3", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
     print(f"  out-of-scope model http={st} (want 401/403)"); ok &= (st in (401, 403))
