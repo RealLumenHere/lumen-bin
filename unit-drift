@@ -6,6 +6,12 @@ The reconciler is READ-ONLY: it reports drift (added/removed/modified units,
 enable-state changes) and exits 1 on drift, 3 on a crash (wq#3099). It never applies or restarts.
 
   unit-drift snapshot          rebuild baseline from /etc, git commit
+  unit-drift accept --ticket <id> <unit>...
+                               scoped baseline bless (wq#3579): update units/,
+                               dropins/, enable-state and MANIFEST for the NAMED
+                               units only, git commit carrying the unit list and
+                               ticket id. For ops bundle install.sh (UNITS=
+                               declaration); anything undeclared still drifts.
   unit-drift check [--digest]  read-only diff; exit 1 on drift;
                                --digest emits an info-class ntfy on drift
                                under one fixed title (= one aq row), skips the
@@ -26,7 +32,7 @@ plaintext secrets ever entering the repo.
 import os, sys, json, hashlib, subprocess, re, datetime
 
 SYS  = os.environ.get("UNIT_DRIFT_SYS", "/etc/systemd/system")  # env override is for tests
-REPO = "/home/lumen/fleet-units"
+REPO = os.environ.get("UNIT_DRIFT_REPO", "/home/lumen/fleet-units")  # env override is for tests
 UNITS_DIR  = os.path.join(REPO, "units")
 DROPIN_DIR = os.path.join(REPO, "dropins")
 MANIFEST   = os.path.join(REPO, "MANIFEST.json")
@@ -167,6 +173,96 @@ def cmd_snapshot():
             len(st["units"]), len(st["dropins"]), len(st["enable"])))
     r = git("commit", "-m", msg)
     print(msg); print((r.stdout or r.stderr).strip())
+    return 0
+
+def cmd_accept(argv):
+    """wq#3579: scoped baseline bless for ops bundle deploys. A blanket `snapshot`
+    as a deploy step would commit every unreviewed change sitting on the box;
+    accept updates units/, dropins/, enable-state and MANIFEST for the NAMED
+    units only, so anything the bundle did not declare still drifts."""
+    ticket, units = None, []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--ticket":
+            ticket = argv[i + 1] if i + 1 < len(argv) else None
+            i += 2
+        else:
+            units.append(argv[i]); i += 1
+    if not ticket or not units:
+        print("usage: unit-drift accept --ticket <wq-id> <unit>...")
+        return 2
+    bad = [u for u in units if not SUF_RE.search(u)]
+    if bad:
+        print("accept: not unit names (need a .%s suffix): %s"
+              % ("/.".join(SUFFIXES[:3]) + "/...", ", ".join(bad)))
+        return 2
+    # the commit must carry ONLY this accept; a dirty baseline repo would smuggle
+    # unreviewed drift into it, which is the exact failure mode accept exists to avoid
+    r = git("status", "--porcelain")
+    if r.returncode != 0:
+        print("accept: git status failed in %s: %s" % (REPO, (r.stderr or r.stdout).strip()))
+        return 2
+    if r.stdout.strip():
+        print("accept: baseline repo %s is dirty — commit or clean it first:" % REPO)
+        print(r.stdout.rstrip())
+        return 2
+    base = load_manifest(); cur = scan()
+    new = {"units": dict(base["units"]), "dropins": dict(base["dropins"]),
+           "enable": dict(base["enable"])}
+    for u in sorted(set(units)):
+        # unit file (plain or .symlink marker, whichever representation is stale)
+        for p in (os.path.join(UNITS_DIR, u), os.path.join(UNITS_DIR, u + ".symlink")):
+            if os.path.exists(p):
+                os.remove(p)
+        if u in cur["units"]:
+            meta = cur["units"][u]
+            os.makedirs(UNITS_DIR, exist_ok=True)
+            if meta["kind"] == "symlink":
+                open(os.path.join(UNITS_DIR, u + ".symlink"), "w").write(meta["target"] + "\n")
+            else:
+                txt = read_bytes(os.path.join(SYS, u)).decode("utf-8", "replace")
+                open(os.path.join(UNITS_DIR, u), "w").write(redact(txt))
+            new["units"][u] = meta
+        else:
+            new["units"].pop(u, None)
+        # drop-ins under <unit>.d/
+        pref = u + ".d/"
+        for rel in [k for k in new["dropins"] if k.startswith(pref)]:
+            del new["dropins"][rel]
+            p = os.path.join(DROPIN_DIR, rel)
+            if os.path.exists(p):
+                os.remove(p)
+        for rel, h in cur["dropins"].items():
+            if not rel.startswith(pref):
+                continue
+            dst = os.path.join(DROPIN_DIR, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            txt = read_bytes(os.path.join(SYS, rel)).decode("utf-8", "replace")
+            open(dst, "w").write(redact(txt))
+            new["dropins"][rel] = h
+        # enable links whose target IS this unit (<dir>.wants/<unit>)
+        for k in [k for k in new["enable"] if k.split("/", 1)[1] == u]:
+            del new["enable"][k]
+        for k, tgt in cur["enable"].items():
+            if k.split("/", 1)[1] == u:
+                new["enable"][k] = tgt
+    with open(ENABLE_TSV, "w") as f:
+        for k in sorted(new["enable"]): f.write(k + "\t" + new["enable"][k] + "\n")
+    json.dump(new, open(MANIFEST, "w"), indent=2, sort_keys=True)
+    # plain -A is safe here: the dirty guard above proved the tree held nothing
+    # but HEAD, so the only changes to stage are the scoped writes just made
+    git("add", "-A")
+    st = git("status", "--porcelain")
+    if not st.stdout.strip():
+        print("accept: baseline already matches for: " + " ".join(sorted(set(units))))
+        return 0
+    msg = "accept %s: %s" % (ticket, " ".join(sorted(set(units))))
+    r = git("commit", "-m", msg)
+    if r.returncode != 0:
+        print("accept: git commit failed: %s" % (r.stderr or r.stdout).strip())
+        return 2
+    print(msg)
+    print((r.stdout or r.stderr).strip().splitlines()[0])
     return 0
 
 def dangling_target_lint():
@@ -357,6 +453,7 @@ def main():
     a = sys.argv[1:]
     if not a: print(__doc__); return 2
     if a[0] == "snapshot":      return cmd_snapshot()
+    if a[0] == "accept":        return cmd_accept(a[1:])
     if a[0] == "check":         return cmd_check(digest="--digest" in a)
     if a[0] == "apply":         return cmd_apply()
     if a[0] == "show-baseline": return cmd_show()
