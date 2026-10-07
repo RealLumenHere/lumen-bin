@@ -15,6 +15,11 @@ __pycache__/
 /trivy
 /gatus
 /renode-dist
+/retdec-decompiler
+# third-party RE checkouts (own .git); the wrappers next to them are tracked (wq#3454)
+/FACT_core/
+/emba-dist/
+/routersploit/
 
 # stale/superseded drafts, retired scripts, backups-by-suffix not caught above
 *.orig
