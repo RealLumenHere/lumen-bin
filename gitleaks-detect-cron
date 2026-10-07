@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""gitleaks_detect.py — full `gitleaks detect` (git-history scan, not just
+the working tree) across every fleet repo, cron-driven, detect-and-alert
+only (wq#1298).
+
+Why not a pre-commit hook: a hook wedges an autonomous agent's commit the
+moment gitleaks has a false positive, and the agent's only escape is
+--no-verify, which trains it to bypass the check permanently. Cron instead:
+runs on a timer, never blocks a commit, alerts on NEW findings only.
+
+Complements bin/lumen-secret-check (which greps just `git config` remote
+URLs for a handful of known PAT prefixes). This scans full git history with
+gitleaks' ~150 rules, catching secrets committed and later "removed" (still
+live in history) as well as anything lumen-secret-check's narrow prefix list
+misses.
+
+Transition-based (kb/ISSUE-LOG.md #10 pattern): each repo's finding
+fingerprints are stored in a state file. A run only alerts on fingerprints
+not seen in the previous run, so a standing leak pages once, not every
+cadence. Never prints the raw secret value (instinct 3, mask before print)
+-- only rule/file/line/fingerprint go into the alert.
+
+Bridge-safe: the only network call this script makes is ntfy-send. It never
+probes routers/bridge and never installs or pulls anything (gitleaks itself
+is installed once, out of band, by install.sh).
+
+Usage:
+  gitleaks_detect.py run [--root DIR] [--state PATH] [--gitleaks-bin PATH] [--dry-run]
+"""
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_ROOT = "/home/lumen"
+DEFAULT_STATE = "/home/lumen/logs/.gitleaks-detect.state.json"
+DEFAULT_GITLEAKS_BIN = "/home/lumen/bin/gitleaks"
+NTFY_BIN = "/home/lumen/bin/ntfy-send"
+STAMP_PATH = "/home/lumen/logs/.stamp.gitleaks-detect"
+LOCK_PATH = "/tmp/gitleaks-detect.lock"
+EXCLUDE_DIR_NAMES = {"node_modules", ".venv", "venv", "__pycache__"}
+
+
+def acquire_lock(path=LOCK_PATH):
+    """Non-blocking flock, held for the process lifetime via the returned fd
+    (same pattern as bin/lumen-secret-check). Returns None if another run
+    already holds it -- a slow full-history scan overlapping the next
+    cadence should skip, not stack."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def find_repos(root=DEFAULT_ROOT, maxdepth=4):
+    """Every git repo under root: dirs containing a .git (dir or file, so
+    worktrees -- whose .git is a file pointing at the shared gitdir -- are
+    included too), excluding common vendor/build dirs."""
+    repos = []
+    root = os.path.abspath(root)
+    base_depth = root.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip("/").count("/") - base_depth
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIR_NAMES]
+        if depth >= maxdepth:
+            dirnames[:] = []
+        if ".git" in dirnames or ".git" in filenames:
+            repos.append(dirpath)
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+    return sorted(repos)
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, state):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def scan_repo(repo, gitleaks_bin, timeout=300):
+    """Run `gitleaks detect` (full git-history scan) against repo. Returns
+    (findings, error). findings is a list of gitleaks JSON report dicts;
+    error is None on a clean run (exit 0/1 are both success -- 1 means
+    "leaks found", not a tool failure) or a string on real tool failure."""
+    with tempfile.NamedTemporaryFile(prefix="gitleaks-", suffix=".json", delete=False) as tf:
+        report_path = tf.name
+    try:
+        proc = subprocess.run(
+            [gitleaks_bin, "detect", "--source", repo, "--report-format", "json",
+             "--report-path", report_path, "--exit-code", "0", "--no-banner"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if proc.returncode != 0:
+            return [], f"gitleaks exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+        try:
+            with open(report_path) as f:
+                content = f.read().strip()
+            findings = json.loads(content) if content else []
+        except (OSError, ValueError) as exc:
+            return [], f"could not parse report: {exc}"
+        return findings, None
+    except subprocess.TimeoutExpired:
+        return [], f"timed out after {timeout}s"
+    finally:
+        try:
+            os.unlink(report_path)
+        except OSError:
+            pass
+
+
+def redact(findings):
+    """Alert-safe view: rule, file, line, commit, fingerprint -- never the
+    Secret/Match fields, which contain the live credential text."""
+    out = []
+    for f in findings:
+        out.append({
+            "fingerprint": f.get("Fingerprint", ""),
+            "rule": f.get("RuleID", "unknown-rule"),
+            "file": f.get("File", "unknown-file"),
+            "line": f.get("StartLine", 0),
+            "commit": (f.get("Commit") or "")[:12],
+        })
+    return out
+
+
+def ntfy(title, message, priority="high", dry_run=False):
+    if dry_run:
+        print(f"[dry-run] ntfy {priority} {title!r}: {message}")
+        return True
+    try:
+        subprocess.run([NTFY_BIN, "-p", priority, "-T", title, message],
+                        capture_output=True, text=True, timeout=15)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def run(root=DEFAULT_ROOT, state_path=DEFAULT_STATE, gitleaks_bin=DEFAULT_GITLEAKS_BIN,
+        dry_run=False):
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print("gitleaks-detect: another run holds the lock, skipping")
+        return 0
+
+    if not os.path.isfile(gitleaks_bin) or not os.access(gitleaks_bin, os.X_OK):
+        ntfy("gitleaks-detect", f"gitleaks binary missing at {gitleaks_bin} -- "
+             "run install.sh (ops/wq1298-gitleaks-detect)", priority="high", dry_run=dry_run)
+        return 0
+
+    state = load_state(state_path)
+    repos = find_repos(root)
+    errors = []
+    any_new = False
+
+    for repo in repos:
+        seen = set(state.get(repo, []))
+        findings, error = scan_repo(repo, gitleaks_bin)
+        if error:
+            errors.append(f"{repo}: {error}")
+            continue
+
+        current = redact(findings)
+        current_fps = {f["fingerprint"] for f in current if f["fingerprint"]}
+        new = [f for f in current if f["fingerprint"] and f["fingerprint"] not in seen]
+
+        if new:
+            any_new = True
+            lines = [f"{f['rule']} in {f['file']}:{f['line']} ({f['commit']})" for f in new[:10]]
+            more = f" (+{len(new) - 10} more)" if len(new) > 10 else ""
+            ntfy("gitleaks: new finding(s)",
+                 f"{repo}: {len(new)} new leak(s) -- " + "; ".join(lines) + more,
+                 priority="high", dry_run=dry_run)
+
+        state[repo] = sorted(current_fps)
+
+    if errors:
+        ntfy("gitleaks-detect: scan errors",
+             f"{len(errors)} repo(s) failed to scan: " + "; ".join(errors[:5]),
+             priority="default", dry_run=dry_run)
+
+    if not dry_run:
+        save_state(state_path, state)
+        os.makedirs(os.path.dirname(STAMP_PATH), exist_ok=True)
+        with open(STAMP_PATH, "w") as f:
+            f.write("")
+
+    print(f"gitleaks-detect: scanned={len(repos)} new_findings={any_new} errors={len(errors)}")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_run = sub.add_parser("run", help="scan all fleet repos, alert on new findings")
+    p_run.add_argument("--root", default=DEFAULT_ROOT)
+    p_run.add_argument("--state", default=DEFAULT_STATE)
+    p_run.add_argument("--gitleaks-bin", default=DEFAULT_GITLEAKS_BIN)
+    p_run.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if args.cmd == "run":
+        return run(root=args.root, state_path=args.state,
+                    gitleaks_bin=args.gitleaks_bin, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

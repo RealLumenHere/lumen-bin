@@ -30,7 +30,6 @@ lumen-cron-stamp dead-man's-switch file so a stopped timer alarms sideways
 via lumen-cron-deadman instead of silently going stale.
 """
 import argparse
-import collections
 import concurrent.futures as cf
 import json
 import os
@@ -40,9 +39,12 @@ import subprocess
 import sys
 import time
 import urllib.request
-from urllib.parse import urlparse
 
-import yaml
+# wq#3212: rung enumeration moved to the shared litellm_rungs module so this
+# probe and lumen-model-watchdog read the SAME rung list (deployed next to
+# this script in /home/lumen/bin; in-repo at ops/wq3212-litellm-dead-rungs/).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import litellm_rungs
 
 ENV_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_ENV", "/home/lumen/agent/.env")
 CONFIG_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_CONFIG", "/home/lumen/agent/litellm_config.yaml")
@@ -52,11 +54,27 @@ NTFY = os.environ.get("LITELLM_COMPLETION_PROBE_NTFY", "/home/lumen/bin/ntfy-sen
 NTFY_TOPIC = os.environ.get("LITELLM_COMPLETION_PROBE_TOPIC", "lumen-alerts")
 AQ = os.environ.get("LITELLM_COMPLETION_PROBE_AQ", "/home/lumen/bin/aq")
 TIMEOUT_S = int(os.environ.get("LITELLM_COMPLETION_PROBE_TIMEOUT_S", "60"))
+# wq#3463: a rung configured with a longer litellm timeout gets that budget, up
+# to this cap. A flat 60s paged nephthys (timeout 2460, CPU-only qwen3:14b cold
+# load) "unreachable" on ~92% of runs while real callers were being served.
+TIMEOUT_CAP_S = int(os.environ.get("LITELLM_COMPLETION_PROBE_TIMEOUT_CAP_S", "300"))
 MAX_TOKENS = int(os.environ.get("LITELLM_COMPLETION_PROBE_MAX_TOKENS", "300"))
 WORKERS = int(os.environ.get("LITELLM_COMPLETION_PROBE_WORKERS", "6"))
-SKIP_SUBSTRINGS = ("embed", "rerank", "whisper", "tts")
+AQ_DIR = os.environ.get("LITELLM_COMPLETION_PROBE_AQ_DIR", "/home/lumen/agents/alert-queue")
+# wq#3587: a free-tier daily request quota is a budget the probe itself spends.
+# gemini-2.5-flash free tier allows 20 requests/day and the 30-min timer sends
+# 48, so the probe alone exhausted it, then paged its own 429 as "unreachable"
+# (aq 2652505). Format: host=seconds[,host=seconds].
+HOST_MIN_INTERVAL_S = {
+    h: int(s) for h, _, s in (p.partition("=") for p in os.environ.get(
+        "LITELLM_COMPLETION_PROBE_HOST_INTERVALS", "gemini=21600").split(",") if "=" in p)}
+RATE_LIMIT_BACKOFF_S = 3600     # 429 without a "retry in" hint
+RATE_LIMIT_BACKOFF_CAP_S = 86400
+RETRY_HINT = re.compile(r"retry in ((?:\d+h)?(?:\d+m)?(?:[\d.]+s)?)", re.I)
+BILLING = re.compile(r"insufficient.balance|insufficient_quota|credit balance", re.I)
 
-Rung = collections.namedtuple("Rung", "host model_name")
+Rung = litellm_rungs.Rung
+one_rung_per_host = litellm_rungs.one_rung_per_host
 
 
 def read_master_key(env_path: str) -> str:
@@ -67,21 +85,33 @@ def read_master_key(env_path: str) -> str:
     return m.group(1)
 
 
-def one_rung_per_host(config_path: str) -> list:
-    """One (host, model_name) per distinct api_base host, skipping deployments
-    a chat-completion probe can't exercise. Host falls back to the model's
-    provider prefix for models with no explicit api_base (matches
-    /home/lumen/scratch/audit_20260929/probe2.py's grouping)."""
-    cfg = yaml.safe_load(pathlib.Path(config_path).read_text())
-    by_host = collections.OrderedDict()
-    for m in cfg.get("model_list", []):
-        lp = m.get("litellm_params", {}) or {}
-        model_id = str(lp.get("model", ""))
-        if any(s in model_id for s in SKIP_SUBSTRINGS):
-            continue
-        host = urlparse(str(lp.get("api_base", ""))).netloc or model_id.split("/")[0]
-        by_host.setdefault(host, m["model_name"])
-    return [Rung(host, name) for host, name in by_host.items()]
+def probe_budget_s(rung: Rung) -> float:
+    """Never stricter than the floor, never longer than the cap, otherwise the
+    rung's own configured timeout — the probe must not call "unreachable" a rung
+    the gateway itself would still be waiting on for a real caller."""
+    return max(TIMEOUT_S, min(rung.timeout or TIMEOUT_S, TIMEOUT_CAP_S))
+
+
+def retry_after_s(text: str) -> int:
+    """Seconds from a provider's "Please retry in 10h20m19.5s" hint, else the
+    default backoff; capped so a garbled hint can't park a host for days."""
+    m = RETRY_HINT.search(text)
+    secs = 0.0
+    for num, unit in re.findall(r"([\d.]+)([hms])", m.group(1) if m else ""):
+        secs += float(num) * {"h": 3600, "m": 60, "s": 1}[unit]
+    return min(int(secs) or RATE_LIMIT_BACKOFF_S, RATE_LIMIT_BACKOFF_CAP_S)
+
+
+def classify(code, text: str) -> str:
+    """wq#3587: a 402/429 is an authenticated answer about the account, not a
+    dead host. billing = out of credit (aq 3198: deepseek "Insufficient
+    Balance", x135 over 6 days while the top-up sat queued as wq#3410);
+    rate_limited = quota spent, comes back by itself."""
+    if code == 402 or BILLING.search(text):
+        return "billing"
+    if code == 429:
+        return "rate_limited"
+    return "unreachable"
 
 
 def probe_one(key: str, rung: Rung) -> dict:
@@ -96,19 +126,23 @@ def probe_one(key: str, rung: Rung) -> dict:
     )
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=probe_budget_s(rung)) as resp:
             json.load(resp)
-        return {"host": rung.host, "model": rung.model_name, "ok": True,
+        return {"host": rung.host, "model": rung.model_name, "ok": True, "kind": "ok",
                 "elapsed_s": round(time.time() - t0, 1), "reason": ""}
     except Exception as e:  # noqa: BLE001 - report any failure shape as a probe FAIL
-        detail = ""
+        body = ""
         try:
-            detail = e.read().decode()[:200]  # type: ignore[attr-defined]
+            body = e.read().decode()  # type: ignore[attr-defined]
         except Exception:
             pass
-        reason = (str(e)[:120] + " " + detail).strip().replace("\n", " ")
-        return {"host": rung.host, "model": rung.model_name, "ok": False,
-                "elapsed_s": round(time.time() - t0, 1), "reason": reason}
+        kind = classify(getattr(e, "code", None), body)
+        reason = (str(e)[:120] + " " + body[:200]).strip().replace("\n", " ")
+        result = {"host": rung.host, "model": rung.model_name, "ok": False, "kind": kind,
+                  "elapsed_s": round(time.time() - t0, 1), "reason": reason}
+        if kind == "rate_limited":
+            result["retry_s"] = retry_after_s(body)
+        return result
 
 
 def run_probes(key: str, rungs: list) -> list:
@@ -148,26 +182,106 @@ def _aq_add(key: str, title: str, message: str) -> None:
         pass
 
 
-def apply_results(results: list) -> dict:
+def _aq_has_open(key: str) -> bool:
+    """False when the db can't be read, so the caller falls back to aq add."""
+    try:
+        if AQ_DIR not in sys.path:
+            sys.path.insert(0, AQ_DIR)
+        import aq as _aq
+        c = _aq.db()
+        row = c.execute("SELECT 1 FROM alerts WHERE source='litellm-completion' "
+                        "AND key=? AND status IN ('open','acked')", (key,)).fetchone()
+        c.close()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _aq_resolve(key: str, why: str) -> None:
+    """wq#3212: close our own open row on a recovery edge or when the host left
+    the probe set (rung removed from litellm_config.yaml). Without this, a row
+    for a removed rung stayed open forever — no probe result ever cleared it.
+    Same direct-db shape as lumen_model_watchdog.aq_clear (wq#548 pattern).
+    wq#3463: acked rows close too — an acked row still counts against the
+    source in sentinel-watch, and aq dedups only onto OPEN rows, so acking one
+    just forked the next failure into a fresh row (aq 3140 -> 2671109)."""
+    try:
+        if AQ_DIR not in sys.path:
+            sys.path.insert(0, AQ_DIR)
+        import aq as _aq
+        c = _aq.db()
+        ts = _aq.now()
+        rows = c.execute("SELECT id FROM alerts WHERE source='litellm-completion' "
+                         "AND key=? AND status IN ('open','acked')", (key,)).fetchall()
+        for (rid,) in rows:
+            c.execute("UPDATE alerts SET status='resolved', note=?, resolved_ts=? "
+                      "WHERE id=? AND status IN ('open','acked')",
+                      (f"auto-cleared: {why} on {ts} probe run", ts, rid))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def _answered(r: dict) -> bool:
+    # a 429 is the host up and authenticated, only out of quota for now
+    return r["ok"] or r.get("kind") == "rate_limited"
+
+
+def due_rungs(rungs: list, state: dict, now: float) -> tuple:
+    """(rungs to probe now, hosts skipped this run). A host is skipped while a
+    429 backoff runs or inside its HOST_MIN_INTERVAL_S since the last probe."""
+    due, skipped = [], set()
+    for r in rungs:
+        prev = state.get(r.host, {})
+        if (now < prev.get("skip_until", 0)
+                or now - prev.get("checked_at", 0) < HOST_MIN_INTERVAL_S.get(r.host, 0)):
+            skipped.add(r.host)
+        else:
+            due.append(r)
+    return due, skipped
+
+
+def apply_results(results: list, skipped: set = frozenset()) -> dict:
     """Edge-triggered aq/ntfy: alert once per host on clear->breach, bump
-    (no re-ntfy) while breached, low-pri notice on breach->clear. Returns the
-    new state dict (caller persists it)."""
+    (no re-ntfy) while breached, low-pri notice on breach->clear. A billing
+    failure keeps one open row without bumping it: the count can't change
+    until someone tops up, and the bumps tripped sentinel-watch's 100-repeat
+    floor into a ticket nobody could fix (wq#3587). Skipped hosts carry their
+    state forward. Returns the new state dict (caller persists it)."""
     path = _state_path()
     state = _load_state(path)
-    now_failed = {r["host"]: r for r in results if not r["ok"]}
+    now = int(time.time())
+    now_failed = {r["host"]: r for r in results if not _answered(r)}
     for host, r in now_failed.items():
         was_failed = state.get(host, {}).get("failed", False)
-        title = f"LiteLLM completion probe: {host} unreachable"
+        billing = r.get("kind") == "billing"
+        title = f"LiteLLM completion probe: {host} " + ("out of credit" if billing else "unreachable")
         msg = f"model={r['model']} elapsed={r['elapsed_s']}s reason={r['reason']}"
-        _aq_add(host, title, msg)
+        if not (billing and _aq_has_open(host)):
+            _aq_add(host, title, msg)
         if not was_failed:
             _notify("urgent", title, msg)
     for r in results:
         host = r["host"]
-        if r["ok"] and state.get(host, {}).get("failed", False):
+        if not _answered(r):
+            continue
+        if state.get(host, {}).get("failed", False):
             _notify("low", f"LiteLLM completion probe: {host} recovered",
                      f"model={r['model']} elapsed={r['elapsed_s']}s")
-    new_state = {r["host"]: {"failed": not r["ok"], "checked_at": int(time.time())} for r in results}
+        # wq#3463: every passing host closes its rows, not only on the state
+        # edge — a lost/rewritten state.json used to strand rows open forever
+        _aq_resolve(host, f"{host} answered (model={r['model']})")
+    probed_hosts = {r["host"] for r in results}
+    for host, prev in state.items():
+        # wq#3212: rung removed from litellm_config.yaml while its row was open
+        if host not in probed_hosts and host not in skipped and prev.get("failed", False):
+            _aq_resolve(host, f"{host} left the probe set (rung removed from config)")
+    new_state = {h: state[h] for h in skipped if h in state}
+    for r in results:
+        new_state[r["host"]] = {"failed": not _answered(r), "checked_at": now}
+        if r.get("kind") == "rate_limited":
+            new_state[r["host"]]["skip_until"] = now + r["retry_s"]
     return new_state
 
 
@@ -177,9 +291,9 @@ def main() -> int:
     args = parser.parse_args()
 
     key = read_master_key(ENV_PATH)
-    rungs = one_rung_per_host(CONFIG_PATH)
+    rungs, skipped = due_rungs(one_rung_per_host(CONFIG_PATH), _load_state(_state_path()), time.time())
     results = run_probes(key, rungs)
-    new_state = apply_results(results)
+    new_state = apply_results(results, skipped)
     path = _state_path()
     try:
         path.write_text(json.dumps(new_state))
@@ -188,8 +302,8 @@ def main() -> int:
 
     if args.do_print:
         fails = [r for r in results if not r["ok"]]
-        print(f"probed {len(results)} hosts, {len(fails)} failing: "
-              + ",".join(r["host"] for r in fails))
+        print(f"probed {len(results)} hosts ({len(skipped)} skipped), {len(fails)} failing: "
+              + ",".join(f"{r['host']}({r['kind']})" for r in fails))
     return 0
 
 

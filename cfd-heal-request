@@ -1,0 +1,6 @@
+#!/bin/bash
+# wq#3575 stage 2 — the self-healer's cloudflared restart_cmd.
+# lumen_self_healer.restart_via_cmd runs subprocess.run([cmd]): one argv element,
+# no shell, so the table cannot carry cfd-actuator's arguments itself.
+exec /home/lumen/bin/cfd-actuator request --from self-healer --kind restart \
+  --reason "watch-table: cloudflared down"
