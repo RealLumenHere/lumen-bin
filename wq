@@ -2765,6 +2765,83 @@ def _ops_deploy_verify_check(deployed_target, cand, art_dir, deploy_verify):
                               f"the real target")
     return "deployed", f"{deployed_target} byte-matches {cand} shipped in {art_dir}; deploy_verify={verify!r}"
 
+# ------------------------------------------------- wq#3487 root-apply follow-up gate
+def _ops_bundle_retired_reason(bundle_dir):
+    """wq#3487: a RETIRED marker file (first line = reason) is the lightweight alternative to
+    hand-writing an inverted --verify handler (ops/VERIFY_CONTRACT.md 'Bundles that are retired
+    or superseded'). A marked bundle is out of scope for this whole gate, whatever --verify says."""
+    try:
+        with open(os.path.join(bundle_dir, "RETIRED")) as f:
+            return f.readline().strip() or "retired"
+    except OSError:
+        return None
+
+def _ops_root_apply_title(bundle_name):
+    return f"[ops-root-apply] {bundle_name}: install.sh --verify fails, needs privileged install"
+
+def _file_or_reuse_root_apply_followup(lane, ticket_id, bundle_name, install_path, why):
+    """wq#3487: an OPS ticket closing over a bundle whose own --verify FAILS must leave a
+    tracked follow-up, not just free text nobody re-reads — that gap is exactly how wq#3336
+    closed on the binary alone and sat orphaned until wq#3479 caught it five days later via an
+    unrelated verify-pass. Never blocks the close (a sandboxed worker genuinely cannot do a
+    root install; queue the physical task, do not gate on it) — files or reuses a follow-up,
+    on the same normalized-title dedup `cmd_add` already uses so repeated closes against the
+    same still-failing bundle collapse onto one ticket. `Liveness: ops_verified(<bundle>)`
+    (harness/liveness.py, wired per ops/VERIFY_CONTRACT.md) makes the follow-up
+    machine-closeable the moment a root session actually runs the install. Best effort: a
+    filing failure here is never a reason to block the close it is a side effect of."""
+    title = _ops_root_apply_title(bundle_name)
+    try:
+        c = conn()
+        try:
+            nt = norm_title(title)
+            for rid, rtitle in c.execute(
+                    "SELECT id, title FROM tasks WHERE status!='done'").fetchall():
+                if norm_title(rtitle) == nt:
+                    return rid
+            detail = (f"wq#{ticket_id} closed over {install_path} with its own --verify "
+                      f"FAILING: {why}. Run the bundle's install.sh as root (or with sudo), "
+                      f"then confirm with `bash {install_path} --verify`.\n"
+                      f"Liveness: ops_verified({bundle_name})")
+            c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,"
+                      "status) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (lane, 2, title, detail, '', '', '', now(), 'open'))
+            c.commit()
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
+_OPS_BUNDLE_REF_RE = re.compile(r"ops/(wq\d+[\w.-]*)(?:/install\.sh)?\b")
+
+def _ops_bundles_from_text(text):
+    """wq#3487: `--no-artifact` skips `find_artifact` entirely, so a ticket closed that way
+    never gets its citation resolved into a bundle at all. A closure can still be self-evidently
+    about an ops bundle (the ticket's own title/detail, or the closer's notes, naming it — e.g.
+    the wq#901/wq#1652 shape: 'ops/wqNNNN-foo/install.sh ready, rollout pending'). Resolved the
+    same way a PR's changed files are (`_local_bundle_installs`)."""
+    names = sorted(set(m.group(1) for m in _OPS_BUNDLE_REF_RE.finditer(text or "")))
+    return _local_bundle_installs([f"ops/{n}/install.sh" for n in names])
+
+def ops_root_apply_check(lane, ticket_id, bundles):
+    """wq#3487: for every (install_path) bundle whose own --verify says FAIL and which carries
+    no RETIRED marker, file-or-reuse a root-apply follow-up. Returns the wq#N ids filed/reused,
+    for the closing ticket's [ROOT-APPLY-FILED: ...] stamp."""
+    filed = []
+    for path in bundles:
+        bundle_dir = os.path.dirname(path)
+        if _ops_bundle_retired_reason(bundle_dir):
+            continue
+        hv, hwhy = ops_verify_handler(path)
+        if hv != "fail":
+            continue
+        fid = _file_or_reuse_root_apply_followup(lane, ticket_id, os.path.basename(bundle_dir),
+                                                 path, hwhy)
+        if fid and fid not in filed:
+            filed.append(fid)
+    return filed
+
 def ops_deploy_check(abs_path, deployed_target, deploy_verify=None):
     """abs_path is the citation `find_artifact` resolved for this close. Returns (verdict, why):
     'none' when abs_path isn't an ops/*/install.sh artifact at all (gate does not apply);
@@ -2776,6 +2853,9 @@ def ops_deploy_check(abs_path, deployed_target, deploy_verify=None):
     artifact ships, or --deploy-verify is missing/structurally incomplete."""
     if not OPS_INSTALL_RE.search(abs_path):
         return "none", ""
+    retired = _ops_bundle_retired_reason(os.path.dirname(abs_path))
+    if retired:
+        return "none", f"{abs_path}: RETIRED ({retired}) — wq#3487 gate does not apply"
     if not deployed_target:
         return "undeployed", (f"{abs_path} is an ops install artifact — its existence on main "
                               f"proves the script landed, not that it ran against a target")
@@ -2903,16 +2983,20 @@ def pr_ops_deploy_check(url, deployed_target=None, deploy_verify=None):
     says so (ops/VERIFY_CONTRACT.md: "merged is not live"), or the caller supplies the
     wq#1724/wq#2762 --deployed + --deploy-verify proof for it. Returns (verdict, why):
     'none' when the PR touches no bundle or the forge could not say (fail open), 'deployed'
-    when every touched bundle is proven live, 'undeployed' when at least one is not."""
+    when every touched bundle is proven live, 'undeployed' when at least one is not. Third
+    element (wq#3487): the bundle install.sh paths whose own --verify says FAIL — a RETIRED
+    bundle (ops_bundle_retired_reason) is skipped entirely, out of scope either way."""
     rels, why = pr_changed_files(url)
     if rels is None:
-        return "none", why
+        return "none", why, []
     bundles = _local_bundle_installs([r for r in rels if OPS_INSTALL_RE.search("/" + r)])
     if not bundles:
-        return "none", ""
-    proofs, misses = [], []
+        return "none", "", []
+    proofs, misses, fails = [], [], []
     for b in bundles:
         name = os.path.basename(os.path.dirname(b))
+        if _ops_bundle_retired_reason(os.path.dirname(b)):
+            continue
         hv, hwhy = ops_verify_handler(b)
         if hv == "ok":
             proofs.append(f"{name}: --verify OK")
@@ -2922,11 +3006,12 @@ def pr_ops_deploy_check(url, deployed_target=None, deploy_verify=None):
             proofs.append(f"{name}: {dwhy}")
         elif hv == "fail":
             misses.append(f"{name}: {hwhy}")
+            fails.append((b, hwhy))
         else:
             misses.append(f"{name}: not proven live ({hwhy}; {dwhy})")
     if misses:
-        return "undeployed", "; ".join(misses[:3])
-    return "deployed", "; ".join(proofs[:3])
+        return "undeployed", "; ".join(misses[:3]), fails
+    return "deployed", "; ".join(proofs[:3]), fails
 
 def cmd_done(a):
     notes = getattr(a, "notes", "") or ""
@@ -2965,6 +3050,24 @@ def cmd_done(a):
         print(f"WARNING: wq#1673 deliverable gate could not verify ({dwhy}). Closing anyway.")
     if no_artifact:
         a.notes = (notes + (" " if notes else "") + f"[NO-ARTIFACT: {no_artifact}]").strip()
+        # wq#3487: --no-artifact skips find_artifact entirely, so a ticket that is
+        # self-evidently about an ops bundle (its own title/detail, or these notes, naming
+        # one) must not walk past the root-apply check just by omitting --notes evidence.
+        _c3487 = conn()
+        try:
+            _trow3487 = _c3487.execute(
+                "SELECT title, detail FROM tasks WHERE id=?", (a.id,)).fetchone()
+        finally:
+            _c3487.close()
+        _text3487 = " ".join([(_trow3487[0] or "") if _trow3487 else "",
+                              (_trow3487[1] or "") if _trow3487 else "", notes])
+        _bundles3487 = _ops_bundles_from_text(_text3487)
+        if _bundles3487:
+            _followups3487 = ops_root_apply_check(
+                _lane_row[0] if _lane_row else "build", a.id, _bundles3487)
+            if _followups3487:
+                a.notes = _stamp(a.notes, "[ROOT-APPLY-FILED: " +
+                                 ", ".join(f"wq#{f}" for f in sorted(set(_followups3487))) + "]")
     else:
         ok, kind, detail, token = find_artifact(notes, resolve_sha=True)
         if not ok:
@@ -3006,8 +3109,8 @@ def cmd_done(a):
             # deployed one (wq#1632, wq#2910). Skipped when --unmerged is on the record:
             # nothing landed, so there is nothing to have deployed.
             if not unmerged:
-                pv, pwhy = pr_ops_deploy_check(detail, getattr(a, "deployed", None),
-                                               getattr(a, "deploy_verify", None))
+                pv, pwhy, pfails = pr_ops_deploy_check(detail, getattr(a, "deployed", None),
+                                                       getattr(a, "deploy_verify", None))
                 if pv == "undeployed" and not getattr(a, "no_deploy_needed", None):
                     eprint(f"REFUSED: wq#2943 ops-deploy gate — task {a.id} not closed. The PR "
                           f"you cited ships an ops bundle that is not live on this box: {pwhy}. "
@@ -3025,6 +3128,17 @@ def cmd_done(a):
                     a.notes = _stamp(a.notes, f"[OPS-DEPLOYED: {pwhy}]")
                 elif pv == "undeployed":
                     a.notes = _stamp(a.notes, f"[NO-DEPLOY-NEEDED: {a.no_deploy_needed}]")
+                    # wq#3487: the override is honored (worker stays unblocked), but a bundle
+                    # whose own --verify confirms FAIL must not vanish into free text — file or
+                    # reuse the tracked follow-up.
+                    followups = [_file_or_reuse_root_apply_followup(
+                                     _lane_row[0] if _lane_row else "build", a.id,
+                                     os.path.basename(os.path.dirname(fb)), fb, fbwhy)
+                                 for fb, fbwhy in pfails]
+                    followups = [f for f in followups if f]
+                    if followups:
+                        a.notes = _stamp(a.notes, "[ROOT-APPLY-FILED: " +
+                                         ", ".join(f"wq#{f}" for f in sorted(set(followups))) + "]")
                 elif pwhy:
                     print(f"WARNING: wq#2943 ops-deploy gate could not list the files in "
                           f"{detail} ({pwhy}). Closing anyway — the gate does not block on "
@@ -3071,6 +3185,13 @@ def cmd_done(a):
                 a.notes = _stamp(a.notes, f"[DEPLOY-VERIFY: {getattr(a, 'deploy_verify', None)}]")
             elif ov == "undeployed" and getattr(a, "no_deploy_needed", None):
                 a.notes = _stamp(a.notes, f"[NO-DEPLOY-NEEDED: {a.no_deploy_needed}]")
+                # wq#3487: same as the PR-URL branch — the override is honored, but a bundle
+                # whose own --verify confirms FAIL must leave a tracked follow-up.
+                followups = ops_root_apply_check(_lane_row[0] if _lane_row else "build",
+                                                 a.id, [abs_path])
+                if followups:
+                    a.notes = _stamp(a.notes, "[ROOT-APPLY-FILED: " +
+                                     ", ".join(f"wq#{f}" for f in sorted(set(followups))) + "]")
     # wq#1702 (D2): a ticket that says it lands via lumen-pr is not done until something in
     # the notes proves it landed. --no-artifact does not excuse this; --unlanded (or an
     # --unmerged already on the record for the same PR) is the on-the-record override.

@@ -16,12 +16,16 @@ itself, and only these can open aq rows (--aq; auto-resolved on VERIFIED).
 HEURISTIC, TRIAGE ONLY, for every other bundle: a file installed under a different name (trivy -> lumen-trivy-weekly)
 or merged into another module reads ABSENT. Truth needs the per-bundle install.sh --verify
 contract (wq#1696 item 2). Heuristic verdicts never reach aq.
+RETIRED (wq#3487): a bundle carrying a RETIRED marker file is reported as RETIRED and
+never alerts — the lightweight alternative to hand-writing an inverted --verify handler
+(ops/VERIFY_CONTRACT.md "Bundles that are retired or superseded"). --aq auto-resolves any
+open ops-drift:<bundle> row for it, same as a VERIFIED run.
 Exit 0 always; --json for machine output; --aq opens one keyed aq row per ABSENT/PARTIAL
 bundle older than 24h (key ops-drift:<bundle>).
 """
 import hashlib, json, os, subprocess, sys, time
 
-OPS = "/home/lumen/foreman/ops"
+OPS = os.environ.get("OPS_DEPLOY_DRIFT_OPS", "/home/lumen/foreman/ops")  # env override is for tests
 ROOTS = ["/home/lumen/bin", "/home/lumen/minerva", "/home/lumen/agents", "/home/lumen/foreman",
          "/home/lumen/autonomy", "/etc/systemd/system", "/home/lumen/.config/systemd/user", "/etc/lumen",
          "/home/lumen/agent", "/usr/local/bin", "/home/lumen/services", "/home/lumen/maint",
@@ -72,6 +76,16 @@ def index_roots():
     return idx
 
 
+def retired_reason(bd):
+    """wq#3487: RETIRED marker — first line is the reason, honored in place of a custom
+    inverted --verify handler. Returns the reason, or None if the bundle is not marked."""
+    try:
+        with open(os.path.join(bd, "RETIRED")) as f:
+            return (f.readline().strip() or "retired") or "retired"
+    except OSError:
+        return None
+
+
 def has_verify(bd):
     """Contract marker (ops/VERIFY_CONTRACT.md). Without it --verify is NEVER run:
     a script that does not know the flag would ignore it and install."""
@@ -100,6 +114,12 @@ def main():
         if not (b.startswith("wq") and os.path.isdir(bd)):
             continue
         age_h = (time.time() - os.path.getmtime(bd)) / 3600
+        reason = retired_reason(bd)
+        if reason is not None:
+            out.append({"bundle": b, "verdict": "RETIRED", "authoritative": True, "files": 0,
+                        "live": 0, "missing": [], "drifted": [], "reason": reason,
+                        "age_h": round(age_h, 1)})
+            continue
         if has_verify(bd):
             v, lines = run_verify(bd)
             out.append({"bundle": b, "verdict": v, "authoritative": True, "files": 0, "live": 0,
@@ -121,7 +141,8 @@ def main():
         print(json.dumps(out, indent=1))
     else:
         for r in out:
-            m = ("  absent: " + ", ".join(r["missing"][:4])) if r["missing"] else ""
+            m = ("  reason: " + r["reason"]) if r.get("reason") else ""
+            m += ("  absent: " + ", ".join(r["missing"][:4])) if r["missing"] else ""
             m += ("  drifted: " + ", ".join(r["drifted"][:3])) if r["drifted"] else ""
             print(f"{r['verdict']:8} {r['live']}/{r['files']:<3} {r['bundle']}{m}")
         c = {}
@@ -140,11 +161,12 @@ def main():
                 aq.ingest(source="ops-deploy-drift", key=key, title=f"ops bundle not live: {r['bundle']}",
                           message=f"install.sh --verify FAIL: {'; '.join(r['missing'][:8])} "
                                   f"(fix: run the bundle's install.sh, or retire the bundle; wq#1696)")
-            elif r["verdict"] == "VERIFIED":
+            elif r["verdict"] in ("VERIFIED", "RETIRED"):
+                note = "auto-cleared: --verify OK" if r["verdict"] == "VERIFIED" else "auto-cleared: RETIRED marker"
                 c = aq.db()
-                c.execute("UPDATE alerts SET status='resolved', note='auto-cleared: --verify OK', "
+                c.execute("UPDATE alerts SET status='resolved', note=?, "
                           "resolved_ts=? WHERE source='ops-deploy-drift' AND key=? AND status='open'",
-                          (aq.now(), key))
+                          (note, aq.now(), key))
                 c.commit(); c.close()
 
 
