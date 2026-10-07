@@ -12,7 +12,8 @@ provenance repo's origin/main (foreman): the bytes on disk are then exactly revi
 touches it, it only raises an aq row.
 
   bin-drift-rescue              report (read-only). exit 0 clean | 1 drift, all proven | 2 drift incl. unproven | 4 still being written
-  bin-drift-rescue --aq         report + one keyed aq row per drifted file older than ALERT_AFTER_S; resolves rows for files that cleared
+  bin-drift-rescue --aq         report + one keyed aq row per drifted file older than ALERT_AFTER_S (one per top-level dir
+                                holding >= AQ_GROUP_MIN of them); resolves rows for files that cleared
   bin-drift-rescue --apply      dry-run plan for the PROVEN, quiet files
   bin-drift-rescue --apply --confirm   land them via a lumen-pr worktree, then bring the primary tree to origin/main.
                                 Every touched file is backed up first and restored if the primary does not end up
@@ -33,7 +34,9 @@ LUMEN_PR = os.environ.get("BDR_LUMEN_PR", "/home/lumen/bin/lumen-pr")
 AQ = os.environ.get("BDR_AQ", "/home/lumen/bin/aq")
 QUIET_S = int(os.environ.get("BDR_QUIET_S", "600"))
 ALERT_AFTER_S = int(os.environ.get("BDR_ALERT_AFTER_S", "1800"))
+AQ_GROUP_MIN = int(os.environ.get("BDR_AQ_GROUP_MIN", "5"))
 AQ_SOURCE = "bin-drift"
+AQ_KEY_W = 40  # `aq list` prints key[:40] (aq cmd_list); a longer key only round-trips as that prefix (wq#3454)
 
 
 def git(repo, *args, check=False):
@@ -145,15 +148,39 @@ def aq(*args):
     return subprocess.run([AQ, *args], capture_output=True, text=True)
 
 
+def alert_units(files):
+    """One alert per drifted file, except a top-level dir holding >= AQ_GROUP_MIN of them is one alert for the dir.
+    wq#3454: an untracked third-party tree (retdec-5.0, ~4000 files) raised one aq row per file."""
+    by_top = {}
+    for f in files:
+        by_top.setdefault(f["path"].split("/", 1)[0], []).append(f)
+    units = []
+    for top, fs in by_top.items():
+        if len(fs) < AQ_GROUP_MIN:
+            units += fs
+            continue
+        bad = [f for f in fs if not f["proven"]]
+        units.append({"path": top + "/", "n": len(fs), "n_unproven": len(bad), "proven": not bad,
+                      "seen_s": max(f["seen_s"] for f in fs)})
+    return units
+
+
 def do_aq(files):
+    units = alert_units(files)
     open_rows = aq("list", "open").stdout.splitlines()
-    live = {f"{AQ_SOURCE}/{f['path']}" for f in files}
+    live = {f"{AQ_SOURCE}/{u['path']}"[:AQ_KEY_W] for u in units}
     for line in open_rows:  # resolve rows for files that cleared
         m = re.match(r"\[\s*(\d+)\]\s+\S+\s+\S+\s+" + re.escape(AQ_SOURCE) + r"\s+(\S+)", line)
         if m and m.group(2) not in live:
             aq("resolve", m.group(1), "file no longer drifted")
-    for f in files:
+    for f in units:
         if f["seen_s"] < ALERT_AFTER_S:
+            continue
+        if "n" in f:
+            msg = (f"{f['n']} drifted files under {f['path']} in {REPO}, {f['n_unproven']} with no backing copy. "
+                   f"A third-party tree belongs outside the repo (see /home/lumen/tools) or in .gitignore; "
+                   f"anything else: bin-drift-rescue --apply --confirm for the proven ones, a rescue commit for the rest.")
+            aq("add", AQ_SOURCE, f"{AQ_SOURCE}/{f['path']}", f"lumen-bin primary drift: {f['path']} ({f['n']} files, {f['n_unproven']} UNPROVEN) {f['seen_s']//60}m", msg)
             continue
         if f["proven"]:
             msg = (f"{f['path']} in {REPO} is uncommitted but byte-identical to {f['source']} on {SRC_REF} (deployed by an ops install.sh). "

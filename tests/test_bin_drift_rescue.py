@@ -189,6 +189,38 @@ def test_aq_row_resolved_when_cleared(env):
     (t / "aq.rows").write_text("[ 41] open     x2   bin-drift   bin-drift/gone-file   title  owner=unassigned 2026-09-29T00:00:00Z  m\\n".replace("\\n", "\n"))
     run(e, "--aq"); assert "resolve 41" in (t / "aq.log").read_text()
 
+def real_aq(t, e):
+    """The real aq on a scratch AQ_DB: the stub's hand-written rows hid that `aq list` cuts keys to 40 chars (wq#3454)."""
+    return {**e, "BDR_AQ": os.path.join(os.path.dirname(TOOL), "aq"), "AQ_DB": str(t / "alerts.db")}
+
+def aq_rows(t):
+    import sqlite3
+    c = sqlite3.connect(t / "alerts.db")
+    try:
+        return c.execute("SELECT key, status, count FROM alerts ORDER BY id").fetchall()
+    finally:
+        c.close()
+
+def test_long_key_row_is_bumped_not_churned(env):
+    """wq#3454: a key over 40 chars never matched its own `aq list` line, so every run resolved it and opened a new row."""
+    t, e = env; e = real_aq(t, e)
+    name = "a-very-long-untracked-tool-name-past-forty-chars.py"
+    (t / "bin" / name).write_text("x\n")
+    run(e, "--aq"); run(e, "--aq"); run(e, "--aq")
+    assert aq_rows(t) == [(f"bin-drift/{name}", "open", 3)]
+    os.remove(t / "bin" / name); run(e, "--aq")
+    assert aq_rows(t) == [(f"bin-drift/{name}", "resolved", 3)]
+
+def test_big_untracked_tree_is_one_row(env):
+    """wq#3454: retdec-5.0 (~4000 files) dropped into the primary raised one row per file."""
+    t, e = env; e = real_aq(t, e)
+    os.makedirs(t / "bin/vendor-tree/include/deep/path")
+    for i in range(7):
+        (t / f"bin/vendor-tree/include/deep/path/h{i}.def").write_text(f"{i}\n")
+    (t / "bin/newtool").write_text("echo reviewed other\n")
+    run(e, "--aq"); run(e, "--aq")
+    assert sorted(aq_rows(t)) == [("bin-drift/newtool", "open", 2), ("bin-drift/vendor-tree/", "open", 2)]
+
 def test_auto_flag_gates_apply(env):
     t, e = env
     (t / "bin/mytool").write_text("print('reviewed v2')\n"); age(t / "bin/mytool")

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""chat-digest-local - run bin/chat-export's JSON archive through the LOCAL Ollama model on
+this node, producing a prose digest per chat instead of chat-digest's keyword heuristics.
+
+Runs ON an Ollama fleet node (hathor, nephthys — see README.md for why isis/maat are not
+targets), reading an archive synced down from Lumen (rsync of bin/chat-export's
+~/.chat-archive/archive.json) and calling http://localhost:11434/api/generate so the chat
+bodies never leave the node. Per-chat failures (model error, timeout) are recorded against
+that chat and do not stop the run; an all-failed run exits 1.
+
+  chat-digest-local --archive archive.json                 # model picked from hostname
+  chat-digest-local --archive archive.json --model qwen3:14b
+  chat-digest-local --archive archive.json --dry-run        # build prompts, skip the Ollama call
+
+Secrets are masked twice: bin/chat-export already masks the archive body, and this CLI masks
+again before building the prompt and before printing the model's response, so a model that
+echoes part of its input back out cannot leak a credential chat-export missed.
+
+Exit: 0 all chats digested (or no chats), 1 every chat failed, 2 usage / bad archive.
+"""
+import argparse
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.request
+
+SECRET_RES = [
+    re.compile(r"\bcf[a-z]{2}_[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    re.compile(r"\b[0-9a-f]{40,}\b"),
+    re.compile(r"(?<![\w/.-])(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{40,}={0,2}(?![\w/.-])"),
+]
+KV_RE = re.compile(r"(?i)\b(password|passwd|pw|secret|token|api[_-]?key)(\s*[=:]\s*)\S+")
+
+# research/inference_nodes.yaml nodes.<host>.models[0].family -> families.<family>.blob
+HOST_MODELS = {
+    "hathor": "llama3.1:8b",
+    "nephthys": "qwen3:14b",
+}
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+PROMPT_TMPL = (
+    "Summarize this Claude Code chat log in 3-6 sentences. Call out any decisions made, "
+    "concrete outcomes, and items left open or pending. Plain prose, no markdown headers.\n\n"
+    "Title: %s\n\n%s"
+)
+MAX_BODY_CHARS = 12000  # keep local-model prompts cheap; bodies are typically summaries already
+
+
+def mask(s):
+    s = KV_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", s)
+    for rx in SECRET_RES:
+        s = rx.sub("<redacted>", s)
+    return s
+
+
+def default_model():
+    return HOST_MODELS.get(socket.gethostname().split(".")[0], next(iter(HOST_MODELS.values())))
+
+
+def load_archive(path):
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("chats", [])
+
+
+def call_ollama(host, model, prompt, timeout):
+    req = urllib.request.Request(
+        host.rstrip("/") + "/api/generate",
+        data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read())
+    return body.get("response", "").strip()
+
+
+def digest_chat(chat, host, model, timeout, dry_run):
+    title = mask(chat.get("title") or chat.get("id") or "(untitled)")
+    body = mask(chat.get("body", ""))[:MAX_BODY_CHARS]
+    prompt = PROMPT_TMPL % (title, body)
+    out = {"id": chat.get("id", ""), "title": title, "url": chat.get("url", "")}
+    if dry_run:
+        out["prompt"] = prompt
+        return out
+    try:
+        out["digest"] = mask(call_ollama(host, model, prompt, timeout))
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        out["error"] = mask(str(e))
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+                                  epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--archive", required=True, help="JSON archive produced by bin/chat-export")
+    ap.add_argument("--model", default=None, help="Ollama model name (default: hostname-based)")
+    ap.add_argument("--ollama-host", default=os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST))
+    ap.add_argument("--timeout", type=float, default=120.0)
+    ap.add_argument("--dry-run", action="store_true", help="build prompts, skip the Ollama call")
+    a = ap.parse_args(argv)
+
+    if not os.path.exists(a.archive):
+        print("chat-digest-local: no such archive: %s" % a.archive, file=sys.stderr)
+        return 2
+    try:
+        chats = load_archive(a.archive)
+    except (json.JSONDecodeError, OSError) as e:
+        print("chat-digest-local: bad archive %s: %s" % (a.archive, e), file=sys.stderr)
+        return 2
+
+    model = a.model or default_model()
+    results = [digest_chat(c, a.ollama_host, model, a.timeout, a.dry_run) for c in chats]
+    print(json.dumps({"model": model, "ollama_host": a.ollama_host, "digests": results}, indent=2))
+
+    if results and not a.dry_run and all("error" in r for r in results):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

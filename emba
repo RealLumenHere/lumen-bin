@@ -1,0 +1,5 @@
+#!/bin/bash
+# wq#3383 — EMBA firmware security analyzer entrypoint (root-free clone only;
+# full dependency install needs a root+container-engine host — wq#3404).
+# Payload lives in emba-dist/ (large upstream clone, not re-vendored here).
+exec /home/lumen/bin/emba-dist/emba "$@"

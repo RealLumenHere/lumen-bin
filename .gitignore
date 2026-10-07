@@ -14,6 +14,7 @@ __pycache__/
 # large downloaded binaries — not source
 /trivy
 /gatus
+/renode-dist
 
 # stale/superseded drafts, retired scripts, backups-by-suffix not caught above
 *.orig

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# wq#3388 — `rsf` on PATH, so callers don't need to know about the venv layout.
+# cd into WORKDIR first: rsf.py opens "routersploit.log" (and any loot/wordlist
+# paths a module needs) relative to cwd.
+set -euo pipefail
+WORKDIR=/home/lumen/bin/routersploit
+cd "$WORKDIR"
+exec "$WORKDIR/.venv/bin/python3" "$WORKDIR/rsf.py" "$@"
