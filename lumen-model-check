@@ -12,7 +12,10 @@ set -uo pipefail
 # wrote that stamp. Stamp directly from the script on every invocation
 # (success or failure) so the dead-man check reflects real liveness.
 trap '/home/lumen/bin/lumen-cron-stamp model-check 2>/dev/null || true' EXIT
-KEY=$(grep -hoE 'LITELLM_MASTER_KEY=sk-[A-Za-z0-9_-]+' /home/lumen/agent/.env 2>/dev/null | head -1 | cut -d= -f2)
+# wq#3681: the master key is retired for non-admin routes since wq#914 (/v1/models -> 401),
+# which made this check page "gateway down" falsely. Use the named model-watchdog service
+# key (same role, lists all models) from the 0600 service-key store. Value is never printed.
+KEY=$(tr -d '\n' < /home/lumen/.secrets/litellm-service-keys/model-watchdog.key 2>/dev/null)
 GW=$(curl -s -m 10 http://localhost:4000/v1/models -H "Authorization: Bearer $KEY" 2>/dev/null | python3 -c "import json,sys;print('\n'.join(m['id'] for m in json.load(sys.stdin).get('data',[])))" 2>/dev/null)
 if [ -z "$GW" ]; then /home/lumen/bin/ntfy-send -p high "model-check: LiteLLM gateway :4000 returned NO models (down?)" 2>/dev/null; echo "gateway down"; exit 1; fi
 CLI=$(grep -oE '(id|alias): +[a-z0-9._-]+' /home/lumen/foreman/research/models.yaml 2>/dev/null | awk '{print $2}' | sort -u)
