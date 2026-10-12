@@ -30,7 +30,7 @@ log() { echo "[ollama-upgrade $NAME $(date -u +%H:%M:%S)Z] $*"; }
 [ -n "$NAME" ] && [ -n "$USR" ] && [ -n "$LAN" ] || { echo "usage: ollama-upgrade --precheck|--apply|--verify|--rollback <name> <user> <lan_ip>"; exit 64; }
 case "$NAME" in thor) echo "REFUSED: Thor is never touched"; exit 3 ;; esac
 R()  { ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$USR@$LAN" "$@"; }
-RD() { local n="$1" c="$2"; R "sudo -n systemd-run --unit=oll-up-$n-\$(date +%s) --wait --collect -q bash -c $(printf %q "$c")" >/dev/null 2>&1; }
+RD() { local n="$1" c="$2"; R "sudo -n systemd-run --unit=oll-up-$n --wait --collect -q bash -c $(printf %q "$c")" >/dev/null 2>&1; }
 sget() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-; }
 sset() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
 api_version() { R "curl -s -m 5 http://127.0.0.1:$API_PORT/api/version" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null; }
