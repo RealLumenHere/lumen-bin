@@ -23,7 +23,7 @@ STATE_DIR=${STATE_DIR:-/home/lumen/.maint-ops}; STATE_NAME=${STATE_NAME:-ha-bes}
 mkdir -p "$STATE_DIR"; STATE="$STATE_DIR/$STATE_NAME.state"
 log() { echo "[ha-upgrade $(date -u +%H:%M:%S)Z] $*"; }
 R()  { ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 "$HOST_USER@$HOST_LAN" "$@"; }
-RD() { local n="$1" c="$2"; R "sudo -n systemd-run --unit=ha-up-$n-\$(date +%s) --wait --collect -q bash -c $(printf %q "$c")" >/dev/null 2>&1; }
+RD() { local n="$1" c="$2"; R "sudo -n systemd-run --unit=ha-up-$n --wait --collect -q bash -c $(printf %q "$c")" >/dev/null 2>&1; }
 sget() { grep "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2-; }
 sset() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
 running_version() { R "docker exec $CNAME python3 -c 'import homeassistant.const as c;print(c.__version__)'" 2>/dev/null | tr -d '\r'; }
