@@ -31,7 +31,8 @@ declare -A LABEL=(
 plugs=$("$FLEET_INV" plugs) || { echo "plug-ctl: fleet-inv plugs failed (inventory unreadable?)" >&2; exit 1; }
 while IFS=$'\t' read -r pid name _; do [[ -n "$pid" ]] && LABEL[${pid,,}]=$name; done <<<"$plugs"
 for n in $ORDER; do LABEL[$n]=${LABEL[$n]:-$n-unoccupied}; done
-k() { "$KASA" --host "$1" --username "$TAPO_USER" --password "$TAPO_PASS" "${@:2}" 2>/dev/null; }
+# wq#3086: creds go via python-kasa env (KASA_USERNAME/KASA_PASSWORD), NEVER argv (visible in ps).
+k() { KASA_USERNAME="$TAPO_USER" KASA_PASSWORD="$TAPO_PASS" "$KASA" --host "$1" "${@:2}" 2>/dev/null; }
 watts_one() { # name ip -> "name state watts"
   local out st w
   out=$(k "$2" state) || { echo "$1 unreachable -"; return; }
