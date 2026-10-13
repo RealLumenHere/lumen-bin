@@ -143,10 +143,11 @@ def main():
 
     conn = db_init()
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    # wq#2821: the pinned rung must be serving the pinned weights, not whatever was
-    # re-tagged under the same name on the node. Required for the pin, optional for
-    # an explicit JUDGE_MODEL override (bench/experiments).
-    ident_err = verify_model_identity(model, required=model_source.startswith("pin:"))
+    # wq#2821/wq#3792: the served rung must be the pinned weights, not whatever was
+    # re-tagged under the same name on the node. Required for any automatic routing
+    # decision (pin: or fallback:) -- optional only for an explicit JUDGE_MODEL
+    # override (env:), which is a deliberate human choice, not a silent retag.
+    ident_err = verify_model_identity(model, required=not model_source.startswith("env:"))
     if ident_err:
         fail_closed(conn, ts, case, model, model_source,
                     {"verdict": None, "error": ident_err, "latency_s": 0, "raw": None})
