@@ -38,7 +38,8 @@ import sys
 import subprocess
 
 sys.path.insert(0, "/home/lumen/foreman/judge")
-from judge_common import call_judge, litellm_key, verify_model_identity  # noqa: E402
+from judge_common import (  # noqa: E402
+    call_judge, litellm_key, resolve_judge_model, verify_model_identity)
 
 MINERVA_DB = "/home/lumen/minerva/minerva.db"
 PIN_FILE = "/home/lumen/foreman/judge/JUDGE_MODEL_PIN"
@@ -47,17 +48,15 @@ EXIT_BY_VERDICT = {"allow": 0, "deny": 1, "allow-with-conditions": 2}
 
 
 def resolve_model():
-    env = os.environ.get("JUDGE_MODEL")
-    if env:
-        return env, "env:JUDGE_MODEL"
-    if os.path.isfile(PIN_FILE):
-        pin = open(PIN_FILE).read().strip()
-        if pin:
-            return pin, f"pin:{PIN_FILE}"
-    sys.stderr.write(
-        "judge: no model configured. Set JUDGE_MODEL or write the pinned model "
-        f"name to {PIN_FILE} (see research/RISK_TIERED_JUDGE.md).\n")
-    sys.exit(3)
+    model, source, note = resolve_judge_model(PIN_FILE)
+    if note:
+        sys.stderr.write(f"judge: {note}\n")
+    if model is None:
+        sys.stderr.write(
+            "judge: no model configured. Set JUDGE_MODEL or write the pinned model "
+            f"name to {PIN_FILE} (see research/RISK_TIERED_JUDGE.md).\n")
+        sys.exit(3)
+    return model, source
 
 
 def db_init():
