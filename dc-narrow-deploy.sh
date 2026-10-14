@@ -3,6 +3,8 @@
 # health-check, deadman auto-revert. Runs DETACHED (systemd-run) so it survives
 # the desktop-commander gateway restart that severs Commander.
 set -uo pipefail
+# wq#3805: desktop-commander-mcp was retired on Lumen (unit masked). Never revive it.
+[ "$(systemctl is-enabled desktop-commander-mcp 2>/dev/null)" = "masked" ] && { echo "desktop-commander-mcp retired on this host (masked) - nothing to do (wq#3805)"; exit 0; }
 LOG=/home/lumen/logs/dc-narrow-deploy.log
 mkdir -p /home/lumen/logs
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }

@@ -3,6 +3,8 @@
 # Verifies the PROCESS restarted (start-timestamp advances) + healthy + no crash-loop.
 # Reverts live dist to broad backup on real failure. Detached-safe.
 set -uo pipefail
+# wq#3805: desktop-commander-mcp was retired on Lumen (unit masked). Never revive it.
+[ "$(systemctl is-enabled desktop-commander-mcp 2>/dev/null)" = "masked" ] && { echo "desktop-commander-mcp retired on this host (masked) - nothing to do (wq#3805)"; exit 0; }
 LOG=/home/lumen/logs/dc-narrow-deploy.log
 log(){ echo "[$(date '+%F %T')] v2 $*" | tee -a "$LOG"; }
 D=/home/lumen/.npm-global/lib/node_modules/supergateway/dist/gateways

@@ -5,6 +5,8 @@
 # claude.ai sessions between requests — verified live 2026-07-19 05:56Z).
 # Runs as root via mcp-pressure-guard.timer (1 min). Cooldown prevents flapping.
 set -u
+# wq#3805: desktop-commander-mcp was retired on Lumen (unit masked). Never revive it.
+[ "$(systemctl is-enabled desktop-commander-mcp 2>/dev/null)" = "masked" ] && { echo "desktop-commander-mcp retired on this host (masked) - nothing to do (wq#3805)"; exit 0; }
 THRESH_PSI=${THRESH_PSI:-25}     # percent, /proc/pressure/memory 'full avg60'
 THRESH_MEM_G=${THRESH_MEM_G:-11} # GiB, gateway cgroup MemoryCurrent
 COOLDOWN=${COOLDOWN:-600}        # seconds between auto-restarts

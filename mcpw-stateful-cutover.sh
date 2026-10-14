@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
+# wq#3805: desktop-commander-mcp was retired on Lumen (unit masked). Never revive it.
+[ "$(systemctl is-enabled desktop-commander-mcp 2>/dev/null)" = "masked" ] && { echo "desktop-commander-mcp retired on this host (masked) - nothing to do (wq#3805)"; exit 0; }
 [ "$(hostname)" = lumen ] || { echo "REFUSING: not lumen ($(hostname))"; exit 9; }
 SG=/home/lumen/.npm-global/lib/node_modules/supergateway/dist/gateways/stdioToStatefulStreamableHttp.js
 UNIT=/etc/systemd/system/desktop-commander-mcp.service

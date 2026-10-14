@@ -3,6 +3,8 @@
 # Runs as root via systemd-run so it survives the MCP connection drop caused by
 # restarting the very gateway we're talking through.
 set -u
+# wq#3805: desktop-commander-mcp was retired on Lumen (unit masked). Never revive it.
+[ "$(systemctl is-enabled desktop-commander-mcp 2>/dev/null)" = "masked" ] && { echo "desktop-commander-mcp retired on this host (masked) - nothing to do (wq#3805)"; exit 0; }
 LOG=/home/lumen/infra/dc-redeploy.log
 UNIT=/etc/systemd/system/desktop-commander-mcp.service
 NEW=/home/lumen/infra/desktop-commander-mcp.service.new

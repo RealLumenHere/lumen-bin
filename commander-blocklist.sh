@@ -4,6 +4,8 @@
 # clobbered (the service re-persists its in-memory list), so this stops -> edits -> starts.
 # Run from an SSH terminal (NOT through Commander itself, since it restarts the service).
 set -e
+# wq#3805: desktop-commander-mcp was retired on Lumen (unit masked). Never revive it.
+[ "$(systemctl is-enabled desktop-commander-mcp 2>/dev/null)" = "masked" ] && { echo "desktop-commander-mcp retired on this host (masked) - nothing to do (wq#3805)"; exit 0; }
 CFG=/home/lumen/.claude-server-commander/config.json
 MODE="${1:-}"
 case "$MODE" in clear|min|restore) ;; *) echo "usage: $0 {clear|min|restore}"; exit 1;; esac
