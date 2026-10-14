@@ -36,6 +36,24 @@ WQ       = "/home/lumen/bin/wq"
 AQ       = "/home/lumen/bin/aq"
 TICKET_AFTER = 2          # consecutive cycles before a ticket is opened
 
+# wq#2676: hosts whose origin is managed by an HA failover monitor, not by a
+# static config. An ORIGIN_DOWN on one of these is very often the monitor's
+# OWN documented state (primary down, standby not promotable -- see its log)
+# rather than an unknown dashboard/reality mismatch. Annotate, never suppress:
+# the finding still fires every cycle until the host actually answers again.
+HA_HOSTS = {"vault.lumennode.uk": Path("/home/lumen/ha")}
+
+
+def ha_context(host):
+    ha_dir = HA_HOSTS.get(host)
+    if not ha_dir:
+        return None
+    try:
+        primary = (ha_dir / "primary").read_text().strip()
+    except Exception:
+        return None
+    return f"HA primary={primary} -- see {ha_dir}/monitor.log before filing as new drift"
+
 
 def sh(cmd, timeout=40):
     try:
@@ -202,8 +220,12 @@ def check(inv, reseed=False):
         new_pins[h] = {"identity": key, "origin": origin, "fp": fp,
                        "seen": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         if not fp.get("reachable"):
+            detail = fp.get("detail", "no answer")
+            note = ha_context(h)
+            if note:
+                detail = f"{detail} [{note}]"
             findings.append({"kind": "ORIGIN_DOWN", "key": f"down:{h}", "host": h,
-                             "where": origin, "detail": fp.get("detail", "no answer")})
+                             "where": origin, "detail": detail})
             continue
         if prev and not reseed:
             if prev.get("origin") != origin:
