@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -61,6 +62,20 @@ class MintError(Exception):
 
 class Refused(Exception):
     """a guard or bad usage stopped us (exit 2)"""
+
+
+VAULT_GATE = "/home/lumen/bin/lib/require-vault-backup.sh"
+
+
+def vault_gate(key, live=None):
+    """wq#3865 (wq#3747): refuse to change a credential whose CURRENT value has no backup.
+    Runs the shared gate (exit 0 = a dated backup byte-identical to `live` exists). Called before
+    anything is created or revoked, so a refusal changes nothing. The gate logs hashes only."""
+    argv = [VAULT_GATE, key] + ([live] if live else [])
+    rc = subprocess.run(argv).returncode
+    if rc != 0:
+        raise Refused("vault-backup gate refused (rc=%d): back up the current value of %s first; "
+                      "nothing was changed" % (rc, key))
 
 
 def call(method, path, token, body=None, query=None):
@@ -385,6 +400,10 @@ def cmd_rotate(a, acct, admin):
                  ", then revoke the old token" if a.revoke_old else ", leaving the old token alive"))
         print("Re-run with --confirm.")
         return 0
+    # wq#3865 (wq#3747): the old value must be backed up BEFORE anything changes. With --revoke-old the
+    # old token is destroyed even when its value is not on disk here, so the gate then runs name-only.
+    if os.path.exists(out) or a.revoke_old:
+        vault_gate(os.path.basename(out), out if os.path.exists(out) else None)
     res, backup = create_and_store(acct, admin, body, out, True, "rotate")
     try:
         ver = verify_token(acct, res["value"])

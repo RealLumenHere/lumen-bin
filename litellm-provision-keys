@@ -142,6 +142,12 @@ def rotate(alias: str, new_alias: str = None):
     old_gateway_alias = prev.get("gateway_alias", alias)
     old_key = prev.get("key")
     keyfile = SECRETS_DIR / f"{alias}.key"
+    # wq#3865 (wq#3747): refuse BEFORE any state change if the key about to be burned has no backup.
+    import subprocess
+    gate = ["/home/lumen/bin/lib/require-vault-backup.sh", f"litellm-{alias}.key"] + ([str(keyfile)] if keyfile.exists() else [])
+    if subprocess.run(gate).returncode != 0:
+        print(f"ERROR: vault-backup gate refused rotation of {alias}; nothing was changed", file=sys.stderr)
+        return 2
     if not old_key and keyfile.exists():
         old_key = keyfile.read_text().strip()
     if new_alias is None:

@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -122,7 +123,14 @@ def env(tmp_path):
              TOKEN_MINT_LOG=str(tmp_path / "audit.jsonl"), TOKEN_MINT_ACCOUNT_FILE=str(acct),
              TOKEN_MINT_VERIFY_RETRIES="1")
     e.pop("CF_ACCOUNT_ID", None)
-    yield {"st": st, "env": e, "sec": sec, "log": tmp_path / "audit.jsonl", "tmp": tmp_path}
+    # wq#3865: rotate is behind the vault-backup gate. Sandbox the gate (never the real /home/lumen/.secrets)
+    # and seed a backup that IS the current value so the pre-existing rotate tests keep exercising the happy path.
+    bk = tmp_path / "rvb-backups"
+    bk.mkdir()
+    shutil.copy2(sec / "dns-edit.token", bk / "dns-edit.token.bak.20261014_000000")
+    e["RVB_BACKUP_DIRS"] = str(bk)
+    e["RVB_LOG"] = str(tmp_path / "rvb.log")
+    yield {"st": st, "env": e, "sec": sec, "log": tmp_path / "audit.jsonl", "tmp": tmp_path, "bk": bk}
     srv.shutdown()
 
 
@@ -268,3 +276,45 @@ def test_orphan_token_deleted_if_value_cannot_be_stored(env, monkeypatch, capsys
     err = capsys.readouterr().err
     assert rc == 1 and "was deleted again" in err
     assert env["st"].deleted == ["tok-new-1"]
+
+
+# ---- wq#3865: vault-backup gate on rotate (dummy credentials only) ----
+
+def _nothing_changed(env):
+    return (env["st"].posts == [] and env["st"].deleted == []
+            and (env["sec"] / "dns-edit.token").read_text() == "OLDVALUE-not-a-real-token\n")
+
+
+def test_rotate_refused_without_vault_backup(env):
+    for f in env["bk"].iterdir():
+        f.unlink()
+    r = tm(env, "rotate", "dns-edit", "--revoke-old", "--confirm")
+    assert r.returncode == 2 and "ROTATION REFUSED" in r.stderr and "gate refused" in r.stderr
+    assert _nothing_changed(env)
+    rvb = (env["tmp"] / "rvb.log").read_text()
+    assert "REFUSED" in rvb and "OLDVALUE" not in rvb
+
+
+def test_rotate_refused_when_backup_holds_an_older_value(env):
+    (env["bk"] / "dns-edit.token.bak.20261014_000000").write_text("an-older-dummy-value\n")
+    r = tm(env, "rotate", "dns-edit", "--confirm")
+    assert r.returncode == 2 and _nothing_changed(env)
+
+
+def test_rotate_dry_run_needs_no_backup(env):
+    for f in env["bk"].iterdir():
+        f.unlink()
+    r = tm(env, "rotate", "dns-edit")
+    assert r.returncode == 0 and "dry run" in r.stdout and env["st"].posts == []
+
+
+def test_rotate_revoke_old_with_new_out_path_still_gated_by_name(env):
+    for f in env["bk"].iterdir():
+        f.unlink()
+    out = env["tmp"] / "elsewhere.token"
+    r = tm(env, "rotate", "dns-edit", "--revoke-old", "--out", str(out), "--confirm")
+    assert r.returncode == 2 and env["st"].posts == [] and env["st"].deleted == [] and not out.exists()
+    (env["bk"] / "elsewhere.token.bak.20261014_000001").write_text("name-only-backup\n")
+    r = tm(env, "rotate", "dns-edit", "--revoke-old", "--out", str(out), "--confirm")
+    assert r.returncode == 0, r.stderr
+    assert env["st"].deleted == ["tok-old"]
