@@ -242,6 +242,16 @@ def run(new, selftest=False, keep_backups=False):
     if not new: sys.exit('nothing to rotate')
     ts = time.strftime('%Y%m%d_%H%M%S')
     say(f'=== rotate {"SELFTEST " if selftest else ""}{sorted(new)} ===')
+    # --- credential rotation safety gate (wq#3747) ---
+    for prov_name in ([] if selftest else sorted(new)):
+        rc = subprocess.run(
+            ['/home/lumen/bin/lib/require-vault-backup.sh', prov_name],
+            capture_output=False
+        ).returncode
+        if rc != 0:
+            say(f'ABORT: safety gate refused rotation for {prov_name} (no backup). Back up old keys first.')
+            return 2
+    # --- end gate ---
     if not preflight(new): say('ABORT: a new key failed preflight at the provider; nothing was changed'); return 2
     saved = backup(ts, sorted(new), selftest)
     t0, interrupted, old = time.time(), None, {p: set() for p in new}

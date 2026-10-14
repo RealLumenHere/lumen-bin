@@ -26,6 +26,11 @@ PY
   exit 0
 fi
 
+# --- credential rotation safety gate (wq#3747) ---
+source /home/lumen/bin/lib/require-vault-backup.sh
+require_vault_backup "gitea-cred" "$CRED" || exit $?
+# --- end gate ---
+
 BAK="$CRED.bak.$(date +%Y%m%d_%H%M%S)_pre_gitea_rotate"
 cp -a "$CRED" "$BAK"; chmod 600 "$BAK"
 echo "backup: $BAK"

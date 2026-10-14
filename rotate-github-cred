@@ -20,7 +20,7 @@ same fingerprint mask_replay / mask-hits records use.
   --no-revoke skips step 5 (old token stays live; say so loudly).
 Idempotent: re-running after success finds no old live token to replace and exits 0.
 """
-import hashlib, json, os, re, shutil, sys, time, urllib.request, urllib.error
+import hashlib, json, os, re, shutil, subprocess, sys, time, urllib.request, urllib.error
 from datetime import datetime
 
 HOME = "/home/lumen"
@@ -135,6 +135,16 @@ def main(argv):
     dead = {i for i, _, _, st, _ in rows if st == 401}
     if not old and not dead:
         print("   nothing to replace (store already on the new token).")
+    # --- credential rotation safety gate (wq#3747): only when a live value will change ---
+    if old or dead:
+        rc = subprocess.run(
+            ['/home/lumen/bin/lib/require-vault-backup.sh',
+             'github-lumen-classic.token', CRED],
+            capture_output=False
+        ).returncode
+        if rc != 0:
+            die('safety gate refused rotation (no backup). Back up old credentials first.')
+    # --- end gate ---
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     bak = f"{CRED}.bak.{ts}_pre_github_rotate"
     shutil.copy2(CRED, bak)

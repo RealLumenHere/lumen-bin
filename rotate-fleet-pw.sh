@@ -62,6 +62,12 @@ OLD=$(tr -d '\n' < "$OLD_F")
 [ -n "$NEW" ] || { echo "FATAL: new pw empty"; exit 1; }
 [ "$NEW" != "$OLD" ] || { echo "FATAL: new == old"; exit 1; }
 
+# --- credential rotation safety gate (wq#3747) ---
+source /home/lumen/bin/lib/require-vault-backup.sh
+require_vault_backup "fleet-pw" "$OLD_F" || exit $?
+# --- end gate ---
+
+
 REVERT_NODE=""
 if [ "${1:-}" = "--revert" ]; then
   REVERT_NODE="${2:?usage: --revert NODE}"

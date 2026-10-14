@@ -62,6 +62,11 @@ if [ -z "$RETIRE_ID" ]; then
 fi
 echo "   retiring: id=$RETIRE_ID name=$RETIRE_NAME"
 
+# --- credential rotation safety gate (wq#3747): before anything is minted or written ---
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/require-vault-backup.sh"
+require_vault_backup "gitea-token" "$SECFILE" || exit $?
+# --- end gate ---
+
 echo "2) minting a new token on Anubis ..."
 NEWNAME="lumen-fleet-$STAMP"
 NEW=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$ANUBIS" \

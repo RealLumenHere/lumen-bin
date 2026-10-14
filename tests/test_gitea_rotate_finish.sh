@@ -40,6 +40,9 @@ setup_sandbox(){
   printf 'http://lumen:oldtok123456789012345678901234@100.121.17.5%%3a3000\n' > "$GITEA_ROTATE_CRED_FILE"
   printf 'oldtok123456789012345678901234' > "$GITEA_ROTATE_SEC_FILE"
   chmod 600 "$GITEA_ROTATE_SEC_FILE"
+  # wq#3747: the rotation gate wants a backup identical to the live value
+  export RVB_BACKUP_DIRS="$SBOX/backups" RVB_LOG="$SBOX/rotation.log"
+  mkdir -p "$SBOX/backups"; cp "$GITEA_ROTATE_SEC_FILE" "$SBOX/backups/gitea-token.bak.test"
 }
 
 teardown_sandbox(){ rm -rf "$SBOX"; }
