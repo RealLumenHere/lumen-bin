@@ -1138,6 +1138,56 @@ def print_bad_gate(bad):
           "can never pass -- gate_met() does not expand '~' (wq#3068) -- so claim --id would be "
           "refused forever. Write the path out in full (/abs/path, not ~/path). Put prose in "
           "--detail, a checkable probe in --liveness, or --force to override (discouraged).")
+def norm_dep_id(tok):
+    """wq#4113: accept 'wq1234'/'wq#1234'/'1234' -- deps_met()'s `WHERE id=?` lookup is
+    against an int-keyed column, so a wq-prefixed id never matches and claim --id refuses
+    forever with a plausible-looking 'deps not met' even once the dep is actually done
+    (wq#3950/#3980/#4071). Strips a leading 'wq'/'wq#' (case-insensitive); returns the rest
+    unchanged so a non-id clause still fails an isdigit() check at the call site."""
+    t = tok.strip()
+    low = t.lower()
+    if low.startswith('wq#'): t = t[3:]
+    elif low.startswith('wq'): t = t[2:]
+    return t.strip()
+def bad_dep_clauses(c, deps):
+    """wq#4113: same fail-closed shape as bad_gate_clauses -- a clause deps_met() can never
+    resolve strands claim --id forever, so refuse it at write time instead. Returns
+    (malformed, missing): malformed clauses aren't an id at all (even after stripping an
+    optional wq/wq# prefix); missing ones normalize to an id but no such task exists --
+    deps_met() can never see a nonexistent task as done either."""
+    if not deps or not deps.strip(): return [], []
+    malformed, missing = [], []
+    for clause in [x.strip() for x in deps.split(',') if x.strip()]:
+        d = norm_dep_id(clause)
+        if not d.isdigit():
+            malformed.append(clause)
+            continue
+        if not c.execute("SELECT 1 FROM tasks WHERE id=?", (d,)).fetchone():
+            missing.append(clause)
+    return malformed, missing
+def normalize_deps(deps):
+    """wq#4113: strip a 'wq'/'wq#' prefix off each clause that normalizes to a bare id, so
+    the stored value is what deps_met()'s `WHERE id=?` can actually match. A clause that
+    doesn't normalize to digits (only reachable via --force) is stored as typed."""
+    if not deps or not deps.strip(): return deps
+    out = []
+    for clause in [x.strip() for x in deps.split(',') if x.strip()]:
+        d = norm_dep_id(clause)
+        out.append(d if d.isdigit() else clause)
+    return ",".join(out)
+def print_bad_deps(malformed, missing):
+    """wq#4113: one refusal text for both write paths (cmd_add, cmd_edit)."""
+    print(f"REFUSED: --deps clause(s) deps_met() can never resolve: "
+          f"{', '.join(malformed + missing)} (wq#4113)")
+    if malformed:
+        print(f"  not an id: {', '.join(malformed)} -- deps_met() does `WHERE id=<clause>` "
+              f"against an int-keyed column, so a non-numeric dep never matches and "
+              f"claim --id would refuse forever on a plausible 'deps not met'. Use the bare "
+              f"id (1234), 'wq1234', or 'wq#1234' -- all three normalize the same way.")
+    if missing:
+        print(f"  no such task: {', '.join(missing)} -- same failure mode, deps_met() can "
+              f"never see a nonexistent task id as done.")
+    print("Use --force to record it anyway (discouraged).")
 def ro_holders(c, base, t_now, exclude=None):
     """wq#1675: live readers on a base scope, minus `exclude` (normally the caller, whose own
     read hold must never block its own writer claim on the same base)."""
@@ -1578,6 +1628,13 @@ def cmd_add(a):
         print_bad_gate(bad_gate)
         sys.exit(1)
     c = conn()
+    # wq#4113: same guard as --gate above -- a wq-prefixed or nonexistent --deps clause
+    # strands claim --id forever on a plausible 'deps not met' (wq#3950/#3980/#4071).
+    malformed, missing = ([], []) if a.force else bad_dep_clauses(c, a.deps)
+    if malformed or missing:
+        print_bad_deps(malformed, missing)
+        c.close(); sys.exit(1)
+    a.deps = normalize_deps(a.deps)
     if not a.force:
         nt = norm_title(a.title)
         for rid, rtitle, rstatus, rlane in c.execute(
@@ -3584,6 +3641,14 @@ def cmd_edit(a):
     if bad_gate:
         print_bad_gate(bad_gate)
         c.close(); sys.exit(1)
+    # wq#4113: same guard as cmd_add -- a wq-prefixed or nonexistent --deps clause strands
+    # claim --id forever on a plausible 'deps not met' (wq#3950/#3980/#4071).
+    if a.deps is not None:
+        malformed, missing = ([], []) if a.force else bad_dep_clauses(c, a.deps)
+        if malformed or missing:
+            print_bad_deps(malformed, missing)
+            c.close(); sys.exit(1)
+        a.deps = normalize_deps(a.deps)
     for col,val in (("title",a.title),("detail",a.detail),("pri",a.pri),("lane",a.lane),
                     ("status",a.status),("subsystems",",".join(parse_subs(a.subsystems)) if a.subsystems is not None else None),
                     ("gate",a.gate),("deps",a.deps),("archetype",a.archetype),
