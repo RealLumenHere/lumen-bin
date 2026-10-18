@@ -268,6 +268,8 @@ def _append_prior_art(prior, kind, query, results):
 # (wq#2564: shared egress IP self-rate-limits every general engine at once).
 WEB_SEARCH_ENGINES = {"brave", "duckduckgo", "google cse", "startpage"}
 BRAVE_API_BASE = "https://api.search.brave.com/res/v1/web/search"
+DEEPSEEK_SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
+DEEPSEEK_FETCH_URL = "https://api.deepseek.com/v1/tools/fetch"
 
 
 def searxng_search(query, n=10, engines=None):
@@ -321,6 +323,82 @@ def brave_api_search(query, n=10, api_key=None):
     return out, None
 
 
+def _deepseek_post(url, body, api_key, timeout=HTTP_TIMEOUT):
+    """POST -> (status, json_or_None). Never raises on HTTP error; returns the code."""
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return e.code, None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, {"error": {"message": str(e)}}
+
+
+def deepseek_search(query, n=10, api_key=None):
+    """Second keyed fallback for cmd_web, tried after brave_api_search (wq#4195).
+    $0.75/1000 successful requests (DEEPSEEK_API_KEY, fleet-provisioned already).
+
+    Returns (results_list_or_None, error_or_None). No key configured is reported
+    as an error, not a crash -- fleet-search still needs to run without one.
+    """
+    api_key = api_key or _env_token("DEEPSEEK_API_KEY")
+    if not api_key:
+        return None, "no DEEPSEEK_API_KEY configured"
+    status, data = _deepseek_post(
+        DEEPSEEK_SEARCH_URL, {"query": query, "count": max(1, min(n, 50)), "need_content": False}, api_key)
+    if status == 0:
+        return None, f"deepseek search unreachable: {(data or {}).get('error', {}).get('message', '')}"
+    if status == 401:
+        return None, "deepseek search 401 — key invalid/revoked"
+    if status == 402:
+        return None, "deepseek search 402 — account balance exhausted"
+    if status == 429:
+        return None, "deepseek search 429 — QPS limit exceeded (5 qps/account)"
+    if status != 200 or data is None:
+        msg = (data or {}).get("error", {}).get("message", "") if data else ""
+        return None, f"deepseek search http {status}: {msg}"
+    out = []
+    for r in data.get("results", [])[:n]:
+        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
+                    "snippet": r.get("summary") or r.get("snippet", ""),
+                    "rerank_score": r.get("rerank_score", 0),
+                    "authority": r.get("authority", -1), "engine": "deepseek-search"})
+    return out, None
+
+
+def deepseek_fetch(url, api_key=None):
+    """Fetch-ladder tier for _fetch_ladder (wq#4195). $0.75/1000 successful requests.
+
+    Returns (page_dict_or_None, error_or_None). page = {"title", "content"}, matching
+    _fetch_and_extract()'s own extraction shape (fleet-search:733-783)."""
+    api_key = api_key or _env_token("DEEPSEEK_API_KEY")
+    if not api_key:
+        return None, "no DEEPSEEK_API_KEY configured"
+    status, data = _deepseek_post(DEEPSEEK_FETCH_URL, {"url": url}, api_key)
+    if status == 0:
+        return None, f"deepseek fetch unreachable: {(data or {}).get('error', {}).get('message', '')}"
+    if status == 401:
+        return None, "deepseek fetch 401 — key invalid/revoked"
+    if status == 402:
+        return None, "deepseek fetch 402 — account balance exhausted"
+    if status == 403:
+        return None, "deepseek fetch 403 — rejected by target site security policy"
+    if status == 404:
+        return None, "deepseek fetch 404 — no usable page content"
+    if status == 429:
+        return None, "deepseek fetch 429 — QPS limit exceeded (5 qps/account, also per-domain)"
+    if status != 200 or data is None:
+        msg = (data or {}).get("error", {}).get("message", "") if data else ""
+        return None, f"deepseek fetch http {status}: {msg}"
+    return {"title": data.get("title", ""), "content": data.get("content", "")}, None
+
+
 def cmd_web(args):
     kind = "web"
     if not args.no_cache:
@@ -340,9 +418,18 @@ def cmd_web(args):
                           unresponsive_engines=unresponsive,
                           note="searxng general engines all suspended/blocked; used keyed Brave API fallback",
                           cached=False))
+        ds_fallback, ds_err = deepseek_search(args.query, args.n)
+        if ds_fallback is not None:
+            cache_store(args.project, kind, args.query, args.n, ds_fallback)
+            emit(envelope("deepseek-search", True, {"results": ds_fallback}, query=args.query,
+                          unresponsive_engines=unresponsive,
+                          note="searxng general engines all suspended/blocked; brave fallback also failed; "
+                               "used keyed DeepSeek Search fallback",
+                          cached=False))
         emit(envelope("searxng", False,
                       error=f"all general web-search engines suspended/blocked "
-                            f"({', '.join(sorted(down))}); fallback failed: {fb_err}",
+                            f"({', '.join(sorted(down))}); brave fallback failed: {fb_err}; "
+                            f"deepseek fallback failed: {ds_err}",
                       query=args.query, unresponsive_engines=unresponsive, cached=False))
     cache_store(args.project, kind, args.query, args.n, results)
     emit(envelope("searxng", True, {"results": results}, query=args.query,
@@ -699,13 +786,27 @@ def _detect_challenge(body):
     return None
 
 
+def _fetch_deepseek(url):
+    """Rung 5 adapter: deepseek_fetch() returns (page_dict_or_None, err) but every
+    other rung returns (status, body, final_url); translate so _fetch_ladder doesn't
+    need a special case. No DEEPSEEK_API_KEY configured is treated as rung-unavailable
+    (None), same as rungs 2-4 missing their dependency, not a 403 to retry past."""
+    page, err = deepseek_fetch(url)
+    if page is None:
+        if err == "no DEEPSEEK_API_KEY configured":
+            return None
+        status = 403 if "403" in err else 429 if "429" in err else 0
+        return status, err.encode("utf-8", "replace"), url
+    return 200, page["content"].encode("utf-8", "replace"), url
+
+
 def _fetch_ladder(url):
     """Ordered fetch ladder for `url`. Each rung is tried ONLY if the previous one
     came back 403/429/503 — a 404 (or any other real answer) stops the ladder right
     there. A rung's body is also checked against known WAF/bot-challenge signatures
     (wq#2494): a match is synthesised to 403 so a rendered challenge/block page
     (which a WAF often serves with a 200) is retry-eligible rather than a terminal
-    "success". Rungs 2-4 are skipped (not attempted) if their dependency is
+    "success". Rungs 2-5 are skipped (not attempted) if their dependency is
     unavailable, never crash the ladder. Returns (status, body, final_url, tier,
     challenge) — tier says which rung produced the returned result, for measuring
     which rung actually serves; challenge is the matched signature name, or None."""
@@ -714,6 +815,7 @@ def _fetch_ladder(url):
         (2, lambda: _fetch_cffi_chrome(url)),
         (3, lambda: _fetch_chromium(url)),
         (4, lambda: _fetch_flaresolverr(url)),
+        (5, lambda: _fetch_deepseek(url)),       # keyed DeepSeek Fetch fallback (wq#4195)
     )
     last = None
     for tier, fn in rungs:
