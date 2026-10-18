@@ -4,9 +4,11 @@ an affiliate tag), and search engines index those URLs verbatim. A fleet-search
 web hit on any Amazon listing then false-triggers the AKIA mask tripwire for a
 value that was never ours (wq#4267/wq#4268 attempt 1, settled via wq#4279).
 
-fleet-search:searxng_search/brave_api_search/deepseek_search must strip that
-noise (via _clean_amazon_url/_clean_amazon_noise, fleet-search:~264-290) from
-every result url and snippet before it reaches cache, prior-art, or emit.
+fleet-search must strip that noise (via _clean_amazon_url/_clean_amazon_noise)
+from every result url and snippet before it reaches cache, prior-art, or emit.
+Since wq#4309 the scrub lives centrally in _scrub() at the cache_store/emit
+sinks rather than in each backend; see tests/test_wq4309_central_amazon_scrub.py
+for the per-surface coverage.
 
 Builds the SubscriptionId value at runtime (never a bare AKIA literal) per the
 mask-tripwire-probe rule.
@@ -65,9 +67,16 @@ def test_clean_amazon_noise_scrubs_url_embedded_in_snippet_text():
     assert "prime eligible" in cleaned
 
 
-def test_searxng_search_end_to_end_strips_subscriptionid(monkeypatch):
+def test_web_end_to_end_strips_subscriptionid(monkeypatch, capsys, tmp_path):
     """Fixture: a full SearXNG json response (the shape _get_json returns) carrying
-    one Amazon result with SubscriptionId/tag noise, same as the live wq#4279 hit."""
+    one Amazon result with SubscriptionId/tag noise, same as the live wq#4279 hit.
+
+    wq#4309 moved the scrub from the per-backend loops to the central sinks
+    (cache_store/emit), so this asserts on cmd_web's emitted envelope — the
+    boundary the tripwire actually reads — not on searxng_search's return."""
+    import argparse
+    import json as _json
+    import pytest
     fixture_response = {
         "results": [
             {
@@ -80,10 +89,20 @@ def test_searxng_search_end_to_end_strips_subscriptionid(monkeypatch):
         "unresponsive_engines": [],
     }
     monkeypatch.setattr(fs, "_get_json", lambda *a, **k: (200, fixture_response, None))
-    results, err, unresponsive = fs.searxng_search("Polaris Freedom pool cleaner")
-    assert err is None
-    assert unresponsive == []
-    assert len(results) == 1
-    assert _SUBSCRIPTION_ID not in results[0]["url"]
-    assert _SUBSCRIPTION_ID not in results[0]["snippet"]
-    assert "SubscriptionId" not in results[0]["url"]
+    monkeypatch.setattr(fs, "_cache_paths", lambda project: (
+        str(tmp_path / "search_cache.jsonl"), str(tmp_path / "PRIOR_ART.md"), str(tmp_path)))
+    args = argparse.Namespace(query="Polaris Freedom pool cleaner", n=10,
+                              project="wq4281test", no_cache=True, ttl=60)
+    with pytest.raises(SystemExit) as exc:
+        fs.cmd_web(args)
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert _SUBSCRIPTION_ID not in out
+    assert "SubscriptionId" not in out
+    data = _json.loads(out)
+    assert len(data["results"]) == 1
+    assert data["results"][0]["url"].startswith(
+        "https://www.amazon.com/Polaris-Freedom-Robotic-Cleaner/dp/B07ABCDEFG")
+    # the cached record was scrubbed too (cache_store sink)
+    cached = (tmp_path / "search_cache.jsonl").read_text()
+    assert _SUBSCRIPTION_ID not in cached

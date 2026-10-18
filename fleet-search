@@ -115,6 +115,10 @@ def envelope(source, ok, payload=None, error=None, **extra):
 
 
 def emit(obj):
+    # wq#4309: central Amazon-noise scrub. emit() is the single exit for every
+    # subcommand INCLUDING cache replay, so records written by a pre-fix binary
+    # still leave clean for their whole TTL. See _scrub / AMAZON_NOISE_PARAMS.
+    obj = _scrub(obj)
     print(json.dumps(obj, ensure_ascii=False, indent=2))
     sys.exit(0 if obj.get("ok") else 2)
 
@@ -225,6 +229,9 @@ def cache_lookup(project, kind, query, n, ttl):
 
 
 def cache_store(project, kind, query, n, results):
+    # wq#4309: scrub before anything is persisted, so the cache file and the
+    # PRIOR_ART.md append (fed the scrubbed value below) never hold the noise.
+    results = _scrub(results)
     if isinstance(results, list) and not results:
         return                        # wq#2603: never cache a claim of "no results"
     path, prior, base = _cache_paths(project)
@@ -266,7 +273,18 @@ def _append_prior_art(prior, kind, query, results):
 # tripwire fires on every such hit and files a pri-1 rotation row for a key that was
 # never ours (wq#4267/wq#4268 attempt 1, settled wq#4279). Strip the noise before a
 # result/snippet reaches cache, prior-art, or emit.
-AMAZON_NOISE_PARAMS = {"SubscriptionId", "tag", "linkCode", "camp", "creative", "creativeASIN", "ascsubtag"}
+# wq#4309: extended from the ClearURLs amazon rule block (rules2.clearurls.xyz
+# data.minify.json, providers.amazon.rules, fetched 2026-10-18) — tracking-only
+# params; content-affecting ones ClearURLs also strips (qid, th, keywords, dchild,
+# coliid/colid) are deliberately kept so a cleaned URL still resolves to the same
+# page/variant. No dependency added: the rule list is mined, not vendored.
+AMAZON_NOISE_PARAMS = {"SubscriptionId", "tag", "linkCode", "camp", "creative", "creativeASIN",
+                       "ascsubtag", "psc", "ref", "ref_", "_encoding", "refRID", "spIA",
+                       "ms3_c", "smid", "crid", "sprefix", "aaxitk", "hsa_cr_id", "rnid",
+                       "dib", "dib_tag", "social_share", "qualifier", "starsLeft",
+                       "skipTwisterOG", "linkId"}
+# ClearURLs wildcard rules p[fd]_rd_[a-z]*, __mk_xx_xx, cv_ct_*, sb-ci-* as prefixes.
+AMAZON_NOISE_PREFIXES = ("pd_rd_", "pf_rd_", "__mk_", "cv_ct_", "sb-ci-")
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+')
 
 
@@ -278,7 +296,7 @@ def _clean_amazon_url(url):
     try:
         parts = urllib.parse.urlsplit(url)
         kept = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-                if k not in AMAZON_NOISE_PARAMS]
+                if k not in AMAZON_NOISE_PARAMS and not k.startswith(AMAZON_NOISE_PREFIXES)]
         return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(kept)))
     except ValueError:
         return url
@@ -289,6 +307,24 @@ def _clean_amazon_noise(text):
     if not text or "amazon." not in text.lower():
         return text
     return _URL_RE.sub(lambda m: _clean_amazon_url(m.group(0)), text)
+
+
+def _scrub(obj):
+    """wq#4309: recursively apply _clean_amazon_noise to every string in a
+    dict/list/tuple tree. Called once at the two sinks every result passes
+    through — cache_store() (which also feeds _append_prior_art) and emit()
+    (which also covers cache replay) — instead of per-backend wiring, which
+    missed 5 of 8 surfaces (hn/so/github/reddit --deep/read), all titles, and
+    every cached record (wq#4305 judgment §2-3). Non-strings pass unchanged."""
+    if isinstance(obj, str):
+        return _clean_amazon_noise(obj)
+    if isinstance(obj, list):
+        return [_scrub(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub(v) for v in obj)
+    if isinstance(obj, dict):
+        return {k: _scrub(v) for k, v in obj.items()}
+    return obj
 
 
 # ---------- SearXNG (web / reddit-discovery) ----------
@@ -324,8 +360,8 @@ def searxng_search(query, n=10, engines=None):
         return None, f"searxng http {status}: {err}", []
     out = []
     for r in data.get("results", [])[:n]:
-        out.append({"title": r.get("title", ""), "url": _clean_amazon_url(r.get("url", "")),
-                    "snippet": _clean_amazon_noise(r.get("content", "") or "")[:400],
+        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
+                    "snippet": (r.get("content", "") or "")[:400],
                     "engine": r.get("engine", "")})
     return out, None, data.get("unresponsive_engines", []) or []
 
@@ -350,8 +386,8 @@ def brave_api_search(query, n=10, api_key=None):
         return None, f"brave api http {status}: {err}"
     out = []
     for r in (data.get("web") or {}).get("results", [])[:n]:
-        out.append({"title": r.get("title", ""), "url": _clean_amazon_url(r.get("url", "")),
-                    "snippet": _clean_amazon_noise(r.get("description", "") or "")[:400], "engine": "brave-api"})
+        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
+                    "snippet": (r.get("description", "") or "")[:400], "engine": "brave-api"})
     return out, None
 
 
@@ -397,8 +433,8 @@ def deepseek_search(query, n=10, api_key=None):
         return None, f"deepseek search http {status}: {msg}"
     out = []
     for r in data.get("results", [])[:n]:
-        out.append({"title": r.get("title", ""), "url": _clean_amazon_url(r.get("url", "")),
-                    "snippet": _clean_amazon_noise(r.get("summary") or r.get("snippet", "")),
+        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
+                    "snippet": r.get("summary") or r.get("snippet", ""),
                     "rerank_score": r.get("rerank_score", 0),
                     "authority": r.get("authority", -1), "engine": "deepseek-search"})
     return out, None
