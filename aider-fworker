@@ -1,0 +1,64 @@
+#!/bin/bash
+# aider-fworker <ticket-id> [model] -- wq#4237, hardened 2026-10-18 (fleet-ops2).
+#
+# Usage: WQ_AGENT=<registered> AIDER_FWORKER_DIR=<linked-worktree> aider-fworker <ticket-id> [model]
+#   optional: AIDER_TEST_CMD='pytest -q'   (enables --auto-test)   AIDER_TIMEOUT=1800 (seconds)
+#
+# SAFETY INVARIANTS (v1 violated all three):
+#  1. NEVER writes in a primary tree. AIDER_FWORKER_DIR must be a LINKED git worktree
+#     (create: lumen-pr start <repo> <type>/<slug> --worktree). aider --yes auto-commits.
+#  2. NEVER leaves the ticket claimed: every exit path after the claim ends in wq block
+#     (EXIT trap covers signals and unexpected errors).
+#  3. NEVER marks the ticket done itself. Local-model output is unreviewed; a clean run is
+#     parked as blocked "AIDER-READY-FOR-REVIEW" with branch+log, and the orchestrator
+#     reviews, lands the PR via lumen-pr, and closes with PR evidence.
+set -uo pipefail
+
+# shellcheck disable=SC1091
+source /etc/lumen-aider-fworker.env
+export OPENAI_API_BASE OPENAI_API_KEY
+export PATH=/home/lumen/.local/bin:/home/lumen/bin:$PATH
+
+TICKET_ID=${1:?Usage: AIDER_FWORKER_DIR=<worktree> aider-fworker <ticket-id> [model]}
+MODEL=${2:-openai/lumen/code}
+: "${WQ_AGENT:?WQ_AGENT unset - register first: eval \"\$(wq whoami --register aider-N --eval)\"}"
+WT=${AIDER_FWORKER_DIR:?AIDER_FWORKER_DIR unset - must be a LINKED git worktree (lumen-pr start ... --worktree)}
+
+# ---- preflight: all refusals happen BEFORE the claim, so nothing can be orphaned ----
+[[ "$TICKET_ID" =~ ^[0-9]+$ ]] || { echo "REFUSED: bad ticket id '$TICKET_ID'" >&2; exit 2; }
+[ -f "$WT/.git" ] || { echo "REFUSED: $WT is not a LINKED worktree (.git must be a file). Never run aider in a primary tree." >&2; exit 2; }
+TITLE=$(wq show "$TICKET_ID" | sed -n 's/^title *: *//p')
+DETAIL=$(wq show "$TICKET_ID" | sed -n 's/^detail *: *//p')
+[ -n "$TITLE" ] || { echo "REFUSED: ticket $TICKET_ID not found" >&2; exit 2; }
+
+CLAIM_OUT=$(wq claim --id "$TICKET_ID" 2>&1) || { echo "claim failed: $CLAIM_OUT" >&2; exit 3; }
+FENCE=$(printf '%s\n' "$CLAIM_OUT" | sed -n 's/.*FENCE=\([0-9][0-9]*\).*/\1/p' | head -1)
+FENCE_ARGS=(); [ -n "$FENCE" ] && FENCE_ARGS=(--fence "$FENCE")
+
+PARKED=0
+park() {  # park <reason> : leave the ticket blocked (never claimed). Falls back to release.
+  wq block "${FENCE_ARGS[@]}" --no-probe "aider-fworker automated park" "$TICKET_ID" "$1" >/dev/null 2>&1 \
+    || wq release "${FENCE_ARGS[@]}" "$TICKET_ID" >/dev/null 2>&1
+  PARKED=1
+}
+trap '[ "$PARKED" = 1 ] || park "aider-fworker: exited unexpectedly (signal/error) - see $LOG"' EXIT
+
+LOG="/tmp/aider-${TICKET_ID}.log"
+BASE=$(git -C "$WT" rev-parse HEAD)
+cd "$WT" || { park "aider-fworker: cannot cd $WT"; exit 5; }
+
+EXTRA=(); [ -n "${AIDER_TEST_CMD:-}" ] && EXTRA=(--auto-test --test-cmd "$AIDER_TEST_CMD")
+timeout "${AIDER_TIMEOUT:-1800}" aider --model "$MODEL" \
+  --message "Implement this ticket: $TITLE. Details: $DETAIL" \
+  --yes --auto-lint --no-gitignore --no-show-model-warnings "${EXTRA[@]}" 2>&1 | tee "$LOG"
+RC=${PIPESTATUS[0]}
+
+NEW=$(git -C "$WT" rev-list --count "$BASE"..HEAD 2>/dev/null || echo 0)
+BRANCH=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+if [ "$RC" -ne 0 ]; then
+  park "aider-fworker: aider exit $RC after ${SECONDS}s (model $MODEL). log $LOG"; exit "$RC"
+elif [ "$NEW" -eq 0 ]; then
+  park "aider-fworker: aider exit 0 but made NO commits (model $MODEL, ${SECONDS}s) - nothing to review. log $LOG"; exit 4
+else
+  park "AIDER-READY-FOR-REVIEW: $NEW commit(s) on $BRANCH in $WT (model $MODEL, ${SECONDS}s). Review diff, then lumen-pr open/land and wq done with PR evidence. log $LOG"
+fi
