@@ -15,8 +15,10 @@ DESIGN:
     every model on it identically, so probing more just burns quota).
   - Embed/rerank/whisper/tts deployments are skipped: chat completions is
     the wrong call shape for them.
-  - Master key is read from agent/.env with a regex, used only in the
-    Authorization header, never printed or logged (instinct 4).
+  - Authenticates with the model-watchdog service key (0600 file), used only
+    in the Authorization header, never printed or logged (instinct 4).
+  - A gateway that rejects the probe's own key is ONE probe-key row, not a
+    row per host (wq#3736).
   - Edge-triggered alerting, same contract as litellm-auth-alert (wq#911)
     and health_check_failure_alert (wq#1295): aq add + urgent ntfy on
     clear->breach, aq bump (no re-ntfy) while the breach persists, low-pri
@@ -38,6 +40,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 # wq#3212: rung enumeration moved to the shared litellm_rungs module so this
@@ -46,9 +49,15 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import litellm_rungs
 
-ENV_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_ENV", "/home/lumen/agent/.env")
+# wq#3736: the master key is retired for non-admin routes (wq#914), so reading
+# LITELLM_MASTER_KEY got a 401 on every host from 2026-10-07 22:06 and the probe
+# filed it as 12 "unreachable" rows. Same key lumen-model-check moved to (wq#3681).
+KEY_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_KEY_FILE",
+                          "/home/lumen/.secrets/litellm-service-keys/model-watchdog.key")
 CONFIG_PATH = os.environ.get("LITELLM_COMPLETION_PROBE_CONFIG", "/home/lumen/agent/litellm_config.yaml")
 GATEWAY_URL = os.environ.get("LITELLM_COMPLETION_PROBE_URL", "http://localhost:4000/v1/chat/completions")
+MODELS_URL = os.environ.get("LITELLM_COMPLETION_PROBE_MODELS_URL", "http://localhost:4000/v1/models")
+PROBE_KEY_HOST = "probe-key"
 STATE_DIR = pathlib.Path(os.environ.get("LITELLM_COMPLETION_PROBE_STATE_DIR", "/home/lumen/agents/litellm-completion-probe"))
 NTFY = os.environ.get("LITELLM_COMPLETION_PROBE_NTFY", "/home/lumen/bin/ntfy-send")
 NTFY_TOPIC = os.environ.get("LITELLM_COMPLETION_PROBE_TOPIC", "lumen-alerts")
@@ -77,12 +86,38 @@ Rung = litellm_rungs.Rung
 one_rung_per_host = litellm_rungs.one_rung_per_host
 
 
-def read_master_key(env_path: str) -> str:
-    text = pathlib.Path(env_path).read_text()
-    m = re.search(r"LITELLM_MASTER_KEY=(sk-[A-Za-z0-9_-]+)", text)
-    if not m:
-        raise RuntimeError("LITELLM_MASTER_KEY not found in " + env_path)
-    return m.group(1)
+def read_service_key(path: str) -> str:
+    key = pathlib.Path(path).read_text().strip()
+    if not key:
+        raise RuntimeError("empty service key file " + path)
+    return key
+
+
+def check_probe_key(key_path: str) -> tuple:
+    """(key, None) when the gateway accepts our key, else (None, failure result).
+    A rejected or unreadable key would fail every host identically, so it is
+    reported once under PROBE_KEY_HOST and the host probes are skipped."""
+    fail = {"host": PROBE_KEY_HOST, "model": "-", "ok": False, "kind": "auth", "elapsed_s": 0.0}
+    try:
+        key = read_service_key(key_path)
+    except Exception as e:  # noqa: BLE001
+        return None, {**fail, "reason": f"service key unreadable: {type(e).__name__} {key_path}"}
+    req = urllib.request.Request(MODELS_URL, headers={"Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S):
+            return key, None
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            body = ""
+            try:
+                body = e.read().decode()
+            except Exception:
+                pass
+            return None, {**fail, "reason": (f"gateway rejected probe key: {e} {body[:200]}").replace("\n", " ")}
+        return key, None
+    except Exception:
+        # gateway down is not a key problem: let the host probes report it
+        return key, None
 
 
 def probe_budget_s(rung: Rung) -> float:
@@ -256,7 +291,10 @@ def apply_results(results: list, skipped: set = frozenset()) -> dict:
     for host, r in now_failed.items():
         was_failed = state.get(host, {}).get("failed", False)
         billing = r.get("kind") == "billing"
-        title = f"LiteLLM completion probe: {host} " + ("out of credit" if billing else "unreachable")
+        if r.get("kind") == "auth":
+            title = "LiteLLM completion probe: gateway rejected the probe's own key"
+        else:
+            title = f"LiteLLM completion probe: {host} " + ("out of credit" if billing else "unreachable")
         msg = f"model={r['model']} elapsed={r['elapsed_s']}s reason={r['reason']}"
         if not (billing and _aq_has_open(host)):
             _aq_add(host, title, msg)
@@ -290,9 +328,15 @@ def main() -> int:
     parser.add_argument("--print", action="store_true", dest="do_print")
     args = parser.parse_args()
 
-    key = read_master_key(ENV_PATH)
     rungs, skipped = due_rungs(one_rung_per_host(CONFIG_PATH), _load_state(_state_path()), time.time())
-    results = run_probes(key, rungs)
+    key, key_failure = check_probe_key(KEY_PATH)
+    if key_failure:
+        # host state and rows carry forward untouched: nothing was learned about them
+        results = [key_failure]
+        skipped = skipped | {r.host for r in rungs}
+    else:
+        results = run_probes(key, rungs) + [
+            {"host": PROBE_KEY_HOST, "model": "-", "ok": True, "kind": "ok", "elapsed_s": 0.0, "reason": ""}]
     new_state = apply_results(results, skipped)
     path = _state_path()
     try:

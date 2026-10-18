@@ -32,6 +32,7 @@ BCAST=${BCAST:-192.168.8.255}
 WAKE_POLL_SECS=${WAKE_POLL_SECS:-180}   # max wait for ssh per wake method
 WOL_PROBE_SECS=${WOL_PROBE_SECS:-25}    # after WoL: if the plug still reads < PLUG_OFF_W the packet did nothing
 PLUG_OFF_W=${PLUG_OFF_W:-15}
+TS_REMEDIATE_SECS=${TS_REMEDIATE_SECS:-45}  # after tailscaled restart: max wait for tailnet port
 PORT=${PORT:-11434}
 # Nodes that auto-sleep.timer manages. isis is WARM STANDBY by Frank directive (2026-09-18):
 # it is woken if found offline but is NEVER put to sleep by this tool.
@@ -93,9 +94,27 @@ wake_node(){ local n="$1" mac ip plug t0 w up
   up=$(( $(date +%s)-t0 ))
   local t1; t1=$(date +%s)
   until online "$n"; do sleep 3; [ $(( $(date +%s)-t1 )) -ge 60 ] && { log "WARN $n: ssh up (${up}s) but :$PORT not answering after +60s"; return 0; }; done
-  # LiteLLM reaches Macs over the tailnet; a cold boot can leave tailscaled 'network down' (seen on hathor 2026-10-08)
+  # LiteLLM reaches Macs over the tailnet; a cold boot can leave tailscaled 'network down' (seen on hathor 2026-10-08).
+  # Auto-remediation (wq#3710): restart tailscaled on the node, re-probe, WARN only if still down.
   local tsip; tsip=$(nodevar "$n" TS_IP)
-  if [ -n "$tsip" ] && ! nc -z -w5 "$tsip" "$PORT" 2>/dev/null; then log "WARN $n: awake on LAN but tailnet $tsip:$PORT unreachable (tailscaled boot race? 'sudo systemctl restart tailscaled' fixed it 2026-10-08)"; fi
+  if [ -n "$tsip" ] && ! nc -z -w5 "$tsip" "$PORT" 2>/dev/null; then
+    log "$n: awake on LAN but tailnet $tsip:$PORT unreachable — restarting tailscaled (boot race remediation)"
+    if ssh -o BatchMode=yes -o ConnectTimeout=6 "$n" 'sudo -n systemctl restart tailscaled' 2>/dev/null; then
+      local ts_t0; ts_t0=$(date +%s)
+      local ts_ok=0
+      while [ $(( $(date +%s)-ts_t0 )) -lt "$TS_REMEDIATE_SECS" ]; do
+        sleep 3
+        if nc -z -w3 "$tsip" "$PORT" 2>/dev/null; then ts_ok=1; break; fi
+      done
+      if [ "$ts_ok" = 1 ]; then
+        log "OK $n: tailscaled restart fixed boot race — $tsip:$PORT up after $(( $(date +%s)-ts_t0 ))s"
+      else
+        log "WARN $n: tailscaled restart did not fix tailnet — $tsip:$PORT still unreachable after ${TS_REMEDIATE_SECS}s"
+      fi
+    else
+      log "WARN $n: cannot restart tailscaled via ssh (sudo -n systemctl restart tailscaled failed)"
+    fi
+  fi
   log "OK $n awake: ssh up ${up}s, :$PORT up at $(( $(date +%s)-t0 ))s"; return 0; }
 
 case "$cmd" in

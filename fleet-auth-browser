@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+Fleet Auth Browser — headless Chromium for OAuth flows.
+Stores persistent cookies so auth only needs to happen once.
+Google 2FA flow: agent launches, Frank matches the number shown.
+
+Usage:
+  fleet-auth-browser login-google        # Initial Google login (needs 2FA once)
+  fleet-auth-browser open <url>          # Open URL with stored session
+  fleet-auth-browser claude-login        # Run claude auth login, handle OAuth
+"""
+import sys
+import os
+import time
+from playwright.sync_api import sync_playwright
+
+COOKIE_DIR = os.path.expanduser("~/.fleet-browser")
+os.makedirs(COOKIE_DIR, exist_ok=True)
+
+def login_google():
+    """Interactive Google login with 2FA. Run once, cookies persist."""
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=os.path.join(COOKIE_DIR, "google-profile"),
+            headless=False if os.environ.get("DISPLAY") else True,
+            args=["--no-sandbox", "--disable-gpu"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto("https://accounts.google.com/")
+        
+        # Check if already logged in
+        if "myaccount.google.com" in page.url or "SignOutOptions" in page.content():
+            print("ALREADY LOGGED IN to Google")
+            context.close()
+            return
+        
+        # Wait for email input
+        print("GOOGLE LOGIN FLOW STARTED")
+        print("Waiting for email field...")
+        page.wait_for_selector(input[type=email], timeout=30000)
+        
+        # Read credentials from .secrets
+        email = open(os.path.expanduser("~/.secrets/google-email")).read().strip()
+        page.fill(input[type=email], email)
+        page.click(#identifierNext)
+        time.sleep(2)
+        
+        # Wait for password
+        print("Email entered. Waiting for password field...")
+        page.wait_for_selector(input[type=password], timeout=30000)
+        password = open(os.path.expanduser("~/.secrets/google-password")).read().strip()
+        page.fill(input[type=password], password)
+        page.click(#passwordNext)
+        time.sleep(3)
+        
+        # Check for 2FA prompt
+        print("Password entered. Checking for 2FA...")
+        try:
+            # Google shows a number to match on your phone
+            page.wait_for_selector([data-challengetype], timeout=10000)
+            # Try to find the number displayed
+            number_el = page.query_selector([data-primary-action-label] span, .vdE7Oc, .EzTQwd)
+            if number_el:
+                number = number_el.inner_text()
+                print(f"\n=== 2FA: TAP THE NUMBER {number} ON YOUR PHONE ===\n")
+            else:
+                print("\n=== 2FA: CHECK YOUR PHONE AND APPROVE THE LOGIN ===\n")
+                # Screenshot for agent to show Frank
+                page.screenshot(path="/tmp/google-2fa-prompt.png")
+                print("Screenshot saved to /tmp/google-2fa-prompt.png")
+            
+            # Wait for 2FA completion (up to 2 minutes)
+            page.wait_for_url("**/myaccount.google.com/**", timeout=120000)
+            print("2FA APPROVED — Google login complete!")
+        except Exception as e:
+            # Maybe no 2FA needed, or different 2FA type
+            print(f"2FA check result: {e}")
+            page.screenshot(path="/tmp/google-auth-state.png")
+            print("Screenshot at /tmp/google-auth-state.png")
+        
+        context.close()
+        print(f"Session cookies saved to {COOKIE_DIR}/google-profile/")
+        print("Future logins will use these cookies — no password needed.")
+
+def open_url(url):
+    """Open a URL using the stored Google session."""
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=os.path.join(COOKIE_DIR, "google-profile"),
+            headless=True,
+            args=["--no-sandbox", "--disable-gpu"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(url)
+        time.sleep(5)
+        
+        # Check result
+        final_url = page.url
+        title = page.title()
+        print(f"URL: {final_url}")
+        print(f"Title: {title}")
+        
+        # If it redirected to a success page or back to the app
+        if "code=" in final_url or "token=" in final_url or "success" in final_url.lower():
+            print("AUTH SUCCESS — token/code received")
+        
+        # Screenshot for verification
+        page.screenshot(path="/tmp/fleet-auth-result.png")
+        print("Screenshot: /tmp/fleet-auth-result.png")
+        context.close()
+
+def claude_login():
+    """Handle claude auth login by capturing the OAuth URL and completing it."""
+    import subprocess
+    proc = subprocess.Popen(
+        ["/home/lumen/.npm-global/bin/claude", "auth", "login"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    
+    auth_url = None
+    for line in proc.stdout:
+        print(line.rstrip())
+        if "http" in line and ("oauth" in line.lower() or "auth" in line.lower() or "login" in line.lower()):
+            auth_url = line.strip()
+            break
+    
+    if auth_url:
+        print(f"\nCaptured auth URL: {auth_url}")
+        print("Opening in headless browser with Google session...")
+        open_url(auth_url)
+    else:
+        print("No auth URL captured from claude output")
+    
+    proc.terminate()
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: fleet-auth-browser <login-google|open URL|claude-login>")
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    if cmd == "login-google":
+        login_google()
+    elif cmd == "open" and len(sys.argv) > 2:
+        open_url(sys.argv[2])
+    elif cmd == "claude-login":
+        claude_login()
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)

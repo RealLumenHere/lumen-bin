@@ -15,6 +15,10 @@
 #    count/last_ts updated) — no ntfy re-fire. On breach->clear it posts a
 #    low-priority recovery notice. Constant re-alerting trains you to ignore
 #    alerts; that is the failure mode this design exists to avoid.
+#  - AUTO-RESOLVE (wq#3735): every below-threshold run closes our own open/acked
+#    burst-401 row. Before this the row only ever bumped, so aq#2390 sat open at
+#    x109 after the last burst (2026-10-08) and sentinel-watch kept refiling it.
+#    Not edge-only: a row left open by a lost state.json still clears next run.
 #  - Reporting only. It never touches keys, containers, or units.
 #  - Fail-open: any internal error exits 0 and leaves state untouched.
 #  - Rotation: the monitor rotates the JSONL at 10 MiB. This reads only the
@@ -31,8 +35,9 @@ WINDOW_MIN="${LITELLM_AUTH_ALERT_WINDOW_MIN:-10}"
 STATE_DIR="${LITELLM_AUTH_ALERT_STATE_DIR:-/home/lumen/agents/litellm-auth-alert}"
 NTFY_TOPIC="${LITELLM_AUTH_ALERT_TOPIC:-lumen-alerts}"
 STATE="$STATE_DIR/state.json"
-NTFY=/home/lumen/bin/ntfy-send
-AQ=/home/lumen/bin/aq
+NTFY="${LITELLM_AUTH_ALERT_NTFY:-/home/lumen/bin/ntfy-send}"
+AQ="${LITELLM_AUTH_ALERT_AQ:-/home/lumen/bin/aq}"
+AQ_DIR="${LITELLM_AUTH_ALERT_AQ_DIR:-/home/lumen/agents/alert-queue}"
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
 
 # Count auth_401 events inside the window and summarize offending IPs/endpoints.
@@ -103,6 +108,21 @@ else
   if [[ "$PREV_BREACHED" == "1" ]]; then
     notify low "LiteLLM auth recovered" "$COUNT 401s in last ${WINDOW_MIN}min, below threshold $THRESHOLD"
   fi
+  # Same direct-db shape as litellm-completion-probe _aq_resolve (wq#3212/wq#3463):
+  # acked rows close too, since aq dedups only onto open rows and sentinel counts acked.
+  AQ_DIR="$AQ_DIR" WHY="$COUNT 401s in last ${WINDOW_MIN}min < threshold $THRESHOLD" \
+    python3 - <<'PY' 2>/dev/null || true
+import os, sys
+sys.path.insert(0, os.environ["AQ_DIR"])
+import aq
+c = aq.db()
+ts = aq.now()
+c.execute("UPDATE alerts SET status='resolved', note=?, resolved_ts=? "
+          "WHERE source='litellm-auth' AND key='burst-401' AND status IN ('open','acked')",
+          (f"auto-cleared: {os.environ['WHY']} on {ts} run", ts))
+c.commit()
+c.close()
+PY
   BREACHED=false
 fi
 

@@ -6,7 +6,8 @@ Frank directive 2026-10-01: audits kept finding the same things because nothing 
 audits. This sweep checks, read-only:
   guards    named guard timers installed + active + armed, paired service not failed
   probes    sentinel probe state: probes currently firing, named probes gone stale
-  aq        alert queue readable; open rows grouped by source (noisy sources become one ticket)
+  aq        alert queue readable; open rows grouped by source (noisy sources become one ticket);
+            daily aq ack hygiene has succeeded within 48h (wq#3737)
   services  failed units and restart-looping units (live crash-loop stops belong to fleet-selfheal)
   disk      local + every ssh-reachable fleet node (unreachable nodes are fleet-ssh-check's job)
   litellm   container health, completion probe, provider rungs cooled by fleet-selfheal
@@ -36,8 +37,10 @@ STATE = os.environ.get("SW_STATE", f"{HOME}/agents/sentinel-watch/state.json")
 NTFY = os.environ.get("SW_NTFY", "http://localhost:8080")
 PROBE_STATE = os.environ.get("SW_PROBE_STATE", f"{HOME}/sentinel/probes/state.json")
 COOLDOWN = os.environ.get("SW_COOLDOWN", f"{HOME}/foreman/dispatcher/runtime/backend_cooldown.json")
+AQ_HYGIENE_STATE = os.environ.get("SW_AQ_HYGIENE_STATE", f"{HOME}/logs/aq-daily-ack.state.json")
+AQ_HYGIENE_MAX_AGE = 48 * 3600
 SELF = f"{HOME}/bin/sentinel-watch"
-MAX_NEW = int(os.environ.get("SW_MAX_TICKETS", "12"))
+MAX_NEW = int(os.environ.get("SW_MAX_TICKETS", "30"))  # wq#3464: 12 was overflowing every run against a ~25-finding backlog
 CLOSED = {"done", "closed", "cancelled", "canceled", "rejected", "wontfix", "superseded", "retired"}
 
 GUARDS = [  # (name, timer unit)
@@ -51,7 +54,7 @@ GUARDS = [  # (name, timer unit)
 GUARD_SERVICES = [("leakwatch", "lumen-leakwatch.service"), ("alert-queue", "lumen-alert-queue.service")]
 KNOWN_ABSENT = {"overlay-drift-guard": "never built (wq#3350: no trace in systemd, journal or git); listed, not ticketed"}
 CORE_PROBES = {"probe-storage-integrity", "probe-r4-unticketed-recovery", "probe-credential-expiry"}
-PROBE_MAX_AGE = {"probe-r4-unticketed-recovery": 50 * 3600, "probe-synthetic-llm": 3 * 3600}  # seconds since last run
+PROBE_MAX_AGE = {"probe-r4-unticketed-recovery": 50 * 3600, "probe-synthetic-llm": 6 * 3600}  # seconds since last run; synthetic-llm self-gates to one run per 4h (sentinel_probes.py PROBES "4h" gate) + up to 30m poll slip, so a 3h threshold false-positives every cycle (wq#3538) -- 6h gives margin above the real 4h+30m cadence
 
 
 def now_pt() -> str:
@@ -163,8 +166,31 @@ def aq_findings(rows, min_rows=10, min_total=100):
     return out
 
 
+def aq_hygiene_findings(now):
+    """wq#3737: daily aq ack hygiene (aq_daily_ack_extend.py --daily, run by dispatch_health
+    on lumen-foreman-health.timer) is the only thing that closes stale aq rows since wq#3648
+    cut lumen-aq-autoack.timer. Without this check, broken hygiene looks the same as a quiet queue."""
+    try:
+        with open(AQ_HYGIENE_STATE) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    last_ok = st.get("last_ok", 0)
+    if st.get("err") and st.get("err_ts", 0) > last_ok:
+        why = f"last run failed: {st.get('err')}"
+    elif not last_ok:
+        why = "no successful run recorded"
+    elif now - last_ok > AQ_HYGIENE_MAX_AGE:
+        why = "no successful run in 48h"
+    else:
+        return []
+    return [mk("aq/hygiene", 2, f"daily aq auto-ack is not running ({why[:80]})",
+               f"{AQ_HYGIENE_STATE}: {why}. Host: dispatcher/dispatch_health.py run_aq_hygiene() on lumen-foreman-health.timer. "
+               "While it is down, open aq rows only accumulate.")]
+
+
 def c_aq(ctx):
-    out = []
+    out = aq_hygiene_findings(ctx["now"])
     rc, so, se = sh([AQ, "list", "open"], 60)
     if rc != 0 or "database is locked" in (so + se):
         out.append(mk("aq/unreadable", 0, "aq (alert queue) is unreadable: database is locked" if "locked" in (so + se) else "aq (alert queue) is unreadable",

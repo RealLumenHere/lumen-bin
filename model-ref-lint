@@ -7,13 +7,20 @@ was dropped 2026-08-30; model-watchdog, lumen-fleet-mistral and model_audit kept
 it (1643 ProxyModelNotFoundError in 5d). minerva-bench-2 called wq2821-judge-llama8b,
 which never existed (wq#2904, 169 failures). Nothing compared the callers to the list.
 
-Two finding kinds:
+Three finding kinds:
   RETIRED  a quoted string literal equal to a name that some litellm_config.yaml.bak*
            model_list carried and the live one does not. High precision, any context.
   UNKNOWN  a name in model context (`"model": "x"`, `model="x"`, `*_MODEL*=x`,
            `--model x`) that is in neither the live model_list nor the fleet CLI roster
            (foreman/research/models.yaml ids/aliases). Provider-native ids (`a/b`,
            `name:tag`) are skipped: those go straight to a provider, not the gateway.
+  MANIFEST the reverse direction (wq#4220): a LIVE research/models.yaml id in a
+           litellm-sourced pool that the live model_list does not serve. RETIRED/UNKNOWN
+           only see names callers still spell; they cannot see a manifest id that moved
+           while the gateway stayed put. wq#4210 renamed `deepseek-v4-flash` to
+           `deepseek-flash` on the strength of DeepSeek's upstream model id, leaving
+           router.py advertising a roster id no gateway entry served and despag 422ing
+           it; this lint ran clean through all of it (wq#4217).
 Known non-gateway names go in ALLOW (below) or --allow-file, one per line, with a reason.
 
 Read-only. Exit 0 clean, 1 drift, 2 the check could not run.
@@ -21,6 +28,11 @@ Read-only. Exit 0 clean, 1 drift, 2 the check could not run.
 resolves it when clean. --json for machine output.
 """
 import argparse, glob, json, os, re, sys
+
+try:
+    import yaml
+except ImportError:                     # the manifest check raises rather than skipping
+    yaml = None
 
 CONFIG = "/home/lumen/agent/litellm_config.yaml"
 MODELS_YAML = "/home/lumen/foreman/research/models.yaml"
@@ -43,7 +55,10 @@ ALLOW = {
     "llama-3.1-8b-instant",             # Groq API direct (agent/lumen_research_agent.py)
     "llama-3.3-70b-versatile",          # Groq API direct (agent/lumen_deep_research_orchestrator.py)
     "gpt-oss-120b",                     # Cerebras API direct (foreman/harness/liveness.py)
-    "mistral-small-latest",             # Mistral API direct, api.mistral.ai (bin/rotate-provider-keys verify; not a gateway alias)
+    "mistral-small-latest",             # Mistral API direct, api.mistral.ai (bin/rotate-provider-keys
+                                        # verify; not a gateway alias). wq#4220: this line existed
+                                        # only in the deployed /home/lumen/bin copy, which is why
+                                        # install.sh --verify read "moved on from its own repo".
     "nomic-embed-text", "minicpm-v4.6", # Ollama native API (minerva verify, vision-eval)
     "recorded-rung",                    # fixture row in bin/minerva-presentation-stability
     "llama33-local",                    # retired-rung registry tuple, minerva/lumen_state_single_owner_migrate.py
@@ -92,6 +107,48 @@ def load_cli(path):
             return set(CLI_RE.findall(fh.read()))
     except OSError:
         return set()
+
+
+def manifest_drift(models_yaml, live):
+    """MANIFEST findings: LIVE manifest ids on a litellm-sourced pool that the live
+    model_list does not serve.
+
+    Scope is deliberately narrow — only rows whose `pools:` include a pool the manifest
+    itself declares `source: litellm`, and only `status: LIVE*`. A DARK row (staged, not
+    selectable) or a `down` rung is absent from the gateway on purpose; flagging those
+    would make the check noise and get it ignored. Missing/unparseable manifest is not
+    drift: there is nothing to compare, so no finding."""
+    try:
+        with open(models_yaml) as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    if yaml is None:
+        raise RuntimeError("PyYAML missing; cannot check manifest ids against model_list")
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        raise RuntimeError(f"cannot parse {models_yaml}: {e}")
+    gateway_pools = {name for name, spec in (data.get("pools") or {}).items()
+                     if (spec or {}).get("source") == "litellm"}
+    out = []
+    for m in data.get("models") or []:
+        mid, status = m.get("id"), str(m.get("status") or "")
+        if not mid or mid in live or not status.upper().startswith("LIVE"):
+            continue
+        if not gateway_pools & set(m.get("pools") or []):
+            continue
+        out.append({"file": models_yaml, "line": manifest_line(text, mid),
+                    "model": mid, "kind": "MANIFEST"})
+    return out
+
+
+def manifest_line(text, mid):
+    rx = re.compile(r"^\s*-?\s*(?:\{\s*)?id:\s*[\"']?" + re.escape(mid) + r"[\"']?\s*(?:,|\}|#|$)")
+    for n, line in enumerate(text.splitlines(), 1):
+        if rx.match(line):
+            return n
+    return 0
 
 
 def is_code_line(line):
@@ -179,7 +236,7 @@ def lint(roots, config, models_yaml, allow):
     live = load_live(config)
     retired = load_retired(config, live)
     known = load_cli(models_yaml) | allow
-    findings = []
+    findings = manifest_drift(models_yaml, live)
     for p in iter_files(roots):
         try:
             with open(p, errors="replace") as fh:
@@ -196,11 +253,14 @@ def aq_sync(findings):
     key = "model-ref-drift"
     if findings:
         names = sorted({f["model"] for f in findings})
-        where = "; ".join(f"{f['model']} {f['file']}:{f['line']}" for f in findings[:8])
+        where = "; ".join(f"{f['kind']} {f['model']} {f['file']}:{f['line']}"
+                          for f in findings[:8])
         aq.ingest(source="model-ref-lint", key=key,
                   title=f"model ref drift: {len(names)} name(s) not in LiteLLM model_list",
                   message=f"{', '.join(names)} | {where} (fix: point the caller at a live "
-                          f"rung or restore the model_list entry; wq#2903)",
+                          f"rung, or restore the model_list entry; a MANIFEST row means "
+                          f"models.yaml advertises an id the gateway never served — move "
+                          f"the model_name first or revert the id; wq#2903, wq#4220)",
                   priority="high")
     else:
         c = aq.db()

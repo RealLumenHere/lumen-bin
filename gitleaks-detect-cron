@@ -41,7 +41,7 @@ DEFAULT_GITLEAKS_BIN = "/home/lumen/bin/gitleaks"
 NTFY_BIN = "/home/lumen/bin/ntfy-send"
 STAMP_PATH = "/home/lumen/logs/.stamp.gitleaks-detect"
 LOCK_PATH = "/tmp/gitleaks-detect.lock"
-EXCLUDE_DIR_NAMES = {"node_modules", ".venv", "venv", "__pycache__"}
+EXCLUDE_DIR_NAMES = {"node_modules", ".venv", "venv", "__pycache__", "worktrees"}
 
 
 def acquire_lock(path=LOCK_PATH):

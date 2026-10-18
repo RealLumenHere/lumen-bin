@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-NEVER_PROBE = {"messenger-chat", "messenger-re"}
+NEVER_PROBE = {"messenger-chat", "messenger-re", "gemini-flash"}  # wq#3675: gemini excluded to stop 429s
 SKIP_SUBSTRINGS = ("embed", "rerank", "whisper", "tts")
 
 # timeout = the rung's own litellm_params.timeout (seconds), None when unset

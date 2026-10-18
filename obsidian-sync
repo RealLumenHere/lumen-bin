@@ -1,0 +1,7 @@
+#!/bin/bash
+# Sync Thor Obsidian vault to Lumen RAID
+# Two-way: Thor is primary (where Frank edits), Lumen RAID is backup
+set -euo pipefail
+SRC="thor@100.112.151.100:/home/thor/Documents/Lumen Industries/"
+DST="/data/lumen/obsidian-vault/"
+rsync -az --delete "$SRC" "$DST" 2>/dev/null && echo "$(date -u +%FT%TZ) synced" || echo "$(date -u +%FT%TZ) sync failed (Thor unreachable?)"

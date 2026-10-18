@@ -91,7 +91,8 @@ def sh(cmd, timeout=30):
 
 def discover_ingress():
     import yaml
-    rc, out, err = sh(["sudo", "-n", "cat", str(CF_CONFIG)])
+    # wq#3668: cloudflared config is world-readable (644 root:root), no sudo needed
+    rc, out, err = sh(["cat", str(CF_CONFIG)])
     if rc != 0 or not out:
         try:
             out = CF_CONFIG.read_text()
