@@ -259,6 +259,38 @@ def _append_prior_art(prior, kind, query, results):
         fh.write("\n")
 
 
+# wq#4281 / ISSUE-LOG row 1437: an Amazon PA-API/affiliate link embeds the publisher's
+# own public AWS access key id as the SubscriptionId query param (plus an affiliate
+# tag), and search engines index those URLs verbatim. A fleet-search web hit on any
+# Amazon listing then carries a value shaped exactly like ours, so the AKIA mask
+# tripwire fires on every such hit and files a pri-1 rotation row for a key that was
+# never ours (wq#4267/wq#4268 attempt 1, settled wq#4279). Strip the noise before a
+# result/snippet reaches cache, prior-art, or emit.
+AMAZON_NOISE_PARAMS = {"SubscriptionId", "tag", "linkCode", "camp", "creative", "creativeASIN", "ascsubtag"}
+_URL_RE = re.compile(r'https?://[^\s"\'<>]+')
+
+
+def _clean_amazon_url(url):
+    """Drop AMAZON_NOISE_PARAMS from an amazon.* URL's query string. Fail-soft: a
+    malformed URL (unparseable query) is returned unchanged rather than raising."""
+    if not url or "amazon." not in url.lower():
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        kept = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+                if k not in AMAZON_NOISE_PARAMS]
+        return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(kept)))
+    except ValueError:
+        return url
+
+
+def _clean_amazon_noise(text):
+    """Apply _clean_amazon_url to every URL embedded in free text (title/snippet)."""
+    if not text or "amazon." not in text.lower():
+        return text
+    return _URL_RE.sub(lambda m: _clean_amazon_url(m.group(0)), text)
+
+
 # ---------- SearXNG (web / reddit-discovery) ----------
 # wq#2568: the general-web engines that actually crawl the open web (as opposed to
 # instant-answer engines like wikipedia/wikidata/currency/lingva, which only ever
@@ -292,8 +324,8 @@ def searxng_search(query, n=10, engines=None):
         return None, f"searxng http {status}: {err}", []
     out = []
     for r in data.get("results", [])[:n]:
-        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
-                    "snippet": (r.get("content", "") or "")[:400],
+        out.append({"title": r.get("title", ""), "url": _clean_amazon_url(r.get("url", "")),
+                    "snippet": _clean_amazon_noise(r.get("content", "") or "")[:400],
                     "engine": r.get("engine", "")})
     return out, None, data.get("unresponsive_engines", []) or []
 
@@ -318,8 +350,8 @@ def brave_api_search(query, n=10, api_key=None):
         return None, f"brave api http {status}: {err}"
     out = []
     for r in (data.get("web") or {}).get("results", [])[:n]:
-        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
-                    "snippet": (r.get("description", "") or "")[:400], "engine": "brave-api"})
+        out.append({"title": r.get("title", ""), "url": _clean_amazon_url(r.get("url", "")),
+                    "snippet": _clean_amazon_noise(r.get("description", "") or "")[:400], "engine": "brave-api"})
     return out, None
 
 
@@ -365,8 +397,8 @@ def deepseek_search(query, n=10, api_key=None):
         return None, f"deepseek search http {status}: {msg}"
     out = []
     for r in data.get("results", [])[:n]:
-        out.append({"title": r.get("title", ""), "url": r.get("url", ""),
-                    "snippet": r.get("summary") or r.get("snippet", ""),
+        out.append({"title": r.get("title", ""), "url": _clean_amazon_url(r.get("url", "")),
+                    "snippet": _clean_amazon_noise(r.get("summary") or r.get("snippet", "")),
                     "rerank_score": r.get("rerank_score", 0),
                     "authority": r.get("authority", -1), "engine": "deepseek-search"})
     return out, None
