@@ -137,7 +137,8 @@ def norm(text):
 def toks(text):
     out = set()
     for w in re.findall(r"[a-z][a-z0-9_./-]{2,}", text.lower()):
-        if w in STOP or w in MARKERS:
+        w = w.rstrip("._/-")  # sentence-final "terminal." must equal "terminal" (mutation test, wq#4314)
+        if len(w) < 3 or w in STOP or w in MARKERS:
             continue
         for suf in ("ing", "ed", "es", "s"):
             if w.endswith(suf) and len(w) - len(suf) >= 4:
@@ -180,14 +181,17 @@ def check_contradictions(secs, findings):
     ds = []
     for s in secs:
         for no, ln in s["lines"]:
-            neg, pos = bool(NEG_RE.search(ln)), bool(POS_RE.search(ln))
-            if neg == pos:
-                continue
-            t = toks(norm(ln))
-            if len(t) >= 3:
-                ds.append((no, ln, "neg" if neg else "pos", t))
+            # clause-split: a rule line often carries several sentences; judging the whole line dilutes
+            # the overlap score (mutation test, wq#4314). Each clause is judged on its own.
+            for cl in re.split(r"(?<=[.!?])\s+|\s+\u2014\s+|;\s+", ln):
+                neg, pos = bool(NEG_RE.search(cl)), bool(POS_RE.search(cl))
+                if neg == pos:
+                    continue
+                t = toks(norm(cl))
+                if len(t) >= 3:
+                    ds.append((no, cl, "neg" if neg else "pos", t))
     for a, b in combinations(ds, 2):
-        if a[2] == b[2]:
+        if a[2] == b[2] or a[0] == b[0]:
             continue
         shared = a[3] & b[3]
         j = len(shared) / len(a[3] | b[3])
