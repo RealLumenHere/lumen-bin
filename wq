@@ -2530,6 +2530,29 @@ def _finish(a, new_status):
              + (", no running unit" if FWORKER_IDENTITY_RE.match(holder) else "")
              + f") — releasing under --dead-worker on behalf of '{caller}' (wq#1498).")
         log_activity(c, caller, f"dead-worker-release:{holder}")
+        # wq#4463: status/block_reason on a blocked ticket is a deliberate decision (often
+        # Frank's) the ~20min dispatcher must keep honoring. --dead-worker clears a dead
+        # holder's stale claim; it must never also silently unblock the ticket, or the
+        # dispatcher redispatches a ticket someone deliberately blocked. Clear claimed_by
+        # (and lease/hold) only; status and block_reason/blocked_at are left untouched.
+        if r[2] == 'blocked':
+            fcl, fpar = fence_guard(c, a, a.id, "release")
+            mark_alive(c, caller, "release")
+            if r[1]:
+                release_subs(c, parse_subs(r[1]), r[0] or "")
+            clr = lease_clear_sql(c)
+            cur = c.execute(f"UPDATE tasks SET claimed_by=NULL, claimed_at=NULL, "
+                            f"lease_expires=NULL, lease_ttl=NULL, hold_by=NULL, "
+                            f"hold_expires=NULL{clr} WHERE id=?{fcl}", [a.id] + fpar)
+            if cur.rowcount == 0:
+                c.execute("ROLLBACK"); c.close()
+                eprint(f"REFUSED: release on wq#{a.id} matched no row under fence "
+                      f"{getattr(a,'fence',None)} — the claim moved while this call was in "
+                      f"flight (wq#1158)."); sys.exit(5)
+            c.execute("COMMIT"); c.close()
+            warn(f"wq#{a.id}: stayed blocked — --dead-worker clears a stale claim, it does "
+                 f"not unblock (wq#4463). block_reason preserved.")
+            return 0
     elif not owner_ok(c, caller, holder, new_status if new_status != 'open' else 'release', a.id):
         if dead_worker:
             c.execute("COMMIT"); c.close()
