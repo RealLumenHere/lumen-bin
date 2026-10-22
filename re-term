@@ -1,0 +1,126 @@
+#!/bin/bash
+# re-term — agent-side driver for the bench serial console.
+#
+# The agent (on Horus, where Commander runs) talks to the RE workstation's
+# shared-terminal / serial-console over ONE persistent SSH connection
+# (ControlMaster), so each snapshot/send costs ~0.1s instead of ~0.8s of fresh
+# SSH handshake. In the 2026-10-19 AP-303/C-130 session the per-call handshake
+# cost is what forced blind `sleep 3` guesses and mistimed boot windows; reusing
+# the connection removes it. re-term also adds combined verbs (`do` = send then
+# snapshot in one round-trip) and a `drive` breadcrumb so Frank attaches with one
+# line instead of hand-built nested SSH strings.
+#
+# Host:    export RE_HOST=maksoor         (ssh alias or user@host; default maksoor)
+# Session: export RE_SESSION=c130  or pass -s <name>   (default bench)
+#
+#   re-term drive [name]                 print the one-liner Frank runs to attach
+#   re-term open <dev> [name] [baud]     serial-console open on the bench (one owner)
+#   re-term snap [name]                  current screen
+#   re-term tail [name] [N]              scrollback (default 200)
+#   re-term do "<text>" [name]           send text+Enter, settle, return new screen
+#   re-term type "<text>" [name]         send text+Enter (no snapshot)
+#   re-term key <K..> [name]             send tmux key names (C-c, f, Enter, Up)
+#   re-term catch <name> <regex> [--enter|--keys K..] [--hz N] [--secs S]
+#                                        boot-window catch (runs LOCAL on the bench)
+#   re-term expect <name> <regex> [secs] wait for the screen to match
+#   re-term status|list|kill [name]      housekeeping
+#   re-term close                        drop the persistent SSH connection
+set -euo pipefail
+
+RE_HOST="${RE_HOST:-maksoor}"
+SESSION_DEFAULT="${RE_SESSION:-bench}"
+SETTLE="${RE_SETTLE:-0.6}"            # seconds to let output appear after a send
+CM_DIR="${XDG_RUNTIME_DIR:-/tmp}/re-term"
+CM="$CM_DIR/cm-%r@%h:%p"
+mkdir -p "$CM_DIR"
+SSH=(ssh -o ControlMaster=auto -o "ControlPath=$CM" -o ControlPersist=120 \
+        -o ConnectTimeout=6 -o BatchMode=yes)
+
+die(){ echo "re-term: $*" >&2; exit 1; }
+# run a command on the bench host over the shared connection
+rc(){ "${SSH[@]}" "$RE_HOST" "$@"; }
+# shell-escape one arg for the remote shell
+q(){ printf '%q' "$1"; }
+
+# pull an optional trailing [name] off the args, else the default
+sess(){ echo "${1:-$SESSION_DEFAULT}"; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  drive)
+    NAME="$(sess "${1:-}")"
+    HP="$(rc 'echo "$USER@$(hostname)"' 2>/dev/null || echo "$RE_HOST")"
+    cat <<EOF
+Frank — attach to the live bench console in your terminal:
+
+  ssh -t $RE_HOST shared-terminal open $NAME
+
+Detach (leaves it running): Ctrl-b d      Quit picocom: Ctrl-a Ctrl-x
+You and the agent share ONE session ($NAME) on $HP. The agent sees exactly what you see.
+EOF
+    ;;
+
+  open)
+    DEV="${1:-}"; NAME="$(sess "${2:-}")"; BAUD="${3:-115200}"
+    [ -n "$DEV" ] || die "usage: re-term open <dev> [name] [baud]"
+    rc "serial-console open $(q "$DEV") $(q "$NAME") $(q "$BAUD")"
+    ;;
+
+  snap|snapshot) NAME="$(sess "${1:-}")"; rc "shared-terminal snapshot $(q "$NAME")";;
+  tail|scrollback) NAME="$(sess "${2:-}")"; N="${1:-200}"; rc "shared-terminal scrollback $(q "$NAME") $(q "$N")";;
+
+  do)                 # send text+Enter, settle, return the new screen — ONE round-trip
+    TEXT="${1:-}"; NAME="$(sess "${2:-}")"
+    [ $# -ge 1 ] || die 'usage: re-term do "<text>" [name]'
+    rc "shared-terminal send $(q "$NAME") $(q "$TEXT") >/dev/null; sleep $SETTLE; shared-terminal snapshot $(q "$NAME")"
+    ;;
+  type)               # send text+Enter, no snapshot
+    TEXT="${1:-}"; NAME="$(sess "${2:-}")"
+    [ $# -ge 1 ] || die 'usage: re-term type "<text>" [name]'
+    rc "shared-terminal send $(q "$NAME") $(q "$TEXT")"
+    ;;
+  key)                # re-term key C-c [name]   /   re-term key f Enter [name]
+    [ $# -ge 1 ] || die "usage: re-term key <K..> [name]"
+    NAME="$SESSION_DEFAULT"
+    KEYS=("$@")
+    rc "shared-terminal send $(q "$NAME") --key $(printf '%q ' "${KEYS[@]}")"
+    ;;
+
+  catch)              # delegate to serial-console on the bench (local catch loop)
+    NAME="${1:-}"; shift || true
+    [ -n "$NAME" ] || die "usage: re-term catch <name> <regex> [--enter|--keys K..] [--hz N] [--secs S]"
+    ARGS=("$NAME" "$@")
+    rc "serial-console catch $(printf '%q ' "${ARGS[@]}")"
+    ;;
+  expect)
+    NAME="${1:-}"; RE="${2:-}"; SECS="${3:-30}"
+    [ -n "$NAME" ] && [ -n "$RE" ] || die "usage: re-term expect <name> <regex> [secs]"
+    rc "serial-console expect $(q "$NAME") $(q "$RE") $(q "$SECS")"
+    ;;
+
+  at)                 # send-at: type ONLY if the screen currently matches <guard> (anti-blind-typing)
+    GUARD="${1:-}"; TEXT="${2:-}"; NAME="$(sess "${3:-}")"
+    [ -n "$GUARD" ] && [ $# -ge 2 ] || die 'usage: re-term at "<guard-regex>" "<text>" [name]'
+    if rc "shared-terminal snapshot $(q "$NAME") | tail -3 | grep -qE -- $(q "$GUARD")"; then
+      rc "shared-terminal send $(q "$NAME") $(q "$TEXT") >/dev/null; sleep $SETTLE; shared-terminal snapshot $(q "$NAME")"
+    else
+      echo "re-term: screen does not match /$GUARD/ — refusing to type (not where you think). Current tail:" >&2
+      rc "shared-terminal snapshot $(q "$NAME") | tail -3" >&2
+      exit 3
+    fi
+    ;;
+  status) NAME="$(sess "${1:-}")"; rc "shared-terminal status $(q "$NAME")";;
+  list)   rc "shared-terminal list";;
+  kill)   NAME="$(sess "${1:-}")"; rc "shared-terminal kill $(q "$NAME")";;
+  close)  rc -O exit 2>/dev/null && echo "re-term: closed persistent connection" || echo "re-term: no live connection";;
+
+  ping)   # report round-trip cost so the agent knows the connection is warm
+    s=$(date +%s.%N); rc true; e=$(date +%s.%N)
+    awk -v s="$s" -v e="$e" 'BEGIN{printf "re-term: %s round-trip %.3fs\n", "'"$RE_HOST"'", e-s}'
+    ;;
+
+  help|--help|-h)
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command '$cmd' (re-term help)";;
+esac
