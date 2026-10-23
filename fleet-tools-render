@@ -2,39 +2,95 @@
 # fleet-tools-render — render FLEET_TOOLS.md from fleet_tools.yaml, verifying every path exists.
 # Exit 0 = rendered clean. Exit 2 = rendered WITH drift warnings (missing paths flagged inline + on stderr).
 # claude_context.sh injects the .md; drift is visible to every orchestrator at boot, not hidden.
-import sys, yaml, os
+#
+# --boot (wq#4540): the default render carries the registry note, a per-group description, and a
+# two-line entry (name+use, then a separate invoke line) per tool. That's the right shape for a
+# human reading FLEET_TOOLS.md, but claude_context.sh --core injects the whole thing every boot,
+# and the note/group-desc/line-doubling cost tokens no boot-time reader needs: a session wants
+# "what tool, what's it for, how do I run it", one line each. --boot drops the note and group
+# descriptions and collapses each tool to a single line (name — use — `invoke`).
+import argparse
+import os
+import sys
 from pathlib import Path
-SRC = Path("/home/lumen/minerva/context/fleet_tools.yaml")
-OUT = Path("/home/lumen/minerva/context/FLEET_TOOLS.md")
-d = yaml.safe_load(open(SRC))
-drift = []
-lines = []
-lines.append("# FLEET_TOOLS — system & fleet-wide capabilities (every orchestrator, every session)")
-lines.append("")
-lines.append(f"_source: minerva/context/fleet_tools.yaml · updated {d.get('updated','?')} · edit the YAML, not this file_")
-lines.append("")
-lines.append(d["note"].strip())
-lines.append("")
-for gname, g in d["groups"].items():
-    lines.append(f"## {gname}")
-    lines.append(f"_{g['desc']}_")
+
+import yaml
+
+SRC = Path(os.environ.get("FLEET_TOOLS_YAML", "/home/lumen/minerva/context/fleet_tools.yaml"))
+OUT = Path(os.environ.get("FLEET_TOOLS_MD", "/home/lumen/minerva/context/FLEET_TOOLS.md"))
+BOOT_OUT = Path(os.environ.get("FLEET_TOOLS_BOOT_MD", "/home/lumen/minerva/context/FLEET_TOOLS_BOOT.md"))
+
+
+def find_drift(d):
+    drift = []
+    for g in d["groups"].values():
+        for t in g["tools"]:
+            p = t.get("path")
+            if p and not os.path.exists(p):
+                drift.append(f"{t['name']}: path missing: {p}")
+    return drift
+
+
+def render_full(d, drift):
+    lines = []
+    lines.append("# FLEET_TOOLS — system & fleet-wide capabilities (every orchestrator, every session)")
     lines.append("")
-    for t in g["tools"]:
-        p = t.get("path")
-        mark = ""
-        if p and not os.path.exists(p):
-            drift.append(f"{t['name']}: path missing: {p}")
-            mark = "  ⚠️DRIFT(path missing)"
-        lines.append(f"- **{t['name']}**{mark} — {t['use']}")
-        lines.append(f"  - `{t['invoke']}`")
+    lines.append(f"_source: minerva/context/fleet_tools.yaml · updated {d.get('updated','?')} · edit the YAML, not this file_")
     lines.append("")
-if drift:
-    lines.insert(4, "> ⚠️ REGISTRY DRIFT — some tool paths below no longer exist; fix fleet_tools.yaml:")
-    for x in drift:
-        lines.insert(5, f">   - {x}")
-    lines.insert(5+len(drift), "")
-OUT.write_text("\n".join(lines))
-if drift:
-    sys.stderr.write("fleet-tools-render: DRIFT\n" + "\n".join(drift) + "\n")
-    sys.exit(2)
-print(f"rendered {OUT} ({len(d['groups'])} groups, {sum(len(g['tools']) for g in d['groups'].values())} tools, no drift)")
+    lines.append(d["note"].strip())
+    lines.append("")
+    for gname, g in d["groups"].items():
+        lines.append(f"## {gname}")
+        lines.append(f"_{g['desc']}_")
+        lines.append("")
+        for t in g["tools"]:
+            mark = "  ⚠️DRIFT(path missing)" if any(t["name"] in x for x in drift) else ""
+            lines.append(f"- **{t['name']}**{mark} — {t['use']}")
+            lines.append(f"  - `{t['invoke']}`")
+        lines.append("")
+    if drift:
+        lines.insert(4, "> ⚠️ REGISTRY DRIFT — some tool paths below no longer exist; fix fleet_tools.yaml:")
+        for x in drift:
+            lines.insert(5, f">   - {x}")
+        lines.insert(5 + len(drift), "")
+    return "\n".join(lines)
+
+
+def render_boot(d, drift):
+    n_tools = sum(len(g["tools"]) for g in d["groups"].values())
+    lines = [f"# FLEET_TOOLS (boot) — {n_tools} tools; full detail in FLEET_TOOLS.md"]
+    if drift:
+        lines.append("> ⚠️ REGISTRY DRIFT: " + "; ".join(drift))
+    lines.append("")
+    for gname, g in d["groups"].items():
+        lines.append(f"## {gname}")
+        for t in g["tools"]:
+            mark = " ⚠️DRIFT" if any(t["name"] in x for x in drift) else ""
+            use_line = t["use"].strip().splitlines()[0]
+            lines.append(f"- **{t['name']}**{mark} — {use_line} — `{t['invoke']}`")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--boot", action="store_true", help="compact render: name + 1 line + invoke, no note/group-desc")
+    ap.add_argument("--src", type=Path, default=SRC, help=f"default {SRC}")
+    ap.add_argument("--out", type=Path, default=None, help="default FLEET_TOOLS.md, or FLEET_TOOLS_BOOT.md with --boot")
+    args = ap.parse_args()
+
+    out = args.out or (BOOT_OUT if args.boot else OUT)
+    d = yaml.safe_load(open(args.src))
+    drift = find_drift(d)
+    text = render_boot(d, drift) if args.boot else render_full(d, drift)
+    out.write_text(text)
+
+    n_tools = sum(len(g["tools"]) for g in d["groups"].values())
+    if drift:
+        sys.stderr.write("fleet-tools-render: DRIFT\n" + "\n".join(drift) + "\n")
+        sys.exit(2)
+    print(f"rendered {out} ({len(d['groups'])} groups, {n_tools} tools, no drift)")
+
+
+if __name__ == "__main__":
+    main()
