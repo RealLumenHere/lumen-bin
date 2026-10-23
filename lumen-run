@@ -126,7 +126,16 @@ case "$cmd" in
         && echo "GONE" || echo "RUNNING"
     fi
     ;;
-  log)   unit="${1:?unit required}"; journalctl -u "$unit" --no-pager -o cat 2>/dev/null;;
+  log)
+    # wq#3606: a job's stdout reaches the caller's transcript through here. wq#3513 a5
+    # hand-redacted a compose dump inside its job, missed one key, and this printed a live
+    # Langfuse secret. Mask here so no job body has to get its own redaction right; with
+    # the sibling mask-secrets missing, print nothing rather than print raw.
+    unit="${1:?unit required}"
+    mask="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/mask-secrets"
+    [ -x "$mask" ] || { echo "lumen-run: $mask missing, refusing to print an unmasked journal" >&2; exit 3; }
+    journalctl -u "$unit" --no-pager -o cat 2>/dev/null | "$mask"
+    ;;
   wait)
     unit="${1:?unit required}"; budget="${2:-3600}"; waited=0
     # wq#3265: a Commander call is killed by the Worker's 70s abort, so a wait longer than
