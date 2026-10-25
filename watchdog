@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# watchdog — run a long command detached, poll for an artifact / exit / log marker,
+#            and hand the verdict back to an agent session that outlives Commander's
+#            90 s call window.                                            (wq#4629)
+#
+# WHY: Commander/`claude -p` tool calls die at ~90 s (Bash tool ceiling ~48 s without
+# an explicit timeout, SIGURG kills even run_in_background — anthropics/claude-code#34138).
+# A 30-minute ISO build run inside that window looks like a failure to the agent. This
+# script is the only process that needs to survive: it daemonises itself (setsid+nohup),
+# supervises the real command in its own process group, and reports once, by every
+# channel it was given.
+#
+# USAGE
+#   watchdog -n <session> [-a <artifact>] [-t <timeout-min>] [options] -- <command ...>
+#
+#   -n, --session NAME     shared-terminal session to inject the verdict into (tmux -L shared).
+#                          Also the default label for all /tmp/watchdog-<label>.* files.
+#   -a, --artifact PATH    success when PATH exists, is non-empty and its size is stable
+#                          for --stable consecutive polls (an ISO exists before it is finished).
+#   -m, --marker REGEX     success when the command's output log matches REGEX (grep -E).
+#   -t, --timeout MIN      minutes before the command is killed (default 60; decimals ok).
+#   -p, --poll SEC         poll interval (default 30; min 1).
+#       --stable N         artifact size must be unchanged for N consecutive polls (default 2).
+#       --cwd DIR          run the command in DIR.
+#       --label NAME       override the file label (default: session name).
+#       --ntfy TOPIC       also push the verdict with ntfy-send -t TOPIC.
+#       --callback URL     also POST result.json to URL (Trigger.dev waitpoint, LangGraph resume hook, ...).
+#       --no-send          do not type into the shared-terminal session (file/ntfy/callback only).
+#       --tail N           lines of command output to keep in the .tail file (default 50).
+#       --fg               run in the foreground (used by the daemon re-exec and by tests).
+#   -h, --help
+#
+# EXIT (foreground)  0 success · 1 command failed · 2 timeout · 3 usage/setup error
+# EXIT (daemonised)  0 after printing the supervisor PID and file paths; the verdict comes later.
+#
+# FILES (all under /tmp, label = session unless --label):
+#   watchdog-<label>.log          supervisor log (every decision, timestamped)
+#   watchdog-<label>.out          the command's combined stdout+stderr
+#   watchdog-<label>.rc           the command's exit code, written by the wrapper on exit
+#   watchdog-<label>.tail         last --tail lines of .out, refreshed at verdict time
+#   watchdog-<label>.result.json  {status, rc, artifact, size, duration_s, cmd, paths...}
+#   watchdog-<label>.pid          PID of the daemonised supervisor
+#
+# INJECTION: one line, so a TUI (Claude Code in the shared pane) receives it as a single
+# prompt and a shell pane does not execute 50 lines of log. The line names the .tail and
+# .result.json paths; the agent reads those. Format:
+#   [watchdog:<label>] OK|FAIL|TIMEOUT — <summary> — details: /tmp/watchdog-<label>.tail
+#
+# Depends on: bash ≥4, coreutils, setsid (util-linux), jq, optionally shared-terminal and
+# ntfy-send from /home/lumen/bin. No inotify (not installed on Lumen; polling is enough at
+# 30 s granularity for multi-minute jobs and works on NFS/overlay where inotify does not).
+set -u
+
+SESSION=""; ARTIFACT=""; MARKER=""; TIMEOUT_MIN=60; POLL=30; STABLE=2; CWD=""
+LABEL=""; NTFY_TOPIC=""; CALLBACK=""; SEND=1; TAILN=50; FG=0
+ORIG_ARGS=("$@")
+
+die() { echo "watchdog: $*" >&2; exit 3; }
+usage() { sed -n '2,/^set -u/p' "$0" | grep -v '^set -u' | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--session)  SESSION=$2; shift 2 ;;
+    -a|--artifact) ARTIFACT=$2; shift 2 ;;
+    -m|--marker)   MARKER=$2; shift 2 ;;
+    -t|--timeout)  TIMEOUT_MIN=$2; shift 2 ;;
+    -p|--poll)     POLL=$2; shift 2 ;;
+    --stable)      STABLE=$2; shift 2 ;;
+    --cwd)         CWD=$2; shift 2 ;;
+    --label)       LABEL=$2; shift 2 ;;
+    --ntfy)        NTFY_TOPIC=$2; shift 2 ;;
+    --callback)    CALLBACK=$2; shift 2 ;;
+    --no-send)     SEND=0; shift ;;
+    --tail)        TAILN=$2; shift 2 ;;
+    --fg)          FG=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            die "unknown option $1 (see --help)" ;;
+    *)             break ;;
+  esac
+done
+[ $# -gt 0 ] || die "no command given (put it after --)"
+[ -n "$SESSION" ] || [ "$SEND" -eq 0 ] || die "-n <session> is required unless --no-send"
+[ -n "$LABEL" ] || LABEL=${SESSION:-job}
+LABEL=${LABEL//[^A-Za-z0-9._-]/_}
+[[ "$POLL" =~ ^[0-9]+$ ]] && [ "$POLL" -ge 1 ] || die "--poll must be an integer ≥1"
+[[ "$STABLE" =~ ^[0-9]+$ ]] && [ "$STABLE" -ge 1 ] || die "--stable must be an integer ≥1"
+TIMEOUT_S=$(awk -v m="$TIMEOUT_MIN" 'BEGIN{ if (m+0<=0) exit 1; printf "%d", m*60 }') || die "--timeout must be a positive number of minutes"
+[ -z "$CWD" ] || [ -d "$CWD" ] || die "--cwd $CWD is not a directory"
+if [ -n "$ARTIFACT" ] && [ -e "$ARTIFACT" ]; then die "artifact $ARTIFACT already exists — remove it or pick another path, or the first poll will report success"; fi
+
+LOG=/tmp/watchdog-$LABEL.log
+OUT=/tmp/watchdog-$LABEL.out
+RCF=/tmp/watchdog-$LABEL.rc
+TAILF=/tmp/watchdog-$LABEL.tail
+RESULT=/tmp/watchdog-$LABEL.result.json
+PIDF=/tmp/watchdog-$LABEL.pid
+CMD_STR="$*"
+
+log() { printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$LABEL" "$*" >>"$LOG"; }
+
+# ---- daemonise: re-exec ourselves in the foreground under a new session -------------------
+if [ "$FG" -eq 0 ]; then
+  if [ -s "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+    die "a watchdog for label '$LABEL' is already running (pid $(cat "$PIDF")); use --label or wait"
+  fi
+  : >"$LOG"; rm -f "$RCF" "$RESULT" "$TAILF"
+  setsid nohup "$0" --fg "${ORIG_ARGS[@]}" >>"$LOG" 2>&1 < /dev/null &
+  echo "watchdog started: label=$LABEL supervisor_pid=$! timeout=${TIMEOUT_MIN}m poll=${POLL}s"
+  echo "  log=$LOG  out=$OUT  result=$RESULT"
+  [ -z "$ARTIFACT" ] || echo "  artifact=$ARTIFACT"
+  [ -z "$SESSION" ]  || echo "  verdict -> shared-terminal send $SESSION"
+  exit 0
+fi
+
+# ---- foreground supervisor --------------------------------------------------------------
+echo $$ >"$PIDF"
+START=$(date +%s)
+log "start cmd=[$CMD_STR] artifact=[${ARTIFACT:-}] marker=[${MARKER:-}] timeout=${TIMEOUT_S}s poll=${POLL}s stable=$STABLE cwd=[${CWD:-$PWD}]"
+rm -f "$RCF"; : >"$OUT"
+
+# The command runs in ITS OWN session/process group so that a timeout can kill the whole
+# tree (make/qemu/children), not just the top bash. $! is the session leader = PGID.
+# The user command runs in a grandchild shell so that an `exit N` inside it cannot skip the
+# rc write (test T1/T2 on 2026-10-24 caught exactly that).
+( [ -z "$CWD" ] || cd "$CWD"; exec setsid bash -c 'bash -c "$1"; echo $? > "$2"' _ "$CMD_STR" "$RCF" ) >>"$OUT" 2>&1 < /dev/null &
+CHILD=$!
+sleep 0.2
+PGID=$(ps -o pgid= -p "$CHILD" 2>/dev/null | tr -d ' ')
+[ -n "$PGID" ] || PGID=$CHILD
+log "spawned pid=$CHILD pgid=$PGID"
+
+alive() { kill -0 "$CHILD" 2>/dev/null; }
+art_size() { [ -n "$ARTIFACT" ] && [ -s "$ARTIFACT" ] && stat -c %s "$ARTIFACT" 2>/dev/null || echo ""; }
+
+STATUS=""; RC=""; NOTE=""; last_size=""; stable_n=0
+while :; do
+  now=$(date +%s); elapsed=$((now-START))
+
+  if [ -s "$RCF" ]; then                       # 1. process finished (wrapper wrote the rc)
+    RC=$(tr -dc '0-9' <"$RCF")
+    if [ "${RC:-1}" -eq 0 ]; then
+      if [ -n "$ARTIFACT" ] && [ ! -s "$ARTIFACT" ]; then
+        STATUS=FAIL; NOTE="exit 0 but artifact missing/empty: $ARTIFACT"
+      else
+        STATUS=OK; NOTE="exit 0 after ${elapsed}s"
+      fi
+    else
+      STATUS=FAIL; NOTE="exit $RC after ${elapsed}s"
+    fi
+    break
+  fi
+
+  if [ -n "$ARTIFACT" ]; then                  # 2. artifact appeared and is stable
+    sz=$(art_size)
+    if [ -n "$sz" ]; then
+      if [ "$sz" = "$last_size" ]; then stable_n=$((stable_n+1)); else stable_n=1; fi
+      last_size=$sz
+      log "artifact present size=$sz stable=$stable_n/$STABLE"
+      if [ "$stable_n" -ge "$STABLE" ]; then
+        if alive; then
+          # give the producer a moment to exit on its own, then report regardless
+          for _ in 1 2 3 4 5 6; do [ -s "$RCF" ] && break; sleep 5; done
+        fi
+        if [ -s "$RCF" ]; then RC=$(tr -dc '0-9' <"$RCF"); else RC=""; fi
+        if [ -n "$RC" ] && [ "$RC" -ne 0 ]; then
+          STATUS=FAIL; NOTE="artifact appeared but command exited $RC"
+        else
+          if [ -n "$RC" ]; then tailnote=", exit $RC"; else tailnote=", producer still running pid=$CHILD"; fi
+          STATUS=OK; NOTE="artifact ready ($sz bytes) after ${elapsed}s$tailnote"
+        fi
+        break
+      fi
+    fi
+  fi
+
+  if [ -n "$MARKER" ] && grep -Eq -- "$MARKER" "$OUT" 2>/dev/null; then   # 3. log marker
+    STATUS=OK; NOTE="log matched /$MARKER/ after ${elapsed}s$(alive && echo ", producer still running pid=$CHILD")"
+    [ -s "$RCF" ] && RC=$(tr -dc '0-9' <"$RCF")
+    break
+  fi
+
+  if [ "$elapsed" -ge "$TIMEOUT_S" ]; then     # 4. timeout: kill the whole process group
+    log "TIMEOUT after ${elapsed}s — sending TERM to pgid $PGID"
+    kill -TERM -- "-$PGID" 2>/dev/null; sleep 5
+    if alive; then log "still alive — sending KILL"; kill -KILL -- "-$PGID" 2>/dev/null; sleep 1; fi
+    STATUS=TIMEOUT; RC=124; NOTE="killed after ${elapsed}s (limit ${TIMEOUT_S}s)"
+    break
+  fi
+
+  if ! alive && [ ! -s "$RCF" ]; then          # 5. vanished without an rc (OOM-kill, SIGKILL)
+    sleep 1
+    if [ ! -s "$RCF" ]; then STATUS=FAIL; RC=137; NOTE="process disappeared without exit code after ${elapsed}s"; break; fi
+  fi
+
+  sleep "$POLL"
+done
+
+END=$(date +%s); DUR=$((END-START))
+tail -n "$TAILN" "$OUT" >"$TAILF" 2>/dev/null || : >"$TAILF"
+ASIZE=""; [ -n "$ARTIFACT" ] && [ -e "$ARTIFACT" ] && ASIZE=$(stat -c %s "$ARTIFACT" 2>/dev/null)
+HUMAN=""; [ -n "$ASIZE" ] && HUMAN=$(du -h "$ARTIFACT" 2>/dev/null | cut -f1)
+
+jq -n --arg status "$STATUS" --arg rc "${RC:-}" --arg note "$NOTE" --arg label "$LABEL" \
+      --arg cmd "$CMD_STR" --arg artifact "$ARTIFACT" --arg size "$ASIZE" --arg human "$HUMAN" \
+      --arg out "$OUT" --arg tailf "$TAILF" --arg log "$LOG" --argjson dur "$DUR" \
+      --arg started "$(date -d @"$START" -Is)" --arg ended "$(date -d @"$END" -Is)" \
+      '{status:$status, rc:($rc|if .=="" then null else tonumber end), note:$note, label:$label, cmd:$cmd,
+        artifact:(if $artifact=="" then null else $artifact end), artifact_bytes:(if $size=="" then null else ($size|tonumber) end),
+        artifact_human:(if $human=="" then null else $human end), duration_s:$dur, started:$started, ended:$ended,
+        out:$out, tail:$tailf, log:$log}' >"$RESULT" 2>>"$LOG" || log "jq failed writing $RESULT"
+log "verdict $STATUS — $NOTE"
+
+case "$STATUS" in
+  OK)      SUMMARY="$NOTE${ARTIFACT:+. Artifact: $ARTIFACT${HUMAN:+ ($HUMAN)}}" ;;
+  FAIL)    SUMMARY="$NOTE. Last $TAILN lines of output: $TAILF" ;;
+  TIMEOUT) SUMMARY="$NOTE. Process group $PGID killed. Last $TAILN lines: $TAILF" ;;
+esac
+LINE="[watchdog:$LABEL] $STATUS — $SUMMARY — details: $RESULT"
+
+# ---- deliver -----------------------------------------------------------------------------
+if [ "$SEND" -eq 1 ] && [ -n "$SESSION" ]; then
+  if command -v shared-terminal >/dev/null 2>&1 && shared-terminal status "$SESSION" >/dev/null 2>&1; then
+    if shared-terminal send "$SESSION" "$LINE" >>"$LOG" 2>&1; then log "injected into shared-terminal '$SESSION'"
+    else log "shared-terminal send to '$SESSION' FAILED (see above)"; fi
+  else
+    log "shared-terminal session '$SESSION' not found — verdict is in $RESULT only (plus ntfy/callback if set)"
+  fi
+fi
+if [ -n "$NTFY_TOPIC" ] && command -v ntfy-send >/dev/null 2>&1; then
+  prio=default; [ "$STATUS" = OK ] || prio=high
+  ntfy-send -t "$NTFY_TOPIC" -p "$prio" -T "watchdog $LABEL: $STATUS" "$SUMMARY" >>"$LOG" 2>&1 && log "ntfy sent to $NTFY_TOPIC" || log "ntfy-send failed"
+fi
+if [ -n "$CALLBACK" ]; then
+  code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data-binary @"$RESULT" "$CALLBACK" 2>>"$LOG")
+  log "callback POST $CALLBACK -> HTTP $code"
+fi
+rm -f "$PIDF"
+case "$STATUS" in OK) exit 0 ;; TIMEOUT) exit 2 ;; *) exit 1 ;; esac
