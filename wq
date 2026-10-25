@@ -2853,6 +2853,21 @@ def _aq_unverified(ticket_id, why):
 # fact for this one shape of citation — not a second gate (ticket text: "extend wq#1673's
 # deliverable check rather than adding a second one").
 OPS_INSTALL_RE = re.compile(r"/ops/wq\d+[\w.-]*/install\.sh$")
+# wq#4641: a bundle is implicated by any file in it, not only its install.sh
+# (ops/VERIFY_CONTRACT.md). wq#4458 and wq#4638 each edited only
+# ops/wq3354-fleet-selfheal/selfheal.yaml, matched OPS_INSTALL_RE nowhere, and closed done
+# without the bundle's --verify ever running; the live sweep config never got either edit.
+OPS_BUNDLE_DIR_RE = re.compile(r"/ops/wq\d+[\w.-]*/(?=.)")
+
+def _ops_bundle_install(path):
+    """The install.sh of the ops/wqNNNN-* bundle `path` sits in (same absolute or
+    repo-relative form as `path`), or None when it sits in no bundle. Whether that install.sh
+    exists is the caller's question."""
+    m = OPS_BUNDLE_DIR_RE.search(path if path.startswith("/") else "/" + path)
+    if not m:
+        return None
+    end = m.end() if path.startswith("/") else m.end() - 1
+    return path[:end] + "install.sh"
 
 def _sha256(path):
     import hashlib
@@ -3101,8 +3116,8 @@ def _local_bundle_installs(rel_paths):
     return out
 
 def pr_ops_deploy_check(url, deployed_target=None, deploy_verify=None):
-    """wq#2943: the kind=="url" mirror of ops_deploy_check. Every ops/wqNNNN-*/install.sh the
-    cited PR touches must be provably LIVE, not merely merged — its own `--verify` handler
+    """wq#2943: the kind=="url" mirror of ops_deploy_check. Every ops/wqNNNN-*/ bundle the
+    cited PR touches any file of (wq#4641), checked once through its install.sh, must be provably LIVE, not merely merged — its own `--verify` handler
     says so (ops/VERIFY_CONTRACT.md: "merged is not live"), or the caller supplies the
     wq#1724/wq#2762 --deployed + --deploy-verify proof for it. Returns (verdict, why):
     'none' when the PR touches no bundle or the forge could not say (fail open), 'deployed'
@@ -3112,7 +3127,12 @@ def pr_ops_deploy_check(url, deployed_target=None, deploy_verify=None):
     rels, why = pr_changed_files(url)
     if rels is None:
         return "none", why, []
-    bundles = _local_bundle_installs([r for r in rels if OPS_INSTALL_RE.search("/" + r)])
+    installs = []
+    for r in rels:
+        inst = _ops_bundle_install(r)
+        if inst and inst not in installs:
+            installs.append(inst)
+    bundles = _local_bundle_installs(installs)
     if not bundles:
         return "none", "", []
     proofs, misses, fails = [], [], []
@@ -3288,7 +3308,12 @@ def cmd_done(a):
             if verdict == "unknown":
                 print(f"WARNING: wq#1673 evidence-durability gate could not verify {abs_path} "
                       f"({why}). Closing anyway — the gate does not block on git trouble.")
-            ov, owhy = ops_deploy_check(abs_path, getattr(a, "deployed", None),
+            # wq#4641: a citation of any file in a bundle (selfheal.yaml, a unit, a shipped
+            # script) is gated as that bundle's install.sh — when the bundle has one.
+            ops_path = _ops_bundle_install(abs_path)
+            if not (ops_path and os.path.isfile(ops_path)):
+                ops_path = abs_path
+            ov, owhy = ops_deploy_check(ops_path, getattr(a, "deployed", None),
                                         getattr(a, "deploy_verify", None))
             if ov == "undeployed" and not getattr(a, "no_deploy_needed", None):
                 eprint(f"REFUSED: wq#1724/wq#2762 ops-deploy gate — task {a.id} not closed. "
@@ -3311,7 +3336,7 @@ def cmd_done(a):
                 # wq#3487: same as the PR-URL branch — the override is honored, but a bundle
                 # whose own --verify confirms FAIL must leave a tracked follow-up.
                 followups = ops_root_apply_check(_lane_row[0] if _lane_row else "build",
-                                                 a.id, [abs_path])
+                                                 a.id, [ops_path])
                 if followups:
                     a.notes = _stamp(a.notes, "[ROOT-APPLY-FILED: " +
                                      ", ".join(f"wq#{f}" for f in sorted(set(followups))) + "]")

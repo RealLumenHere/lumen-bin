@@ -89,6 +89,10 @@ def repo(tmp_path):
         'echo "VERIFY FAIL (1)"; exit 1; }\n'
         '  echo "VERIFY OK"; exit 0\nfi\n'
         'install -m 644 "$SRC/payload.conf" "$TARGET"\n')
+    (bundle / "units").mkdir()
+    (bundle / "units" / "scratch.service").write_text("[Service]\nExecStart=/bin/true\n")
+    (r / "ops" / "wq8888-no-installer").mkdir()
+    (r / "ops" / "wq8888-no-installer" / "NOTES.md").write_text("notes only\n")
     (r / "README.md").write_text("scratch\n")
     git(r, "init", "-q", "-b", "main")
     git(r, "config", "user.email", "t@example.invalid")
@@ -142,8 +146,21 @@ MERGED_PR = {"state": "closed", "merged": True, "head": {"sha": "a" * 40},
 
 @pytest.fixture
 def gitea():
-    """PR 7 touches the ops bundle; PR 8 touches only a README; PR 9's file list 404s."""
+    """PR 7 touches the ops bundle; PR 8 touches only a README; PR 9's file list 404s.
+    wq#4641: PR 10 touches only the bundle's payload (the wq#4458/wq#4638 selfheal.yaml
+    shape), PR 11 two payload files of one bundle, PR 12 a file of an ops dir with no
+    install.sh."""
     srv = _serve({
+        "/api/v1/repos/o/r/pulls/10": MERGED_PR,
+        "/api/v1/repos/o/r/pulls/10/files": [
+            {"filename": "ops/wq9999-scratch-bundle/payload.conf"}],
+        "/api/v1/repos/o/r/pulls/11": MERGED_PR,
+        "/api/v1/repos/o/r/pulls/11/files": [
+            {"filename": "ops/wq9999-scratch-bundle/payload.conf"},
+            {"filename": "ops/wq9999-scratch-bundle/units/scratch.service"}],
+        "/api/v1/repos/o/r/pulls/12": MERGED_PR,
+        "/api/v1/repos/o/r/pulls/12/files": [
+            {"filename": "ops/wq8888-no-installer/NOTES.md"}],
         "/api/v1/repos/o/r/pulls/7": MERGED_PR,
         "/api/v1/repos/o/r/pulls/7/files": [
             {"filename": "README.md"},
@@ -222,6 +239,47 @@ def test_a_pr_touching_no_ops_bundle_is_untouched_by_the_gate(tmp_path, repo, gi
     r, _bundle, _target = repo
     tid = open_ticket(env, "wq2943 ordinary PR")
     p = wq(env, "done", tid, "--notes", f"http://{gitea}/o/r/pulls/8", cwd=r)
+    assert p.returncode == 0, out(p)
+    assert "ops-deploy gate" not in out(p)
+
+
+def test_a_payload_only_pr_implicates_its_bundle(tmp_path, repo, gitea):
+    """wq#4641: the wq#4458/wq#4638 shape. The PR edits only a file the bundle ships, never
+    its install.sh; the install.sh-only regex matched nothing and the close went through
+    with the target never touched."""
+    env = make_env(tmp_path)
+    r, _bundle, _target = repo
+    tid = open_ticket(env, "wq4641 payload-only PR")
+    p = wq(env, "done", tid, "--notes", f"http://{gitea}/o/r/pulls/10", cwd=r)
+    assert p.returncode == 9, out(p)
+    assert "wq#2943 ops-deploy gate" in p.stderr
+    assert "wq9999-scratch-bundle" in p.stderr
+
+
+def test_a_bundle_touched_in_several_files_is_checked_once(tmp_path, repo, gitea):
+    env = make_env(tmp_path)
+    r, bundle, target = repo
+    _install(bundle, target)
+    tid = open_ticket(env, "wq4641 two payload files, one bundle")
+    p = wq(env, "done", tid, "--notes", f"http://{gitea}/o/r/pulls/11", cwd=r)
+    assert p.returncode == 0, out(p)
+    assert p.stdout.count("wq9999-scratch-bundle: --verify OK") == 1, out(p)
+
+
+def test_a_payload_only_pr_on_a_retired_bundle_closes(tmp_path, repo, gitea):
+    env = make_env(tmp_path)
+    r, bundle, _target = repo
+    (bundle / "RETIRED").write_text("superseded by wq9998\n")
+    tid = open_ticket(env, "wq4641 payload-only PR, retired bundle")
+    p = wq(env, "done", tid, "--notes", f"http://{gitea}/o/r/pulls/10", cwd=r)
+    assert p.returncode == 0, out(p)
+
+
+def test_an_ops_dir_without_an_install_sh_is_untouched_by_the_gate(tmp_path, repo, gitea):
+    env = make_env(tmp_path)
+    r, _bundle, _target = repo
+    tid = open_ticket(env, "wq4641 ops dir with no installer")
+    p = wq(env, "done", tid, "--notes", f"http://{gitea}/o/r/pulls/12", cwd=r)
     assert p.returncode == 0, out(p)
     assert "ops-deploy gate" not in out(p)
 

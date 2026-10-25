@@ -98,6 +98,18 @@ def test_ops_install_citation_without_deploy_refuses_rc9(tmp_path, repo_with_ops
     assert notes_of(env, tid) == "", "a refused close must not write notes"
 
 
+def test_ops_payload_citation_without_deploy_refuses_rc9(tmp_path, repo_with_ops_artifact):
+    """wq#4641: citing a file the bundle ships, not its install.sh, is the same unproven
+    deploy; the path branch used to match only install.sh and close it."""
+    env = make_env(tmp_path)
+    repo, art_dir, _target = repo_with_ops_artifact
+    tid = open_ticket(env, "wq4641 self-test: undeployed ops payload citation")
+
+    done = wq(env, "done", tid, "--notes", f"shipped {art_dir}/lumen_state.py", cwd=repo)
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert f"{art_dir}/install.sh" in done.stdout + done.stderr
+
+
 _DEPLOY_VERIFY = ("premise: re-checked lumen_state.py's lifecycle-closure bug is still "
                   "live on the target before deploying; "
                   "probe: dry-run diff of install.sh's cp against the live target showed "
