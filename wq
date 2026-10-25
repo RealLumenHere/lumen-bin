@@ -1567,6 +1567,39 @@ def _reject_liveness_grep_invert(text):
     sys.exit(1)
 # --- end wq#2529 helpers ---
 
+# --- wq#4402 sibling-ref dep guard ---
+_WQ_REF_RE = re.compile(r'\bwq\s*#?\s*(\d+)\b', re.IGNORECASE)
+def undeclared_sibling_refs(c, title, detail):
+    """wq#4402: scans title+detail for a 'wq#NNNN'/'wqNNNN'/'wq NNNN' reference to an
+    OPEN (not done) task and returns [(id, status), ...] for each. A back-reference to
+    an already-done sibling is a normal citation, not an undeclared dependency, so it
+    is excluded here -- the guard must not fire on routine references to closed work."""
+    text = f"{title or ''}\n{detail or ''}"
+    seen, out = set(), []
+    for m in _WQ_REF_RE.finditer(text):
+        rid = m.group(1)
+        if rid in seen: continue
+        seen.add(rid)
+        row = c.execute("SELECT status FROM tasks WHERE id=?", (rid,)).fetchone()
+        if row and row[0] != 'done':
+            out.append((rid, row[0]))
+    return out
+def print_sibling_ref_notice(refs, refuse):
+    """wq#4402: refuse (build lane) or warn (elsewhere) -- same prose, different exit."""
+    ids = ', '.join(f"wq#{rid} [{status}]" for rid, status in refs)
+    lead = "REFUSED" if refuse else "WARNING"
+    print(f"{lead}: title/detail names {ids} as if this ticket wraps/depends on it, but "
+          f"--deps is empty (wq#4402 -- wq#4396 shipped 8/8 green with 0/4 tools working "
+          f"this exact way: the dependency was only ever prose, deps_met() had nothing "
+          f"to enforce).")
+    if refuse:
+        print("  Add --deps with the referenced id(s), or --force if this really is just "
+              "a back-reference and not a dependency.")
+    else:
+        print("  If this ticket actually wraps that task's deliverable, add --deps so "
+              "deps_met() can enforce it before claim.")
+# --- end wq#4402 helpers ---
+
 def cmd_add(a):
     subs = parse_subs(a.subsystems)
     # wq#1675: validate on the BASE — ':ro'/':rw' is a mode, not new vocabulary.
@@ -1635,6 +1668,16 @@ def cmd_add(a):
         print_bad_deps(malformed, missing)
         c.close(); sys.exit(1)
     a.deps = normalize_deps(a.deps)
+    # wq#4402: sibling-ref dep guard -- a title/detail naming an OPEN sibling wq# with
+    # no --deps is either refused (build lane) or warned (elsewhere); a done sibling is
+    # a routine back-reference and never fires this
+    if not (a.deps or "").strip():
+        sib_refs = undeclared_sibling_refs(c, a.title, a.detail)
+        if sib_refs:
+            refuse = (a.lane == "build" and not a.force)
+            print_sibling_ref_notice(sib_refs, refuse)
+            if refuse:
+                c.close(); sys.exit(1)
     if not a.force:
         nt = norm_title(a.title)
         for rid, rtitle, rstatus, rlane in c.execute(
