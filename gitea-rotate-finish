@@ -82,16 +82,21 @@ echo "   OK: authenticates as $WHO"
 
 OLD=$(tr -d '\n\r ' < "$SECFILE" 2>/dev/null || true)
 
+# wq#4599: every pre-rotation backup gets an expiry. secret-backup-sweep shreds it once its old values are proven dead.
+reg_bak() { /home/lumen/bin/secret-backup-sweep register "$1" --ttl 7d --owner gitea-rotate-finish --why "pre-rotate backup (old Gitea token)" >/dev/null 2>&1 || true; }
+
 echo "4) writing all 4 copies ..."
 TMPTOK="/tmp/gitea-rotate.$$.tok"
 umask 077
 printf '%s' "$NEW" > "$TMPTOK"
 
 cp -a "$SECFILE" "$SECFILE.bak.${STAMP}_pre_rotate" 2>/dev/null || true
+reg_bak "$SECFILE.bak.${STAMP}_pre_rotate"
 install -m600 "$TMPTOK" "$SECFILE"
 echo "   OK $SECFILE"
 
 cp -a "$CRED" "$CRED.bak.${STAMP}_pre_rotate"
+reg_bak "$CRED.bak.${STAMP}_pre_rotate"
 ENC=${HOST/:/%3a}
 grep -v "$ENC" "$CRED" > "/tmp/gc.$$" 2>/dev/null || true
 printf 'http://%s:%s@%s\n' "$GUSER" "$NEW" "$ENC" >> "/tmp/gc.$$"
@@ -99,6 +104,7 @@ install -m600 "/tmp/gc.$$" "$CRED"; rm -f "/tmp/gc.$$"
 echo "   OK $CRED"
 
 cp -a "$ENVF" "$ENVF.bak.${STAMP}_pre_rotate"
+reg_bak "$ENVF.bak.${STAMP}_pre_rotate"
 NEWTOK="$NEW" python3 - "$ENVF" <<'PY'
 import re, os, sys
 tok = os.environ["NEWTOK"]; p = sys.argv[1]
@@ -116,6 +122,7 @@ PY
 
 if sudo -n test -d "$ENGINE_DIR" 2>/dev/null; then
   sudo -n cp -a "$ENGINE_FILE" "$ENGINE_FILE.bak.${STAMP}_pre_rotate" 2>/dev/null || true
+  reg_bak "$ENGINE_FILE.bak.${STAMP}_pre_rotate"   # owned by another user: the sweep cannot read it, so this only records intent
   sudo -n install -m600 -o tokeneng -g tokeneng "$TMPTOK" "$ENGINE_FILE"
   echo "   OK $ENGINE_FILE"
 else
