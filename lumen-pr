@@ -349,6 +349,20 @@ lint_second_person() { # lint_second_person <file-or-string> <label>
   return 0
 }
 
+lint_secrets() { # lint_secrets <label> <text>   (wq#4600: never publish a secret literal in a commit, PR or comment)
+  local label="$1" text="$2" tool out
+  tool="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/cmd-secret-lint"
+  if [ ! -x "$tool" ]; then
+    printf 'lumen-pr: WARNING: %s not found, secret-literal lint SKIPPED for %s\n' "$tool" "$label" >&2
+    return 0
+  fi
+  if ! out=$(printf '%s' "$text" | "$tool" --name "$label" 2>&1); then
+    printf '%s\n' "$out" >&2
+    die "$label carries a secret literal (wq#4600): remove it and refer to the secret by path or name"
+  fi
+  return 0
+}
+
 lint_body_sections() { # lint_body_sections <body-text>
   local body="$1" missing=""
   for s in What Why How Testing; do
@@ -1115,7 +1129,9 @@ cmd_commit() {
       *) die "unknown flag for commit: $1" ;;
     esac
   done
+  lint_secrets "commit subject" "$subject"
   lint_subject "$subject"
+  [ -n "$body_file" ] && [ -r "$body_file" ] && lint_secrets "commit body" "$(cat "$body_file")"
   local cur; cur=$(git -C "$REPO_PATH" branch --show-current)
   [ "$cur" = "$DEFAULT_BRANCH" ] && \
     die "refusing to commit directly to '$DEFAULT_BRANCH' (§2, §10.1). Run: lumen-pr start $REPO_PATH <type>/<slug>"
@@ -1169,6 +1185,8 @@ cmd_open() {
   [ -n "$title" ] || die "missing --title"
   [ -n "$body_file" ] && [ -r "$body_file" ] || die "missing or unreadable --body-file"
   local body; body=$(cat "$body_file")
+  lint_secrets "PR title" "$title"
+  lint_secrets "PR body" "$body"
   lint_subject "$title"
   lint_body_sections "$body"
   lint_second_person "$title" "PR title"
@@ -1218,6 +1236,7 @@ cmd_comment() {
   done
   [ -n "$pr" ] || die "usage: lumen-pr comment <repo-path> <pr-number> --body-file F"
   [ -n "$body_file" ] && [ -r "$body_file" ] || die "missing or unreadable --body-file"
+  lint_secrets "PR comment" "$(cat "$body_file")"
   lint_second_person "$(cat "$body_file")" "PR comment"
   te_grant
   local staged
