@@ -502,6 +502,12 @@ def init():
     # A ticket that knows its deliverable is held to it at `done`. ADDITIVE and opt-in: NULL on
     # every existing row and on every `add` that omits --deliverable = no check, as before.
     if "deliverable"  not in cols: c.execute("ALTER TABLE tasks ADD COLUMN deliverable TEXT")
+    # wq#4659: who filed the ticket (the caller's explicit identity, NULL when it had none) and
+    # when it was last `wq release`d. The dispatcher holds a ticket an orch-* session filed for
+    # ORCH_GRACE_MIN unless it has been released, so an orchestrator that files a ticket and
+    # builds it itself is not raced by a duplicate fworker. ADDITIVE — NULL on every existing row.
+    if "created_by"   not in cols: c.execute("ALTER TABLE tasks ADD COLUMN created_by TEXT")
+    if "released_at"  not in cols: c.execute("ALTER TABLE tasks ADD COLUMN released_at TEXT")
     # wq#568: retirement is a SEPARATE table, not columns on agent_sessions, because it must
     # SURVIVE the registry row: --release DELETES the row, and a purged/deregistered id calling
     # back in is exactly the respawn this exists to stop. ADDITIVE — nothing else reads it.
@@ -1601,6 +1607,21 @@ def print_sibling_ref_notice(refs, refuse):
 # --- end wq#4402 helpers ---
 
 def cmd_add(a):
+    # wq#4659: an orchestrator that filed a build ticket and started on it itself raced the
+    # dispatcher, which spawned a duplicate fworker 16-60 s after the add (wq#4645, wq#4658).
+    # --claim writes a hold for the caller INTO the INSERT, so no dispatcher pass or other
+    # claimer ever sees the ticket open and unheld, then claims it by id (every claim --id guard
+    # applies). Only an explicit identity can hold: the hostname:pid fallback dies with this call.
+    creator, explicit = resolve_identity(a)
+    claim = getattr(a, "claim", False)
+    if claim and not explicit:
+        print("REFUSED: --claim needs an identity — export WQ_AGENT (wq whoami --register <name>) "
+              "or pass --by <agent> (wq#4659)")
+        sys.exit(1)
+    if claim and getattr(a, "frank_gated", False):
+        print("REFUSED: --claim and --frank-gated contradict — a Frank-gated ticket is not "
+              "claimable (wq#4659)")
+        sys.exit(1)
     subs = parse_subs(a.subsystems)
     # wq#1675: validate on the BASE — ':ro'/':rw' is a mode, not new vocabulary.
     bad = [s for s in subs if sub_base(s) not in CANON_SUBSYSTEMS]
@@ -1702,9 +1723,11 @@ def cmd_add(a):
     needs_val = getattr(a, "needs", None)
     if needs_val is not None:
         check_needs_or_die(c, needs_val)  # wq#1331: refused pre-migration / on bad tags
-    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,model,effort,archetype,status,gate_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    hold_by, hold_expires = (creator, lease_from(a.ttl)) if claim else (None, None)
+    c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,model,effort,archetype,status,gate_type,created_by,hold_by,hold_expires) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (a.lane, a.pri, a.title, a.detail or '', a.deps or '', ",".join(subs), a.gate or '', now(),
-               model, effort, (a.archetype or None), init_status, gate_type))
+               model, effort, (a.archetype or None), init_status, gate_type,
+               creator if explicit else None, hold_by, hold_expires))
     if needs_val is not None:
         c.execute("UPDATE tasks SET needs=? WHERE id=last_insert_rowid()", (needs_val.strip(),))
     if force_unmapped:
@@ -1713,12 +1736,17 @@ def cmd_add(a):
     deliverable = (getattr(a, "deliverable", None) or "").strip()
     if deliverable:
         c.execute("UPDATE tasks SET deliverable=? WHERE id=last_insert_rowid()", (deliverable,))
-    c.commit(); print(f"added task {c.execute('SELECT last_insert_rowid()').fetchone()[0]} [{a.lane}]"
+    tid = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    c.commit(); print(f"added task {tid} [{a.lane}]"
                       + (f" status={init_status}" if frank_gated else "")
                       + (f" subsystems={','.join(subs)}" if subs else "")
                       + (f" gate={a.gate}" if a.gate else "")
                       + (f" deliverable={deliverable}" if deliverable else "")
                       + (f" model={model}@{effort or '-'}" if model else "")); c.close()
+    if claim:
+        # If the claim is refused (deps unmet, subsystem held) the hold stays until it expires,
+        # which is the wq#1461 intent marker: the dispatcher still skips the ticket.
+        cmd_claim(argparse.Namespace(agent=creator, by=None, lane="auto", ttl=a.ttl, id=tid))
 def cmd_claim(a):
     if a.lane == 'user':
         print("REFUSED: 'user' lane is Frank-only — never agent-claimable"); sys.exit(1)
@@ -2642,10 +2670,12 @@ def _finish(a, new_status):
                         f"hold_expires=NULL{clr} WHERE id=?{fcl}",
                         [now(), getattr(a,'notes','') or '', a.id] + fpar)
     elif new_status == 'open':
+        # wq#4659: released_at is the explicit hand-off that lifts the dispatcher's orch-filed
+        # grace window (foreman gates.OrchFresh) before ORCH_GRACE_MIN runs out.
         cur = c.execute(f"UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
                         f"lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, "
-                        f"hold_by=NULL, hold_expires=NULL"
-                        f"{clr} WHERE id=?{fcl}", [a.id] + fpar)
+                        f"hold_by=NULL, hold_expires=NULL, released_at=?"
+                        f"{clr} WHERE id=?{fcl}", [now(), a.id] + fpar)
     elif new_status == 'blocked':
         # wq#741: block_reason/blocked_at are the structural home for this — notes keeps
         # getting the same string too, so `wq show`/`wq list` need no changes.
@@ -4003,7 +4033,7 @@ def _pri(v):
     v=str(v).strip()
     if v[:1] in ("p","P"): v=v[1:]
     return int(v)
-s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=_pri,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_add)
+s=sub.add_parser("add"); s.add_argument("--lane",default="auto"); s.add_argument("--pri",type=_pri,default=2); s.add_argument("--title",required=True); s.add_argument("--detail"); s.add_argument("--deliverable",default=None,metavar="PATH",help="wq#1673: the file this ticket must produce — `done` refuses unless it is on main"); s.add_argument("--deps"); s.add_argument("--subsystems"); s.add_argument("--gate"); s.add_argument("--model",help="wq#617: dispatch model id (claude-sonnet-5 ...)"); s.add_argument("--effort",help="wq#617: low|medium|high|xhigh|max"); s.add_argument("--archetype",help="wq#617: routing archetype (FOREMAN_RESEARCH §15)"); s.add_argument("--gate-type",dest="gate_type",default=None,help="wq#662: gate_type=frank_decision marks Frank-decision gate tickets"); s.add_argument("--frank-gated",dest="frank_gated",action="store_true",help="wq#662: add ticket in frank_gated status (implies --gate-type frank_decision)"); s.add_argument("--needs",help="wq#1331: capability tags, e.g. 'repo(/home/lumen/questfree), dir(/home/lumen/kb)' (closed §2.3 set; needs the wq1331 migration)"); s.add_argument("--force",action="store_true"); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.add_argument("--claim",action="store_true",help="wq#4659: claim the new ticket for the caller (WQ_AGENT or --by) — the hold is written in the same INSERT, so the dispatcher never sees it unclaimed. Use whenever you will build the ticket yourself"); s.add_argument("--by",dest="by",default=None,help="wq#4659: caller identity for --claim and created_by (default WQ_AGENT)"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="wq#4659: --claim lease/hold minutes"); s.set_defaults(f=cmd_add)
 s=sub.add_parser("claim"); s.add_argument("agent",nargs="?"); s.add_argument("--by",dest="by",default=None,help="alias for positional agent"); s.add_argument("--lane",default="auto"); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="lease minutes"); s.add_argument("--id",type=int,default=None,help="claim THIS ticket id — every guard applies, none relaxed, no --force (wq#582)"); s.set_defaults(f=cmd_claim)
 s=sub.add_parser("whoami",help="show identity / --register <name> to mint a session id"); s.add_argument("--register",metavar="BASE_NAME"); s.add_argument("--release",action="store_true",help="deregister this session (clean exit) — frees its base name immediately"); s.add_argument("--agent",default=None); s.add_argument("--force",action="store_true"); s.add_argument("--eval",action="store_true",help="wq#1720: with --register, print ONLY 'export WQ_AGENT=...' on stdout (everything else to stderr) — for eval \"$(wq whoami --register <name> --eval)\""); s.set_defaults(f=cmd_whoami)
 s=sub.add_parser("concurrency",help="wq#594: report one session id being driven from two places"); s.set_defaults(f=cmd_concurrency)
