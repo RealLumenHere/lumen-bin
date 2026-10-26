@@ -193,12 +193,97 @@ def test_dead_verifier_needs_the_port_to_be_closed(m, monkeypatch):
 
 def test_litellm_sk_family_can_raise_live_but_never_revoked(m, monkeypatch):
     sk = "sk-" + "e" * 30
+    monkeypatch.setattr(m, "litellm_keyinfo_known", lambda v: False)   # unidentified origin, see wq#4653 tests below
     monkeypatch.setitem(m.PROBES, "litellm-sk", lambda ctx, v: "live" if v in (CUR, sk) else "revoked")
     put(m.h / "agent" / ".env", "LITELLM_MASTER_KEY=%s\n" % CUR)
     p = put(m.h / ".secrets" / "x.py.bak.20200101_000000", 'K = "%s"\n' % sk)
     assert run(m, p)["verdict"] == "ORPHAN_LIVE"
     monkeypatch.setitem(m.PROBES, "litellm-sk", lambda ctx, v: "live" if v == CUR else "revoked")
     assert run(m, p)["verdict"] == "HOLD"      # rejected here proves nothing: it may belong to another provider
+
+
+def test_cfuser_probe_reads_json_success_field_not_status_code(m, monkeypatch):
+    """wq#4653: Cloudflare's /user/tokens/verify answers a non-401 status for a garbage token too (seen live:
+    HTTP 400 with success:false, code 1000) -- only the body's `success` field may decide live vs revoked."""
+    def fake_http_full(url, headers, timeout=6):
+        token = headers["Authorization"].split()[1]
+        if token == CUR:
+            return 200, b'{"success":true,"result":{"id":"x"}}'
+        return 400, b'{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}'
+    monkeypatch.setattr(m, "_http_full", fake_http_full)
+    ctx = {"base": "https://api.cloudflare.com/client/v4/user/tokens/verify"}
+    assert m.PROBES["cfuser"](ctx, CUR) == "live"
+    assert m.PROBES["cfuser"](ctx, OLD) == "revoked"
+
+
+def test_cfat_prefix_routes_to_cfuser_with_mailbot_token_as_control(m, monkeypatch):
+    """wq#4653: cfat_ (API token) must route to the same family as cfut_ (user token); the mailbot deploy
+    token (no cfut_/cfat_ prefix) is the only live CF credential on record and must serve as its control."""
+    monkeypatch.setitem(m.PROBES, "cfuser", lambda ctx, v: "live" if v == CUR else "revoked")
+    (m.h / "mailbot").mkdir()
+    put(m.h / "mailbot" / ".cf_deploy_token", CUR + "\n")
+    p = put(m.h / ".secrets" / "cf-worker.token.bak.20200101_000000", "cfat_" + "x" * 25)
+    r = run(m, p)
+    assert kinds(r) == ["REVOKED"] and r["verdict"] == "ELIGIBLE"
+
+
+def test_gemini_api_key_family_live_and_revoked(m, monkeypatch):
+    monkeypatch.setitem(m.PROBES, "gemini", lambda ctx, v: "live" if v == CUR else "revoked")
+    p = mk(m, "GEMINI_API_KEY=%s\n" % OLD, live_text="GEMINI_API_KEY=%s\n" % CUR)
+    assert kinds(run(m, p)) == ["REVOKED"] and run(m, p)["verdict"] == "ELIGIBLE"
+
+
+def test_gemini_accept_everything_probe_cannot_prove_anything(m, monkeypatch):
+    """A probe that accepts EVERYTHING fails its own negative control (a random value must be rejected to
+    be trusted), so it must not be able to call anything LIVE or REVOKED -- stays HOLD."""
+    monkeypatch.setitem(m.PROBES, "gemini", lambda ctx, v: "live")
+    p = mk(m, "GEMINI_API_KEY=%s\n" % OLD, live_text="GEMINI_API_KEY=%s\n" % CUR)
+    assert run(m, p)["verdict"] == "HOLD"
+
+
+def test_mcpw_pool_health_family(m, monkeypatch):
+    monkeypatch.setitem(m.PROBES, "mcpw", lambda ctx, v: "live" if v == CUR else "revoked")
+    put(m.h / ".secrets" / "mcpw-pool-health.env", "MCPW_POOL_HEALTH_SECRET=%s\n" % CUR)
+    p = mk(m, "MCPW_POOL_HEALTH_SECRET=%s\n" % OLD)
+    assert kinds(run(m, p)) == ["REVOKED"] and run(m, p)["verdict"] == "ELIGIBLE"
+
+
+def test_mongo_backup_password_follows_retired_container(m, monkeypatch):
+    monkeypatch.setattr(m, "mongo_dead", lambda: True)
+    p = mk(m, "MONGO_BACKUP_PASSWORD=%s\n" % OLD)
+    assert kinds(run(m, p)) == ["DEAD_SERVICE"]
+    m._MONGO.clear(); monkeypatch.setattr(m, "mongo_dead", lambda: False)
+    assert run(m, p)["verdict"] == "HOLD"
+
+
+def test_mongo_json_url_credential_follows_retired_container(m, monkeypatch):
+    """wq#4653: a JSON config backup holding a mongodb:// connection string must route through the same
+    retired-container check as MONGO_BACKUP_PASSWORD, by connection scheme rather than key name."""
+    monkeypatch.setattr(m, "mongo_dead", lambda: True)
+    p = put(m.h / ".secrets" / "app-config.json.bak.20200101_000000",
+            '{"uri": "mongodb://dbuser:%s@10.0.0.5:27017/admin"}' % OLD)
+    assert kinds(run(m, p)) == ["DEAD_SERVICE"]
+
+
+def test_litellm_sk_keyinfo_upgrades_a_dead_litellm_key_to_revoked(m, monkeypatch):
+    """wq#4653: LiteLLM's /v1/models rejecting an sk- literal cannot alone prove it dead (litellm-sk,
+    LIVE_ONLY) -- but if /key/info says the key IS known to litellm's VerificationTokenTable, rejection
+    means a dead litellm key, not an unidentified foreign one."""
+    sk = "sk-" + "e" * 30
+    monkeypatch.setitem(m.PROBES, "litellm-sk", lambda ctx, v: "live" if v == CUR else "revoked")
+    monkeypatch.setattr(m, "litellm_keyinfo_known", lambda v: True)
+    put(m.h / "agent" / ".env", "LITELLM_MASTER_KEY=%s\n" % CUR)
+    p = put(m.h / ".secrets" / "x.py.bak.20200101_000000", 'K = "%s"\n' % sk)
+    assert kinds(run(m, p)) == ["REVOKED"]
+
+
+def test_litellm_sk_keyinfo_leaves_a_foreign_key_unproven(m, monkeypatch):
+    sk = "sk-" + "e" * 30
+    monkeypatch.setitem(m.PROBES, "litellm-sk", lambda ctx, v: "live" if v == CUR else "revoked")
+    monkeypatch.setattr(m, "litellm_keyinfo_known", lambda v: False)
+    put(m.h / "agent" / ".env", "LITELLM_MASTER_KEY=%s\n" % CUR)
+    p = put(m.h / ".secrets" / "y.py.bak.20200101_000000", 'K = "%s"\n' % sk)
+    assert run(m, p)["verdict"] == "HOLD"
 
 
 def test_cli_smoke_on_empty_home(tmp_path):
