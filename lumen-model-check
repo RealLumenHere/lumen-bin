@@ -21,7 +21,25 @@ if [ -z "$GW" ]; then /home/lumen/bin/ntfy-send -p high "model-check: LiteLLM ga
 CLI=$(grep -oE '(id|alias): +[a-z0-9._-]+' /home/lumen/foreman/research/models.yaml 2>/dev/null | awk '{print $2}' | sort -u)
 VALID=$(printf '%s\n%s\n' "$GW" "$CLI" | sort -u)
 declare -A CFG
-while read -r m; do [ -n "$m" ] && CFG["$m"]="LPP brain-env"; done < <(grep -hoE 'LPP_BRAIN[A-Z_]*=[a-z0-9._-]+' /etc/systemd/system/lumen-pokemon-live.service.d/*.conf 2>/dev/null | cut -d= -f2 | sort -u)
+# CLASS (2026-10-26): a config source is only a defect if something LIVE consumes it.
+# LPP (lumen-pokemon-live) was decommissioned (masked, wq#1053/wq#2218) but its brain-env
+# drop-ins stayed on disk as the revive config; when cerebras left the gateway (10-19) this
+# check paged "model config drift" every 15 min for 7 days (658 pages) over a model nothing
+# runs. unit_live: active OR enabled-ish. masked/not-found/disabled AND inactive => skip.
+unit_live() {  # $1 = unit name; rc0 = something can still consume its config
+  local en act
+  en=$(systemctl is-enabled "$1" 2>/dev/null || true)
+  act=$(systemctl is-active "$1" 2>/dev/null || true)
+  [ "$act" = active ] && return 0
+  case "$en" in masked|masked-runtime|not-found|disabled|"") return 1 ;; esac
+  return 0
+}
+LPP_UNIT=lumen-pokemon-live.service
+if unit_live "$LPP_UNIT"; then
+  while read -r m; do [ -n "$m" ] && CFG["$m"]="LPP brain-env"; done < <(grep -hoE 'LPP_BRAIN[A-Z_]*=[a-z0-9._-]+' /etc/systemd/system/${LPP_UNIT}.d/*.conf 2>/dev/null | cut -d= -f2 | sort -u)
+else
+  echo "skip LPP brain-env: $LPP_UNIT is $(systemctl is-enabled "$LPP_UNIT" 2>/dev/null)/$(systemctl is-active "$LPP_UNIT" 2>/dev/null), nothing consumes it"
+fi
 while read -r m; do [ -n "$m" ] && CFG["$m"]="wq active ticket"; done < <(sqlite3 /home/lumen/agents/work-queue/queue.db "select distinct model from tasks where status in ('open','claimed') and model is not null and model != '';" 2>/dev/null)
 BAD=""
 for m in "${!CFG[@]}"; do printf '%s\n' "$VALID" | grep -qx "$m" || BAD="${BAD} ${m}(${CFG[$m]})"; done
