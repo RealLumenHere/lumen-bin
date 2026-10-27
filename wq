@@ -2981,6 +2981,51 @@ def _file_or_reuse_root_apply_followup(lane, ticket_id, bundle_name, install_pat
     except sqlite3.Error:
         return None
 
+def _unmerged_followup_title(slug, num):
+    return f"[ops] land or close unmerged PR {slug}#{num} left open by a --unmerged close"
+
+def _file_or_reuse_unmerged_followups(lane, ticket_id, pr_match, reason):
+    """wq#4720: `done --unmerged` is an on-the-record override of the wq#899 merge-state
+    gate (research/TICKET_CLOSURE_AUDIT.md:72), but the [UNMERGED-PR] stamp it writes had
+    no consumer — nothing ever asked whether the PR later landed, so the debt sat until an
+    unrelated verify-pass tripped over it (wq#4654 closed --unmerged on PR #2473 2026-10-26;
+    wq#4657 found the still-open PR a day later). Mirror of
+    _file_or_reuse_root_apply_followup: file-or-reuse a reconciliation follow-up so the
+    override records a debt WITH an owner. Dedup is on the normalized title, which carries
+    the PR identity and not the closing ticket id, so repeated --unmerged closes over the
+    same PR collapse onto one ticket. Returns the wq#N ids filed/reused (empty on filing
+    trouble) for the [UNMERGED-FOLLOWUP: ...] stamp. Never blocks the close it is a side
+    effect of — the override is honored either way."""
+    host, owner, repo, num = (pr_match.group(1), pr_match.group(2),
+                              pr_match.group(3), pr_match.group(4))
+    slug = f"{owner}/{repo}"
+    forge = "github" if host.lower().endswith("github.com") else "gitea"
+    title = _unmerged_followup_title(slug, num)
+    try:
+        c = conn()
+        try:
+            nt = norm_title(title)
+            for rid, rtitle in c.execute(
+                    "SELECT id, title FROM tasks WHERE status!='done'").fetchall():
+                if norm_title(rtitle) == nt:
+                    return [rid]
+            detail = (f"wq#{ticket_id} closed `done --unmerged` over {pr_match.group(0)} "
+                      f"(reason on the record: {reason}). The PR had not landed at close "
+                      f"time. Collect the debt: land the PR if the work is real and belongs "
+                      f"on main, or close it on the forge with a comment saying where the "
+                      f"work actually lives (stale reference). Filed at the gate (wq#4720) — "
+                      f"the [UNMERGED-PR] stamp alone had no consumer.\n"
+                      f"Liveness: pr_merged({slug}, {num}, closed, {forge})")
+            c.execute("INSERT INTO tasks(lane,pri,title,detail,deps,subsystems,gate,created_at,"
+                      "status) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (lane, 2, title, detail, '', '', '', now(), 'open'))
+            c.commit()
+            return [c.execute("SELECT last_insert_rowid()").fetchone()[0]]
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return []
+
 _OPS_BUNDLE_REF_RE = re.compile(r"ops/(wq\d+[\w.-]*)(?:/install\.sh)?\b")
 
 def _ops_bundles_from_text(text):
@@ -3267,6 +3312,21 @@ def cmd_done(a):
             if unmerged:
                 a.notes = (a.notes + (" " if a.notes else "") +
                            f"[UNMERGED-PR: {unmerged}]").strip()
+                # wq#4720: the stamp alone was a debt nobody collected — the one-shot
+                # pr_recon (wq#899) had no timer, so wq#4654's open PR sat until a verify
+                # ticket tripped over it. File the landing follow-up at the gate, same
+                # shape as [ROOT-APPLY-FILED]. Skipped when the PR in fact landed
+                # (squash/cherry-pick: --unmerged given but there is no debt).
+                if verdict in ("open", "unknown") and _pm:
+                    _followups4720 = _file_or_reuse_unmerged_followups(
+                        _lane_row[0] if _lane_row else "build", a.id, _pm, unmerged)
+                    if _followups4720:
+                        a.notes = _stamp(a.notes, "[UNMERGED-FOLLOWUP: " +
+                                         ", ".join(f"wq#{f}" for f in
+                                                   sorted(set(_followups4720))) + "]")
+                        print(f"note: wq#4720 — filed/reused landing follow-up "
+                              f"{', '.join(f'wq#{f}' for f in sorted(set(_followups4720)))} "
+                              f"for the still-open PR.")
             elif verdict == "unknown":
                 # wq#1702 (audit F1 P0): fail open, but never silently — the stamp is what
                 # closure-quality and the next audit count, the aq row is what Frank sees.

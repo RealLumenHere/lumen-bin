@@ -77,7 +77,10 @@ def test_done_against_a_known_open_pr_refuses_rc3(tmp_path):
         f"expected rc=3 (wq#899 gate refuses an open PR), got {result.returncode}: "
         f"{result.stdout}{result.stderr}")
     assert "wq#899" in result.stdout + result.stderr
-    assert "still OPEN" in result.stdout + result.stderr or "not on" in result.stdout + result.stderr
+    # wq#4720: PR #92 was closed-without-merging on the forge after this fixture was
+    # pinned; the gate still refuses it rc=3, with the CLOSED-without-merging detail.
+    out = result.stdout + result.stderr
+    assert ("still OPEN" in out or "not on" in out or "CLOSED without merging" in out)
 
 
 @pytest.mark.skipif(not _have_token(), reason="no github token file on this box")
@@ -94,3 +97,47 @@ def test_done_against_a_known_open_pr_accepts_with_unmerged_flag(tmp_path):
 
     show = wq(env, "show", str(ticket_id), "--json")
     assert "[UNMERGED-PR: test: intentionally closing over an open PR]" in show.stdout
+    # wq#4720: the override must also record the debt with an owner, not just a stamp.
+    import re
+    m = re.search(r"\[UNMERGED-FOLLOWUP: wq#(\d+)\]", show.stdout)
+    assert m, f"no [UNMERGED-FOLLOWUP] stamp on wq#{ticket_id}: {show.stdout}"
+    fshow = wq(env, "show", m.group(1), "--json")
+    # a github.com PR must get the github forge in its machine-closeable liveness line
+    assert "pr_merged(frankstupak/lumen-plays-pokemon, 92, closed, github)" in fshow.stdout
+
+
+# wq#4720: offline by design — an unreachable forge resolves 'unknown', and the follow-up
+# must file for any non-landed verdict, so this covers the gate without token or network.
+UNREACHABLE_PR = "http://127.0.0.1:1/lumen/some-repo/pulls/77"
+
+
+def _done_unmerged(env, title):
+    ticket_id = wq_add(env, title)
+    claim = wq(env, "claim", "--id", str(ticket_id))
+    assert claim.returncode == 0, claim.stdout + claim.stderr
+    result = wq(env, "done", str(ticket_id), "--notes", f"PR {UNREACHABLE_PR} -- open",
+                "--unmerged", "test: closing over an open PR")
+    assert result.returncode == 0, result.stdout + result.stderr
+    return ticket_id
+
+
+def test_unmerged_close_files_a_landing_followup(tmp_path):
+    import re
+    env = make_env(tmp_path)
+    t1 = _done_unmerged(env, "wq4720 self-test: unmerged close files follow-up")
+    show = wq(env, "show", str(t1), "--json")
+    assert "[UNMERGED-PR: test: closing over an open PR]" in show.stdout
+    m = re.search(r"\[UNMERGED-FOLLOWUP: wq#(\d+)\]", show.stdout)
+    assert m, f"no [UNMERGED-FOLLOWUP] stamp on wq#{t1}: {show.stdout}"
+    fid = int(m.group(1))
+
+    fshow = wq(env, "show", str(fid), "--json")
+    assert fshow.returncode == 0, fshow.stdout + fshow.stderr
+    assert "land or close unmerged PR lumen/some-repo#77" in fshow.stdout
+    # machine-closeable the moment the PR merges or is closed (harness/liveness.py)
+    assert "pr_merged(lumen/some-repo, 77, closed, gitea)" in fshow.stdout
+
+    # dedup: a second --unmerged close over the SAME still-open PR reuses the ticket
+    t2 = _done_unmerged(env, "wq4720 self-test: unmerged close dedups follow-up")
+    show2 = wq(env, "show", str(t2), "--json")
+    assert f"[UNMERGED-FOLLOWUP: wq#{fid}]" in show2.stdout
