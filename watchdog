@@ -17,6 +17,11 @@
 #                          Also the default label for all /tmp/watchdog-<label>.* files.
 #   -a, --artifact PATH    success when PATH exists, is non-empty and its size is stable
 #                          for --stable consecutive polls (an ISO exists before it is finished).
+#       --require-exit     with -a: artifact stability alone is not OK. Wait for the producer
+#                          to actually exit (up to --timeout); OK needs artifact AND exit 0,
+#                          a stable artifact followed by a nonzero exit is FAIL. Default build-job
+#                          flag (wq#4711) — plain -a can report OK while a post-artifact stage
+#                          (e.g. an installer gate run after xorriso) is still running and fails.
 #   -m, --marker REGEX     success when the command's output log matches REGEX (grep -E).
 #   -t, --timeout MIN      minutes before the command is killed (default 60; decimals ok).
 #   -p, --poll SEC         poll interval (default 30; min 1).
@@ -52,7 +57,7 @@
 set -u
 
 SESSION=""; ARTIFACT=""; MARKER=""; TIMEOUT_MIN=60; POLL=30; STABLE=2; CWD=""
-LABEL=""; NTFY_TOPIC=""; CALLBACK=""; SEND=1; TAILN=50; FG=0
+LABEL=""; NTFY_TOPIC=""; CALLBACK=""; SEND=1; TAILN=50; FG=0; REQUIRE_EXIT=0
 ORIG_ARGS=("$@")
 
 die() { echo "watchdog: $*" >&2; exit 3; }
@@ -66,6 +71,7 @@ while [ $# -gt 0 ]; do
     -t|--timeout)  TIMEOUT_MIN=$2; shift 2 ;;
     -p|--poll)     POLL=$2; shift 2 ;;
     --stable)      STABLE=$2; shift 2 ;;
+    --require-exit) REQUIRE_EXIT=1; shift ;;
     --cwd)         CWD=$2; shift 2 ;;
     --label)       LABEL=$2; shift 2 ;;
     --ntfy)        NTFY_TOPIC=$2; shift 2 ;;
@@ -87,6 +93,7 @@ LABEL=${LABEL//[^A-Za-z0-9._-]/_}
 [[ "$STABLE" =~ ^[0-9]+$ ]] && [ "$STABLE" -ge 1 ] || die "--stable must be an integer ≥1"
 TIMEOUT_S=$(awk -v m="$TIMEOUT_MIN" 'BEGIN{ if (m+0<=0) exit 1; printf "%d", m*60 }') || die "--timeout must be a positive number of minutes"
 [ -z "$CWD" ] || [ -d "$CWD" ] || die "--cwd $CWD is not a directory"
+[ "$REQUIRE_EXIT" -eq 0 ] || [ -n "$ARTIFACT" ] || die "--require-exit requires -a/--artifact"
 if [ -n "$ARTIFACT" ] && [ -e "$ARTIFACT" ]; then die "artifact $ARTIFACT already exists — remove it or pick another path, or the first poll will report success"; fi
 
 LOG=/tmp/watchdog-$LABEL.log
@@ -116,7 +123,7 @@ fi
 # ---- foreground supervisor --------------------------------------------------------------
 echo $$ >"$PIDF"
 START=$(date +%s)
-log "start cmd=[$CMD_STR] artifact=[${ARTIFACT:-}] marker=[${MARKER:-}] timeout=${TIMEOUT_S}s poll=${POLL}s stable=$STABLE cwd=[${CWD:-$PWD}]"
+log "start cmd=[$CMD_STR] artifact=[${ARTIFACT:-}] marker=[${MARKER:-}] timeout=${TIMEOUT_S}s poll=${POLL}s stable=$STABLE require_exit=$REQUIRE_EXIT cwd=[${CWD:-$PWD}]"
 rm -f "$RCF"; : >"$OUT"
 
 # The command runs in ITS OWN session/process group so that a timeout can kill the whole
@@ -158,18 +165,25 @@ while :; do
       last_size=$sz
       log "artifact present size=$sz stable=$stable_n/$STABLE"
       if [ "$stable_n" -ge "$STABLE" ]; then
-        if alive; then
-          # give the producer a moment to exit on its own, then report regardless
-          for _ in 1 2 3 4 5 6; do [ -s "$RCF" ] && break; sleep 5; done
-        fi
-        if [ -s "$RCF" ]; then RC=$(tr -dc '0-9' <"$RCF"); else RC=""; fi
-        if [ -n "$RC" ] && [ "$RC" -ne 0 ]; then
-          STATUS=FAIL; NOTE="artifact appeared but command exited $RC"
+        if [ "$REQUIRE_EXIT" -eq 1 ]; then
+          # --require-exit: stability is not a verdict by itself. Keep polling; branch 1
+          # (RCF written) is the only path to OK/FAIL, so a producer that is still running
+          # after the artifact stabilizes is neither OK nor FAIL yet (wq#4711).
+          log "artifact stable but --require-exit set — waiting for producer exit (pid=$CHILD)"
         else
-          if [ -n "$RC" ]; then tailnote=", exit $RC"; else tailnote=", producer still running pid=$CHILD"; fi
-          STATUS=OK; NOTE="artifact ready ($sz bytes) after ${elapsed}s$tailnote"
+          if alive; then
+            # give the producer a moment to exit on its own, then report regardless
+            for _ in 1 2 3 4 5 6; do [ -s "$RCF" ] && break; sleep 5; done
+          fi
+          if [ -s "$RCF" ]; then RC=$(tr -dc '0-9' <"$RCF"); else RC=""; fi
+          if [ -n "$RC" ] && [ "$RC" -ne 0 ]; then
+            STATUS=FAIL; NOTE="artifact appeared but command exited $RC"
+          else
+            if [ -n "$RC" ]; then tailnote=", exit $RC"; else tailnote=", producer still running pid=$CHILD"; fi
+            STATUS=OK; NOTE="artifact ready ($sz bytes) after ${elapsed}s$tailnote"
+          fi
+          break
         fi
-        break
       fi
     fi
   fi
