@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""research-prompt-adapter — file each *.txt in scratch/research_prompts as a wq research ticket.
+
+wq#4677. The research-prompt-queue inbox had no consumer since 2026-07 (its drain engine is a
+dormant direct-provider script). This adapter makes the advertised contract true again by
+turning every prompt into the thing the fleet DOES drain: a `wq add --lane research` ticket.
+
+Idempotent by construction (three layers, see design/research_prompt_adapter.md §3):
+  1. a name already present as queued/*_<name>.txt is never re-filed;
+  2. a content sha256 already in the ledger is never re-filed (file joins its ticket);
+  3. wq's own DUPLICATE-title refusal is parsed and treated like (2).
+No provider calls: the only side effects are `wq add` and file moves. Stdlib only.
+
+Exit codes: 0 ran (one `summary:` line), 2 could not run (inbox missing / state unwritable).
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+INBOX_DEFAULT = Path(os.environ.get("RPA_INBOX", "/home/lumen/scratch/research_prompts"))
+STATE_DEFAULT = Path(os.environ.get("RPA_STATE", "/home/lumen/logs/.research-prompt-adapter.state.json"))
+WQ_DEFAULT = os.environ.get("RPA_WQ", "/home/lumen/bin/wq")
+RESEARCH_OUT = "/home/lumen/scratch/research"
+MAX_INLINE = 8192          # bytes; bodies above this send a head + the path (ticket rule)
+HEAD_CHARS = 2000
+MAX_AGE_DAYS = 30
+MAX_PER_RUN = 10
+TITLE_MAX = 120
+
+ADDED_RE = re.compile(r"added task (\d+)")
+DUP_RE = re.compile(r"DUPLICATE\s*[—-]+\s*task (\d+)")
+LABEL_RE = re.compile(r"^\s*(RESEARCH PROMPT|DELIVERABLE|PROMPT|TITLE|RESEARCH)\s*:\s*", re.I)
+
+
+def log(msg):
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%SZ')}] {msg}", flush=True)
+
+
+def normalise(body: str) -> str:
+    return "\n".join(line.rstrip() for line in body.replace("\r\n", "\n").split("\n")).strip()
+
+
+def sha(body: str) -> str:
+    return hashlib.sha256(normalise(body).encode("utf-8")).hexdigest()
+
+
+def clean_title(s: str) -> str:
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s[:TITLE_MAX].rstrip(" -–—:")
+
+
+def derive_title(body: str, stem: str) -> str:
+    lines = [l for l in body.split("\n") if l.strip()]
+    # 1. an explicit Title: line in the first 20 lines (lumen_intel shape; line 1 is boilerplate)
+    for l in lines[:20]:
+        m = re.match(r"^\s*Title\s*:\s*(.+)$", l, re.I)
+        if m and m.group(1).strip():
+            return clean_title(m.group(1))
+    # 2. first non-empty line, label stripped. A DELIVERABLE: line is a path, not a subject —
+    #    the path stays in the detail; fall through to the next line for the subject.
+    for l in lines[:5]:
+        if re.match(r"^\s*DELIVERABLE\s*:", l, re.I):
+            continue
+        t = clean_title(LABEL_RE.sub("", l))
+        if len(t) >= 8:
+            return t
+    # 3. filename
+    return clean_title(stem.replace("_", " ").replace("-", " "))
+
+
+def safe_stem(name: str) -> str:
+    stem = Path(name).stem
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem)[:80] or "prompt"
+
+
+def build_detail(body: str, path: Path, nbytes: int, max_inline: int) -> str:
+    cited = (f"\n\nSOURCE FILE: {path} (moves to {path.parent}/queued/<wq-id>_{path.name} once filed)"
+             f"\nFiled by research-prompt-adapter (wq#4677).")
+    if nbytes <= max_inline:
+        return body.rstrip() + cited
+    head = body[:HEAD_CHARS].rstrip()
+    return (f"{head}\n\n[... FULL PROMPT ({nbytes} bytes, >{max_inline}B) NOT inlined — read it from the "
+            f"SOURCE FILE path below ...]" + cited)
+
+
+def load_state(path: Path) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            st = json.load(fh)
+        if isinstance(st, dict) and isinstance(st.get("by_sha"), dict):
+            return st
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # corrupt ledger: start fresh, layers 1+3 still protect
+        log(f"WARN ledger unreadable ({e}); starting a new one")
+    return {"version": 1, "by_sha": {}}
+
+
+def save_state(path: Path, st: dict):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def move(src: Path, dst_dir: Path, new_name: str, dry: bool) -> Path:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / new_name
+    if dst.exists():  # never clobber: suffix with a timestamp
+        dst = dst_dir / f"{int(time.time())}_{new_name}"
+    if not dry:
+        os.replace(src, dst)
+    return dst
+
+
+def run_wq(wq: str, title: str, detail: str, liveness: str, dry: bool):
+    """Return (wq_id, status) where status in {'added','duplicate','failed'}."""
+    cmd = [wq, "add", "--lane", "research", "--pri", "3", "--by", "research-prompt-adapter",
+           "--title", title, "--detail", detail, "--liveness", liveness]
+    if dry:
+        return None, "dry-run"
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        log(f"  wq exec failed: {e}")
+        return None, "failed"
+    out = (p.stdout or "") + (p.stderr or "")
+    m = ADDED_RE.search(out)
+    if p.returncode == 0 and m:
+        return int(m.group(1)), "added"
+    m = DUP_RE.search(out)
+    if m:
+        return int(m.group(1)), "duplicate"
+    log("  wq add refused: " + " | ".join(l for l in out.strip().splitlines()[:4]))
+    return None, "failed"
+
+
+def process(inbox: Path, state_path: Path, wq: str, dry: bool, max_age_days: int,
+            max_per_run: int, max_inline: int) -> int:
+    queued = inbox / "queued"
+    expired = inbox / "expired"
+    st = load_state(state_path)
+    by_sha = st["by_sha"]
+    counts = dict(filed=0, dup=0, expired=0, failed=0, deferred=0)
+    now = time.time()
+    files = sorted(p for p in inbox.glob("*.txt") if p.is_file())
+    for p in files:
+        name = p.name
+        stem = safe_stem(name)
+        # layer 1: name already queued
+        if queued.is_dir() and any(queued.glob(f"*_{name}")):
+            dst = move(p, expired, f"dup-name_{name}", dry)
+            log(f"dup-name {name} -> {dst}")
+            counts["dup"] += 1
+            continue
+        try:
+            raw = p.read_bytes()
+        except Exception as e:
+            log(f"unreadable {name}: {e}")
+            counts["failed"] += 1
+            continue
+        if not raw.strip():
+            dst = move(p, expired, f"empty_{name}", dry)
+            log(f"empty {name} -> {dst}")
+            counts["expired"] += 1
+            continue
+        age_days = (now - p.stat().st_mtime) / 86400.0
+        if max_age_days > 0 and age_days > max_age_days:
+            dst = move(p, expired, f"stale_{name}", dry)
+            log(f"stale ({age_days:.0f}d) {name} -> {dst}")
+            counts["expired"] += 1
+            continue
+        body = raw.decode("utf-8", errors="replace")
+        key = sha(body)
+        # layer 2: same body already filed
+        if key in by_sha:
+            wid = by_sha[key].get("wq_id")
+            dst = move(p, queued, f"{wid}_{name}", dry)
+            log(f"dup-body {name} == wq#{wid} -> {dst}")
+            counts["dup"] += 1
+            continue
+        if counts["filed"] >= max_per_run:
+            counts["deferred"] += 1
+            continue
+        title = "RESEARCH: " + derive_title(body, stem)
+        detail = build_detail(body, p, len(raw), max_inline)
+        liveness = f"test -f {RESEARCH_OUT}/{stem}.md"
+        wid, status = run_wq(wq, title, detail, liveness, dry)
+        if status == "dry-run":
+            log(f"DRY would file {name}: {title!r} ({len(raw)}B, inline={len(raw) <= max_inline})")
+            counts["filed"] += 1
+            continue
+        if status == "failed":
+            counts["failed"] += 1
+            continue
+        # layer 3 ('duplicate') joins the existing ticket exactly like 'added'
+        by_sha[key] = {"wq_id": wid, "name": name, "filed_at": datetime.now(timezone.utc).isoformat(),
+                       "via": status}
+        save_state(state_path, st)
+        dst = move(p, queued, f"{wid}_{name}", dry)
+        log(f"{status} {name} -> wq#{wid} {title!r} -> {dst}")
+        counts["filed" if status == "added" else "dup"] += 1
+    log("summary: " + " ".join(f"{k}={v}" for k, v in counts.items()) + f" inbox={inbox}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--inbox", type=Path, default=INBOX_DEFAULT)
+    ap.add_argument("--state", type=Path, default=STATE_DEFAULT)
+    ap.add_argument("--wq", default=WQ_DEFAULT, help="wq binary (RPA_WQ)")
+    ap.add_argument("--dry-run", action="store_true", help="print what would be filed; no wq add, no moves")
+    ap.add_argument("--max-age-days", type=int, default=MAX_AGE_DAYS, help="older prompts go to expired/ (0 = never)")
+    ap.add_argument("--max-per-run", type=int, default=MAX_PER_RUN)
+    ap.add_argument("--max-inline-bytes", type=int, default=MAX_INLINE)
+    a = ap.parse_args(argv)
+    if not a.inbox.is_dir():
+        log(f"ERROR inbox missing: {a.inbox}")
+        return 2
+    try:
+        a.state.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(str(a.state) + ".lock", "a+")
+    except Exception as e:
+        log(f"ERROR state dir unusable: {e}")
+        return 2
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("summary: locked (another run active) — nothing touched")
+        return 0
+    try:
+        return process(a.inbox, a.state, a.wq, a.dry_run, a.max_age_days, a.max_per_run, a.max_inline_bytes)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
