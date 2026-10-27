@@ -29,6 +29,11 @@ INBOX_DEFAULT = Path(os.environ.get("RPA_INBOX", "/home/lumen/scratch/research_p
 STATE_DEFAULT = Path(os.environ.get("RPA_STATE", "/home/lumen/logs/.research-prompt-adapter.state.json"))
 WQ_DEFAULT = os.environ.get("RPA_WQ", "/home/lumen/bin/wq")
 RESEARCH_OUT = "/home/lumen/scratch/research"
+# wq#4690 lesson: an fworker lands its deliverable by PR into foreman/research/<name> (its sandbox
+# cannot write scratch/). The probe accepts either place, and every tick mirrors landed files
+# from foreman/research into scratch/research (copy-if-absent, never overwrite).
+FOREMAN_RESEARCH = Path(os.environ.get("RPA_FOREMAN_RESEARCH", "/home/lumen/foreman/research"))
+SCRATCH_RESEARCH = Path(os.environ.get("RPA_SCRATCH_RESEARCH", RESEARCH_OUT))
 MAX_INLINE = 8192          # bytes; bodies above this send a head + the path (ticket rule)
 HEAD_CHARS = 2000
 MAX_AGE_DAYS = 30
@@ -89,6 +94,42 @@ def deliverable_path(body: str):
     return m.group(1).rstrip(".,;)") if m else None
 
 
+def probe_for(body: str, stem: str) -> str:
+    """Liveness probe: the prompt's own DELIVERABLE: path (or scratch/research/<stem>.md), OR the
+    same basename under foreman/research — where a sandboxed fworker can actually land it."""
+    primary = deliverable_path(body) or f"{SCRATCH_RESEARCH}/{stem}.md"
+    alt = FOREMAN_RESEARCH / Path(primary).name
+    return f"test -f {primary} || test -f {alt}"
+
+
+def mirror_landed(inbox: Path, dry: bool) -> int:
+    """For each queued prompt whose deliverable is expected under scratch/research but was landed
+    under foreman/research (PR path), copy it across if absent. Returns the copy count."""
+    n = 0
+    queued = inbox / "queued"
+    if not queued.is_dir():
+        return 0
+    for q in sorted(queued.glob("*.txt")):
+        try:
+            body = q.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        stem = safe_stem(q.name.split("_", 1)[1] if "_" in q.name else q.name)
+        primary = Path(deliverable_path(body) or f"{SCRATCH_RESEARCH}/{stem}.md")
+        if primary.exists() or SCRATCH_RESEARCH not in primary.parents:
+            continue
+        src = FOREMAN_RESEARCH / primary.name
+        if src.is_file():
+            log(f"mirror {src} -> {primary}" + (" (dry)" if dry else ""))
+            if not dry:
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                tmp = primary.with_suffix(primary.suffix + ".tmp")
+                tmp.write_bytes(src.read_bytes())
+                os.replace(tmp, primary)
+            n += 1
+    return n
+
+
 def safe_stem(name: str) -> str:
     stem = Path(name).stem
     return re.sub(r"[^A-Za-z0-9._-]+", "_", stem)[:80] or "prompt"
@@ -96,6 +137,9 @@ def safe_stem(name: str) -> str:
 
 def build_detail(body: str, path: Path, nbytes: int, max_inline: int) -> str:
     cited = (f"\n\nSOURCE FILE: {path} (moves to {path.parent}/queued/<wq-id>_{path.name} once filed)"
+             f"\nLANDING: a sandboxed fworker cannot write scratch/; land the deliverable by PR as "
+             f"{FOREMAN_RESEARCH}/<deliverable basename> and the adapter mirrors it into scratch/research "
+             f"on its next tick (the Liveness probe accepts either path)."
              f"\nFiled by research-prompt-adapter (wq#4677).")
     if nbytes <= max_inline:
         return body.rstrip() + cited
@@ -162,7 +206,8 @@ def process(inbox: Path, state_path: Path, wq: str, dry: bool, max_age_days: int
     expired = inbox / "expired"
     st = load_state(state_path)
     by_sha = st["by_sha"]
-    counts = dict(filed=0, dup=0, expired=0, failed=0, deferred=0)
+    counts = dict(filed=0, dup=0, expired=0, failed=0, deferred=0, mirrored=0)
+    counts["mirrored"] = mirror_landed(inbox, dry)
     now = time.time()
     files = sorted(p for p in inbox.glob("*.txt") if p.is_file())
     for p in files:
@@ -205,7 +250,7 @@ def process(inbox: Path, state_path: Path, wq: str, dry: bool, max_age_days: int
             continue
         title = "RESEARCH: " + derive_title(body, stem)
         detail = build_detail(body, p, len(raw), max_inline)
-        liveness = f"test -f {deliverable_path(body) or f'{RESEARCH_OUT}/{stem}.md'}"
+        liveness = probe_for(body, stem)
         wid, status = run_wq(wq, title, detail, liveness, dry)
         if status == "dry-run":
             log(f"DRY would file {name}: {title!r} ({len(raw)}B, inline={len(raw) <= max_inline})")
