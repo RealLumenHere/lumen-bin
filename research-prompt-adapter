@@ -77,6 +77,18 @@ def derive_title(body: str, stem: str) -> str:
     return clean_title(stem.replace("_", " ").replace("-", " "))
 
 
+DELIV_RE = re.compile(r"^\s*DELIVERABLE\s*:\s*(/\S+)", re.I | re.M)
+
+
+def deliverable_path(body: str):
+    """A prompt that names its own `DELIVERABLE: /abs/path` (first 40 lines) is the authority on
+    what `done` must prove. wq#4677 live run: the stem-based probe said twn4-…-reflash.md while
+    the prompt said …-reflash-runbook.md, so the ticket could never go green on the real output."""
+    head = "\n".join(body.split("\n")[:40])
+    m = DELIV_RE.search(head)
+    return m.group(1).rstrip(".,;)") if m else None
+
+
 def safe_stem(name: str) -> str:
     stem = Path(name).stem
     return re.sub(r"[^A-Za-z0-9._-]+", "_", stem)[:80] or "prompt"
@@ -193,7 +205,7 @@ def process(inbox: Path, state_path: Path, wq: str, dry: bool, max_age_days: int
             continue
         title = "RESEARCH: " + derive_title(body, stem)
         detail = build_detail(body, p, len(raw), max_inline)
-        liveness = f"test -f {RESEARCH_OUT}/{stem}.md"
+        liveness = f"test -f {deliverable_path(body) or f'{RESEARCH_OUT}/{stem}.md'}"
         wid, status = run_wq(wq, title, detail, liveness, dry)
         if status == "dry-run":
             log(f"DRY would file {name}: {title!r} ({len(raw)}B, inline={len(raw) <= max_inline})")
