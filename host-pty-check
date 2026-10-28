@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""host-pty-check: is this host still able to hand out PTYs? (wq#4771)
+
+A limpet ISO chroot teardown unmounted Lumen's /dev/pts and left /dev/ptmx owned
+lumen:lumen; for 3 days every `ssh -t` failed with "PTY allocation request failed" and
+nothing noticed. Read-only. Healthy means a devpts mount at /dev/pts and /dev/ptmx the
+5:2 char device, owned by root (group root or tty), mode 0666.
+
+  host-pty-check            one line, exit 0 OK / 1 FAIL
+  host-pty-check --aq       also file an aq row on FAIL (aq dedups an open row)
+
+--mountinfo/--ptmx point it at a fixture for tests.
+"""
+import argparse
+import grp
+import os
+import stat
+import subprocess
+import sys
+
+AQ = "/home/lumen/bin/aq"
+PTMX_DEV = (5, 2)
+
+
+def _unescape(field):
+    # mountinfo octal-escapes space, tab, newline and backslash in paths.
+    return field.encode().decode("unicode_escape")
+
+
+def devpts_at(mountinfo, target="/dev/pts"):
+    with open(mountinfo) as f:
+        for line in f:
+            pre, sep, post = line.partition(" - ")
+            if sep and len(pre.split()) > 4 and _unescape(pre.split()[4]) == target and post.split()[0] == "devpts":
+                return True
+    return False
+
+
+def ptmx_problems(path, stat_fn=os.stat):
+    try:
+        st = stat_fn(path)
+    except OSError as e:
+        return [f"ptmx={path}:{e.strerror}"]
+    out = []
+    if not stat.S_ISCHR(st.st_mode) or (os.major(st.st_rdev), os.minor(st.st_rdev)) != PTMX_DEV:
+        out.append(f"ptmx={path}:not-the-5:2-char-device")
+    ok_gids = {0}
+    try:
+        ok_gids.add(grp.getgrnam("tty").gr_gid)
+    except KeyError:
+        pass
+    if st.st_uid != 0 or st.st_gid not in ok_gids:
+        out.append(f"ptmx-owner={st.st_uid}:{st.st_gid}")
+    if stat.S_IMODE(st.st_mode) != 0o666:
+        out.append(f"ptmx-mode={stat.S_IMODE(st.st_mode):04o}")
+    return out
+
+
+def check(mountinfo, ptmx):
+    problems = [] if devpts_at(mountinfo) else ["devpts-not-mounted-at-/dev/pts"]
+    return problems + ptmx_problems(ptmx)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mountinfo", default="/proc/self/mountinfo")
+    ap.add_argument("--ptmx", default="/dev/ptmx")
+    ap.add_argument("--aq", action="store_true", help="file an aq row (source host-pty, key devpts) on FAIL")
+    a = ap.parse_args(argv)
+    problems = check(a.mountinfo, a.ptmx)
+    if not problems:
+        print("host-pty-check: OK")
+        return 0
+    detail = " ".join(problems)
+    print(f"host-pty-check: FAIL {detail}")
+    if a.aq:
+        subprocess.run([AQ, "add", "host-pty", "devpts", "[ops] host cannot allocate PTYs (ssh -t fails)",
+                        f"{detail} -- restore: mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666; "
+                        "chown root:root /dev/ptmx; chmod 666 /dev/ptmx (wq#4771)"],
+                       capture_output=True, timeout=30)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
