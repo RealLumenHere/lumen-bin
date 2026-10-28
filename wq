@@ -135,6 +135,10 @@ NTFY_BIN = os.environ.get("WQ_NTFY_BIN", "/home/lumen/bin/ntfy-send")
 # without hardcoding the shape twice.
 FWORKER_IDENTITY_RE = re.compile(
     os.environ.get("WQ_FWORKER_IDENTITY_RE", r"^fworker-wq\d+$"))
+# wq#4761: grant-request/approval TTL (agent-authority DESIGN.md §2.3 step 4). One window for
+# both phases: a pending request expires if nobody decides within it, and an approval expires
+# if no resume consumes it within it. `wq grant approve --ttl-hours` overrides per approval.
+GRANT_TTL_HOURS = _envint("WQ_GRANT_TTL_HOURS", 24)
 # wq#1498: `lumen-run list` unit column, e.g. "lumen-job-fworker-wq616-1786850106.service" —
 # mirrors harness/concurrency.py's UNIT_RE so a --dead-worker liveness check reads the exact
 # same signal the dispatcher's own concurrency cap does, instead of inventing a second one.
@@ -515,6 +519,26 @@ def init():
         session_id TEXT PRIMARY KEY, base_name TEXT, retired_at TEXT,
         kind TEXT, reason TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_retired_base ON retired_sessions(base_name)")
+    # wq#4761: hold-state grant requests (agent-authority DESIGN.md §2.3/§2.6). One row per
+    # held tool call; fingerprint UNIQUE is the replay guard — an approval is bound to THE one
+    # pending call (ticket, session, tool_use_id, canonical input) and can never be re-filed or
+    # re-pointed at a different call. ADDITIVE — only `wq grant`/`wq await-grant`/`wq reap` and
+    # hold_gate.py (foreman B1-T1) read it; queue-status/mctl/lumen-sqlutil are untouched.
+    # NOT a reuse of `wq hold` (wq#1461): hold is a soft intent marker on an open ticket; this
+    # is the authority record for a specific deferred tool call.
+    c.execute("""CREATE TABLE IF NOT EXISTS grant_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL,
+        session_id TEXT, tool_use_id TEXT, class TEXT, target TEXT,
+        fingerprint TEXT UNIQUE NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+        requested_at TEXT, decided_by TEXT, decided_at TEXT, reason TEXT,
+        expires_at TEXT, consumed_at TEXT, consumed_lease TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_grant_requests_ticket ON grant_requests(ticket_id)")
+    cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+    # wq#4761: awaiting_grant parking. resume_session is the CLI session id the dispatcher
+    # resumes with `--resume <sid>` after approval; grant_req points at the grant_requests row
+    # the ticket is parked on. ADDITIVE — NULL on every pre-existing row.
+    if "resume_session" not in cols: c.execute("ALTER TABLE tasks ADD COLUMN resume_session TEXT")
+    if "grant_req"      not in cols: c.execute("ALTER TABLE tasks ADD COLUMN grant_req INTEGER")
     c.commit(); c.close()
 
 # ---------------------------------------------------------------- wq#1158 lease/fence layer
@@ -1859,6 +1883,9 @@ def cmd_claim(a):
             refuse = "FRANK_GATED — awaiting decision (wq decide / wq answer / wq review)"
         elif st_now == 'pending_review':
             refuse = "PENDING_REVIEW — awaiting ORCH review of Frank's response (wq review)"
+        elif st_now == 'awaiting_grant':
+            refuse = ("AWAITING_GRANT — parked on a pending grant request (wq#4761). Decide it "
+                      "first: wq grant approve|deny <req> (wq grant list --ticket this id)")
         elif st_now != 'open':
             refuse = f"status={st_now}"
         else:
@@ -2667,15 +2694,17 @@ def _finish(a, new_status):
     if new_status == 'done':
         cur = c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, lease_expires=NULL, "
                         f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, hold_by=NULL, "
-                        f"hold_expires=NULL{clr} WHERE id=?{fcl}",
+                        f"hold_expires=NULL, resume_session=NULL, grant_req=NULL{clr} WHERE id=?{fcl}",
                         [now(), getattr(a,'notes','') or '', a.id] + fpar)
     elif new_status == 'open':
         # wq#4659: released_at is the explicit hand-off that lifts the dispatcher's orch-filed
         # grace window (foreman gates.OrchFresh) before ORCH_GRACE_MIN runs out.
+        # wq#4761 F7: release also drops resume_session/grant_req — a released ticket goes back
+        # to the pool for a FRESH attempt; a materialized grant never outlives its lease.
         cur = c.execute(f"UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, "
                         f"lease_expires=NULL, lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, "
-                        f"hold_by=NULL, hold_expires=NULL, released_at=?"
-                        f"{clr} WHERE id=?{fcl}", [now(), a.id] + fpar)
+                        f"hold_by=NULL, hold_expires=NULL, resume_session=NULL, grant_req=NULL, "
+                        f"released_at=?{clr} WHERE id=?{fcl}", [now(), a.id] + fpar)
     elif new_status == 'blocked':
         # wq#741: block_reason/blocked_at are the structural home for this — notes keeps
         # getting the same string too, so `wq show`/`wq list` need no changes.
@@ -3539,6 +3568,247 @@ def cmd_hold(a):
     c.execute("UPDATE tasks SET hold_by=?, hold_expires=? WHERE id=?", (agent, exp, a.id))
     c.execute("COMMIT"); c.close()
     print(f"HELD wq#{a.id} by '{agent}' until {exp}Z (ttl {a.ttl}m)")
+# ---------------------------------------------------------------- wq#4761 hold-state grants
+# agent-authority DESIGN.md §2.3 steps 3-5, §2.6 schema, §2.7 F4/F5/F8. A worker's held tool
+# call becomes a grant_requests row (filed by hold_gate.py via `wq grant request`); fworker
+# parks the ticket with `wq await-grant` (lease released, dispatcher never claims it); an
+# approver — never the requesting worker itself (F8) — decides it with `wq grant approve|deny`;
+# the resumed session's hold_gate consumes the approval ATOMICALLY with `wq grant consume`
+# (F5: two racing resumes, exactly one winner). `wq reap` expires whatever nobody decided or
+# consumed inside the TTL. Deliberately NOT built on `wq hold` (wq#1461): that is a soft
+# intent marker on an open ticket; this is the authority record for one deferred tool call.
+GRANT_STATES = ("pending", "approved", "denied", "expired", "consumed")
+GRANT_FP_RE = re.compile(r"^[0-9a-f]{64}$")
+def _grant_fetch(c, rid):
+    return c.execute("SELECT id, ticket_id, session_id, tool_use_id, class, target, fingerprint,"
+                     " state, requested_at, decided_by, decided_at, reason, expires_at,"
+                     " consumed_at, consumed_lease FROM grant_requests WHERE id=?", (rid,)).fetchone()
+def _grant_line(r):
+    return (f"GRANT_REQ id={r[0]} ticket={r[1]} state={r[7]} class={r[4] or '-'} "
+            f"target={r[5] or '-'} session={r[2] or '-'} fp={r[6][:16]}… "
+            f"expires={r[12] or '-'}Z decided_by={r[9] or '-'} consumed={r[13] or '-'}")
+def _grant_expire_if_stale(c, row, t_now):
+    """Lazy expiry: a pending/approved row past expires_at is treated as expired at the point
+    of use, whether or not `wq reap` has swept yet. Returns the row's effective state."""
+    if row[7] in ("pending", "approved") and row[12] and row[12] < t_now:
+        c.execute("UPDATE grant_requests SET state='expired', decided_at=? "
+                  "WHERE id=? AND state=?", (t_now, row[0], row[7]))
+        return "expired"
+    return row[7]
+def _is_self_approval(c, caller, req_session, ticket_id):
+    """F8: the identity approving a grant may not be the one that requested it. The requesting
+    worker is known two ways: the session_id stored on the request, and the ticket's stable
+    per-ticket fworker identity (fworker-wq<N>, wq#1498) that every attempt claims under.
+    Compare both against the caller AND the caller's registered base name."""
+    fw = f"fworker-wq{ticket_id}"
+    names = {caller, base_of(c, caller)}
+    targets = {fw}
+    if req_session:
+        targets.add(req_session)
+        targets.add(base_of(c, req_session))
+    return bool(names & targets)
+def cmd_await_grant(a):
+    """§2.3 step 3: park a CLAIMED ticket on a pending grant request. The lease and subsystem
+    locks are released (no slot held while a human/orchestrator decides), status goes
+    awaiting_grant (the dispatcher's lane scan only ever selects status='open', and claim --id
+    refuses it explicitly), and resume_session/grant_req are stored so the approve path can
+    re-open the ticket for a --resume <sid> spawn with full context."""
+    ping("await-grant")
+    caller, _ = resolve_identity(a)
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    t_now = now()
+    row = c.execute("SELECT claimed_by, subsystems, status FROM tasks WHERE id=?", (a.id,)).fetchone()
+    if not row:
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {a.id}"); sys.exit(1)
+    holder, subsystems, status = row
+    if status != 'claimed':
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: wq#{a.id} is {status!r} — await-grant parks a CLAIMED ticket on its "
+               f"pending request (the held call belongs to a live attempt)"); sys.exit(1)
+    if not owner_ok(c, caller, holder, "await-grant", a.id):
+        c.execute("COMMIT"); c.close(); sys.exit(1)
+    g = _grant_fetch(c, a.req)
+    if not g:
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no grant request {a.req}"); sys.exit(1)
+    if g[1] != a.id:
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: grant request {a.req} belongs to wq#{g[1]}, not wq#{a.id}"); sys.exit(1)
+    st = _grant_expire_if_stale(c, g, t_now)
+    if st != 'pending':
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: grant request {a.req} is {st!r} — only a pending request parks a ticket"); sys.exit(1)
+    fcl, fpar = fence_guard(c, a, a.id, "await-grant")
+    mark_alive(c, caller, "await-grant")
+    if subsystems:
+        release_subs(c, parse_subs(subsystems), holder or "")
+    clr = lease_clear_sql(c)
+    cur = c.execute(f"UPDATE tasks SET status='awaiting_grant', claimed_by=NULL, claimed_at=NULL, "
+                    f"lease_expires=NULL, lease_ttl=NULL, hold_by=NULL, hold_expires=NULL, "
+                    f"resume_session=?, grant_req=?{clr} WHERE id=?{fcl}",
+                    [a.session, a.req, a.id] + fpar)
+    if cur.rowcount == 0:
+        c.execute("ROLLBACK"); c.close()
+        eprint(f"REFUSED: await-grant on wq#{a.id} matched no row under fence "
+               f"{getattr(a,'fence',None)} — the claim moved while this call was in flight "
+               f"(wq#1158)."); sys.exit(5)
+    c.execute("COMMIT"); c.close()
+    print(f"AWAITING_GRANT wq#{a.id} req={a.req} resume_session={a.session} "
+          f"(lease released; decide with: wq grant approve|deny {a.req})")
+def cmd_grant(a):
+    ping(f"grant-{a.action}")
+    c = conn(); c.isolation_level = None
+    c.execute("BEGIN IMMEDIATE")
+    t_now = now()
+    if a.action == "request":
+        # Filed by hold_gate.py at defer time (§2.3 step 1). Idempotent on fingerprint: the
+        # UNIQUE constraint makes a duplicate filing return the existing live row instead of a
+        # second one, and a terminal-state fingerprint is refused outright — a retried call
+        # after expiry/denial carries a new session or tool_use_id, hence a NEW fingerprint.
+        tid = a.req
+        if tid is None:
+            c.execute("COMMIT"); c.close(); eprint("REFUSED: grant request takes a ticket id"); sys.exit(2)
+        if not a.fingerprint or not GRANT_FP_RE.match(a.fingerprint):
+            c.execute("COMMIT"); c.close()
+            eprint("REFUSED: --fingerprint must be the 64-hex sha256 from DESIGN.md §2.6"); sys.exit(2)
+        if not c.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
+            c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no such task {tid}"); sys.exit(1)
+        exp = lease_from(int(a.ttl_hours * 60))
+        try:
+            cur = c.execute("INSERT INTO grant_requests(ticket_id, session_id, tool_use_id, class,"
+                            " target, fingerprint, state, requested_at, expires_at) VALUES"
+                            " (?,?,?,?,?,?,'pending',?,?)",
+                            (tid, a.session, a.tool_use, a.klass, a.target, a.fingerprint, t_now, exp))
+            rid = cur.lastrowid
+            c.execute("COMMIT")
+            print(f"GRANT_REQ id={rid} ticket={tid} state=pending expires={exp}Z")
+        except sqlite3.IntegrityError:
+            c.execute("ROLLBACK")
+            c2 = conn(); c2.isolation_level = None; c2.execute("BEGIN IMMEDIATE")
+            ex = c2.execute("SELECT id, state, expires_at, ticket_id FROM grant_requests "
+                            "WHERE fingerprint=?", (a.fingerprint,)).fetchone()
+            live = ex and ex[1] in ("pending", "approved") and (not ex[2] or ex[2] >= t_now)
+            c2.execute("COMMIT"); c2.close()
+            if live:
+                print(f"GRANT_REQ id={ex[0]} ticket={ex[3]} state={ex[1]} expires={ex[2]}Z "
+                      f"[DUPLICATE — existing live request returned, not re-filed]")
+            else:
+                eprint(f"REFUSED: fingerprint already decided — request {ex[0]} is {ex[1]!r}. "
+                       f"A re-issued call mints a NEW fingerprint (new session/tool_use_id); "
+                       f"a terminal one is never reopened (§2.6 replay guard).")
+                c.close(); sys.exit(1)
+        c.close(); return
+    if a.action == "list":
+        q = ("SELECT id, ticket_id, session_id, tool_use_id, class, target, fingerprint, state,"
+             " requested_at, decided_by, decided_at, reason, expires_at, consumed_at,"
+             " consumed_lease FROM grant_requests")
+        wh, params = [], []
+        if a.state:
+            if a.state not in GRANT_STATES:
+                c.execute("COMMIT"); c.close()
+                eprint(f"REFUSED: --state must be one of {'|'.join(GRANT_STATES)}"); sys.exit(2)
+            wh.append("state=?"); params.append(a.state)
+        if a.ticket is not None:
+            wh.append("ticket_id=?"); params.append(a.ticket)
+        if wh: q += " WHERE " + " AND ".join(wh)
+        rows = c.execute(q + " ORDER BY id ASC", params).fetchall()
+        c.execute("COMMIT"); c.close()
+        for r in rows: print(_grant_line(r))
+        print(f"{len(rows)} grant request(s)")
+        return
+    if a.action == "consume":
+        # §2.3 step 7 / F5: the ATOMIC consume. One UPDATE whose WHERE carries every condition
+        # (approved, unconsumed, unexpired); under BEGIN IMMEDIATE exactly one of two racing
+        # resumes gets rowcount=1 — the loser diagnoses itself from the row's state, rc!=0.
+        if not a.fingerprint:
+            c.execute("COMMIT"); c.close(); eprint("REFUSED: consume takes --fingerprint"); sys.exit(2)
+        cur = c.execute("UPDATE grant_requests SET state='consumed', consumed_at=?, consumed_lease=? "
+                        "WHERE fingerprint=? AND state='approved' AND consumed_at IS NULL "
+                        "AND (expires_at IS NULL OR expires_at >= ?)",
+                        (t_now, a.lease or '', a.fingerprint, t_now))
+        if cur.rowcount == 1:
+            rid = c.execute("SELECT id FROM grant_requests WHERE fingerprint=?",
+                            (a.fingerprint,)).fetchone()[0]
+            c.execute("COMMIT"); c.close()
+            print(f"GRANT_CONSUMED id={rid} lease={a.lease or '-'}"); return
+        ex = c.execute("SELECT id, state, expires_at FROM grant_requests WHERE fingerprint=?",
+                       (a.fingerprint,)).fetchone()
+        c.execute("COMMIT"); c.close()
+        if not ex:
+            eprint("GRANT_CONSUME_REFUSED: no request with that fingerprint"); sys.exit(1)
+        if ex[1] == 'consumed':
+            eprint(f"GRANT_CONSUME_REFUSED: request {ex[0]} already consumed (F5: the other "
+                   f"resume won the race)"); sys.exit(4)
+        if ex[1] == 'approved' and ex[2] and ex[2] < t_now:
+            eprint(f"GRANT_CONSUME_REFUSED: request {ex[0]} approval expired {ex[2]}Z"); sys.exit(3)
+        eprint(f"GRANT_CONSUME_REFUSED: request {ex[0]} is {ex[1]!r}, not approved"); sys.exit(2)
+    # approve / deny / show — all take a request id
+    if a.req is None:
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: grant {a.action} takes a request id"); sys.exit(2)
+    g = _grant_fetch(c, a.req)
+    if not g:
+        c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no grant request {a.req}"); sys.exit(1)
+    if a.action == "show":
+        c.execute("COMMIT"); c.close()
+        print(_grant_line(g)); print(f"  fingerprint: {g[6]}")
+        if g[11]: print(f"  reason: {g[11]}")
+        return
+    caller, explicit = resolve_identity(a)
+    st = _grant_expire_if_stale(c, g, t_now)
+    if st != 'pending':
+        c.execute("COMMIT"); c.close()
+        eprint(f"REFUSED: grant request {a.req} is {st!r} — only a pending request can be "
+               f"{a.action}d" + (" (F4: the parked ticket goes blocked via wq reap)"
+                                 if st == 'expired' else "")); sys.exit(1)
+    if a.action == "approve":
+        # F8: self-approval. The requesting worker asking for authority and then granting it
+        # to itself is the exact loop this table exists to break.
+        if _is_self_approval(c, caller, g[2], g[1]):
+            c.execute("COMMIT"); c.close()
+            eprint(f"REFUSED: self-approval — '{caller}' is the requesting worker for wq#{g[1]} "
+                   f"(session {g[2] or f'fworker-wq{g[1]}'}). A grant is decided by a DIFFERENT "
+                   f"identity: the orchestrator under full autonomy, or Frank (F8).")
+            sys.exit(1)
+        if not explicit and not is_session(c, caller):
+            warn(f"approving as UNREGISTERED fallback identity '{caller}' — register "
+                 f"(wq whoami --register <name>) so the decided_by audit line means something.")
+        exp = lease_from(int(a.ttl_hours * 60))
+        c.execute("UPDATE grant_requests SET state='approved', decided_by=?, decided_at=?, "
+                  "expires_at=? WHERE id=?", (caller, t_now, exp, a.req))
+        trow = c.execute("SELECT status, grant_req, resume_session FROM tasks WHERE id=?",
+                         (g[1],)).fetchone()
+        reopened = ""
+        if trow and trow[0] == 'awaiting_grant' and trow[1] == a.req:
+            # §2.3 step 5: back to open WITH resume_session kept — the dispatcher claims it and
+            # spawns fworker --resume <sid> with an empty prompt (F9 guard lives in fworker).
+            c.execute("UPDATE tasks SET status='open' WHERE id=?", (g[1],))
+            reopened = f"; wq#{g[1]} open for resume (session {trow[2]})"
+        c.execute("COMMIT"); c.close()
+        print(f"GRANT_APPROVED id={a.req} by={caller} expires={exp}Z (one-shot, consume-once)"
+              + reopened)
+        return
+    if a.action == "deny":
+        if not a.reason:
+            c.execute("COMMIT"); c.close()
+            eprint("REFUSED: grant deny requires --reason (it lands verbatim on the ticket's "
+                   "block_reason)"); sys.exit(2)
+        c.execute("UPDATE grant_requests SET state='denied', decided_by=?, decided_at=?, reason=? "
+                  "WHERE id=?", (caller, t_now, a.reason, a.req))
+        trow = c.execute("SELECT status, grant_req FROM tasks WHERE id=?", (g[1],)).fetchone()
+        blocked = ""
+        if trow and trow[0] == 'awaiting_grant' and trow[1] == a.req:
+            # §2.3 step 5: deny -> blocked, and the worker never sees the call run. Direct
+            # UPDATE, not _finish(): the parked ticket holds no claim and the denier is an
+            # approver identity, not the (refused) owner.
+            why = f"grant denied: {a.reason}"
+            c.execute("UPDATE tasks SET status='blocked', block_reason=?, blocked_at=?, notes=? "
+                      "WHERE id=?", (why, t_now, why, g[1]))
+            blocked = f"; wq#{g[1]} blocked ({why})"
+        c.execute("COMMIT"); c.close()
+        print(f"GRANT_DENIED id={a.req} by={caller}{blocked}")
+        return
+    c.execute("COMMIT"); c.close()
+    eprint(f"REFUSED: unknown grant action {a.action!r}"); sys.exit(2)
 def cmd_preflight(a):
     """Ad-hoc guard: warn if about to touch subsystems with no held lock for this holder."""
     holder = a.holder or os.environ.get("WQ_AGENT", "").strip() or f"{socket.gethostname()}:{os.getpid()}"
@@ -3997,6 +4267,29 @@ def cmd_reap(a):
             uparams.append(a.lane)
         c.execute(uq, uparams)
         c.execute("DELETE FROM slocks WHERE expires_at < ?", (t_now,))
+    # wq#4761: expire stale grant requests in the same sweep (DESIGN.md §2.6 "wq reap expires
+    # its stale requests"). A pending/approved row past expires_at goes 'expired'; a ticket
+    # still PARKED on it (awaiting_grant, grant_req pointing at the row) goes blocked (F4) so
+    # it surfaces on the blocked board instead of dangling invisibly forever — awaiting_grant
+    # is by design a status no claim scan ever touches.
+    stale_grants = c.execute(
+        "SELECT id, ticket_id, state, expires_at FROM grant_requests "
+        "WHERE state IN ('pending','approved') AND expires_at IS NOT NULL AND expires_at < ?",
+        (t_now,)).fetchall()
+    grant_blocked = []
+    if stale_grants and not a.dry_run:
+        c.execute("UPDATE grant_requests SET state='expired', decided_at=? "
+                  "WHERE state IN ('pending','approved') AND expires_at IS NOT NULL "
+                  "AND expires_at < ?", (t_now, t_now))
+        for gid, gtid, gstate, gexp in stale_grants:
+            trow = c.execute("SELECT status, grant_req FROM tasks WHERE id=?", (gtid,)).fetchone()
+            if trow and trow[0] == 'awaiting_grant' and trow[1] == gid:
+                why = (f"grant request {gid} expired {gexp}Z undecided (ttl ran out)"
+                       if gstate == 'pending' else
+                       f"grant request {gid} approval expired {gexp}Z unconsumed")
+                c.execute("UPDATE tasks SET status='blocked', block_reason=?, blocked_at=?, "
+                          "notes=? WHERE id=?", (why, t_now, why, gtid))
+                grant_blocked.append((gtid, why))
     c.execute("COMMIT"); c.close()
     for tid, lane, holder, claimed_at, exp, ttl, title in expired:
         held_for = idle_minutes(claimed_at)
@@ -4005,8 +4298,12 @@ def cmd_reap(a):
               f"claimed_ago_min={'?' if held_for is None else f'{held_for:.0f}'} "
               f"lease_expired_ago_min={'?' if gone is None else f'{gone:.0f}'} "
               f"title={title!r}")
-    suffix = " [dry-run, not applied]" if a.dry_run and expired else ""
-    print(f"reaped {len(expired)} ticket(s){suffix}")
+    for gid, gtid, gstate, gexp in stale_grants:
+        print(f"GRANT_EXPIRED id={gid} ticket={gtid} was={gstate} expired={gexp}Z")
+    for gtid, why in grant_blocked:
+        print(f"BLOCKED #{gtid} — {why}")
+    suffix = " [dry-run, not applied]" if a.dry_run and (expired or stale_grants) else ""
+    print(f"reaped {len(expired)} ticket(s), {len(stale_grants)} grant request(s){suffix}")
 # ---------------------------------------------------------------- wq#1158 idempotency helper
 # The fence stops a duplicate worker from CORRUPTING the ticket. It does nothing about the side
 # effects that worker already had outside the DB — and the expensive one is a second pull
@@ -4104,6 +4401,8 @@ s=sub.add_parser("done"); s.add_argument("id",type=int); s.add_argument("--notes
 s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--dead-worker",dest="dead_worker",action="store_true",help="wq#1498: release a claim held by a DIFFERENT identity if, and only if, it verifiably has no live session and (for fworker-wq<id>) no running unit — the stale-claim path that does not poison a per-ticket identity the way `wq retire` does"); s.set_defaults(f=cmd_release)
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_block)
 s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)
+s=sub.add_parser("await-grant",help="wq#4761: park a CLAIMED ticket on a pending grant request — lease released, status awaiting_grant (never claimable), resume_session stored for the post-approval --resume spawn"); s.add_argument("id",type=int); s.add_argument("--req",type=int,required=True,help="grant_requests row id (from `wq grant request`/hold_gate)"); s.add_argument("--session",required=True,help="CLI session id to resume after approval"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_await_grant)
+s=sub.add_parser("grant",help="wq#4761: hold-state grant requests (agent-authority DESIGN.md §2.3/§2.6) — request <ticket> files, approve|deny <req> decides (self-approval refused, F8), consume --fingerprint is the atomic one-shot for hold_gate (F5), list/show inspect"); s.add_argument("action",choices=["request","approve","deny","list","show","consume"]); s.add_argument("req",nargs="?",type=int,default=None,help="request id (approve/deny/show) or ticket id (request)"); s.add_argument("--fingerprint",default=None,help="§2.6 sha256 fingerprint (request/consume)"); s.add_argument("--session",default=None,help="request: the held call's CLI session id"); s.add_argument("--tool-use",dest="tool_use",default=None,help="request: the held call's tool_use_id"); s.add_argument("--class",dest="klass",default=None,help="request: grant class (e.g. H1 dir-read, H2 repo-read)"); s.add_argument("--target",default=None,help="request: canonical (realpath) target"); s.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=GRANT_TTL_HOURS,help=f"request/approve expiry window (default WQ_GRANT_TTL_HOURS={GRANT_TTL_HOURS})"); s.add_argument("--reason",default=None,help="deny: required — lands verbatim as the ticket's 'grant denied: <reason>'"); s.add_argument("--lease",default=None,help="consume: the consuming lease/attempt identity, recorded as consumed_lease"); s.add_argument("--state",default=None,help="list: filter by state"); s.add_argument("--ticket",type=int,default=None,help="list: filter by ticket id"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_grant)
 s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, and a check-then-create PR lookup"); s.add_argument("kind",choices=["branch","path","pr"]); s.add_argument("id",type=int); s.add_argument("--type",default="feat",help="Conventional Commit type for the branch (default feat)"); s.add_argument("--branch",default=None,help="override the derived branch for the pr check"); s.set_defaults(f=cmd_idem)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
