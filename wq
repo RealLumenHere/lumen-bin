@@ -3587,6 +3587,16 @@ def _grant_line(r):
     return (f"GRANT_REQ id={r[0]} ticket={r[1]} state={r[7]} class={r[4] or '-'} "
             f"target={r[5] or '-'} session={r[2] or '-'} fp={r[6][:16]}… "
             f"expires={r[12] or '-'}Z decided_by={r[9] or '-'} consumed={r[13] or '-'}")
+# wq#4765: column order matches _grant_fetch's SELECT (and the list/show queries below,
+# which select the same columns in the same order) — fworker's cross-check of a result
+# frame's deferred_tool_use.id against the pending row, and its read of the approved H1
+# grant's target at resume, both need tool_use_id/target as real JSON fields rather than
+# _grant_line's truncated fingerprint/no-tool_use_id text summary.
+_GRANT_COLS = ("id", "ticket_id", "session_id", "tool_use_id", "class", "target",
+               "fingerprint", "state", "requested_at", "decided_by", "decided_at",
+               "reason", "expires_at", "consumed_at", "consumed_lease")
+def _grant_json(rows):
+    return json.dumps([dict(zip(_GRANT_COLS, r)) for r in rows])
 def _grant_expire_if_stale(c, row, t_now):
     """Lazy expiry: a pending/approved row past expires_at is treated as expired at the point
     of use, whether or not `wq reap` has swept yet. Returns the row's effective state."""
@@ -3710,9 +3720,13 @@ def cmd_grant(a):
             wh.append("state=?"); params.append(a.state)
         if a.ticket is not None:
             wh.append("ticket_id=?"); params.append(a.ticket)
+        if getattr(a, "session", None):
+            wh.append("session_id=?"); params.append(a.session)
         if wh: q += " WHERE " + " AND ".join(wh)
         rows = c.execute(q + " ORDER BY id ASC", params).fetchall()
         c.execute("COMMIT"); c.close()
+        if getattr(a, "json", False):
+            print(_grant_json(rows)); return
         for r in rows: print(_grant_line(r))
         print(f"{len(rows)} grant request(s)")
         return
@@ -3750,6 +3764,8 @@ def cmd_grant(a):
         c.execute("COMMIT"); c.close(); eprint(f"REFUSED: no grant request {a.req}"); sys.exit(1)
     if a.action == "show":
         c.execute("COMMIT"); c.close()
+        if getattr(a, "json", False):
+            print(_grant_json([g])); return
         print(_grant_line(g)); print(f"  fingerprint: {g[6]}")
         if g[11]: print(f"  reason: {g[11]}")
         return
@@ -4402,7 +4418,7 @@ s=sub.add_parser("release"); s.add_argument("id",type=int); s.add_argument("--ag
 s=sub.add_parser("block"); s.add_argument("id",type=int); s.add_argument("reason"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.add_argument("--liveness",default=None,metavar="PROBE",help="wq#1676: inject Liveness: PROBE into detail — satisfies the mandatory on-ramp tag"); s.add_argument("--no-probe",dest="no_probe",default=None,metavar="REASON",help="wq#1676: physical-task escape hatch — no deterministic check exists, on the record"); s.add_argument("--accept-probe",dest="accept_probe",action="store_true",help="wq#1676: write derive_probe()'s proposed tag when the text parses one"); s.set_defaults(f=cmd_block)
 s=sub.add_parser("hold",help="wq#1461: soft intent marker on an open (incl. deps-blocked) ticket — no lease, no --force claim override"); s.add_argument("id",type=int); s.add_argument("--by",dest="by",default=None,help="alias for --agent (matches claim's --by)"); s.add_argument("--agent",default=None); s.add_argument("--ttl",type=int,default=DEFAULT_TTL_MIN,help="hold minutes"); s.set_defaults(f=cmd_hold)
 s=sub.add_parser("await-grant",help="wq#4761: park a CLAIMED ticket on a pending grant request — lease released, status awaiting_grant (never claimable), resume_session stored for the post-approval --resume spawn"); s.add_argument("id",type=int); s.add_argument("--req",type=int,required=True,help="grant_requests row id (from `wq grant request`/hold_gate)"); s.add_argument("--session",required=True,help="CLI session id to resume after approval"); s.add_argument("--agent",default=None); s.add_argument("--fence",type=int,default=None,help=FENCE_HELP); s.set_defaults(f=cmd_await_grant)
-s=sub.add_parser("grant",help="wq#4761: hold-state grant requests (agent-authority DESIGN.md §2.3/§2.6) — request <ticket> files, approve|deny <req> decides (self-approval refused, F8), consume --fingerprint is the atomic one-shot for hold_gate (F5), list/show inspect"); s.add_argument("action",choices=["request","approve","deny","list","show","consume"]); s.add_argument("req",nargs="?",type=int,default=None,help="request id (approve/deny/show) or ticket id (request)"); s.add_argument("--fingerprint",default=None,help="§2.6 sha256 fingerprint (request/consume)"); s.add_argument("--session",default=None,help="request: the held call's CLI session id"); s.add_argument("--tool-use",dest="tool_use",default=None,help="request: the held call's tool_use_id"); s.add_argument("--class",dest="klass",default=None,help="request: grant class (e.g. H1 dir-read, H2 repo-read)"); s.add_argument("--target",default=None,help="request: canonical (realpath) target"); s.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=GRANT_TTL_HOURS,help=f"request/approve expiry window (default WQ_GRANT_TTL_HOURS={GRANT_TTL_HOURS})"); s.add_argument("--reason",default=None,help="deny: required — lands verbatim as the ticket's 'grant denied: <reason>'"); s.add_argument("--lease",default=None,help="consume: the consuming lease/attempt identity, recorded as consumed_lease"); s.add_argument("--state",default=None,help="list: filter by state"); s.add_argument("--ticket",type=int,default=None,help="list: filter by ticket id"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_grant)
+s=sub.add_parser("grant",help="wq#4761: hold-state grant requests (agent-authority DESIGN.md §2.3/§2.6) — request <ticket> files, approve|deny <req> decides (self-approval refused, F8), consume --fingerprint is the atomic one-shot for hold_gate (F5), list/show inspect"); s.add_argument("action",choices=["request","approve","deny","list","show","consume"]); s.add_argument("req",nargs="?",type=int,default=None,help="request id (approve/deny/show) or ticket id (request)"); s.add_argument("--fingerprint",default=None,help="§2.6 sha256 fingerprint (request/consume)"); s.add_argument("--session",default=None,help="request: the held call's CLI session id; list: filter to this session_id (wq#4765: fworker's cross-check of a result frame's deferred_tool_use against the row hold_gate filed)"); s.add_argument("--tool-use",dest="tool_use",default=None,help="request: the held call's tool_use_id"); s.add_argument("--class",dest="klass",default=None,help="request: grant class (e.g. H1 dir-read, H2 repo-read)"); s.add_argument("--target",default=None,help="request: canonical (realpath) target"); s.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=GRANT_TTL_HOURS,help=f"request/approve expiry window (default WQ_GRANT_TTL_HOURS={GRANT_TTL_HOURS})"); s.add_argument("--reason",default=None,help="deny: required — lands verbatim as the ticket's 'grant denied: <reason>'"); s.add_argument("--lease",default=None,help="consume: the consuming lease/attempt identity, recorded as consumed_lease"); s.add_argument("--state",default=None,help="list: filter by state"); s.add_argument("--ticket",type=int,default=None,help="list: filter by ticket id"); s.add_argument("--json",action="store_true",help="wq#4765: list/show — emit the row(s) as JSON instead of the printed summary line, same rationale as `wq show --json` (wq#1277)"); s.add_argument("--agent",default=None); s.set_defaults(f=cmd_grant)
 s=sub.add_parser("idem",help="wq#1158: deterministic ticket-keyed branch/path, and a check-then-create PR lookup"); s.add_argument("kind",choices=["branch","path","pr"]); s.add_argument("id",type=int); s.add_argument("--type",default="feat",help="Conventional Commit type for the branch (default feat)"); s.add_argument("--branch",default=None,help="override the derived branch for the pr check"); s.set_defaults(f=cmd_idem)
 s=sub.add_parser("preflight"); s.add_argument("subsystems"); s.add_argument("--holder"); s.set_defaults(f=cmd_preflight)
 s=sub.add_parser("list"); s.add_argument("lane",nargs="?"); s.add_argument("--lane",dest="lane_flag",default=None,help="alias for positional lane"); s.add_argument("--by",dest="by",default=None,help="filter by claimed_by"); s.add_argument("--status",dest="status",default=None,help="filter by status"); s.add_argument("--sort",dest="sort",default="default",choices=["default","effective"],help="wq#661: 'effective' sorts by aged effective_priority instead of stored pri"); s.set_defaults(f=cmd_list)
