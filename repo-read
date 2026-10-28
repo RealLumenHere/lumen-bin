@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""repo-read — read-only git-object broker for a managed repo pinned at a 40-hex sha
+(wq#4762, foreman docs/agent-authority-research/DESIGN.md §2.5).
+
+  repo-read ls   <repo-key> <sha> [path]
+  repo-read show <repo-key> <sha> <path>
+  repo-read grep <repo-key> <sha> <pattern>
+  repo-read log  <repo-key> <sha>
+
+Built for the verify-pass/verify-probe worker that needs to read ANOTHER managed
+repo's history without the hazards of an add_dir onto that repo's primary tree: the
+primary tree is mutable, may carry untracked .env/state files, and may have moved
+since the PR this worker is verifying shipped.
+
+Every call: (1) <repo-key> must be a key of repo_sweep.managed_repos() — never an
+arbitrary worker-supplied path; the root is that key's realpath. (2) <sha> must be a
+full 40-hex commit id that `git cat-file -e <sha>^{commit}` accepts — a branch name,
+HEAD, or an abbreviation is refused, because a ref is mutable and an abbreviation is
+ambiguous. (3) the ticket's FOREMAN_GRANT_FILE must carry a {"kind": "repo", "key":
+<repo-key>, "sha": <sha>} grant (same FOREMAN_GRANT_FILE/FOREMAN_GRANT_SHA pattern
+fleet-exec already uses, fleet_exec_policy.load_grant) — an ungranted key@sha is a
+DENY, never a guess. (4) only git objects are read (ls-tree/show/grep/log against the
+pinned sha), never the working tree, so an untracked .env is unreachable by
+construction. (5) git runs with GIT_OPTIONAL_LOCKS=0 and core.hooksPath=/dev/null, so
+even these reads trigger no hooks or index writes. (6) output is masked
+(harness/masking.mask_text) before it reaches stdout.
+
+Exit 0: read succeeded. Exit 2: refused (bad repo-key/sha shape, ungranted, or git
+itself failed) — reason on stderr, nothing of the read on stdout.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+HARNESS_DIR = os.environ.get("FOREMAN_HARNESS_DIR", "/home/lumen/foreman/harness")
+sys.path.insert(0, HARNESS_DIR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import masking  # noqa: E402
+import repo_sweep  # noqa: E402
+import fleet_exec_policy as policy  # noqa: E402
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_WQ_AGENT_RE = re.compile(r"^fworker-wq(\d+)$")
+
+
+def die(msg):
+    print(f"repo-read: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def resolve_root(repo_key):
+    """realpath of repo_key iff repo_key is itself a managed_repos() member — the
+    worker names the key, never a path, so there is nothing to realpath-and-hope-it's-
+    inside-something; membership is checked on the raw key first."""
+    if repo_key not in repo_sweep.managed_repos():
+        return None
+    return os.path.realpath(repo_key)
+
+
+def sha_error(root, sha):
+    if not _SHA_RE.match(sha or ""):
+        return ("sha must be a full 40-hex commit id — branch names, HEAD, and "
+                "abbreviations are refused (a ref is mutable, an abbreviation is ambiguous)")
+    p = subprocess.run(["git", "-C", root, "cat-file", "-e", f"{sha}^{{commit}}"],
+                        capture_output=True, text=True, timeout=15)
+    if p.returncode != 0:
+        return f"{sha} is not a commit object reachable in {root}"
+    return None
+
+
+def ticket_identity():
+    wq_agent = os.environ.get("WQ_AGENT", "")
+    m = _WQ_AGENT_RE.match(wq_agent)
+    ticket = (m.group(1) if m else None) or os.environ.get("FOREMAN_TICKET_ID")
+    return ticket, wq_agent
+
+
+def grant_error(repo_key, sha):
+    ticket, wq_agent = ticket_identity()
+    if not ticket:
+        return "no ticket identity (WQ_AGENT/FOREMAN_TICKET_ID unset) — refusing to guess"
+    grant_path = os.environ.get("FOREMAN_GRANT_FILE")
+    grant_sha = os.environ.get("FOREMAN_GRANT_SHA")
+    grant, err = policy.load_grant(grant_path, grant_sha, ticket, wq_agent)
+    if err:
+        return f"grant denied ({err})"
+    # Shape shared with hold_gate._repo_granted (already landed, harness/hold_gate.py):
+    # one grant entry {"kind": "repo", "repo": "<key>@<sha>"}. hold_gate only matches the
+    # key half (it just decides hold-vs-not); this is the authoritative, sha-exact check.
+    wanted = f"{repo_key}@{sha}"
+    for g in grant.get("grants", []):
+        if g.get("kind") == "repo" and g.get("repo") == wanted:
+            return None
+    return f"ungranted: needs:repo({wanted}) is not in this ticket's grant"
+
+
+def run_git(root, args):
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    cmd = ["git", "-C", root, "-c", "core.hooksPath=/dev/null"] + args
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+
+
+def git_args(verb, sha, path):
+    if verb == "ls":
+        return ["ls-tree", sha] + (["--", path] if path else [])
+    if verb == "show":
+        if not path:
+            die("show requires a path: repo-read show <repo-key> <sha> <path>")
+        return ["show", f"{sha}:{path}"]
+    if verb == "grep":
+        if not path:
+            die("grep requires a pattern: repo-read grep <repo-key> <sha> <pattern>")
+        return ["grep", "-n", path, sha]
+    if verb == "log":
+        return ["log", "-n50", sha] + (["--", path] if path else [])
+    die(f"unknown verb {verb!r}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="repo-read")
+    sub = ap.add_subparsers(dest="verb", required=True)
+    for verb in ("ls", "show", "grep", "log"):
+        p = sub.add_parser(verb)
+        p.add_argument("repo_key")
+        p.add_argument("sha")
+        p.add_argument("path", nargs="?", default=None)
+    args = ap.parse_args(argv)
+
+    root = resolve_root(args.repo_key)
+    if root is None:
+        die(f"{args.repo_key!r} is not a repo_sweep.managed_repos() key")
+
+    err = sha_error(root, args.sha)
+    if err:
+        die(err)
+
+    err = grant_error(args.repo_key, args.sha)
+    if err:
+        die(err)
+
+    gargs = git_args(args.verb, args.sha, args.path)
+    try:
+        p = run_git(root, gargs)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        die(f"git {args.verb} failed to run: {e}")
+
+    out, _ = masking.mask_text(p.stdout)
+    err_out, _ = masking.mask_text(p.stderr)
+    sys.stdout.write(out)
+    sys.stderr.write(err_out)
+    sys.exit(p.returncode)
+
+
+if __name__ == "__main__":
+    main()
