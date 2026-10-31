@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""session-briefing — wq#4787.
+
+Writes /home/lumen/minerva/context/SESSION-BRIEFING.md: a generated situational
+briefing written FOR the incoming agent, not an archive. claude_context.sh --core
+prints it right after the live VERIFY block, before HANDOFF.md and before the
+claude_memory.md selector output.
+
+NOT the same file as /home/lumen/scratch/subtraction/SESSION-BRIEFING.md (the
+hand-appended, append-only session log). This one is regenerated whole on every
+run and never hand-edited. It lives in minerva/context/ (gitignored, next to
+LIVE_FLEET_STATE.md) so a generated file never dirties the minerva primary tree.
+
+Sections (all generated, no hand prose):
+  1 RECENT CHATS     claude.ai chat-list snapshot (context/recent_chats.json, written
+                     by `session-briefing ingest-chats` from a browser session's
+                     recent_chats output) merged with CCC-exported conversations in
+                     /home/lumen/publish/inbox. When that is thin or stale, a labelled
+                     PROXY list from claude-session episodes is shown as well.
+  2 ACTIVE WORK      wq claimed / frank_gated / pending_review / blocked + pending grants
+  3 LAST 48H         episodes (what changed, what failed), Frank-stated facts, decisions
+  4 STANDING ORDERS  parsed from claude_memory.md (hand prose first, then decisions)
+  5 OPEN HANDOFFS    open tickets whose notes say handoff / incomplete / not done
+
+Hard cap 400 lines. Over the cap it trims, in order: oldest episodes, lowest-pri
+blocked tickets, lowest-pri frank_gated tickets, standing orders, handoffs, chats.
+
+Usage:
+  session-briefing                          render to the default path
+  session-briefing --out PATH               render elsewhere (tests)
+  session-briefing --stdout                 print, write nothing
+  session-briefing ingest-chats [--file F]  recent_chats tool output (or a JSON list /
+                                            {"chats": [...]}) on stdin or F -> merged
+                                            into context/recent_chats.json
+Exit: 0 ok, 1 could not write (previous file kept), 2 ingest-chats parsed nothing.
+Read-only on every database (sqlite mode=ro, closed on every path).
+"""
+import argparse
+import glob
+import html
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+WQ_DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
+MINERVA_DB = os.environ.get("MINERVA_DB", "/home/lumen/minerva/minerva.db")
+MEMORY_MD = os.environ.get("BRIEFING_MEMORY_MD", "/home/lumen/claude_memory.md")
+CTX = os.environ.get("BRIEFING_CTX", "/home/lumen/minerva/context")
+OUT_PATH = os.path.join(CTX, "SESSION-BRIEFING.md")
+CHATS_PATH = os.environ.get("BRIEFING_CHATS", os.path.join(CTX, "recent_chats.json"))
+INBOX = os.environ.get("BRIEFING_INBOX", "/home/lumen/publish/inbox")
+MAX_LINES = 400
+PT = ZoneInfo("America/Los_Angeles")
+CHAT_KEEP = 50                 # snapshot retention (newest first)
+CHAT_STALE = timedelta(hours=72)
+EPISODE_WINDOW = timedelta(hours=48)
+FACT_WINDOW = timedelta(days=7)
+CONV_MAX_BYTES = 50 * 1024 * 1024
+
+# initial caps and floors per trimmable list, and the order they give way in
+CAPS = {"episodes": 40, "blocked": 25, "gated": 30, "orders": 40, "handoffs": 15, "chats": 20}
+FLOORS = {"episodes": 5, "blocked": 5, "gated": 10, "orders": 10, "handoffs": 5, "chats": 5}
+TRIM_ORDER = ["episodes", "blocked", "gated", "orders", "handoffs", "chats"]
+
+SECRET_RE = re.compile(
+    r"sk-ant-[A-Za-z0-9_\-]{8,}|sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}|cf[au]t_[A-Za-z0-9_\-]{16,}|AKIA[0-9A-Z]{16}"
+    r"|glpat-[A-Za-z0-9_\-]{16,}|xox[abprs]-[A-Za-z0-9\-]{10,}"
+    r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"
+    r"|Bearer\s+[A-Za-z0-9._\-]{24,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+)
+URL_CRED_RE = re.compile(r"(://)[^/\s:@]+:[^/\s@]+@")
+ORDER_RE = re.compile(r"STANDING ORDER|\b[Dd]o NOT\b|\b[Dd]o not\b|\bNEVER\b|\bRETIRED\b|\bDEAD\b|off-limits")
+HANDOFF_RE = re.compile(r"hand-?off|handover|SESSION-BRIEFING|incomplete|not[ -]done", re.I)
+CHAT_RE = re.compile(r"""<chat url=(['"])(.+?)\1 updated_at=(['"])(.+?)\3[^>]*>(.*?)</chat>""", re.S)
+ORDER_SECTIONS = ["HAND PROSE", "PERMANENT DECISIONS", "FRANK CORRECTIONS", "STANDING RULES"]
+
+
+def mask(s):
+    return URL_CRED_RE.sub(r"\1<redacted>@", SECRET_RE.sub("<redacted>", s))
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    if len(s) > 10 and s[10] == " ":
+        s = s[:10] + "T" + s[11:]
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        t = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def pt(t):
+    return t.astimezone(PT).strftime("%m-%d %H:%M %Z") if t else "?"
+
+
+def age(t, now):
+    if not t:
+        return "?"
+    s = max(0, (now - t).total_seconds())
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    if s < 172800:
+        return f"{s / 3600:.0f}h"
+    return f"{s / 86400:.0f}d"
+
+
+def one(s, n):
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def ro(path):
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=5000")
+    return c
+
+
+def iso_cut(now, delta):
+    return (now - delta).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def atomic_write(path, text, mode=0o644):
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".session-briefing.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------- data loaders
+def load_chats(now):
+    """-> (chats newest-first, note). Snapshot + CCC exports, merged by uuid."""
+    chats, notes = {}, []
+    try:
+        with open(CHATS_PATH) as f:
+            snap = json.load(f)
+        gen = parse_ts(snap.get("generated_at"))
+        notes.append(f"snapshot {age(gen, now)} old ({len(snap.get('chats', []))} chats, "
+                     f"{os.path.basename(CHATS_PATH)})")
+        for c in snap.get("chats", []):
+            key = c.get("uuid") or c.get("url")
+            if key:
+                chats[key] = dict(c, src="snapshot")
+        stale = gen is None or now - gen > CHAT_STALE
+    except FileNotFoundError:
+        notes.append("no chat snapshot yet")
+        stale = True
+    except (OSError, ValueError, AttributeError) as e:
+        notes.append(f"snapshot unreadable ({type(e).__name__})")
+        stale = True
+    n_ccc = 0
+    for path in sorted(glob.glob(os.path.join(INBOX, "*", "conversation.json"))):
+        try:
+            if os.path.getsize(path) > CONV_MAX_BYTES:
+                continue
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        uuid = d.get("uuid")
+        if not uuid:
+            continue
+        prev = chats.get(uuid)
+        if prev and (parse_ts(prev.get("updated_at")) or now) >= (parse_ts(d.get("updated_at")) or now):
+            continue
+        chats[uuid] = {"uuid": uuid, "title": d.get("name") or "(untitled)",
+                       "updated_at": d.get("updated_at"),
+                       "summary": first_sentence(d.get("summary") or ""),
+                       "url": f"https://claude.ai/chat/{uuid}", "src": "ccc-export"}
+        n_ccc += 1
+    if n_ccc:
+        notes.append(f"{n_ccc} from CCC exports")
+    rows = sorted(chats.values(), key=lambda c: parse_ts(c.get("updated_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return rows, "; ".join(notes), stale
+
+
+def first_sentence(text):
+    text = html.unescape(text or "")
+    lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or re.fullmatch(r"\**[A-Za-z ]+\**:?", ln):   # '**Conversation Overview**'
+            continue
+        lines.append(ln)
+    s = re.sub(r"\*\*|__|`", "", " ".join(lines))
+    m = re.match(r"(.{20,240}?[.!?])(\s|$)", s)
+    return one(m.group(1) if m else s, 240)
+
+
+def load_proxy_sessions(c, n):
+    return c.execute(
+        "SELECT created_at, title, source_ref FROM archival_notes "
+        "WHERE origin='claude-session' AND revoked_at IS NULL AND superseded_by IS NULL "
+        "ORDER BY created_at DESC LIMIT ?", (n,)).fetchall()
+
+
+def load_work(c, now):
+    tasks = c.execute(
+        "SELECT id, lane, pri, title, status, claimed_by, claimed_at, block_reason, "
+        "decision_prompt, notes, created_at FROM tasks "
+        "WHERE status IN ('claimed','frank_gated','pending_review','blocked') "
+        "ORDER BY COALESCE(pri, 9) ASC, id DESC").fetchall()
+    grants = c.execute(
+        "SELECT id, ticket_id, class, target, requested_at, expires_at FROM grant_requests "
+        "WHERE state='pending' ORDER BY id DESC").fetchall()
+    live = [g for g in grants if not g["expires_at"] or (parse_ts(g["expires_at"]) or now) > now]
+    return tasks, live
+
+
+def load_handoffs(c):
+    rows = c.execute(
+        "SELECT id, pri, status, title, notes FROM tasks "
+        "WHERE status NOT IN ('done','cancelled','rejected','retired') AND notes IS NOT NULL "
+        "AND (notes LIKE '%hand%off%' OR notes LIKE '%handover%' OR notes LIKE '%SESSION-BRIEFING%' "
+        "OR notes LIKE '%incomplete%' OR notes LIKE '%not done%' OR notes LIKE '%not-done%') "
+        "ORDER BY COALESCE(pri, 9) ASC, id DESC").fetchall()
+    out = []
+    for r in rows:
+        hits = [ln for ln in (r["notes"] or "").splitlines() if HANDOFF_RE.search(ln)]
+        if hits:
+            out.append((r, hits[-1]))
+    return out
+
+
+def load_episodes(c, now):
+    return c.execute(
+        "SELECT created_at, kind, title, source_ref, content, origin FROM archival_notes "
+        "WHERE created_at >= ? AND revoked_at IS NULL AND superseded_by IS NULL "
+        "AND COALESCE(origin,'') != 'state-mirror' ORDER BY created_at DESC",
+        (iso_cut(now, EPISODE_WINDOW),)).fetchall()
+
+
+def load_frank_facts(c, now):
+    return c.execute(
+        "SELECT subject, predicate, value, ingested_at FROM state_facts "
+        "WHERE source_kind='frank_stated' AND invalidated_at IS NULL AND ingested_at >= ? "
+        "ORDER BY ingested_at DESC LIMIT 15", (iso_cut(now, FACT_WINDOW),)).fetchall()
+
+
+def load_decisions(c, now):
+    return c.execute(
+        "SELECT id, decision, created_at FROM fleet_decisions "
+        "WHERE status='active' AND created_at >= ? ORDER BY created_at DESC LIMIT 10",
+        ((now - FACT_WINDOW).strftime("%Y-%m-%d %H:%M:%S"),)).fetchall()
+
+
+def md_section(content, name):
+    m = re.search(r"^## " + re.escape(name) + r"\n(.*?)(?=^## |\Z)", content or "", re.S | re.M)
+    if not m:
+        return []
+    items = [ln[2:].strip() for ln in m.group(1).splitlines() if ln.startswith("- ")]
+    return [i for i in items if i.lower().strip(". ") not in ("(none)", "none", "nothing", "n/a", "")]
+
+
+def load_orders():
+    """Standing-order lines from claude_memory.md, hand prose first, deduped."""
+    with open(MEMORY_MD) as f:
+        lines = f.read().splitlines()
+    by_sec = {k: [] for k in ORDER_SECTIONS}
+    sec, sub, sub_hit, sub_used = None, None, False, False
+
+    def close_sub():
+        # a hand-prose heading that is itself an order ("M80 DEAD — final") but has no
+        # matching body line still counts, once, as its own entry
+        if sec == "HAND PROSE" and sub and sub_hit and not sub_used:
+            by_sec[sec].append([f"[{sub}]"])
+
+    for ln in lines:
+        if ln.startswith("## ") or ln.startswith("### "):
+            close_sub()
+            if ln.startswith("## "):
+                sec = next((k for k in ORDER_SECTIONS if ln[3:].upper().startswith(k)), None)
+                sub, sub_hit = None, False
+            else:
+                sub = ln[4:].strip()
+                sub_hit = bool(ORDER_RE.search(sub))
+            sub_used = False
+            if sec == "HAND PROSE" and ln.startswith("### "):
+                by_sec[sec].append([])          # one group per dated hand-prose block
+            continue
+        if sec is None or not ORDER_RE.search(ln):
+            continue
+        text = re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", ln)
+        text = re.sub(r"^(?:note|description):\s*", "", text)
+        if sec == "HAND PROSE":
+            if sub:
+                text = f"[{sub}] {text}"
+                sub_used = True
+            if not by_sec[sec]:
+                by_sec[sec].append([])
+            by_sec[sec][-1].append(text)
+        else:
+            by_sec[sec].append(text)
+    close_sub()
+    # hand prose blocks are dated ascending: newest block first, lines in order within it
+    hand = [t for grp in reversed(by_sec["HAND PROSE"]) for t in grp]
+    ordered = hand + by_sec["PERMANENT DECISIONS"] + by_sec["FRANK CORRECTIONS"] + by_sec["STANDING RULES"]
+    seen, out = set(), []
+    for t in ordered:
+        key = re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()[:100]
+        if key and key not in seen:
+            seen.add(key)
+            out.append(t)
+    return out
+
+
+# ---------------------------------------------------------------- rendering
+def safe(fn, *a):
+    try:
+        return fn(*a), None
+    except Exception as e:  # one broken source must not kill the briefing
+        return None, f"{type(e).__name__}: {one(e, 160)}"
+
+
+def collect(now):
+    data = {}
+    data["chats"], data["chats_err"] = safe(load_chats, now)
+    try:
+        with closing(ro(WQ_DB)) as c:
+            data["work"], data["work_err"] = safe(load_work, c, now)
+            data["handoffs"], data["handoffs_err"] = safe(load_handoffs, c)
+    except sqlite3.Error as e:
+        data["work"] = data["handoffs"] = None
+        data["work_err"] = data["handoffs_err"] = f"queue.db: {e}"
+    try:
+        with closing(ro(MINERVA_DB)) as c:
+            data["proxy"], data["proxy_err"] = safe(load_proxy_sessions, c, CAPS["chats"])
+            data["episodes"], data["episodes_err"] = safe(load_episodes, c, now)
+            data["facts"], data["facts_err"] = safe(load_frank_facts, c, now)
+            data["decisions"], data["decisions_err"] = safe(load_decisions, c, now)
+    except sqlite3.Error as e:
+        for k in ("proxy", "episodes", "facts", "decisions"):
+            data[k], data[k + "_err"] = None, f"minerva.db: {e}"
+    data["orders"], data["orders_err"] = safe(load_orders)
+    return data
+
+
+def more(n_all, n_shown, cmd):
+    return [f"- … {n_all - n_shown} more: `{cmd}`"] if n_all > n_shown else []
+
+
+def render(data, caps, now):
+    L = []
+    L.append("# SESSION BRIEFING — read this first")
+    L.append(f"_Generated {pt(now)} by /home/lumen/bin/session-briefing (wq#4787) on every state-regen "
+             "and every `--core` boot. Never hand-edit: fix the source. Precedence: live VERIFY > this "
+             "briefing > HANDOFF.md prose > claude_memory.md. Not the append-only log at "
+             "scratch/subtraction/SESSION-BRIEFING.md._")
+    L.append("")
+
+    # 1 RECENT CHATS
+    L.append("## 1. RECENT CHATS (what Frank has been doing, all sessions)")
+    if data["chats_err"]:
+        L.append(f"- (chat sources unavailable: {data['chats_err']})")
+        chats, note, stale = [], "", True
+    else:
+        chats, note, stale = data["chats"]
+    L.append(f"_Source: {note or 'none'}. Refresh from a claude.ai session: pipe recent_chats(n=20) output "
+             "into `ssh lumen@100.117.66.102 'session-briefing ingest-chats'`._")
+    for ch in chats[: caps["chats"]]:
+        t = parse_ts(ch.get("updated_at"))
+        summ = f" — {one(ch.get('summary'), 180)}" if ch.get("summary") else ""
+        L.append(f"- {pt(t)} · **{one(ch.get('title') or '(untitled)', 80)}**{summ} · {ch.get('url', '')}")
+    if stale or len(chats) < 5:
+        proxy = data.get("proxy") or []
+        n = max(0, min(caps["chats"], 10) if chats else caps["chats"])
+        if proxy and n:
+            why = "missing" if not chats else ("stale" if stale else "thin")
+            L.append(f"_PROXY (snapshot {why}): latest claude-session episodes_")
+            for r in proxy[:n]:
+                ref = f" [{r['source_ref']}]" if r["source_ref"] else ""
+                L.append(f"- {pt(parse_ts(r['created_at']))} · {one(r['title'], 160)}{ref}")
+        elif data.get("proxy_err"):
+            L.append(f"- (proxy unavailable: {data['proxy_err']})")
+    L.append("")
+
+    # 2 ACTIVE WORK
+    L.append("## 2. ACTIVE WORK")
+    if data["work_err"]:
+        L.append(f"- (queue unavailable: {data['work_err']})")
+    else:
+        tasks, grants = data["work"]
+        by = {s: [t for t in tasks if t["status"] == s] for s in ("frank_gated", "claimed", "pending_review", "blocked")}
+        gated = by["frank_gated"]
+        L.append(f"### Waiting on Frank — {len(gated)} frank_gated, {len(grants)} pending grant request(s)")
+        for g in grants[:10]:
+            L.append(f"- grant#{g['id']} for wq#{g['ticket_id']}: {g['class']} → {one(g['target'], 90)} "
+                     f"(requested {pt(parse_ts(g['requested_at']))})")
+        for t in gated[: caps["gated"]]:
+            why = f" — {one(t['decision_prompt'], 140)}" if t["decision_prompt"] else ""
+            L.append(f"- wq#{t['id']} P{t['pri']} [{t['lane']}] {one(t['title'], 100)}{why}")
+        L += more(len(gated), min(len(gated), caps["gated"]), "wq list --status frank_gated")
+        cl = by["claimed"]
+        L.append(f"### In flight — {len(cl)} claimed")
+        for owner, pred in (("orchestrator", lambda w: w and not w.startswith("fworker")),
+                            ("fworker", lambda w: w and w.startswith("fworker"))):
+            for t in [t for t in cl if pred(t["claimed_by"] or "")]:
+                L.append(f"- {owner} `{t['claimed_by']}`: wq#{t['id']} P{t['pri']} {one(t['title'], 110)} "
+                         f"(claimed {age(parse_ts(t['claimed_at']), now)} ago)")
+        pr = by["pending_review"]
+        if pr:
+            L.append(f"### Pending review — {len(pr)}")
+            for t in pr[:10]:
+                L.append(f"- wq#{t['id']} P{t['pri']} {one(t['title'], 120)}")
+            L += more(len(pr), min(len(pr), 10), "wq list --status pending_review")
+        bl = by["blocked"]
+        L.append(f"### Blocked — {len(bl)} (highest pri first)")
+        for t in bl[: caps["blocked"]]:
+            why = f" — {one(t['block_reason'], 140)}" if t["block_reason"] else ""
+            L.append(f"- wq#{t['id']} P{t['pri']} {one(t['title'], 90)}{why}")
+        L += more(len(bl), min(len(bl), caps["blocked"]), "wq list --status blocked")
+    L.append("")
+
+    # 3 LAST 48H
+    L.append("## 3. LAST 48H — episodes, failures, Frank's decisions")
+    if data["episodes_err"]:
+        L.append(f"- (episodes unavailable: {data['episodes_err']})")
+    else:
+        eps = data["episodes"]
+        n_fail = 0
+        for r in eps[: caps["episodes"]]:
+            failed = md_section(r["content"], "What failed")
+            changed = md_section(r["content"], "What changed")
+            ref = f" [{r['source_ref']}]" if r["source_ref"] else ""
+            line = f"- {pt(parse_ts(r['created_at']))} · {r['kind']} · {one(r['title'], 150)}{ref}"
+            if changed:
+                line += f" · changed: {one('; '.join(changed), 90)}"
+            if failed:
+                n_fail += 1
+                line += f" · **FAILED:** {one('; '.join(failed), 120)}"
+            L.append(line)
+        if not eps:
+            L.append("- (no episodes in the last 48h)")
+        L += more(len(eps), min(len(eps), caps["episodes"]), "lumen_episode.py recall '<topic>'")
+    facts = data.get("facts") or []
+    decs = data.get("decisions") or []
+    if facts or decs:
+        L.append("### Frank-stated facts and active decisions (last 7d)")
+        for f in facts:
+            L.append(f"- {pt(parse_ts(f['ingested_at']))} · {f['subject']}.{f['predicate']} = {one(f['value'], 130)}")
+        for d in decs:
+            L.append(f"- decision#{d['id']} {pt(parse_ts(d['created_at']))} · {one(d['decision'], 150)}")
+    for k in ("facts_err", "decisions_err"):
+        if data.get(k):
+            L.append(f"- ({k[:-4]} unavailable: {data[k]})")
+    L.append("")
+
+    # 4 STANDING ORDERS
+    L.append("## 4. STANDING ORDERS (things incoming agents keep violating — from claude_memory.md)")
+    if data["orders_err"]:
+        L.append(f"- (claude_memory.md unreadable: {data['orders_err']})")
+    else:
+        orders = data["orders"]
+        for o in orders[: caps["orders"]]:
+            L.append(f"- {one(o, 220)}")
+        L += more(len(orders), min(len(orders), caps["orders"]), "grep -nE 'STANDING ORDER|NEVER|RETIRED|DEAD' /home/lumen/claude_memory.md")
+    L.append("")
+
+    # 5 OPEN HANDOFFS
+    L.append("## 5. OPEN HANDOFFS (open tickets whose notes say handoff / incomplete / not done)")
+    if data["handoffs_err"]:
+        L.append(f"- (queue unavailable: {data['handoffs_err']})")
+    else:
+        ho = data["handoffs"]
+        for r, hit in ho[: caps["handoffs"]]:
+            L.append(f"- wq#{r['id']} P{r['pri']} {r['status']} · {one(r['title'], 80)} — {one(hit, 140)}")
+        if not ho:
+            L.append("- (none)")
+        L += more(len(ho), min(len(ho), caps["handoffs"]), "wq show <id>")
+    L.append("_Last sessions' close-out prose: HANDOFF.md 'Orchestrator notes' and "
+             "`tail -60 /home/lumen/scratch/subtraction/SESSION-BRIEFING.md`._")
+    return L
+
+
+def build(now=None):
+    now = now or datetime.now(timezone.utc)
+    data = collect(now)
+    caps = dict(CAPS)
+    lines = render(data, caps, now)
+    while len(lines) > MAX_LINES:
+        k = next((k for k in TRIM_ORDER if caps[k] > FLOORS[k]), None)
+        if k is None:
+            break
+        caps[k] = max(FLOORS[k], caps[k] - max(1, (len(lines) - MAX_LINES)))
+        lines = render(data, caps, now)
+    if len(lines) > MAX_LINES:
+        lines = lines[: MAX_LINES - 1] + [f"_(truncated at {MAX_LINES} lines)_"]
+    return mask("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------- ingest-chats
+def parse_chat_input(text):
+    text = text.strip()
+    if text.startswith("[") or text.startswith("{"):
+        d = json.loads(text)
+        items = d.get("chats", []) if isinstance(d, dict) else d
+        out = []
+        for c in items:
+            url = c.get("url") or (f"https://claude.ai/chat/{c['uuid']}" if c.get("uuid") else "")
+            uuid = c.get("uuid") or url.rstrip("/").rsplit("/", 1)[-1]
+            if uuid:
+                out.append({"uuid": uuid, "url": url, "updated_at": c.get("updated_at"),
+                            "title": one(c.get("title") or c.get("name") or "(untitled)", 120),
+                            "summary": first_sentence(c.get("summary") or "")})
+        return out
+    out = []
+    for _q1, url, _q2, upd, body in CHAT_RE.findall(text):
+        body = html.unescape(body)
+        uuid = url.rstrip("/").rsplit("/", 1)[-1]
+        if "[Content redacted" in body:
+            title, summ = "(content redacted by classifier)", ""
+        else:
+            m = re.search(r"^\s*Title:\s*(.+)$", body, re.M)
+            title = m.group(1).strip() if m else "(untitled)"
+            summ = ""
+            sm = (re.search(r"^\s*Summary:\s*(.*)", body, re.M | re.S)
+                  or re.search(r"<chat_summary>(.*?)(?:</chat_summary>|$)", body, re.S))
+            if sm:
+                summ = first_sentence(sm.group(1)[:3000])
+            else:
+                hm = re.search(r"^(?:H|Human):[ \t]*(\S.*)$", body, re.M)
+                if hm:
+                    summ = "Frank: " + one(hm.group(1), 160)
+        out.append({"uuid": uuid, "url": url, "updated_at": upd, "title": one(title, 120), "summary": summ})
+    return out
+
+
+def ingest_chats(text, now=None):
+    now = now or datetime.now(timezone.utc)
+    new = parse_chat_input(text)
+    if not new:
+        print("session-briefing: ingest-chats parsed 0 chats (expected recent_chats output or JSON)", file=sys.stderr)
+        return 2
+    merged = {}
+    try:
+        with open(CHATS_PATH) as f:
+            for c in json.load(f).get("chats", []):
+                if c.get("uuid"):
+                    merged[c["uuid"]] = c
+    except (OSError, ValueError, AttributeError):
+        pass
+    for c in new:
+        prev = merged.get(c["uuid"])
+        if not prev or (parse_ts(c.get("updated_at")) or now) >= (parse_ts(prev.get("updated_at")) or now):
+            merged[c["uuid"]] = {k: mask(v) if isinstance(v, str) else v for k, v in c.items()}
+    rows = sorted(merged.values(), key=lambda c: parse_ts(c.get("updated_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:CHAT_KEEP]
+    snap = {"generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "claude.ai recent_chats via browser session (session-briefing ingest-chats)",
+            "chats": rows}
+    atomic_write(CHATS_PATH, json.dumps(snap, indent=1, ensure_ascii=False) + "\n", mode=0o600)
+    print(f"session-briefing: ingested {len(new)} chat(s); snapshot holds {len(rows)} -> {CHATS_PATH}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="session-briefing", description=__doc__.split("\n")[0])
+    ap.add_argument("cmd", nargs="?", choices=["render", "ingest-chats"], default="render")
+    ap.add_argument("--out", default=OUT_PATH)
+    ap.add_argument("--stdout", action="store_true")
+    ap.add_argument("--file", help="ingest-chats: read this file instead of stdin")
+    a = ap.parse_args(argv)
+    if a.cmd == "ingest-chats":
+        text = open(a.file).read() if a.file else sys.stdin.read()
+        try:
+            return ingest_chats(text)
+        except ValueError as e:
+            print(f"session-briefing: bad JSON: {e}", file=sys.stderr)
+            return 2
+    text = build()
+    if a.stdout:
+        sys.stdout.write(text)
+        return 0
+    try:
+        atomic_write(a.out, text)
+    except OSError as e:
+        print(f"session-briefing: could not write {a.out}: {e} (previous file kept)", file=sys.stderr)
+        return 1
+    print(f"session-briefing: wrote {a.out} ({text.count(chr(10))} lines)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
