@@ -25,6 +25,11 @@ DESIGN:
     ntfy on breach->clear. Constant re-alerting trains you to ignore pages.
   - Nothing is printed on a normal run; --print emits a one-line summary
     (for manual/test invocation).
+  - wq#4692: a rung the shared litellm_rungs module flags metered (real
+    $/token, e.g. the per-token Anthropic rungs) gets a GET /v1/models
+    presence check instead of a real completion — this probe was sending
+    331 billed completions/7d to lumen/claude-sonnet alone, against Frank's
+    standing no-spend rule.
 
 Deploy: see install.sh (script -> /home/lumen/bin, units -> systemd, timer
 runs this every 30 min). The .service's ExecStartPost writes the
@@ -149,7 +154,35 @@ def classify(code, text: str) -> str:
     return "unreachable"
 
 
+def check_model_present(key: str, model_name: str) -> dict:
+    """Zero-cost liveness for a metered rung (wq#4692): confirm GET /v1/models
+    lists it instead of spending a real, billed completion on it every cycle —
+    this is the sentinel-3 half of the 1318-call/7d no-spend-rule violation."""
+    req = urllib.request.Request(MODELS_URL, headers={"Authorization": "Bearer " + key})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+            data = json.load(resp)
+        names = {m.get("id") for m in data.get("data", [])}
+        ok = model_name in names
+        return {"model": model_name, "ok": ok, "kind": "ok" if ok else "unreachable",
+                "elapsed_s": round(time.time() - t0, 1),
+                "reason": "" if ok else f"{model_name} not listed in GET /v1/models"}
+    except Exception as e:  # noqa: BLE001 - report any failure shape as a probe FAIL
+        body = ""
+        try:
+            body = e.read().decode()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        kind = classify(getattr(e, "code", None), body)
+        reason = (str(e)[:120] + " " + body[:200]).strip().replace("\n", " ")
+        return {"model": model_name, "ok": False, "kind": kind,
+                "elapsed_s": round(time.time() - t0, 1), "reason": reason}
+
+
 def probe_one(key: str, rung: Rung) -> dict:
+    if rung.metered:
+        return {"host": rung.host, **check_model_present(key, rung.model_name)}
     body = json.dumps({
         "model": rung.model_name,
         "messages": [{"role": "user", "content": "Reply with the single word: pong"}],
