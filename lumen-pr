@@ -349,6 +349,18 @@ lint_second_person() { # lint_second_person <file-or-string> <label>
   return 0
 }
 
+lint_no_coauthor() { # lint_no_coauthor <text> <label>   (wq#4798: house rule is Assisted-by, never Co-authored-by)
+  local text="$1" label="$2"
+  if printf '%s' "$text" | grep -qiE '^co-authored-by:'; then
+    printf 'lumen-pr: %s carries a Co-authored-by trailer, which the house rule bans — use the Assisted-by footer this tool already appends instead:\n' "$label" >&2
+    printf '  %s\n' "$FOOTER_ASSIST" >&2
+    printf '  offending line(s):\n' >&2
+    printf '%s' "$text" | grep -inE '^co-authored-by:' | head -5 | sed 's/^/    /' >&2
+    die "$label carries a Co-authored-by trailer (wq#4798)"
+  fi
+  return 0
+}
+
 lint_secrets() { # lint_secrets <label> <text>   (wq#4600: never publish a secret literal in a commit, PR or comment)
   local label="$1" text="$2" tool out
   tool="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/cmd-secret-lint"
@@ -1131,7 +1143,9 @@ cmd_commit() {
   done
   lint_secrets "commit subject" "$subject"
   lint_subject "$subject"
+  lint_no_coauthor "$subject" "commit subject"
   [ -n "$body_file" ] && [ -r "$body_file" ] && lint_secrets "commit body" "$(cat "$body_file")"
+  [ -n "$body_file" ] && [ -r "$body_file" ] && lint_no_coauthor "$(cat "$body_file")" "commit body"
   local cur; cur=$(git -C "$REPO_PATH" branch --show-current)
   [ "$cur" = "$DEFAULT_BRANCH" ] && \
     die "refusing to commit directly to '$DEFAULT_BRANCH' (§2, §10.1). Run: lumen-pr start $REPO_PATH <type>/<slug>"
