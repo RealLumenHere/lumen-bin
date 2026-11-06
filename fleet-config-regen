@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""fleet-config-regen -- regenerate /home/lumen/.ssh/fleet_config from the lumen_state store (wq#4919).
+
+For every roster host emits a Tailscale block (Host <n>) and, when state holds a LAN IP, a LAN
+block (Host <n>-lan). Source precedence per field: lumen_state (current) > fleet-inv ssh-list >
+previous fleet_config. Roster = fleet-inv ssh-list (active,standby,bench) UNION every non-LAN host
+in the previous fleet_config, so a host is never silently dropped.
+
+Safety: backs up the old file first (fleet_config.bak.<ts>_regen, newest 10 kept), validates the
+new file with `ssh -G` before replacing, replaces atomically, and does nothing when the content is
+unchanged. SSH keys / authorized_keys / ~/.ssh/config are never touched.
+
+Usage: fleet-config-regen [--dry-run] [--out PATH]
+Exit 0 = ok/unchanged, 1 = error (old file left in place). Safe to call from state-regen (fail-open).
+NOTE: fleet-keymesh also writes a fleet_config (TS only) -- rerunning it overwrites this file;
+run fleet-config-regen afterwards.
+"""
+import argparse, datetime, glob, ipaddress, os, re, shutil, subprocess, sys
+from zoneinfo import ZoneInfo
+
+STATE_PY = "/home/lumen/minerva/lumen_state.py"
+FLEET_INV = "/home/lumen/bin/fleet-inv"
+DEFAULT_OUT = "/home/lumen/.ssh/fleet_config"
+REQUIRED = ["lumen", "thor", "thoth", "anubis", "horus", "ptah", "neith", "khnum", "maksoor"]
+PRED_RE = re.compile(r"^\s*([a-z0-9][a-z0-9_-]*)\.(tailscale_ip|lan_ip|ssh_user|status)\s+=\s+(.*)$")
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+USER_RE = re.compile(r"^([a-z_][a-z0-9_-]*)")
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
+HDR = "# fleet-config-regen generated"
+
+
+def warn(msg):
+    print("fleet-config-regen: WARN " + msg, file=sys.stderr)
+
+
+def pick_ip(val, kind):
+    for s in IP_RE.findall(val or ""):
+        try:
+            ip = ipaddress.ip_address(s)
+        except ValueError:
+            continue
+        if kind == "ts" and ip in CGNAT:
+            return s
+        if kind == "lan" and ip.is_private and ip not in CGNAT:
+            return s
+    return None
+
+
+def load_state():
+    r = subprocess.run(["python3", STATE_PY, "current"], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError("lumen_state.py current failed rc=%s: %s" % (r.returncode, r.stderr[:200]))
+    st = {}
+    for line in r.stdout.splitlines():
+        m = PRED_RE.match(line)
+        if not m:
+            continue
+        subj, pred, val = m.groups()
+        st.setdefault(subj, {}).setdefault(pred, val)
+    return st
+
+
+def load_inv():
+    r = subprocess.run([FLEET_INV, "ssh-list", "--all", "--status", "active,standby,bench"],
+                       capture_output=True, text=True, timeout=60)
+    inv = {}
+    for line in r.stdout.splitlines():
+        if not line.strip() or line.startswith("#") or "\t" not in line:
+            continue
+        name, tgt = line.split("\t", 1)
+        if "@" in tgt:
+            u, h = tgt.strip().split("@", 1)
+            inv[name.strip()] = {"user": u, "ts": h}
+    return inv
+
+
+def load_prev(path):
+    prev, cur = {}, None
+    if not os.path.exists(path):
+        return prev
+    for line in open(path):
+        s = line.strip()
+        if s.startswith("Host "):
+            cur = s.split(None, 1)[1]
+            if not cur.endswith("-lan"):
+                prev[cur] = {}
+            else:
+                cur = None
+        elif cur and s.startswith("HostName "):
+            prev[cur]["ts"] = s.split(None, 1)[1]
+        elif cur and s.startswith("User "):
+            prev[cur]["user"] = s.split(None, 1)[1]
+    return prev
+
+
+def build(st, inv, prev):
+    names = sorted(set(inv) | set(prev), key=lambda x: (x != "lumen", x))
+    for req in REQUIRED:
+        if req not in names:
+            warn("required host %s missing from roster" % req)
+    out, expect = [], {}
+    now = datetime.datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
+    out.append("%s %s from lumen_state (wq#4919). DO NOT HAND-EDIT: run /home/lumen/bin/fleet-config-regen" % (HDR, now))
+    out.append("# Host <n> = Tailscale path, Host <n>-lan = LAN path. Offline hosts keep their last known IPs.")
+    for n in names:
+        s, i, p = st.get(n, {}), inv.get(n, {}), prev.get(n, {})
+        ts = pick_ip(s.get("tailscale_ip"), "ts") or i.get("ts") or p.get("ts")
+        um = USER_RE.match(s.get("ssh_user", "")) if s.get("ssh_user") else None
+        # user: inventory (structured) > state (free-form text, first token) > previous fleet_config
+        sus = um.group(1) if um else None
+        user = i.get("user") or sus or p.get("user")
+        if i.get("user") and sus and sus != i["user"]:
+            warn("%s user: state=%r (free-form) ignored, inventory=%s used" % (n, sus, i["user"]))
+        lan = pick_ip(s.get("lan_ip"), "lan")
+        for fld, sv, ov in (("user", user, p.get("user")), ("ts", ts, p.get("ts"))):
+            if ov and sv and ov != sv:
+                warn("%s %s: generated=%s previous-fleet_config=%s" % (n, fld, sv, ov))
+        status = re.split(r"\s{2}\(since", s.get("status", ""))[0].strip()[:70] or "n/a"
+        out.append("# %s -- state status: %s" % (n, status))
+        if not user:
+            out.append("# %s: no ssh user in state/inventory/previous config -- skipped" % n)
+            continue
+        if ts:
+            out += ["Host " + n, "  HostName " + ts, "  User " + user,
+                    "  StrictHostKeyChecking accept-new", "  ConnectTimeout 10"]
+            expect[n] = (ts, user)
+        else:
+            out.append("# %s: no tailscale_ip known -- TS block skipped" % n)
+        if lan:
+            out += ["Host %s-lan" % n, "  HostName " + lan, "  User " + user,
+                    "  StrictHostKeyChecking accept-new", "  ConnectTimeout 10"]
+            expect[n + "-lan"] = (lan, user)
+        else:
+            out.append("# %s: no lan_ip in state -- LAN block skipped" % n)
+    return "\n".join(out) + "\n", expect, [n for n in prev]
+
+
+def validate(text, expect, prev_names, scratch):
+    open(scratch, "w").write(text)
+    for h, (ip, user) in expect.items():
+        r = subprocess.run(["ssh", "-F", scratch, "-G", h], capture_output=True, text=True, timeout=15)
+        got = dict(l.split(None, 1) for l in r.stdout.splitlines() if " " in l)
+        if got.get("hostname", "").strip() != ip or got.get("user", "").strip() != user:
+            raise RuntimeError("validate %s: want %s@%s got %s@%s" % (h, user, ip, got.get("user"), got.get("hostname")))
+    for n in prev_names:
+        if n not in expect:
+            raise RuntimeError("previous host %s would be dropped -- refusing" % n)
+
+
+def body(t):
+    return [l for l in t.splitlines() if not l.startswith(HDR)]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--out", default=DEFAULT_OUT)
+    a = ap.parse_args()
+    try:
+        st, inv, prev = load_state(), load_inv(), load_prev(a.out)
+        text, expect, prev_names = build(st, inv, prev)
+        scratch = "/tmp/fleet-config-regen.%d.validate" % os.getpid()
+        try:
+            validate(text, expect, prev_names, scratch)
+        finally:
+            if os.path.exists(scratch):
+                os.remove(scratch)
+        if a.dry_run:
+            sys.stdout.write(text)
+            return 0
+        old = open(a.out).read() if os.path.exists(a.out) else ""
+        if body(old) == body(text):
+            print("fleet-config-regen: unchanged (%d blocks)" % len(expect))
+            return 0
+        ts = datetime.datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y%m%d_%H%M%S")
+        if old:
+            shutil.copy2(a.out, "%s.bak.%s_regen" % (a.out, ts))
+        tmp = "%s.new.%d" % (a.out, os.getpid())
+        open(tmp, "w").write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, a.out)
+        for old_bak in sorted(glob.glob(a.out + ".bak.*_regen"))[:-10]:
+            os.remove(old_bak)
+        print("fleet-config-regen: wrote %s (%d blocks)" % (a.out, len(expect)))
+        return 0
+    except Exception as e:
+        print("fleet-config-regen: ERROR %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

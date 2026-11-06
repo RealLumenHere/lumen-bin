@@ -22,6 +22,10 @@ python3 lumen_state_gen.py > context/LIVE_FLEET_STATE.md \
     && python3 projection_state.py stamp lumen_state_txt lumen_state.txt \
     && python3 projection_state.py clear live_fleet_state lumen_state_txt \
     && echo regenerated
+# wq#4919: regenerate ~/.ssh/fleet_config (TS + -lan blocks) from the same state. Fail-open: an error
+# here never blocks the state projections; fleet-config-regen keeps the old file on any failure.
+timeout 120 /home/lumen/bin/fleet-config-regen >/dev/null 2>&1 \
+    || echo "state-regen: WARN fleet-config-regen failed (wq#4919); previous fleet_config kept" >&2
 # Memory V3 P2: keep the recall edge-graph fresh (incremental; only un-edged notes)
 python3 /home/lumen/minerva/lumen_edges.py >/dev/null 2>&1 &
 /home/lumen/bin/system-map-update &
