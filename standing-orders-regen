@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""standing-orders-regen -- wq#4920.
+
+Projects the standing orders (NEVER / DO NOT / STANDING ORDER ...) out of
+/home/lumen/claude_memory.md into a short standalone file,
+/home/lumen/STANDING-ORDERS.md, so a new agent reads the rules without wading
+through the 600-line memory file.
+
+Never hand-edit STANDING-ORDERS.md. To change a rule, edit the hand-prose region
+at the bottom of claude_memory.md (any unit with a trigger word is picked up),
+then run this. Called from bin/state-regen (fail-open there). Idempotent.
+
+A "unit" is one bullet / numbered item / paragraph line. It is extracted when:
+  1. it contains a trigger (TRIG_* below: the wq#4920 keyword list, plus the
+     emphasis tokens MUST / ALWAYS / FRANK DECIDES this file uses for rules), or
+  2. it sits under a rule-only heading (RULE_H2 / RULE_H3), or
+  3. it is a roster entry whose status= is DEAD / RETIRED / DECOMMISSIONED.
+Skipped: the generated header block, the FLEET DEVICES roster prose, RECENT EPISODES.
+A long unit is cut to its trigger sentences (plus an immediate qualifier such as
+"Every other node ..."), and each cut piece is filed on its own. Every piece goes in
+ONE section (ORDER below, first hit wins; nothing hits -> Agent Behavior), except
+that anything naming key hardware (Thor, M80, neith, khnum ...) is also listed
+under Hardware, so retired hardware shows in both places.
+
+Safety: if the source looks truncated (a half-written regen) it exits 2 and keeps
+the previous STANDING-ORDERS.md. The write is atomic (tmp + rename).
+"""
+import argparse
+import datetime
+import os
+import re
+import sys
+import tempfile
+
+SRC = "/home/lumen/claude_memory.md"
+OUT = "/home/lumen/STANDING-ORDERS.md"
+MAXLEN, WHOLE = 700, 200
+
+SECTIONS = [  # output order
+    ("hw", "Hardware — Do Not Touch"),
+    ("cred", "Credential Safety"),
+    ("cmd", "Command Safety"),
+    ("svc", "Service Safety"),
+    ("dep", "Deployment Rules"),
+    ("agent", "Agent Behavior"),
+    ("dead", "Retired/Dead — Do Not Raise"),
+]
+
+# ---- what counts as a standing order -------------------------------------
+TRIG_CI = re.compile(r"STANDING ORDER|\bDO NOT\b|\bMUST NOT\b|\bFORBIDDEN\b|"
+                     r"\bPROHIBITED\b|OFF[- ]LIMITS|REQUIRED ON ALL", re.I)
+TRIG_CS = re.compile(r"\b(?:NEVER|CRITICAL|RETIRED|DEAD|SHELVED|DECOMMISSIONED|"
+                     r"MUST|ALWAYS)\b|FRANK DECIDES")
+# lowercase "never" only when it opens a clause (an imperative), so a plain
+# statement like "leases never expire" is not mistaken for a rule
+TRIG_NEVER = re.compile(r"(?:^|[:;(\[—–.!?])\s*never\b", re.I)
+# a sentence that qualifies the rule right before it stays attached to it
+QUAL = re.compile(r"^(?:Every other|Crown jewels|Except|Exception|Unless|However|Otherwise|If)\b")
+# status/ticket bookkeeping that merely contains DEAD / CLOSED, not a rule
+NOISE = re.compile(r"\bwq#\d+(?:[, ]+#?\d+)*\s+CLOSED\b|\.(?:status|lifecycle)=")
+
+RULE_H2 = ("PERMANENT DECISIONS",)  # whole section is "never re-ask" rules
+RULE_H3 = ("COMMANDER MCP RULES", "CONTROL PLANE HARD RULES", "MEMORY DISCIPLINE",
+           "SAFETY AND OPERATIONS", "SESSION DISCIPLINE")
+SKIP_H2 = ("FLEET DEVICES", "RECENT EPISODES")
+# NOT in RULE_H3 on purpose: AUTONOMY POLICY (its permissive lines, e.g. "DO without
+# asking ... credential rotation", would contradict the credential rule).
+
+# ---- routing: one primary section per piece, first hit in ORDER wins ---------
+ORDER = ("cred", "dead", "cmd", "svc", "agent", "dep", "hw")
+RX = {
+    "cred": re.compile(r"credential|pass" r"wd|password|\brotat|\.secrets|\bsecrets?\b|\btokens?\b|"
+                       r"DATABASE_URL|api[ _]key|masking", re.I),
+    "cmd": re.compile(r"\bdd\b|\badb\b|re" r"boot|(?-i:\bMAC\b)|\brestic\b|\bgrep\b|(?-i:\bSSH\b)|"
+                      r"SSH-wrap|exec-out|blocklist|start_process|tool call|lumen-run|unscoped|"
+                      r"partition dump|byte count", re.I),
+    "svc": re.compile(r"cloudflared|lumen-agent|initramfs|\bCCC\b|PUBLISH_ENABLED|\bCommander\b|"
+                      r"control plane|failover|switchover|unattended|lumen-kvm|\bvault\b", re.I),
+    "agent": re.compile(r"chat_id|Co-authored-by|Assisted-by|research before|zero assumptions|"
+                        r"verify state|verify and correct|\bargue|precheck|lumen_episode|"
+                        r"conversation_search|WQ_AGENT|\bwq done\b|MODEL —|timestamps|\bPDT\b|"
+                        r"SOLUTIONS|hear about problems|no output|max_tokens|anthropic memory|"
+                        r"hand-edit|hand-prose|state-regen|ingest", re.I),
+    "dep": re.compile(r"minimized|Thunar|headed|Balena|deploy|provision|\binstall|staging|"
+                      r"cutover|\bISO\b|/scratch|Ubuntu|rollback|freeze|\bprod\b|\ball builds\b", re.I),
+    "hw": re.compile(r"\b(?:M80|M70|Thor|Surface Pro|TP-Link|smart plugs?|Mac Pro|Macs?|Optane|"
+                     r"BC-250|Miko|ST-Link|NCS2|amdgpu|GPU-B|neith|khnum|Station P1|KVM|apis|"
+                     r"battery|charge threshold)\b"),
+}
+# "dead" is not a plain regex: its uppercase status words must stay case-sensitive,
+# because "retired by instinct" is not a retirement.
+DEAD_CS = re.compile(r"\b(?:RETIRED|DEAD|SHELVED|DECOMMISSIONED|WOUND DOWN)\b")
+DEAD_CI = re.compile(r"\bdo not (?:reopen|re-raise|raise|reconsider|propose|ask Frank about)\b", re.I)
+# hardware that is ALSO listed under Hardware when its primary section is another one
+HW_STRONG = re.compile(r"\b(?:M80|M70|Thor|Surface Pro|TP-Link|Mac Pro|Optane|neith|khnum)\b")
+
+# ---- extraction ----------------------------------------------------------
+BULLET = re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)(.*)$")
+H2 = re.compile(r"^##\s+(.*)$")
+H3 = re.compile(r"^###\s+(.*)$")
+ROSTER = re.compile(r"^- \*\*(?P<name>[^*]+)\*\*\s+—\s+(?P<rest>.*)$")
+STATUS = re.compile(r"status=(?P<s>[A-Za-z_]+)")
+DEAD_STATUS = {"DEAD", "RETIRED", "DECOMMISSIONED"}
+PROV = re.compile(r"\s+[—-]+\s+(?:supersedes\b|contradicted by\b|source HANDOFF).*$")
+SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[`\"'*])")
+ENUM = re.compile(r"^\(\w{1,2}\)\s*")
+SECRET = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|"
+                    r"cfat_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b")
+DATED = re.compile(r"^\d{4}-\d{2}-\d{2}\b")
+
+
+def triggered(t):
+    return bool(TRIG_CI.search(t) or TRIG_CS.search(t) or TRIG_NEVER.search(t))
+
+
+def clip(s):
+    return s if len(s) <= MAXLEN else s[:MAXLEN].rsplit(" ", 1)[0] + " …"
+
+
+def fragments(text):
+    """Cut a unit down to the pieces that carry the rule. Short units stay whole."""
+    t = PROV.sub("", text).strip()
+    sents = SPLIT.split(t)
+    if len(t) <= WHOLE or len(sents) <= 2:
+        return [clip(ENUM.sub("", t))]
+    keep, prev = [], False
+    for s in sents:
+        prev = bool(triggered(s) or (prev and QUAL.match(s)))
+        keep.append(prev)
+    runs, cur = [], []
+    for i, (s, k) in enumerate(zip(sents, keep)):
+        if k:
+            cur.append((i, s))
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    out = []
+    for run in runs:
+        s = " ".join(x for _, x in run)
+        if len(s) < 40 and run[0][0] > 0:      # too terse to stand alone ("Do not hand-edit.")
+            s = sents[0][:160].rstrip() + " … " + s
+        out.append(clip(ENUM.sub("", s)))
+    return out or [clip(sents[0])]
+
+
+def norm(t):
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
+
+
+def title_of(h3):
+    t = re.sub(r"^\[\d{4}-\d{2}-\d{2}\s+([^\]]*)\]\s*", r"\1: ", h3)
+    t = re.sub(r"^\d{4}-\d{2}-\d{2}\s*", "", t)
+    t = re.split(r"\s+[—=]\s+|\s+\(", t)[0]
+    return t if len(t) <= 48 else t[:48].rsplit(" ", 1)[0] + "…"
+
+
+def parse(lines):
+    """-> list of (lineno, prefix, text, forced_labels or None)"""
+    units, region, h2, h3 = [], "header", "", ""
+    for n, raw in enumerate(lines, 1):
+        line, s = raw.rstrip("\n"), raw.strip()
+        if "<!-- hand-prose:begin -->" in s:
+            region, h2, h3 = "hand", "", ""
+            continue
+        if "<!-- hand-prose:end -->" in s:
+            region = "tail"
+            continue
+        if region == "header":           # generated banner, ends at the first ---
+            region = "gen" if s == "---" else region
+            continue
+        if region == "tail" or not s or s == "---":
+            continue
+        m = H3.match(line)
+        if m:
+            h3 = m.group(1).strip()
+            continue
+        m = H2.match(line)
+        if m:
+            h2, h3 = m.group(1).strip(), ""
+            continue
+        if line.startswith("#"):
+            continue
+        if h2.startswith(SKIP_H2):       # roster: only keep dead/retired nodes
+            r = ROSTER.match(line)
+            st = STATUS.search(line) if r else None
+            if r and st and st.group("s").upper() in DEAD_STATUS:
+                nm = r.group("name").strip()
+                units.append((n, "", f"**{nm}** — status {st.group('s').upper()} per roster "
+                              f"(verify: `lumen_state.py current {nm}`)", ["hw", "dead"]))
+            continue
+        mb = BULLET.match(line)
+        text = re.sub(r"^(?:note|description):\s*", "", (mb.group(1) if mb else s).strip())
+        in_rule = h2.startswith(RULE_H2) or h3 in RULE_H3
+        if triggered(text) or in_rule:
+            pre = ""
+            if region == "hand" and h3 and not DATED.match(text):
+                pre = f"**{title_of(h3)}:** "
+            units.append((n, pre, text, None))
+    return units
+
+
+def hit(key, s):
+    if key == "dead":
+        return bool(DEAD_CS.search(s) or DEAD_CI.search(s))
+    return bool(RX[key].search(s))
+
+
+def classify(pre, body):
+    prim = next((k for k in ORDER if hit(k, body)), None)
+    if prim is None and pre:             # "Do NOT recreate an 85 cap" -> the heading says Thor
+        prim = next((k for k in ORDER if k != "agent" and hit(k, pre)), None)
+    labels = [prim or "agent"]
+    if "hw" not in labels and HW_STRONG.search(pre + body):
+        labels.append("hw")              # retired / key hardware is listed under both
+    return labels
+
+
+def pacific_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M (host-local)")
+
+
+BANNER = ("> **READ BEFORE ANY FLEET WORK.** Violating these costs Frank time and money.\n"
+          "> Auto-generated by `/home/lumen/bin/standing-orders-regen` (run from `state-regen`). "
+          "Do not hand-edit: change a rule in the hand-prose region at the bottom of "
+          "`/home/lumen/claude_memory.md` (any line with NEVER / DO NOT / STANDING ORDER / MUST "
+          "is picked up), then re-run the script.\n"
+          "> `(Lnn)` = line in claude_memory.md when generated. Live fleet facts: "
+          "`python3 /home/lumen/minerva/lumen_state.py current <host>` (never unscoped).")
+
+
+def build(src_path, min_units):
+    with open(src_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    if not any("<!-- hand-prose:end -->" in l for l in lines):
+        return None, "no hand-prose end marker: source looks truncated"
+    units = parse(lines)
+    if len(units) < min_units:
+        return None, f"only {len(units)} units extracted (< {min_units}): source looks wrong"
+    buckets = {k: [] for k, _ in SECTIONS}
+    seen = {k: set() for k, _ in SECTIONS}
+    distinct = set()
+    for n, pre, raw, forced in units:
+        for frag in fragments(raw):
+            if NOISE.search(frag):
+                continue
+            body = SECRET.sub("[REDACTED]", frag)
+            key = norm(body)
+            for lab in (forced or classify(pre, body)):
+                if key not in seen[lab]:
+                    seen[lab].add(key)
+                    distinct.add(key)
+                    buckets[lab].append(f"- {pre}{body} _(L{n})_")
+    out = ["# Standing Orders", f"Last generated: {pacific_now()}",
+           "Source: claude_memory.md (auto-extracted)", "", BANNER, ""]
+    for key, title in SECTIONS:
+        out += [f"## {title}", ""] + (buckets[key] or ["- (none extracted)"]) + [""]
+    out += ["---", f"_{len(distinct)} rules from {len(lines)} source lines. "
+            "Regenerate: `/home/lumen/bin/standing-orders-regen`_", ""]
+    return "\n".join(out), f"{len(distinct)} rules, {sum(len(v) for v in buckets.values())} entries"
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(prefix=".standing-orders.", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Regenerate STANDING-ORDERS.md from claude_memory.md")
+    ap.add_argument("--src", default=SRC)
+    ap.add_argument("--out", default=OUT, help="output path, or - for stdout (dry run)")
+    ap.add_argument("--min-units", type=int, default=20)
+    a = ap.parse_args()
+    try:
+        doc, info = build(a.src, a.min_units)
+    except OSError as e:
+        print(f"standing-orders-regen: cannot read {a.src}: {e}", file=sys.stderr)
+        return 1
+    if doc is None:
+        print(f"standing-orders-regen: REFUSING to write ({info}); previous file kept", file=sys.stderr)
+        return 2
+    if a.out == "-":
+        sys.stdout.write(doc)
+    else:
+        write_atomic(a.out, doc)
+        print(f"standing-orders-regen: wrote {a.out} ({info})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,6 +9,11 @@ cd /home/lumen/minerva || exit 1
 # --if-dirty skip. Fail-open: a briefing error never blocks the state projections.
 timeout 20 /home/lumen/bin/session-briefing >/dev/null 2>&1 \
     || echo "state-regen: WARN session-briefing failed rc=$? (wq#4787); previous briefing kept" >&2
+# wq#4920: STANDING-ORDERS.md is projected from claude_memory.md (hand prose + rules), which the
+# state_facts dirty flag does not track, so like session-briefing it runs on EVERY invocation,
+# including the clean --if-dirty skip below. Fail-open; the previous file is kept on error.
+timeout 20 /home/lumen/bin/standing-orders-regen >/dev/null 2>&1 \
+    || echo "state-regen: WARN standing-orders-regen failed rc=$? (wq#4920); previous STANDING-ORDERS.md kept" >&2
 if [ "$1" = "--if-dirty" ]; then
     if ! python3 projection_state.py is-dirty live_fleet_state lumen_state_txt; then
         echo "state-regen: clean, skipping (wq#1633 --if-dirty)"
