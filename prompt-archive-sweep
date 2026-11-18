@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""prompt-archive-sweep — wq#5082 (design: fleet-intel/designs/orchestrator-strengthening.md Q2).
+
+Archival is a sweep, not a question. For every paste prompt
+  <prompts>/wq<N>-<slug>.md
+whose ticket wq#N is `done` in queue.db, move it to <prompts>/_archive/ and log one line.
+
+Never touched:
+  - templates (orchestrator*.md, *template*.md, TEMPLATE*, limpet-build.md) even if wq-prefixed
+  - files whose ticket is not done (open/claimed/blocked/frank_gated/...) or not in queue.db
+  - files without a wq<N>- prefix (unticketed: listed by session-briefing §2a, never moved)
+  - anything not a regular *.md file at the top level of <prompts>
+
+Runs every 2 min from prompt-archive-sweep.timer (foreman ops/wq5082-prompt-archive-sweep).
+Read-only on queue.db (sqlite mode=ro). flock against overlapping runs.
+
+Usage:
+  prompt-archive-sweep [--dry-run] [--prompts DIR] [--db PATH] [--log PATH]
+Exit: 0 ok (moved or nothing to do), 1 queue.db unreadable, 2 prompts dir missing, 3 another run holds the lock.
+"""
+import argparse
+import fcntl
+import os
+import re
+import sqlite3
+import sys
+from contextlib import closing
+from datetime import datetime, timezone
+
+PROMPTS = os.environ.get("PROMPT_SWEEP_DIR", "/home/lumen/fleet-intel/prompts")
+WQ_DB = os.environ.get("WQ_DB", "/home/lumen/agents/work-queue/queue.db")
+LOG = os.environ.get("PROMPT_SWEEP_LOG", "/home/lumen/logs/prompt-archive-sweep.log")
+
+TICKET_RE = re.compile(r"^wq(\d+)-[^/]+\.md$")
+TEMPLATE_RE = re.compile(r"(?i)(^orchestrator.*\.md$|template|^limpet-build\.md$)")
+DONE = {"done"}
+
+
+def ticket_status(db, ids):
+    if not ids:
+        return {}
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)) as c:
+        c.execute("PRAGMA busy_timeout=5000")
+        q = "SELECT id, status FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids))
+        return {int(i): s for i, s in c.execute(q, sorted(ids)).fetchall()}
+
+
+def plan(prompts, db):
+    """-> list of (name, ticket, status, action) for every top-level *.md file."""
+    rows, ids = [], set()
+    for name in sorted(os.listdir(prompts)):
+        p = os.path.join(prompts, name)
+        if not name.endswith(".md") or not os.path.isfile(p) or os.path.islink(p):
+            continue
+        if TEMPLATE_RE.search(name):
+            rows.append([name, None, None, "skip-template"])
+            continue
+        m = TICKET_RE.match(name)
+        if not m:
+            rows.append([name, None, None, "skip-unticketed"])
+            continue
+        n = int(m.group(1))
+        ids.add(n)
+        rows.append([name, n, None, None])
+    st = ticket_status(db, ids)
+    for r in rows:
+        if r[1] is None:
+            continue
+        r[2] = st.get(r[1], "missing")
+        r[3] = "archive" if r[2] in DONE else "keep"
+    return rows
+
+
+def dest_for(archive, name):
+    d = os.path.join(archive, name)
+    if not os.path.exists(d):
+        return d
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = name[:-3]
+    return os.path.join(archive, f"{base}.{stamp}.md")
+
+
+def log_line(path, text):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {text}\n")
+    except OSError as e:
+        print(f"prompt-archive-sweep: log write failed: {e}", file=sys.stderr)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="prompt-archive-sweep", description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true", help="print the plan, move nothing")
+    ap.add_argument("--prompts", default=PROMPTS)
+    ap.add_argument("--db", default=WQ_DB)
+    ap.add_argument("--log", default=LOG)
+    ap.add_argument("-v", "--verbose", action="store_true", help="also list kept/skipped files")
+    a = ap.parse_args(argv)
+
+    if not os.path.isdir(a.prompts):
+        print(f"prompt-archive-sweep: no prompts dir {a.prompts}", file=sys.stderr)
+        return 2
+    archive = os.path.join(a.prompts, "_archive")
+    lockf = open(os.environ.get("PROMPT_SWEEP_LOCK", f"/tmp/prompt-archive-sweep.{os.getuid()}.lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("prompt-archive-sweep: another run holds the lock", file=sys.stderr)
+        return 3
+    try:
+        try:
+            rows = plan(a.prompts, a.db)
+        except sqlite3.Error as e:
+            print(f"prompt-archive-sweep: queue.db unreadable: {e} (nothing moved)", file=sys.stderr)
+            return 1
+        moved = 0
+        for name, n, status, action in rows:
+            if action != "archive":
+                if a.verbose or a.dry_run:
+                    print(f"{action:16} {name}" + (f"  (wq#{n} {status})" if n else ""))
+                continue
+            src = os.path.join(a.prompts, name)
+            if a.dry_run:
+                print(f"{'would-archive':16} {name}  (wq#{n} {status})")
+                continue
+            os.makedirs(archive, exist_ok=True)
+            dst = dest_for(archive, name)
+            os.rename(src, dst)          # same filesystem: atomic, no copy
+            moved += 1
+            msg = f"archived {name} -> _archive/{os.path.basename(dst)} (wq#{n} {status})"
+            print(msg)
+            log_line(a.log, msg)
+        if not a.dry_run and moved == 0 and a.verbose:
+            print("prompt-archive-sweep: nothing to archive")
+        return 0
+    finally:
+        lockf.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

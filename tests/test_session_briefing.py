@@ -91,7 +91,28 @@ def env(tmp_path):
     e = dict(os.environ, WQ_DB=str(tmp_path / "queue.db"), MINERVA_DB=str(tmp_path / "minerva.db"),
              BRIEFING_MEMORY_MD=str(mem), BRIEFING_CTX=str(ctx),
              BRIEFING_CHATS=str(ctx / "recent_chats.json"), BRIEFING_INBOX=str(tmp_path / "inbox"))
+    e.update(fake_health_env(tmp_path))
     return tmp_path, e
+
+
+def fake_health_env(tmp_path, timer_state="active", fworkers="0"):
+    """wq#5082: never touch live systemctl / pgrep / router / prompts dir from a test."""
+    fb = tmp_path / "fakebin"
+    fb.mkdir(exist_ok=True)
+    sc = fb / "systemctl"
+    sc.write_text("#!/bin/sh\nif [ \"$1\" = is-enabled ]; then echo enabled; else echo %s; fi\n" % timer_state)
+    pg = fb / "pgrep"
+    pg.write_text("#!/bin/sh\necho %s\n" % fworkers)
+    router = fb / "router.py"
+    router.write_text("import json,sys\nprint(json.dumps({'ticket': int(sys.argv[2]), "
+                      "'rung': {'model': 'fake-model-%s' % sys.argv[2], 'effort': 'high'}}))\n")
+    for f in (sc, pg):
+        f.chmod(0o755)
+    prompts = tmp_path / "prompts"
+    prompts.mkdir(exist_ok=True)
+    return dict(BRIEFING_PROMPTS=str(prompts), BRIEFING_DISARM=str(tmp_path / "DISPATCH_DISARM"),
+                BRIEFING_PAUSE=str(tmp_path / "DISPATCH_PAUSE"), BRIEFING_USAGE=str(tmp_path / "state.json"),
+                BRIEFING_ROUTER=str(router), BRIEFING_SYSTEMCTL=str(sc), BRIEFING_PGREP=str(pg))
 
 
 def run(e, *args, stdin=None):
@@ -245,3 +266,126 @@ def test_ccc_export_merged(env):
         "chat_messages": []}))
     out = run(e, "--stdout").stdout
     assert "Exported chat" in out and "It exported." in out and "1 from CCC exports" in out
+
+
+# ---------------------------------------------------------------- wq#5082 sections 0 / 2a / 2b
+def make_wq_full(path, tasks):
+    """queue.db with the gate/deps/model/effort columns the NEXT UP loader reads."""
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE tasks(id INTEGER PRIMARY KEY, lane TEXT, pri INTEGER, title TEXT, status TEXT,"
+              " claimed_by TEXT, claimed_at TEXT, block_reason TEXT, decision_prompt TEXT, notes TEXT,"
+              " created_at TEXT, gate TEXT DEFAULT '', deps TEXT DEFAULT '', model TEXT, effort TEXT)")
+    c.execute("CREATE TABLE grant_requests(id INTEGER PRIMARY KEY, ticket_id INTEGER, class TEXT, target TEXT,"
+              " state TEXT, requested_at TEXT, expires_at TEXT)")
+    for t in tasks:
+        row = dict(lane="build", pri=2, claimed_by=None, claimed_at=None, created_at=wq_ts(1), gate="",
+                   deps="", model=None, effort=None)
+        row.update(t)
+        c.execute("INSERT INTO tasks(id,lane,pri,title,status,claimed_by,claimed_at,created_at,gate,deps,model,effort)"
+                  " VALUES(:id,:lane,:pri,:title,:status,:claimed_by,:claimed_at,:created_at,:gate,:deps,:model,:effort)", row)
+    c.commit()
+    c.close()
+
+
+PIPE_TASKS = [
+    dict(id=101, title="ready one", status="open", pri=1),
+    dict(id=102, title="running one", status="claimed", claimed_by="orch-x", claimed_at=wq_ts(1)),
+    dict(id=103, title="finished one", status="done"),
+    dict(id=104, title="stuck one", status="blocked"),
+    # NEXT UP candidates
+    dict(id=201, title="p1 dispatchable", status="open", pri=1),
+    dict(id=202, title="gated", status="open", pri=0, gate="frank"),
+    dict(id=203, title="[no-auto] research", status="open", pri=0),
+    dict(id=204, title="user lane", status="open", pri=0, lane="user"),
+    dict(id=205, title="deps not done", status="open", pri=0, deps="102"),
+    dict(id=206, title="deps done", status="open", pri=1, deps="103"),
+    dict(id=207, title="stamped", status="open", pri=1, model="claude-opus-5-5", effort="high"),
+    dict(id=208, title="aged p3", status="open", pri=3, created_at=wq_ts(24 * 8)),   # eff 2
+    dict(id=209, title="p3 young", status="open", pri=3),
+    dict(id=210, title="frank lane", status="open", pri=0, lane="frank-hw"),
+    dict(id=211, title="PHYSICAL swap fan", status="open", pri=0),
+]
+
+
+def write_prompts(d):
+    (d / "wq101-ready.md").write_text("MODEL: claude-sonnet-5-5\nTICKET: wq#101\n")
+    (d / "wq102-running.md").write_text("MODEL: x\n")
+    (d / "wq103-finished.md").write_text("MODEL: x\n")
+    (d / "wq104-stuck.md").write_text("no model line\n")
+    (d / "wq999-missing.md").write_text("MODEL: x\n")
+    (d / "legacy-name.md").write_text("MODEL: x\nTICKET: wq#101\n")
+    (d / "loose-notes.md").write_text("MODEL: opus\n")
+    (d / "orchestrator.md").write_text("template")
+    (d / "limpet-build.md").write_text("template")
+    (d / "wq101-ready.md.bak.1").write_text("ignored")
+
+
+def test_health_pipeline_nextup(env):
+    tmp, e = env
+    make_wq_full(e["WQ_DB"], PIPE_TASKS)
+    make_minerva(e["MINERVA_DB"])
+    write_prompts(tmp / "prompts")
+    (tmp / "DISPATCH_DISARM").write_text("")
+    (tmp / "state.json").write_text(json.dumps({"last_good_at": iso(24 * 30), "stale": True, "primary_fail_streak": 99,
+                                                "limits": {"weekly_all": {"percent": 46}}}))
+    r = run(e, "--stdout")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    order = [out.index(h) for h in ("## 0.", "## 1.", "## 2.", "## 2a.", "## 2b.", "## 3.")]
+    assert order == sorted(order)
+    s0 = out[out.index("## 0."):out.index("## 1.")]
+    assert "DISPATCH_DISARM PRESENT" in s0 and "\U0001F534" in s0
+    assert "lumen-foreman-dispatch enabled/active" in s0 and "prompt-archive-sweep enabled/active" in s0
+    assert "fail streak 99" in s0 and "weekly_all 46%" in s0 and "STALE" in s0
+    assert "fworkers running: 0" in s0
+    s2a = out[out.index("## 2a."):out.index("## 2b.")]
+    ready = s2a[s2a.index("### READY"):s2a.index("### RUNNING")]
+    assert "`wq101-ready.md` · wq#101 open" in ready and "MODEL claude-sonnet-5-5" in ready
+    assert "`legacy-name.md` (rename to wq<N>-<slug>.md) · wq#101 open" in ready
+    assert "`wq102-running.md` · wq#102 claimed" in s2a
+    done = s2a[s2a.index("### DONE"):]
+    assert "`wq103-finished.md` · wq#103 done" in done
+    other = s2a[s2a.index("### OTHER"):]
+    assert "wq#104 blocked" in other and "no MODEL line" in other and "wq#999 missing" in other
+    unt = s2a[s2a.index("### UNTICKETED"):]
+    assert "`loose-notes.md` · no ticket" in unt
+    assert "templates (never archived): limpet-build.md, orchestrator.md" in s2a
+    assert ".bak" not in s2a
+    s2b = out[out.index("## 2b."):out.index("## 3.")]
+    ids = [int(x) for x in __import__("re").findall(r"^- wq#(\d+)", s2b, __import__("re").M)]
+    assert ids == [101, 201, 206, 207, 208]              # eff pri then id; gated/no-auto/user/frank/physical/deps skipped
+    assert "MODEL `fake-model-201@high` (router)" in s2b
+    assert "MODEL `claude-opus-5-5@high` (stamp)" in s2b
+    assert "wq#208 eP2" in s2b
+
+
+def test_health_green_and_dashboard(env):
+    tmp, e = env
+    make_wq_full(e["WQ_DB"], [dict(id=1, title="only", status="open")])
+    make_minerva(e["MINERVA_DB"])
+    (tmp / "state.json").write_text(json.dumps({"last_good_at": iso(0.1), "stale": False, "limits": {}}))
+    e.update(fake_health_env(tmp, fworkers="2"))
+    r = run(e, "dashboard")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert out.startswith("## 0. HEALTH LINE") and "## 2a." in out and "## 2b." in out
+    assert "## 1." not in out and "## 3." not in out
+    assert "dispatch latch: absent" in out and "fworkers running: 2" in out
+    assert "\U0001F534" not in out
+    assert "(no prompts)" in out
+
+
+def test_new_sections_fail_open(env):
+    tmp, e = env
+    make_wq(e["WQ_DB"], base_tasks())                      # old schema: no gate/deps/model columns
+    make_minerva(e["MINERVA_DB"])
+    e["BRIEFING_PROMPTS"] = str(tmp / "no-such-dir")
+    e["BRIEFING_SYSTEMCTL"] = str(tmp / "no-such-systemctl")
+    e["BRIEFING_ROUTER"] = str(tmp / "no-router.py")
+    r = run(e, "--stdout")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "(pipeline unavailable: FileNotFoundError" in out
+    assert "state unreadable" in out and "lumen-foreman-dispatch ?/?" in out
+    s2b = out[out.index("## 2b."):]
+    assert "wq#16" in s2b and "(no router)" in s2b

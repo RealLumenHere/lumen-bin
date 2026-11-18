@@ -12,12 +12,18 @@ run and never hand-edited. It lives in minerva/context/ (gitignored, next to
 LIVE_FLEET_STATE.md) so a generated file never dirties the minerva primary tree.
 
 Sections (all generated, no hand prose):
+  0 HEALTH LINE      wq#5082: dispatch latch, dispatch/sweep timer state, usage freshness,
+                     fworkers running. Red marks when the pipeline is off.
   1 RECENT CHATS     claude.ai chat-list snapshot (context/recent_chats.json, written
                      by `session-briefing ingest-chats` from a browser session's
                      recent_chats output) merged with CCC-exported conversations in
                      /home/lumen/publish/inbox. When that is thin or stale, a labelled
                      PROXY list from claude-session episodes is shown as well.
   2 ACTIVE WORK      wq claimed / frank_gated / pending_review / blocked + pending grants
+  2a PROMPT PIPELINE wq#5082: every paste prompt in fleet-intel/prompts with its ticket status,
+                     grouped READY / RUNNING / DONE-not-archived / OTHER / UNTICKETED
+  2b NEXT UP         wq#5082: top 5 unblocked, non-gated open tickets by effective priority,
+                     with the router's model tuple (stamp if present, else router --dry-run)
   3 LAST 48H         episodes (what changed, what failed), Frank-stated facts, decisions
   4 STANDING ORDERS  parsed from claude_memory.md (hand prose first, then decisions)
   5 OPEN HANDOFFS    open tickets whose notes say handoff / incomplete / not done
@@ -29,6 +35,7 @@ Usage:
   session-briefing                          render to the default path
   session-briefing --out PATH               render elsewhere (tests)
   session-briefing --stdout                 print, write nothing
+  session-briefing dashboard                print sections 0, 2a, 2b only (mid-session refresh)
   session-briefing ingest-chats [--file F]  recent_chats tool output (or a JSON list /
                                             {"chats": [...]}) on stdin or F -> merged
                                             into context/recent_chats.json
@@ -42,6 +49,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from contextlib import closing
@@ -63,10 +71,29 @@ EPISODE_WINDOW = timedelta(hours=48)
 FACT_WINDOW = timedelta(days=7)
 CONV_MAX_BYTES = 50 * 1024 * 1024
 
+# wq#5082 sections 0 / 2a / 2b
+PROMPTS_DIR = os.environ.get("BRIEFING_PROMPTS", "/home/lumen/fleet-intel/prompts")
+DISARM = os.environ.get("BRIEFING_DISARM", "/home/lumen/autonomy/DISPATCH_DISARM")
+PAUSE = os.environ.get("BRIEFING_PAUSE", "/home/lumen/foreman/DISPATCH_PAUSE")
+USAGE_STATE = os.environ.get("BRIEFING_USAGE", "/home/lumen/foreman/state.json")
+ROUTER = os.environ.get("BRIEFING_ROUTER", "/home/lumen/foreman/orchestrator/router.py")
+SYSTEMCTL = os.environ.get("BRIEFING_SYSTEMCTL", "systemctl")
+PGREP = os.environ.get("BRIEFING_PGREP", "pgrep")
+FWORKER_PAT = "^python3 /home/lumen/foreman/harness/fworker.py run"
+TIMERS = ["lumen-foreman-dispatch.timer", "lumen-auto-dispatch.timer", "prompt-archive-sweep.timer"]
+USAGE_STALE = timedelta(hours=1)
+NEXT_N = 5
+AGING_DAYS = int(os.environ.get("WQ_AGING_DAYS", "7"))
+TICKET_FILE_RE = re.compile(r"^wq(\d+)-[^/]+\.md$")
+TICKET_LINE_RE = re.compile(r"^TICKET:\s*wq#?(\d+)", re.M)
+TEMPLATE_RE = re.compile(r"(?i)(^orchestrator.*\.md$|template|^limpet-build\.md$)")
+NOAUTO_RE = re.compile(r"\[no-auto\]|\[physical\]|PHYSICAL|\[frank", re.I)
+NEXT_SKIP_LANES = {"user", "user-projects", "session"}
+
 # initial caps and floors per trimmable list, and the order they give way in
-CAPS = {"episodes": 40, "blocked": 25, "gated": 30, "orders": 40, "handoffs": 15, "chats": 20}
-FLOORS = {"episodes": 5, "blocked": 5, "gated": 10, "orders": 10, "handoffs": 5, "chats": 5}
-TRIM_ORDER = ["episodes", "blocked", "gated", "orders", "handoffs", "chats"]
+CAPS = {"episodes": 40, "blocked": 25, "gated": 30, "orders": 40, "handoffs": 15, "pipeline": 30, "chats": 20}
+FLOORS = {"episodes": 5, "blocked": 5, "gated": 10, "orders": 10, "handoffs": 5, "pipeline": 10, "chats": 5}
+TRIM_ORDER = ["episodes", "blocked", "gated", "orders", "handoffs", "pipeline", "chats"]
 
 SECRET_RE = re.compile(
     r"sk-ant-[A-Za-z0-9_\-]{8,}|sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}"
@@ -325,6 +352,136 @@ def load_orders():
     return out
 
 
+# ---------------------------------------------------------------- wq#5082 loaders
+def _run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, type(e).__name__
+
+
+def _mtime(path):
+    try:
+        return datetime.fromtimestamp(os.stat(path).st_mtime, timezone.utc)
+    except OSError:
+        return None
+
+
+def load_health(now):
+    h = {"disarm": _mtime(DISARM), "pause": _mtime(PAUSE), "timers": [], "usage": None}
+    for t in TIMERS:
+        rc1, en = _run([SYSTEMCTL, "is-enabled", t])
+        rc2, ac = _run([SYSTEMCTL, "is-active", t])
+        en = en.splitlines()[0] if rc1 is not None and en else "?"
+        ac = ac.splitlines()[0] if rc2 is not None and ac else "?"
+        h["timers"].append((t, en, ac))
+    rc, out = _run([PGREP, "-fc", FWORKER_PAT])
+    h["fworkers"] = int(out) if rc in (0, 1) and out.isdigit() else None
+    try:
+        with open(USAGE_STATE) as f:
+            u = json.load(f)
+        h["usage"] = {"last_good": parse_ts(u.get("last_good_at")), "stale": bool(u.get("stale")),
+                      "streak": u.get("primary_fail_streak"), "limits": u.get("limits") or {}}
+    except (OSError, ValueError, AttributeError) as e:
+        h["usage_err"] = type(e).__name__
+    return h
+
+
+def _cols(c, table):
+    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+
+def _status_map(c, ids):
+    if not ids:
+        return {}
+    q = "SELECT id, status, title FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids))
+    return {r["id"]: r for r in c.execute(q, sorted(ids))}
+
+
+def load_pipeline(c, now):
+    """-> (rows, templates). rows: dict(name, ticket, status, title, model, age_t, named)."""
+    rows, templates, ids = [], [], set()
+    for name in sorted(os.listdir(PROMPTS_DIR)):
+        p = os.path.join(PROMPTS_DIR, name)
+        if not name.endswith(".md") or not os.path.isfile(p):
+            continue
+        if TEMPLATE_RE.search(name):
+            templates.append(name)
+            continue
+        try:
+            with open(p, errors="replace") as f:
+                head = f.read(4096)
+        except OSError:
+            head = ""
+        m = TICKET_FILE_RE.match(name) or TICKET_LINE_RE.search(head)
+        n = int(m.group(1)) if m else None
+        first = head.splitlines()[0] if head else ""
+        model = first.split(":", 1)[1].split("#")[0].strip() if first.upper().startswith("MODEL:") else ""
+        rows.append({"name": name, "ticket": n, "model": model, "age_t": _mtime(p),
+                     "named": bool(TICKET_FILE_RE.match(name))})
+        if n:
+            ids.add(n)
+    st = _status_map(c, ids)
+    for r in rows:
+        t = st.get(r["ticket"])
+        r["status"] = t["status"] if t else ("missing" if r["ticket"] else None)
+        r["title"] = t["title"] if t else ""
+    return rows, templates
+
+
+def eff_pri(pri, status, gate, created_at, now):
+    """mirror of wq.effective_pri (wq#661): open, ungated tickets gain one tier after AGING_DAYS."""
+    pri = 9 if pri is None else pri
+    if status != "open" or (gate or "").strip():
+        return pri
+    t = parse_ts(created_at)
+    if not t:
+        return pri
+    return max(1, pri - min(1, int((now - t).total_seconds() / 86400 / AGING_DAYS)))
+
+
+def router_tuple(tid, model, effort):
+    if model:
+        return (f"{model}@{effort}" if effort else model), "stamp"
+    if not ROUTER or not os.path.exists(ROUTER):
+        return "?", "no router"
+    rc, out = _run([sys.executable, ROUTER, "assign", str(tid), "--dry-run"], timeout=10)
+    try:
+        rung = json.loads(out.splitlines()[-1])["rung"]
+        return (f"{rung['model']}@{rung['effort']}" if rung.get("effort") else rung["model"]), "router"
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return "?", f"router rc={rc}"
+
+
+def load_next(c, now):
+    cols = _cols(c, "tasks")
+    want = ["id", "lane", "pri", "title", "status", "created_at", "gate", "deps", "model", "effort"]
+    sel = ", ".join(x if x in cols else f"NULL AS {x}" for x in want)
+    rows = c.execute(f"SELECT {sel} FROM tasks WHERE status='open'").fetchall()
+    cand = []
+    for r in rows:
+        lane = r["lane"] or ""
+        if (r["gate"] or "").strip() or lane in NEXT_SKIP_LANES or lane.startswith("frank"):
+            continue
+        if NOAUTO_RE.search(r["title"] or ""):
+            continue
+        deps = [int(d) for d in re.findall(r"\d+", r["deps"] or "")]
+        cand.append((eff_pri(r["pri"], r["status"], r["gate"], r["created_at"], now), r["id"], r, deps))
+    cand.sort(key=lambda x: (x[0], x[1]))
+    out, dep_status = [], {}
+    for e, _i, r, deps in cand:
+        missing = {d for d in deps if d not in dep_status}
+        if missing:
+            dep_status.update({k: v["status"] for k, v in _status_map(c, missing).items()})
+        if any(dep_status.get(d) != "done" for d in deps):
+            continue
+        out.append((e, r))
+        if len(out) >= NEXT_N:
+            break
+    return [(e, r, *router_tuple(r["id"], r["model"], r["effort"])) for e, r in out]
+
+
 # ---------------------------------------------------------------- rendering
 def safe(fn, *a):
     try:
@@ -340,9 +497,11 @@ def collect(now):
         with closing(ro(WQ_DB)) as c:
             data["work"], data["work_err"] = safe(load_work, c, now)
             data["handoffs"], data["handoffs_err"] = safe(load_handoffs, c)
+            data["pipeline"], data["pipeline_err"] = safe(load_pipeline, c, now)
+            data["next"], data["next_err"] = safe(load_next, c, now)
     except sqlite3.Error as e:
-        data["work"] = data["handoffs"] = None
-        data["work_err"] = data["handoffs_err"] = f"queue.db: {e}"
+        for k in ("work", "handoffs", "pipeline", "next"):
+            data[k], data[k + "_err"] = None, f"queue.db: {e}"
     try:
         with closing(ro(MINERVA_DB)) as c:
             data["proxy"], data["proxy_err"] = safe(load_proxy_sessions, c, CAPS["chats"])
@@ -353,11 +512,97 @@ def collect(now):
         for k in ("proxy", "episodes", "facts", "decisions"):
             data[k], data[k + "_err"] = None, f"minerva.db: {e}"
     data["orders"], data["orders_err"] = safe(load_orders)
+    data["health"], data["health_err"] = safe(load_health, now)
     return data
 
 
 def more(n_all, n_shown, cmd):
     return [f"- … {n_all - n_shown} more: `{cmd}`"] if n_all > n_shown else []
+
+
+RED = "\U0001F534"   # red circle
+
+
+def render_health(data, now):
+    L = ["## 0. HEALTH LINE (dispatch pipeline; red = off)"]
+    if data.get("health_err"):
+        return L + [f"- (health unavailable: {data['health_err']})", ""]
+    h = data["health"]
+    if h["disarm"]:
+        L.append(f"- {RED} dispatch latch: DISPATCH_DISARM PRESENT ({age(h['disarm'], now)} old), "
+                 f"no fworker starts. Re-arm is a Frank decision. `{DISARM}`")
+    else:
+        L.append("- dispatch latch: absent (armed)")
+    if h["pause"]:
+        L.append(f"- {RED} DISPATCH_PAUSE present ({age(h['pause'], now)} old) `{PAUSE}`")
+    parts = []
+    for t, en, ac in h["timers"]:
+        bad = ac != "active" and t != "lumen-auto-dispatch.timer"   # auto-dispatch is staged-off by design
+        parts.append(f"{RED + ' ' if bad else ''}{t[:-6] if t.endswith('.timer') else t} {en}/{ac}")
+    L.append("- timers: " + " · ".join(parts))
+    u = h.get("usage")
+    if u is None:
+        L.append(f"- {RED} usage: state unreadable ({h.get('usage_err', '?')}) `{USAGE_STATE}`")
+    else:
+        lg = u["last_good"]
+        stale = u["stale"] or not lg or now - lg > USAGE_STALE
+        pct = ", ".join(f"{k} {v.get('percent')}%" for k, v in u["limits"].items() if isinstance(v, dict))
+        L.append(f"- {RED + ' ' if stale else ''}usage: last good read {age(lg, now)} ago ({pt(lg)})"
+                 + (f", fail streak {u['streak']}" if stale and u.get("streak") else "")
+                 + (f" · as of then: {pct}" if pct else "")
+                 + (" · STALE: nothing on the box knows current usage" if stale else ""))
+    fw = h.get("fworkers")
+    L.append(f"- {RED + ' ' if (fw == 0 and h['disarm']) else ''}fworkers running: {fw if fw is not None else '?'}")
+    L.append("")
+    return L
+
+
+def render_pipeline(data, caps, now):
+    L = ["## 2a. PROMPT PIPELINE (fleet-intel/prompts: paste prompts and their ticket state)"]
+    if data.get("pipeline_err"):
+        return L + [f"- (pipeline unavailable: {data['pipeline_err']})", ""]
+    rows, templates = data["pipeline"]
+    groups = [("READY (ticket open, paste it)", lambda r: r["status"] == "open"),
+              ("RUNNING (ticket claimed)", lambda r: r["status"] == "claimed"),
+              ("DONE, not archived yet (prompt-archive-sweep moves these)", lambda r: r["status"] == "done"),
+              ("OTHER (blocked / gated / review / missing)",
+               lambda r: r["ticket"] and r["status"] not in ("open", "claimed", "done")),
+              ("UNTICKETED (invisible to the box: file a ticket, rename wq<N>-<slug>.md)", lambda r: not r["ticket"])]
+    shown = 0
+    for label, pred in groups:
+        g = [r for r in rows if pred(r)]
+        if not g:
+            continue
+        L.append(f"### {label}: {len(g)}")
+        for r in g:
+            if shown >= caps["pipeline"]:
+                break
+            shown += 1
+            tk = f"wq#{r['ticket']} {r['status']}" if r["ticket"] else "no ticket"
+            nm = "" if r["named"] or not r["ticket"] else " (rename to wq<N>-<slug>.md)"
+            md = f" · MODEL {one(r['model'], 40)}" if r["model"] else " · no MODEL line"
+            L.append(f"- `{r['name']}`{nm} · {tk} · {age(r['age_t'], now)} old{md}"
+                     + (f" · {one(r['title'], 80)}" if r["title"] else ""))
+    if not rows:
+        L.append("- (no prompts)")
+    L += more(len(rows), shown if rows else 0, f"ls -lt {PROMPTS_DIR}")
+    if templates:
+        L.append(f"_templates (never archived): {', '.join(templates)}_")
+    L.append("")
+    return L
+
+
+def render_next(data, now):
+    L = [f"## 2b. NEXT UP (top {NEXT_N} unblocked, non-gated open tickets by effective priority)"]
+    if data.get("next_err"):
+        return L + [f"- (next-up unavailable: {data['next_err']})", ""]
+    for e, r, tup, src in data["next"]:
+        L.append(f"- wq#{r['id']} eP{e} [{r['lane']}] {one(r['title'], 100)} · MODEL `{tup}` ({src})")
+    if not data["next"]:
+        L.append("- (nothing dispatchable)")
+    L.append("_Paste prompt for one: `agent-prompt <id>`; full order: `wq list --sort effective`._")
+    L.append("")
+    return L
 
 
 def render(data, caps, now):
@@ -368,6 +613,8 @@ def render(data, caps, now):
              "briefing > HANDOFF.md prose > claude_memory.md. Not the append-only log at "
              "scratch/subtraction/SESSION-BRIEFING.md._")
     L.append("")
+
+    L += render_health(data, now)
 
     # 1 RECENT CHATS
     L.append("## 1. RECENT CHATS (what Frank has been doing, all sessions)")
@@ -431,6 +678,9 @@ def render(data, caps, now):
             L.append(f"- wq#{t['id']} P{t['pri']} {one(t['title'], 90)}{why}")
         L += more(len(bl), min(len(bl), caps["blocked"]), "wq list --status blocked")
     L.append("")
+
+    L += render_pipeline(data, caps, now)
+    L += render_next(data, now)
 
     # 3 LAST 48H
     L.append("## 3. LAST 48H — episodes, failures, Frank's decisions")
@@ -575,7 +825,7 @@ def ingest_chats(text, now=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="session-briefing", description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", nargs="?", choices=["render", "ingest-chats"], default="render")
+    ap.add_argument("cmd", nargs="?", choices=["render", "ingest-chats", "dashboard"], default="render")
     ap.add_argument("--out", default=OUT_PATH)
     ap.add_argument("--stdout", action="store_true")
     ap.add_argument("--file", help="ingest-chats: read this file instead of stdin")
@@ -587,6 +837,12 @@ def main(argv=None):
         except ValueError as e:
             print(f"session-briefing: bad JSON: {e}", file=sys.stderr)
             return 2
+    if a.cmd == "dashboard":
+        now = datetime.now(timezone.utc)
+        data = collect(now)
+        lines = render_health(data, now) + render_pipeline(data, dict(CAPS), now) + render_next(data, now)
+        sys.stdout.write(mask("\n".join(lines) + "\n"))
+        return 0
     text = build()
     if a.stdout:
         sys.stdout.write(text)
