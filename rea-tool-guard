@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""rea-tool-guard: Claude Code PreToolUse hook for the LOCAL (Lumen) rea MCP registration.
+
+Enforces common/tools/HOSTILE_INPUT_POLICY.md section 2 mechanically (it was policy-only):
+the local `rea` server stays static-analysis only. Runtime capture / instrumentation /
+ADB / debugger / browser tools run ONLY through rea-maksoor, never on Lumen.
+Matcher in settings is mcp__rea__.* so rea-maksoor and every other tool are untouched.
+Fail closed: an unparseable payload for a rea tool is denied. Logs tool name + decision only
+(never arguments). wq#4752 / wq#4889.
+"""
+import json, os, re, sys, time
+
+PREFIX = "mcp__rea__"
+DENY = re.compile(
+    r"(capture|frida|adb|gdb|rizin|electron|browser|web_|_web|playwright|instrument|observe_|"
+    r"execute_|spawn|launch|debug|install|uninstall|push_|pull_|cutter|runtime_targets)", re.I)
+LOG = "/home/lumen/logs/rea-tool-guard.log"
+
+
+def log(tool, decision):
+    try:
+        with open(LOG, "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%F %T"), "tool": tool, "decision": decision}) + "\n")
+    except Exception:
+        pass
+
+
+def main():
+    try:
+        tool = json.load(sys.stdin).get("tool_name", "")
+    except Exception:
+        log("<unparseable>", "DENY")
+        sys.stderr.write("rea-tool-guard: unparseable hook payload for a rea tool; denied (fail closed)\n")
+        return 2
+    if not tool.startswith(PREFIX):
+        return 0
+    name = tool[len(PREFIX):]
+    if DENY.search(name):
+        log(tool, "DENY")
+        sys.stderr.write(
+            "rea-tool-guard: %s is an execution-class tool (capture/instrument/ADB/debugger/browser). "
+            "HOSTILE_INPUT_POLICY.md section 2: local rea is static-analysis only on Lumen; "
+            "run this through rea-maksoor on the isolated RE node instead.\n" % name)
+        return 2
+    log(tool, "ALLOW")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -20,10 +20,10 @@ svc(){ local n="$1" st d; st=$(systemctl is-active "$n" 2>/dev/null)
 verify(){
   echo "===== VERIFY NOW — live state @ $(pt '+%Y-%m-%d %H:%M %Z') (trust THIS over prose) ====="
   echo "## vault HA"
-  _ha=$(bash /home/lumen/bin/wadjet-ha-failback.sh status 2>/dev/null) || _ha=""
+  _ha=$(bash /home/lumen/bin/vault-ha-failback.sh status 2>/dev/null) || _ha=""
   if [ -n "$_ha" ]; then printf '%s\n' "$_ha" | sed 's/^/  /'; else echo "  (ha status unavailable)"; fi
   { [ -f /home/lumen/ha/AUTO_PROMOTE_ENABLED ] && echo "  auto_promote: ARMED"; } || echo "  auto_promote: DISARMED"
-  _tm=$(systemctl is-active wadjet-ha-monitor.timer 2>/dev/null)
+  _tm=$(systemctl is-active vault-ha-monitor.timer 2>/dev/null)
   echo "  ha_monitor_timer: ${_tm:-unknown}"
   # ISSUE-LOG #847: 'sobek in_recovery: f' printed here for ~4 weeks (2026-08-31 -> 09-26) and
   # was never read as an alarm. Exactly one node may be out of recovery. Say it loudly.
@@ -33,10 +33,10 @@ verify(){
     echo "  !!! or switch over. See ISSUE-LOG #847 and lumen_state current sobek / vault."
   fi
   if [ -f /home/lumen/ha/AUTO_PROMOTE_ENABLED ] && [ "${_tm}" != active ]; then
-    echo "  !!! auto_promote ARMED but wadjet-ha-monitor.timer is ${_tm:-unknown}: failover is NOT actually armed"
+    echo "  !!! auto_promote ARMED but vault-ha-monitor.timer is ${_tm:-unknown}: failover is NOT actually armed"
   fi
   echo "## dead-man: critical timer LastTrigger age (wq#1658)"
-  for t in wadjet-ha-monitor.timer lumen-backup-critical.timer; do
+  for t in vault-ha-monitor.timer lumen-backup-critical.timer; do
     lt=$(systemctl show "$t" -p LastTriggerUSec --value 2>/dev/null)
     if [ -z "$lt" ] || [ "$lt" = "n/a" ]; then
       printf "  %-28s never triggered (or unit missing)\n" "$t:"

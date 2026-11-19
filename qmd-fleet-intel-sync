@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# qmd-fleet-intel-sync — triggered by qmd-fleet-intel.path (wq#4952).
+# Debounce, regenerate the watched-directory list, then qmd update && qmd embed under flock.
+set -u
+export PATH=/home/lumen/.npm-global/bin:/home/lumen/bin:/usr/local/bin:/usr/bin:/bin
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+ROOT=/home/lumen/fleet-intel
+DROPIN="$HOME/.config/systemd/user/qmd-fleet-intel.path.d/dirs.conf"
+LOCK="$HOME/.cache/qmd/sync.lock"
+LOG="$HOME/.cache/qmd/sync.log"
+mkdir -p "$(dirname "$LOCK")" "$(dirname "$DROPIN")"
+
+gen_dirs() {
+  echo "[Path]"
+  find "$ROOT" -type d \( -name .git -o -name node_modules -o -name __pycache__ \) -prune -o -type d -print | sort | sed 's/^/PathChanged=/'
+}
+
+# 1. debounce: let a burst of writes settle
+sleep "${QMD_SYNC_DEBOUNCE:-5}"
+
+# 2. self-heal the watch list (PathChanged is non-recursive)
+new="$(gen_dirs)"
+if [ ! -f "$DROPIN" ] || [ "$new" != "$(cat "$DROPIN")" ]; then
+  printf '%s\n' "$new" > "$DROPIN.tmp" && mv "$DROPIN.tmp" "$DROPIN"
+  systemctl --user daemon-reload
+  # restart the .path unit after we exit so it re-reads the list
+  systemd-run --user --on-active=3 --unit="qmd-fleet-intel-rewatch-$$" systemctl --user restart qmd-fleet-intel.path >/dev/null 2>&1 || true
+fi
+
+# 3. serialized update + embed
+exec 9>"$LOCK"
+if ! flock -n 9; then echo "$(date -Is) another sync running; skipping" >> "$LOG"; exit 0; fi
+{
+  echo "$(date -Is) sync start"
+  qmd update && qmd embed
+  rc=$?
+  echo "$(date -Is) sync end rc=$rc"
+  exit $rc
+} >> "$LOG" 2>&1

@@ -130,6 +130,17 @@ case "${1:-help}" in
     exists "$2" || die "no session '$2'"
     T kill-session -t "=$2" && echo "killed $2"
     ;;
+  invite)                    # invite <name>   signal Claude to join this session
+    need_name "${2:-}" "invite <name>"; name="$2"; host="$(hostname)"
+    exists "$name" || die "no session '$name'"
+    invite_file="$HOME/.shared-terminal-invite"
+    printf '{"host":"%s","session":"%s","socket":"%s","invited_at":"%s","user":"%s"}
+' \
+      "$host" "$name" "$SOCK" "$(date -Is)" "$(whoami)" > "$invite_file"
+    ssh lumen@100.117.66.102 "mkdir -p /home/lumen/.shared-terminal-invites && cat > /home/lumen/.shared-terminal-invites/${host}.json" < "$invite_file" 2>/dev/null || true
+    echo "Invited agent to session '$name' on $host"
+    echo "Agent: ssh $host 'shared-terminal snapshot $name'"
+    ;;
   help|--help|-h)
     cat <<EOF
 shared-terminal: one tmux session Frank and an agent share (socket: tmux -L $SOCK)
@@ -146,6 +157,7 @@ Agent side
   send <name> --key K...     send tmux key names: C-c  C-d  Enter  Up  Escape  F1
   wait <name> <regex> [sec]  block until the screen matches (exit 2 on timeout)
 Both
+  invite <name>              signal Claude to join your session
   status <name>  |  list  |  log <name> [-f]  |  kill <name>
 
 Transcript logs: $LOG_DIR/<name>.log   Both parties must be the same Unix user.

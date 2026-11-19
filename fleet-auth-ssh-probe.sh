@@ -23,7 +23,6 @@ hathor hathor@100.80.71.13
 seshat seshat@192.168.8.219
 anubis anubis@192.168.8.232
 apep apep@100.82.2.72
-wadjet wadjet@100.116.217.15
 maat maam@100.105.219.34
 thoth thoth@192.168.8.218
 thor thor@100.112.151.100

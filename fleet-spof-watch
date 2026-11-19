@@ -14,7 +14,7 @@ Four subcommands, one per gap the atlas named as "dies silently, nobody notices"
              lumen-alert-queue does not subscribe to.
   restarts   §5 #7 / §5.1 item 3 — Restart=always with no StartLimitBurst turns
              a permanently broken dependency into an infinite quiet loop.
-  timers     §5 #4 — wadjet-ha-monitor (Frank's password manager) and the
+  timers     §5 #4 — vault-ha-monitor (password manager) and the
              backup chain have no dead-man of their own. Asserts ran-recently
              (timer LastTriggerUSec) and succeeded (service Result), which are
              different assertions (ISSUE-LOG #44).
@@ -65,7 +65,7 @@ DAEMONS = [
 # real cadence read off `systemctl list-timers` on 2026-09-11; a tighter bound
 # would false-positive against this guard's own 10-minute cadence.
 TIMERS = [
-    {"timer": "wadjet-ha-monitor.timer", "max_age_s": 300,
+    {"timer": "vault-ha-monitor.timer", "max_age_s": 300,
      "why": "vault primary unwatched: vault.lumennode.uk down needs a human"},
     {"timer": "lumen-backup-critical.timer", "max_age_s": 7200,
      "why": "hourly critical backup stopped"},

@@ -1,0 +1,115 @@
+#!/bin/bash
+# serial-console — a serial/UART console that lives inside a shared-terminal
+# tmux session, so Frank and an agent drive the SAME picocom, and the agent's
+# boot-window automation (mash Enter / send-at-prompt) runs INSIDE that session
+# instead of a second picocom fighting it for the port.
+#
+# This is the fix for the 2026-10-19 AP-303/C-130 session, where a pexpect
+# script spawned its own picocom on /dev/ttyUSB0 while the shared terminal held
+# another: two writers on one PTY, tangled keystrokes, missed 2-3s boot windows.
+# Here there is exactly ONE reader/writer of the port (picocom in the tmux
+# pane), the human sees it live, and the agent uses tmux capture/send — which
+# have no SSH round-trip inside the catch loop, so the boot window is catchable.
+#
+#   open <dev> [name] [baud]   picocom in a shared session (human attaches)
+#   catch <name> <regex> [--enter|--keys K..] [--hz N] [--secs S]
+#                              spam a key until the screen matches (boot window)
+#   expect <name> <regex> [secs]        wait for the screen to match
+#   send/snapshot/scrollback/status/list/kill  -> delegate to shared-terminal
+#
+# Everything else (snapshot, send, etc.) is just `shared-terminal <cmd> <name>`.
+set -euo pipefail
+
+ST="${SHARED_TERMINAL_BIN:-$(command -v shared-terminal || echo /usr/local/bin/shared-terminal)}"
+DEFAULT_BAUD="${SERIAL_CONSOLE_BAUD:-115200}"
+die() { echo "serial-console: $*" >&2; exit 1; }
+[ -x "$ST" ] || die "shared-terminal not found (looked at $ST)"
+
+# pick the one obvious USB serial device if the user doesn't name one
+autodev() {
+  local d
+  for d in /dev/ttyUSB* /dev/ttyACM*; do [ -e "$d" ] && { echo "$d"; return; }; done
+  return 1
+}
+
+case "${1:-help}" in
+  open)                      # open [dev] [name] [baud]
+    DEV="${2:-$(autodev || die 'no /dev/ttyUSB* or /dev/ttyACM* found; name one')}"
+    NAME="${3:-$(basename "$DEV")}"
+    BAUD="${4:-$DEFAULT_BAUD}"
+    [ -e "$DEV" ] || die "no such device: $DEV"
+    # one owner only: refuse if some other process already holds the port
+    if command -v fuser >/dev/null && sudo -n fuser "$DEV" >/dev/null 2>&1; then
+      HOLD="$(sudo -n fuser -v "$DEV" 2>&1 | tail -1)"
+      die "port $DEV is already open by: $HOLD  (serial-console kill $NAME, or free it first)"
+    fi
+    if "$ST" status "$NAME" >/dev/null 2>&1; then
+      echo "serial-console: session '$NAME' already exists — attach with: shared-terminal open $NAME" >&2
+      exit 0
+    fi
+    # -q = no startup banner/prompt (keeps the screen = pure device output);
+    # exit key stays Ctrl-A Ctrl-X. picocom runs as the ONLY port owner.
+    "$ST" start "$NAME" sudo picocom -b "$BAUD" -q "$DEV" >/dev/null
+    sleep 1
+    echo "serial-console: '$NAME' open on $DEV @ ${BAUD}8N1"
+    echo "  human:  shared-terminal open $NAME            (detach Ctrl-b d; quit picocom Ctrl-a Ctrl-x)"
+    echo "  agent:  serial-console snapshot $NAME | catch $NAME '<regex>' --enter | expect $NAME '<regex>'"
+    ;;
+
+  catch)                     # catch <name> <regex> [--enter|--keys K..] [--hz N] [--secs S]
+    NAME="${2:-}"; RE="${3:-}"; [ -n "$NAME" ] && [ -n "$RE" ] || die "usage: catch <name> <regex> [--enter|--keys K..] [--hz N] [--secs S]"
+    shift 3
+    MODE="enter"; KEYS=(); HZ=20; SECS=60
+    while [ $# -gt 0 ]; do case "$1" in
+      --enter) MODE="enter"; shift;;
+      --keys)  MODE="keys"; shift; while [ $# -gt 0 ] && [[ "$1" != --* ]]; do KEYS+=("$1"); shift; done;;
+      --hz)    HZ="$2"; shift 2;;
+      --secs)  SECS="$2"; shift 2;;
+      *) die "catch: unknown arg $1";;
+    esac; done
+    "$ST" status "$NAME" >/dev/null 2>&1 || die "no session '$NAME'"
+    # Interval between key bursts. The catch loop is LOCAL to this box (tmux
+    # send-keys + capture-pane), no SSH per iteration, so 20 Hz is realistic.
+    INT="$(awk "BEGIN{print 1/$HZ}")"
+    END=$(( $(date +%s) + SECS ))
+    echo "serial-console: catching /$RE/ (<=${SECS}s, ${HZ}Hz, mode=$MODE)..." >&2
+    while :; do
+      if "$ST" snapshot "$NAME" | grep -qE -- "$RE"; then
+        echo "serial-console: matched /$RE/" >&2; exit 0
+      fi
+      if [ "$MODE" = keys ]; then "$ST" send "$NAME" --key "${KEYS[@]}"; else "$ST" send "$NAME" --key Enter; fi
+      [ "$(date +%s)" -lt "$END" ] || { echo "serial-console: timeout, /$RE/ not seen in ${SECS}s" >&2; exit 2; }
+      sleep "$INT"
+    done
+    ;;
+
+  expect)                    # expect <name> <regex> [secs]   (no key spam, just wait)
+    NAME="${2:-}"; RE="${3:-}"; SECS="${4:-30}"
+    [ -n "$NAME" ] && [ -n "$RE" ] || die "usage: expect <name> <regex> [secs]"
+    exec "$ST" wait "$NAME" "$RE" "$SECS"
+    ;;
+
+  snapshot|scrollback|send|status|list|kill|log|attach)
+    exec "$ST" "$@"          # straight passthrough to shared-terminal
+    ;;
+
+  help|--help|-h)
+    cat <<EOF
+serial-console: a UART console inside a shared-terminal session (one port owner).
+
+  open <dev> [name] [baud]        picocom in a shared session  (baud default $DEFAULT_BAUD)
+                                  dev optional if exactly one /dev/ttyUSB*/ttyACM*
+  catch <name> <regex> [opts]     spam a key until the screen matches (boot window)
+       --enter            (default) send Enter each tick
+       --keys K [K..]     send tmux key names each tick (e.g. --keys Enter Space)
+       --hz N             bursts/sec (default 20)      --secs S  timeout (default 60)
+  expect <name> <regex> [secs]    wait for the screen to match (no key spam)
+  send/snapshot/scrollback/status/list/log/kill/attach <name>   -> shared-terminal
+
+Human attaches with: shared-terminal open <name>  (quit picocom: Ctrl-a Ctrl-x).
+Only ONE process owns the serial port (picocom in the pane) — never run a second
+picocom/pexpect against the same /dev/ttyUSB*.
+EOF
+    ;;
+  *) die "unknown command '$1' (serial-console help)";;
+esac

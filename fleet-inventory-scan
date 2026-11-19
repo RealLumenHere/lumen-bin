@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""fleet-inventory-scan -- per-machine inventory scanner (wq#4918).
+
+Runs ON LUMEN. One read-only SSH session per target: a probe script is fed on
+stdin to `bash -s`, its sections are parsed here, and the result is rendered to
+/home/lumen/fleet-inventory/<name>.md (atomic write).
+
+  fleet-inventory-scan NAME [NAME...]      scan + write
+  fleet-inventory-scan --all               scan every machine in FLEET
+  fleet-inventory-scan NAME --dry-run      render to stdout, write nothing
+  fleet-inventory-scan NAME --target USER@HOST[,HOSTKEYALIAS]   extra ssh target (repeatable, tried first)
+  fleet-inventory-scan --mark-offline NAME "reason"
+  fleet-inventory-scan --readme            regenerate the README.md table only
+
+Safety: nothing on a target is modified (no sudo, no writes, no service or
+package-manager calls). Host-key checking stays ON (StrictHostKeyChecking=yes);
+a changed key is reported, never bypassed. Re-scans keep hand edits (Purpose,
+Disabled/not-used when edited by hand) and move superseded values into
+"Previous configuration" + "Change log".
+Exit: 0 ok, 2 unreachable (status recorded), 1 error.
+"""
+import argparse, json, os, re, subprocess, sys, tempfile
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+INV_DIR = Path(os.environ.get("FLEET_INVENTORY_DIR", "/home/lumen/fleet-inventory"))
+STATUS_DIR = INV_DIR / ".status"
+STATE_PY = "/home/lumen/minerva/lumen_state.py"
+PT = ZoneInfo("America/Los_Angeles")
+DATA_TAG = "fleet-inventory-scan:data"
+LOCAL = {"lumen"}
+
+# name -> ordered ssh candidates (user@host, HostKeyAlias|None). First that answers wins.
+# horus: LAN .229 serves Horus's own host keys (verified out-of-band 2026-11-05) but Lumen's
+# known_hosts holds stale entries for that IP; the alias reuses the trusted tailnet-IP entry.
+FLEET = {
+    "lumen": [],
+    "thor":   [("thor@100.112.151.100", None), ("thor@192.168.8.132", None)],
+    "thoth":  [("thoth@100.75.1.108", None), ("thoth@192.168.8.218", None)],
+    "anubis": [("anubis@100.121.17.5", None), ("anubis@192.168.8.232", None)],
+    "horus":  [("horus@192.168.8.229", "100.83.19.124"), ("horus@100.83.19.124", None)],
+    "ptah":   [("ptah@100.78.207.56", None), ("ptah@192.168.8.125", None)],
+    "neith":  [("neith@100.108.107.111", None), ("neith@192.168.8.147", None)],
+    "khnum":  [("khnum@100.76.194.58", None), ("khnum@192.168.8.110", None)],
+}
+
+PROBE = r"""
+export LC_ALL=C
+export PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/snap/bin"
+sec(){ printf '\n@@%s\n' "$1"; }
+sec HOSTNAME; hostname 2>/dev/null
+sec LSCPU; lscpu 2>/dev/null
+sec NPROC; nproc --all 2>/dev/null
+sec CPUINFO; grep -m1 -iE "^(model name|hardware|model)[[:space:]]*:" /proc/cpuinfo 2>/dev/null
+sec MEM; grep -E "^(MemTotal|SwapTotal):" /proc/meminfo 2>/dev/null
+sec LSBLK; lsblk -dn -P -o NAME,SIZE,TYPE,ROTA,TRAN,MODEL 2>/dev/null
+sec LSUSB
+if command -v lsusb >/dev/null 2>&1; then lsusb 2>/dev/null
+else
+  echo "# usb-via-sysfs"
+  for d in /sys/bus/usb/devices/*-*; do
+    case "${d##*/}" in *:*) continue;; esac
+    [ -r "$d/idVendor" ] || continue
+    [ "$(cat "$d/bDeviceClass" 2>/dev/null)" = "09" ] && continue
+    printf "Bus %03d Device %03d: ID %s:%s %s %s\n" "$(cat "$d/busnum" 2>/dev/null || echo 0)" "$(cat "$d/devnum" 2>/dev/null || echo 0)" "$(cat "$d/idVendor")" "$(cat "$d/idProduct")" "$(cat "$d/manufacturer" 2>/dev/null)" "$(cat "$d/product" 2>/dev/null)"
+  done
+fi
+sec LSPCI
+if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null; else echo "__MISSING__"; fi
+sec IPLINK; ip -o link 2>/dev/null
+sec IFTYPE
+for d in /sys/class/net/*; do
+  n=${d##*/}; [ "$n" = lo ] && continue
+  if [ -d "$d/wireless" ] || [ -d "$d/phy80211" ]; then t=wifi
+  elif readlink -f "$d" 2>/dev/null | grep -q "/virtual/"; then t=virtual
+  else t=ethernet; fi
+  drv=""; [ -e "$d/device/driver" ] && drv=$(basename "$(readlink -f "$d/device/driver")")
+  printf "%s|%s|%s\n" "$n" "$t" "$drv"
+done
+sec LOADAVG; cat /proc/loadavg 2>/dev/null
+sec FREE; free -h 2>/dev/null
+sec DF; df -hP -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null
+sec LSB; lsb_release -a 2>/dev/null
+sec OSREL; grep -E "^(PRETTY_NAME|NAME|VERSION)=" /etc/os-release 2>/dev/null
+sec KERNEL; uname -r
+sec ARCH; uname -m
+sec DESKTOP
+echo "XDG=${XDG_CURRENT_DESKTOP:-}"
+echo "SESSIONS=$(ls /usr/share/xsessions /usr/share/wayland-sessions 2>/dev/null | tr '\n' ' ')"
+command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' xfce4-session gnome-shell cosmic-session plasma-desktop mate-session-manager cinnamon lxqt-session budgie-desktop 2>/dev/null | awk '$1=="ii"{print "PKG="$2}'
+ps -eo comm= 2>/dev/null | grep -E "^(xfce4-session|gnome-shell|cosmic-comp|cosmic-session|plasmashell|mate-session|cinnamon|lxqt-session|budgie-wm)$" | sort -u | sed "s/^/PROC=/"
+sec APT
+echo "PKGCACHE=$(stat -c %y /var/cache/apt/pkgcache.bin 2>/dev/null)"
+echo "STAMP=$(stat -c %y /var/lib/apt/periodic/update-success-stamp 2>/dev/null)"
+sec PKGCOUNT
+if command -v dpkg >/dev/null 2>&1; then dpkg --get-selections 2>/dev/null | awk '$2=="install"' | wc -l; else echo none; fi
+sec KEYSW
+v(){ label=$1; shift; command -v "$1" >/dev/null 2>&1 || return 0; out=$(timeout 10 "$@" 2>&1 | grep -m1 -E "[0-9]+\.[0-9]+"); [ -n "$out" ] && printf "%s|%s\n" "$label" "$out"; return 0; }
+v docker docker --version
+v "docker compose" docker compose version
+v docker-compose docker-compose --version
+v python3 python3 --version
+v pip3 pip3 --version
+v node node --version
+v npm npm --version
+v tailscale tailscale version
+v ollama ollama --version
+v claude claude --version
+v git git --version
+v restic restic version
+v borg borg --version
+v psql psql --version
+v nginx nginx -v
+v sqlite3 sqlite3 --version
+v rsync rsync --version
+v smartctl smartctl --version
+v ffmpeg ffmpeg -version
+v go go version
+v rustc rustc --version
+v cargo cargo --version
+v java java -version
+v gcc gcc --version
+v qemu-system-x86_64 qemu-system-x86_64 --version
+v gitea gitea --version
+v transmission-daemon transmission-daemon --version
+sec KEYDPKG
+command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${db:Status-Abbrev}|${Package}|${Version}\n' plexmediaserver qbittorrent-nox apache2 postgresql grafana prometheus-node-exporter samba nfs-kernel-server ntfy openvino 2>/dev/null | awk -F"|" '$1 ~ /^ii/ {print $2"|"$3}'
+sec TSIP
+if command -v tailscale >/dev/null 2>&1; then timeout 8 tailscale ip -4 2>&1 | head -n1; else echo "tailscale not installed"; fi
+sec LANIP; ip -4 -o addr show scope global 2>/dev/null | awk '{print $2" "$4}'
+sec END
+exit 0
+"""
+
+USB_NOTES = {
+    "03e7:2485": "Intel Movidius NCS2 (MyriadX), pre-boot ID",
+    "03e7:f63b": "Intel Movidius NCS2 (MyriadX), booted ID",
+    "03e7:2150": "Intel Movidius NCS1",
+    "0403:6001": "FTDI FT232 USB-serial", "0403:6010": "FTDI FT2232 USB-serial",
+    "0403:6014": "FTDI FT232H USB-serial", "0403:6015": "FTDI FT-X USB-serial",
+    "10c4:ea60": "CP210x USB-UART serial", "1a86:7523": "CH340 USB-serial",
+    "1a86:55d4": "CH9102 USB-serial", "067b:2303": "Prolific PL2303 USB-serial",
+}
+USB_VENDOR_NOTES = {"2935": "Magewell capture device"}
+DE_MAP = [("xfce4-session", "XFCE"), ("gnome-shell", "GNOME"), ("cosmic", "COSMIC"),
+          ("plasma", "KDE Plasma"), ("mate-session", "MATE"), ("cinnamon", "Cinnamon"),
+          ("lxqt-session", "LXQt"), ("budgie", "Budgie")]
+LINK_RE = re.compile(r"^\d+:\s+(?P<name>[^:@\s]+)(?:@[^:\s]+)?:\s+<(?P<flags>[^>]*)>.*?\sstate\s+(?P<state>\S+).*?link/(?P<lt>\S+)(?:\s+(?P<mac>(?:[0-9a-f]{2}:){5}[0-9a-f]{2}))?")
+DISABLED_RE = re.compile(r"\b(disabled|not used|unused|not in use|blacklisted|masked|off-limits|dead|failed|broken)\b", re.I)
+HW_PREDS = re.compile(r"^(hardware|gpu|gpu_policy|nic.*|storage.*|ram.*|usb.*)$")
+
+
+def now_pt():
+    return datetime.now(PT)
+
+
+def fmt_pt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def shorten(s, n):
+    s = " ".join(str(s).split())
+    if len(s) <= n:
+        return s
+    cut = s[:n].rsplit(" ", 1)[0]
+    return cut + " ..."
+
+
+# ----------------------------------------------------------------- collection
+def run_probe(name, extra):
+    attempts = []
+    if name in LOCAL:
+        r = subprocess.run(["bash", "-s"], input=PROBE, capture_output=True, text=True, timeout=120)
+        if "@@END" in r.stdout:
+            return r.stdout, "local", attempts
+        attempts.append(("local", " ".join(r.stderr.split())[:300] or "rc=%d" % r.returncode))
+        return None, None, attempts
+    for target, alias in list(extra) + FLEET.get(name, []):
+        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+               "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
+               "-o", "StrictHostKeyChecking=yes", "-o", "LogLevel=ERROR"]
+        if alias:
+            cmd += ["-o", "HostKeyAlias=" + alias]
+        cmd += [target, "bash -s"]
+        try:
+            r = subprocess.run(cmd, input=PROBE, capture_output=True, text=True, timeout=150)
+        except subprocess.TimeoutExpired:
+            attempts.append((target, "timeout 150s"))
+            continue
+        if "@@END" in r.stdout:
+            return r.stdout, target, attempts
+        attempts.append((target, " ".join(r.stderr.split())[:300] or "rc=%d" % r.returncode))
+    return None, None, attempts
+
+
+def split_sections(txt):
+    secs, cur = {}, None
+    for line in txt.splitlines():
+        if line.startswith("@@"):
+            cur = line[2:].strip()
+            secs[cur] = []
+        elif cur is not None:
+            secs[cur].append(line)
+    return {k: "\n".join(v).strip("\n") for k, v in secs.items()}
+
+
+def state_facts(name):
+    try:
+        r = subprocess.run(["python3", STATE_PY, "current", name], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return {}
+    facts = {}
+    pat = re.compile(r"^\s*" + re.escape(name) + r"\.(\S+)\s*=\s*(.*?)\s+\(since (\d{4}-\d{2}-\d{2})\)")
+    for line in r.stdout.splitlines():
+        m = pat.match(line)
+        if m:
+            facts[m.group(1)] = (m.group(2), m.group(3))
+    return facts
+
+
+# -------------------------------------------------------------------- parsing
+def parse_cpu(s):
+    models, maxmhz, kv = [], [], {}
+    for line in s.get("LSCPU", "").splitlines():
+        if ":" not in line:
+            continue
+        k, v = [x.strip() for x in line.split(":", 1)]
+        if k == "Model name":
+            if v and v not in models:
+                models.append(v)
+        elif k == "CPU max MHz":
+            try:
+                maxmhz.append(float(v))
+            except ValueError:
+                pass
+        else:
+            kv.setdefault(k, v)
+    if not models:
+        m = re.search(r":\s*(.+)$", s.get("CPUINFO", ""))
+        if m:
+            models.append(m.group(1).strip())
+    nproc = s.get("NPROC", "").strip()
+    threads = int(kv["CPU(s)"]) if kv.get("CPU(s)", "").isdigit() else (int(nproc) if nproc.isdigit() else None)
+    # lscpu per-socket/cluster fields mislead on heterogeneous ARM (RK3399 = 2xA72+4xA53), so derive cores from threads/threads-per-core
+    tpc = kv.get("Thread(s) per core", "")
+    cores = threads // int(tpc) if threads and tpc.isdigit() and int(tpc) > 0 and threads % int(tpc) == 0 else threads
+    parts = [" + ".join(models) or "unknown CPU"]
+    if cores and threads and cores != threads:
+        parts.append("%d cores / %d threads" % (cores, threads))
+    elif threads:
+        parts.append("%d cores" % threads)
+    if maxmhz:
+        parts.append("max %d MHz" % max(maxmhz))
+    return ", ".join(parts), threads
+
+
+def parse_ram(s):
+    m = re.search(r"MemTotal:\s+(\d+)\s+kB", s.get("MEM", ""))
+    return "%.1f GiB" % (int(m.group(1)) / 1048576.0) if m else "unknown"
+
+
+def parse_storage(s):
+    out = []
+    for line in s.get("LSBLK", "").splitlines():
+        d = dict(re.findall(r'(\w+)="([^"]*)"', line))
+        n = d.get("NAME", "")
+        if d.get("TYPE") != "disk" or re.match(r"^(loop|zram|ram|sr)", n) or re.search(r"(boot\d+|rpmb)$", n):
+            continue
+        if n.startswith("mtdblock"):
+            kind = "SPI flash (MTD)"
+        elif n.startswith("nvme"):
+            kind = "NVMe SSD"
+        elif n.startswith("mmcblk"):
+            kind = "eMMC/SD"
+        elif d.get("TRAN") == "usb":
+            kind = "USB HDD" if d.get("ROTA") == "1" else "USB SSD/flash"
+        else:
+            kind = "HDD" if d.get("ROTA") == "1" else "SSD"
+        out.append((n, d.get("SIZE", "?"), kind, d.get("MODEL", "").strip()))
+    return out
+
+
+def parse_nics(s):
+    types = {}
+    for line in s.get("IFTYPE", "").splitlines():
+        p = line.split("|")
+        if len(p) >= 2:
+            types[p[0]] = (p[1], p[2] if len(p) > 2 else "")
+    nics, veth = [], 0
+    for line in s.get("IPLINK", "").splitlines():
+        m = LINK_RE.match(line)
+        if not m or m.group("name") == "lo":
+            continue
+        n = m.group("name")
+        if n.startswith("veth"):
+            veth += 1
+            continue
+        t, drv = types.get(n, ("?", ""))
+        nics.append((n, m.group("mac") or "-", t, m.group("state"), drv))
+    return nics, veth
+
+
+def parse_usb(s):
+    out = []
+    for line in s.get("LSUSB", "").splitlines():
+        m = re.match(r"^Bus (\d+) Device (\d+): ID ([0-9a-f]{4}):([0-9a-f]{4})\s*(.*)$", line)
+        if not m or re.search(r"\bhub\b", m.group(5), re.I):
+            continue
+        vid, pid = m.group(3), m.group(4)
+        note = USB_NOTES.get(vid + ":" + pid) or USB_VENDOR_NOTES.get(vid)
+        out.append((vid + ":" + pid, m.group(5).strip() or "unknown", note or ""))
+    return out
+
+
+def parse_pci(s):
+    out = []
+    for line in s.get("LSPCI", "").splitlines():
+        m = re.match(r"^(\S+)\s+(.*)$", line)
+        if m:
+            out.append((m.group(1), m.group(2).strip()))
+    return out
+
+
+def parse_resources(s, threads):
+    la = s.get("LOADAVG", "").split()
+    load = "%s / %s / %s (1/5/15 min; %s threads)" % (la[0], la[1], la[2], threads or "?") if len(la) >= 3 else "unknown"
+    ram = swap = "unknown"
+    for line in s.get("FREE", "").splitlines():
+        f = line.split()
+        if f and f[0] == "Mem:" and len(f) >= 7:
+            ram = "%s / %s (available %s)" % (f[2], f[1], f[6])
+        if f and f[0] == "Swap:" and len(f) >= 3:
+            swap = "%s / %s" % (f[2], f[1])
+    df = []
+    for line in s.get("DF", "").splitlines()[1:]:
+        f = line.split(None, 5)
+        if len(f) == 6:
+            df.append("%s (%s): %s / %s (%s)" % (f[5], f[0], f[2], f[1], f[4]))
+    return load, ram, swap, df
+
+
+def to_pt(stat_ts):
+    m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)? ([+-]\d{4})", stat_ts.strip())
+    if not m:
+        return ""
+    return fmt_pt(datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S %z").astimezone(PT))
+
+
+def parse_software(s):
+    lsb = {}
+    for line in s.get("LSB", "").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            lsb[k.strip()] = v.strip()
+    if lsb.get("Description"):
+        os_ = lsb["Description"] + (" (%s)" % lsb["Codename"] if lsb.get("Codename") else "")
+    else:
+        m = re.search(r'PRETTY_NAME="?([^"\n]+)', s.get("OSREL", ""))
+        os_ = m.group(1) if m else "unknown"
+    kernel = s.get("KERNEL", "").strip() or "unknown"
+    arch = s.get("ARCH", "").strip()
+    xdg, procs, pkgs, sess = "", [], [], ""
+    for line in s.get("DESKTOP", "").splitlines():
+        if line.startswith("XDG="):
+            xdg = line[4:].strip()
+        elif line.startswith("PROC="):
+            procs.append(line[5:])
+        elif line.startswith("PKG="):
+            pkgs.append(line[4:])
+        elif line.startswith("SESSIONS="):
+            sess = line[9:].strip()
+
+    def de_name(x):
+        for key, nm in DE_MAP:
+            if key in x:
+                return nm
+        return x
+    if xdg:
+        desktop = xdg
+    elif procs:
+        desktop = "%s (session process running)" % de_name(procs[0])
+    elif pkgs:
+        desktop = "%s (installed, no session running at scan)" % de_name(pkgs[0])
+    elif sess:
+        desktop = "none running (session files present: %s)" % sess
+    else:
+        desktop = "none (headless)"
+    apt = {}
+    for line in s.get("APT", "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            apt[k] = to_pt(v)
+    if apt.get("PKGCACHE"):
+        apt_txt = apt["PKGCACHE"] + " (pkgcache.bin)"
+        if apt.get("STAMP"):
+            apt_txt += "; update-success-stamp " + apt["STAMP"]
+    elif apt.get("STAMP"):
+        apt_txt = apt["STAMP"] + " (update-success-stamp)"
+    else:
+        apt_txt = "unknown (no apt cache on this host)"
+    pc = s.get("PKGCOUNT", "").strip()
+    return os_, kernel, arch, desktop, (pc if pc.isdigit() else "n/a"), apt_txt
+
+
+def parse_keysw(s):
+    out = {}
+    for line in s.get("KEYSW", "").splitlines():
+        if "|" not in line:
+            continue
+        label, raw = line.split("|", 1)
+        m = re.search(r"\d+(?:\.\d+)+[A-Za-z0-9.+~_-]*", raw)
+        out[label] = m.group(0) if m else shorten(raw, 60)
+    for line in s.get("KEYDPKG", "").splitlines():
+        p = line.split("|")
+        if len(p) == 2 and p[0] not in out:
+            out[p[0]] = p[1] + " (dpkg)"
+    return out
+
+
+def parse_net(s, nics):
+    ts, ts_msg = "", ""
+    for line in s.get("TSIP", "").splitlines():
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", line.strip()):
+            ts = line.strip()
+            break
+        if line.strip() and not ts_msg:
+            ts_msg = shorten(line.strip(), 100)
+    lan = []
+    for line in s.get("LANIP", "").splitlines():
+        f = line.split()
+        if len(f) == 2 and not re.match(r"^(tailscale|docker|br-|virbr|veth|cni|flannel|zt)", f[0]):
+            lan.append((f[0], f[1].split("/")[0]))
+    return ts, lan, ts_msg
+
+
+def state_fields(name, facts):
+    role = facts.get("role", ("", ""))[0] or facts.get("purpose", ("", ""))[0]
+    purpose = shorten(role, 200) if role else ""
+    hits = []
+    for pred, (val, since) in facts.items():
+        if HW_PREDS.match(pred) and DISABLED_RE.search(val):
+            for sent in re.split(r"(?<=[.;])\s+", val):
+                if DISABLED_RE.search(sent):
+                    hits.append("%s (state %s.%s, since %s)" % (shorten(sent, 200), name, pred, since))
+                    break
+    hw = facts.get("hardware", ("", ""))
+    hwnote = "%s (state %s.hardware, since %s)" % (shorten(hw[0], 300), name, hw[1]) if hw[0] else ""
+    return purpose, " | ".join(hits[:4]), hwnote
+
+
+# ------------------------------------------------------------- flatten + diff
+def flatten(d):
+    f = {"hostname": d["hostname"], "cpu": d["cpu"], "ram": d["ram"], "os": d["os"], "kernel": d["kernel"],
+         "desktop": d["desktop"], "pkgs.installed": d["pkgcount"], "tailscale_ip": d["ts_ip"] or "(none)"}
+    for n, size, kind, model in d["storage"]:
+        f["storage:" + n] = "%s %s %s" % (size, kind, model)
+    for n, mac, t, st, drv in d["nics"]:
+        f["nic:" + n] = "%s %s %s" % (mac, t, drv)
+    seen = {}
+    for vp, desc, note in d["usb"]:
+        seen[vp] = seen.get(vp, 0) + 1
+        f["usb:%s#%d" % (vp, seen[vp])] = desc
+    for slot, desc in d["pci"]:
+        f["pci:" + slot] = desc
+    for k, v in d["keysw"].items():
+        f["pkg:" + k] = v
+    for iface, ip in d["lan"]:
+        f["lan_ip:" + iface] = ip
+    return f
+
+
+def diff_flat(old, new):
+    ch = []
+    for k in sorted(set(old) | set(new)):
+        if old.get(k) != new.get(k):
+            ch.append((k, old.get(k), new.get(k)))
+    return ch
+
+
+# ------------------------------------------------------------------- old file
+def parse_old(path):
+    if not path.exists():
+        return None
+    txt = path.read_text()
+    m = re.search(r"<!-- " + re.escape(DATA_TAG) + r"\n(.*?)\n-->", txt, re.S)
+    try:
+        js = json.loads(m.group(1)) if m else {}
+    except ValueError:
+        js = {}
+    secs, cur, buf = {}, None, []
+    for line in txt.splitlines():
+        h = re.match(r"^## (.+)$", line)
+        if line.startswith("<!-- " + DATA_TAG):
+            if cur:
+                secs[cur] = "\n".join(buf).strip()
+            cur, buf = None, []
+        elif h:
+            if cur:
+                secs[cur] = "\n".join(buf).strip()
+            cur, buf = h.group(1).strip(), []
+        elif cur:
+            buf.append(line)
+    if cur:
+        secs[cur] = "\n".join(buf).strip()
+    pm = re.search(r"^Purpose:[ \t]*(.*)$", txt, re.M)
+    dm = re.search(r"^Disabled/not-used:[ \t]*(.*)$", txt, re.M)
+    return {"json": js, "secs": secs, "purpose": pm.group(1).strip() if pm else "",
+            "disabled": dm.group(1).strip() if dm else ""}
+
+
+def pick(auto_new, file_val, auto_old):
+    if file_val and file_val != (auto_old or ""):
+        return file_val            # hand-edited since last scan: keep it
+    return auto_new or file_val or ""
+
+
+def short_change(k, o, n):
+    return "%s: %s -> %s" % (k, shorten(o if o is not None else "(none)", 60), shorten(n if n is not None else "(removed)", 60))
+
+
+# --------------------------------------------------------------------- render
+def build(name, d, via, state, old, scan_dt):
+    today = scan_dt.strftime("%Y-%m-%d")
+    purpose_auto, disabled_auto, hwnote = state
+    oj = (old or {}).get("json", {})
+    purpose = pick(purpose_auto, (old or {}).get("purpose", ""), oj.get("auto_purpose"))
+    disabled = pick(disabled_auto, (old or {}).get("disabled", ""), oj.get("auto_disabled"))
+    flat = flatten(d)
+    changes = diff_flat(oj["fp"], flat) if old and oj.get("fp") else []
+    secs = (old or {}).get("secs", {})
+
+    prev = secs.get("Previous configuration", "")
+    if prev.startswith("(blank"):
+        prev = ""
+    log = [l for l in secs.get("Change log", "").splitlines() if l.strip()]
+    if not old or not oj.get("fp"):
+        if not any("Initial scan" in l for l in log):
+            log.append("- %s Initial scan" % today)
+    elif changes:
+        block = "### Superseded %s (values before the %s re-scan)\n" % (today, today)
+        block += "\n".join("- %s: %s" % (k, o if o is not None else "(not present)") for k, o, n in changes)
+        prev = (prev + "\n\n" if prev else "") + block
+        shown = "; ".join(short_change(*c) for c in changes[:10])
+        more = " (+%d more)" % (len(changes) - 10) if len(changes) > 10 else ""
+        log.append("- %s Re-scan: %d change(s): %s%s" % (today, len(changes), shown, more))
+    if not prev:
+        prev = "(blank — filled on subsequent changes)"
+
+    host = d["hostname"]
+    h1 = name if host == name else "%s (hostname: %s)" % (name, host)
+    L = ["# " + h1, "Purpose: " + purpose, "Last scanned: " + fmt_pt(scan_dt), "", "## Hardware",
+         "CPU: " + d["cpu"], "RAM: " + d["ram"], "Storage:"]
+    L += ["- %s: %s, %s%s" % (n, size, kind, (", " + model) if model else "") for n, size, kind, model in d["storage"]] or ["- (no physical disks reported)"]
+    L.append("Network interfaces:")
+    for n, mac, t, st, drv in d["nics"]:
+        L.append("- %s: MAC %s, %s, %s%s" % (n, mac, t, st, (", driver " + drv) if drv else ""))
+    if d["veth"]:
+        L.append("- (+%d veth container interfaces not listed)" % d["veth"])
+    L.append("Special hardware:")
+    usb = d["usb"][:25]
+    L += ["- USB %s %s%s" % (vp, desc, (" [" + note + "]") if note else "") for vp, desc, note in usb] or ["- (no non-hub USB devices)"]
+    if len(d["usb"]) > 25:
+        L.append("- (+%d more USB devices)" % (len(d["usb"]) - 25))
+    if d.get("usb_note"):
+        L.append("- (" + d["usb_note"] + ")")
+    if hwnote:
+        L.append("- Note: " + hwnote)
+    L.append("PCI devices:")
+    if d.get("pci_missing"):
+        L.append("- (lspci not installed on host; PCI not scanned)")
+    else:
+        L += ["- %s %s" % (s_, desc) for s_, desc in d["pci"][:40]] or ["- (no PCI devices reported)"]
+    if len(d["pci"]) > 40:
+        L.append("- (+%d more PCI devices)" % (len(d["pci"]) - 40))
+    L.append("Disabled/not-used: " + disabled)
+    L += ["", "## Resources at last scan", "CPU load: " + d["load"], "RAM used: " + d["ram_used"], "Swap used: " + d["swap_used"], "Disk used:"]
+    L += ["- " + x for x in d["df"]] or ["- (none reported)"]
+    L += ["", "## Software", "OS: " + d["os"], "Kernel: %s%s" % (d["kernel"], (" (%s)" % d["arch"]) if d["arch"] else ""),
+          "Desktop: " + d["desktop"], "Installed packages: %s" % d["pkgcount"], "Last apt update: " + d["apt"],
+          "", "## Key packages"]
+    L += ["- %s: %s" % (k, v) for k, v in sorted(d["keysw"].items())] or ["- (none of the tracked packages found)"]
+    L += ["", "## Network", "Tailscale IP: " + (d["ts_ip"] or "(none: %s)" % (d.get("ts_msg") or "no response")),
+          "LAN IP: " + (", ".join("%s (%s)" % (ip, ifc) for ifc, ip in d["lan"]) or "(none)"), "Hostname: " + host,
+          "", "## Previous configuration", prev, "", "## Change log"] + log
+    summary = {"os": d["os"], "kernel": d["kernel"], "cpu": d["cpu"], "ram": d["ram"], "ts_ip": d["ts_ip"],
+               "lan": [ip for _, ip in d["lan"]], "pkgcount": d["pkgcount"]}
+    blob = {"name": name, "scanned": fmt_pt(scan_dt), "via": via, "auto_purpose": purpose_auto,
+            "auto_disabled": disabled_auto, "fp": flat, "summary": summary}
+    L += ["", "<!-- " + DATA_TAG, json.dumps(blob, indent=1, sort_keys=True).replace("-->", "--\\u003e"), "-->", ""]
+    return "\n".join(L), changes, purpose
+
+
+def collect(name, extra, scan_dt):
+    out, via, attempts = run_probe(name, extra)
+    if out is None:
+        return None, None, attempts
+    s = split_sections(out)
+    cpu, threads = parse_cpu(s)
+    nics, veth = parse_nics(s)
+    load, ram_used, swap_used, df = parse_resources(s, threads)
+    os_, kernel, arch, desktop, pkgcount, apt = parse_software(s)
+    ts, lan, ts_msg = parse_net(s, nics)
+    d = dict(hostname=s.get("HOSTNAME", "").strip() or name, cpu=cpu, ram=parse_ram(s), storage=parse_storage(s),
+             nics=nics, veth=veth, usb=parse_usb(s), pci=parse_pci(s), load=load, ram_used=ram_used,
+             swap_used=swap_used, df=df, os=os_, kernel=kernel, arch=arch, desktop=desktop, pkgcount=pkgcount,
+             apt=apt, keysw=parse_keysw(s), ts_ip=ts, lan=lan, ts_msg=ts_msg,
+             usb_note=("enumerated via sysfs; lsusb not installed" if "# usb-via-sysfs" in s.get("LSUSB", "") else ""),
+             pci_missing=("__MISSING__" in s.get("LSPCI", "")))
+    return d, via, attempts
+
+
+# --------------------------------------------------------------- file helpers
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, str(path))
+
+
+def write_status(name, status, reason=""):
+    p = STATUS_DIR / (name + ".json")
+    if status == "ok":
+        if p.exists():
+            p.unlink()
+        return
+    atomic_write(p, json.dumps({"name": name, "status": status, "reason": reason, "ts": fmt_pt(now_pt())}, indent=1) + "\n")
+
+
+def cell(x):
+    return " ".join(str(x).replace("|", "/").split())
+
+
+def write_readme():
+    rows, offline = [], []
+    status = {}
+    if STATUS_DIR.exists():
+        for p in sorted(STATUS_DIR.glob("*.json")):
+            try:
+                js = json.loads(p.read_text())
+                status[js["name"]] = js
+            except Exception:
+                pass
+    names = set()
+    for p in sorted(INV_DIR.glob("*.md")):
+        if p.name == "README.md":
+            continue
+        nm = p.stem
+        names.add(nm)
+        old = parse_old(p) or {"json": {}, "purpose": ""}
+        sm = old["json"].get("summary", {})
+        st = status.get(nm)
+        flag = "ok" if not st else "LAST SCAN FAILED %s (%s)" % (st["ts"], st["status"])
+        rows.append("| [%s](%s) | %s | %s | %s | %s | %s |" % (
+            nm, p.name, cell(shorten(old["purpose"], 90)) or "_(blank - Frank to fill)_", cell(sm.get("os", "?")),
+            cell(sm.get("kernel", "?")), cell(old["json"].get("scanned", "?")), cell(flag)))
+    for nm, st in sorted(status.items()):
+        if nm not in names:
+            offline.append("| %s | %s | %s | %s |" % (nm, st["status"], cell(st.get("reason", "")), cell(st["ts"])))
+    gen = ["<!-- BEGIN generated by fleet-inventory-scan (--readme); do not hand-edit between the markers -->",
+           "## Machines", "", "| Machine | Purpose | OS | Kernel | Last scanned | Scan status |", "|---|---|---|---|---|---|"]
+    gen += rows or ["| _(none yet)_ | | | | | |"]
+    gen += ["", "## Offline / not scanned", ""]
+    if offline:
+        gen += ["| Machine | Status | Reason | Recorded |", "|---|---|---|---|"] + offline
+    else:
+        gen.append("_(none recorded)_")
+    gen += ["", "_Table regenerated %s._" % fmt_pt(now_pt()), "<!-- END generated -->"]
+    block = "\n".join(gen)
+    rp = INV_DIR / "README.md"
+    if rp.exists() and "<!-- BEGIN generated" in rp.read_text():
+        txt = re.sub(r"<!-- BEGIN generated.*?<!-- END generated -->", lambda m: block, rp.read_text(), flags=re.S)
+    else:
+        txt = HEADER + block + "\n" + FOOTER
+    atomic_write(rp, txt)
+
+
+HEADER = """# Fleet inventory (per-machine)
+
+One file per machine: `/home/lumen/fleet-inventory/<hostname>.md`, auto-populated by
+`/home/lumen/bin/fleet-inventory-scan` (wq#4918) and updated incrementally. Each file records
+Purpose, Hardware (incl. special / disabled), Resources at last scan, Software, Key packages,
+Network, Previous configuration and a Change log.
+
+**Read the machine's file before issuing any command on that machine.**
+
+"""
+
+FOOTER = """
+## How to use
+
+```
+# rescan one or more machines (read-only on the target; writes only <name>.md here)
+/home/lumen/bin/fleet-inventory-scan thor thoth
+# rescan the whole scanned set, or preview without writing
+/home/lumen/bin/fleet-inventory-scan --all
+/home/lumen/bin/fleet-inventory-scan thor --dry-run
+# record a machine as offline / skipped
+/home/lumen/bin/fleet-inventory-scan --mark-offline maksoor "offline at scan time"
+```
+
+- Re-scans refresh everything under Hardware / Resources / Software / Network. When a hardware or
+  software fact changed, the old value is moved to **Previous configuration** and a line is added to
+  the **Change log**. Resource numbers and apt timestamps are volatile and are not logged as changes.
+- `Purpose` and `Disabled/not-used` come from `lumen_state.py` when it has them; hand edits are
+  preserved. Blank Purpose = no `role` fact in state, Frank to fill.
+- `Last apt update` is the mtime of `/var/cache/apt/pkgcache.bin` (plus `update-success-stamp` when present).
+
+## Related sources
+
+- Roster of record (YAML SoT): `/home/lumen/fleet/inventory/machines/*.yaml` (`fleet-inv list`)
+- Rendered roster: `/home/lumen/FLEET_MAP.md`
+- Bi-temporal facts: `python3 /home/lumen/minerva/lumen_state.py current <machine>`
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Scan fleet machines into /home/lumen/fleet-inventory/")
+    ap.add_argument("names", nargs="*")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--target", action="append", default=[], help="USER@HOST[,HOSTKEYALIAS], tried first")
+    ap.add_argument("--readme", action="store_true")
+    ap.add_argument("--mark-offline", nargs=2, metavar=("NAME", "REASON"))
+    a = ap.parse_args()
+    INV_DIR.mkdir(parents=True, exist_ok=True)
+    if a.mark_offline:
+        write_status(a.mark_offline[0], "offline", a.mark_offline[1])
+        write_readme()
+        print("marked offline: %s (%s)" % tuple(a.mark_offline))
+        return 0
+    if a.readme and not (a.names or a.all):
+        write_readme()
+        print("README.md regenerated")
+        return 0
+    names = list(FLEET) if a.all else a.names
+    if not names:
+        ap.error("give NAME(s), --all, --readme or --mark-offline")
+    extra = []
+    for t in a.target:
+        tgt, _, alias = t.partition(",")
+        extra.append((tgt, alias or None))
+    rc = 0
+    for name in names:
+        name = name.lower()
+        scan_dt = now_pt()
+        d, via, attempts = collect(name, extra, scan_dt)
+        if d is None:
+            detail = "; ".join("%s: %s" % (t, e) for t, e in attempts) or "no ssh targets known"
+            print("UNREACHABLE %s -- %s" % (name, detail), file=sys.stderr)
+            if not a.dry_run:
+                write_status(name, "unreachable", detail[:400])
+            rc = max(rc, 2)
+            continue
+        state = state_fields(name, state_facts(name))
+        path = INV_DIR / (name + ".md")
+        md, changes, purpose = build(name, d, via, state, parse_old(path), scan_dt)
+        if a.dry_run:
+            print(md)
+            continue
+        atomic_write(path, md)
+        write_status(name, "ok")
+        print("OK %s via %s -> %s (%d change(s) vs previous scan)%s" % (
+            name, via, path, len(changes), "" if purpose else "  [Purpose blank]"))
+    if not a.dry_run:
+        write_readme()
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""publish-flag — the ONLY write path from CCC into fleet publish_flags (wq#4779).
+
+CCC (Thor) calls this over ssh with Thor's existing key, so the shared litellm
+Postgres stays on 127.0.0.1 and no DB credential leaves Lumen.
+
+  publish-flag get <uuid> [<uuid> ...]            -> {"<uuid>": {"<dest>": "<state>", ...}, ...}
+  publish-flag set <uuid> <dest> <off|queued> [<title-base64>]
+                                                   -> {"ok": true, "state": "..."} | {"ok": false, "error": "..."}
+
+Rules (contract 2026-10-28): CCC sets off<->queued only; review/live belong to
+the export pipeline and are never overwritten from here.
+"""
+import base64, json, re, subprocess, sys
+
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DEST = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+PSQL = ["docker", "exec", "-i", "lumen-pgvector", "psql", "-U", "lumen", "-d", "litellm", "-v", "ON_ERROR_STOP=1", "-qtA"]
+
+def psql(sql, **vars_):
+    cmd = list(PSQL)
+    for k, v in vars_.items():
+        cmd += ["-v", f"{k}={v}"]
+    r = subprocess.run(cmd, input=sql, capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[:300])
+    return r.stdout
+
+def out(o, code=0):
+    print(json.dumps(o)); sys.exit(code)
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "get":
+        ids = [u for u in argv[1:] if UUID.match(u)]
+        if not ids: out({})
+        rows = psql("select session_id, destination, state, extract(epoch from updated_at)::bigint from publish_flags where session_id = any(string_to_array(:'ids', ','));", ids="claude.ai/chat/" + ",claude.ai/chat/".join(ids))
+        import os
+        res = {u: {"_updated": {}, "_exported": None} for u in ids}
+        for line in rows.splitlines():
+            if not line: continue
+            sid, dest, state, upd = line.split("|")
+            u = sid.rsplit("/", 1)[-1]
+            res[u][dest] = state; res[u]["_updated"][dest] = int(upd)
+        for u in ids:
+            m = os.path.join("/home/lumen/publish/inbox", u, "manifest.json")
+            if os.path.isfile(m): res[u]["_exported"] = int(os.path.getmtime(m))
+        out(res)
+    if len(argv) in (4, 5) and argv[0] == "set":
+        uuid, dest, state = argv[1], argv[2], argv[3]
+        if not UUID.match(uuid): out({"ok": False, "error": "bad session uuid"}, 2)
+        if not DEST.match(dest): out({"ok": False, "error": "bad destination"}, 2)
+        if state not in ("off", "queued"): out({"ok": False, "error": "CCC may only set off or queued"}, 2)
+        title = ""
+        if len(argv) == 5:
+            try: title = base64.b64decode(argv[4]).decode("utf-8", "replace")[:200]
+            except Exception: title = ""
+        # Upsert, but never touch a row the pipeline has moved to review/live.
+        res = psql("""insert into publish_flags (session_id, destination, state, session_title, updated_at)
+                      values (:'sid', :'dest', :'state', nullif(:'title', ''), now())
+                      on conflict (session_id, destination) do update
+                        set state = excluded.state, session_title = coalesce(excluded.session_title, publish_flags.session_title), updated_at = now()
+                        where publish_flags.state in ('off', 'queued')
+                      returning state;""", sid="claude.ai/chat/" + uuid, dest=dest, state=state, title=title.replace("\n", " "))
+        if res.strip():
+            out({"ok": True, "state": res.strip()})
+        cur = psql("select state from publish_flags where session_id = :'sid' and destination = :'dest';", sid="claude.ai/chat/" + uuid, dest=dest).strip()
+        out({"ok": False, "state": cur, "error": f"pipeline owns this row ({cur})"}, 3)
+    if len(argv) == 2 and argv[0] == "ingest":
+        ingest(argv[1])
+    out({"ok": False, "error": "usage: publish-flag get <uuid>... | set <uuid> <dest> <off|queued> [title-b64] | ingest <uuid> < export.tar"}, 1)
+
+INBOX = "/home/lumen/publish/inbox"
+MAX_TAR = 1 << 30   # 1 GiB: originals of an RE chat can be big, a runaway can't be bigger
+
+def ingest(uuid):
+    """Atomically install a CCC export (tar on stdin) as INBOX/<uuid>/ (wq#4783).
+    Extracted into <uuid>.tmp-<pid> with tarfile's 'data' filter (no absolute
+    paths, no .., no links/devices), verified against manifest.json sha256s,
+    then renamed over any previous export. The pipeline only ever sees a
+    complete directory."""
+    import hashlib, io, os, shutil, tarfile, time
+    if not UUID.match(uuid): out({"ok": False, "error": "bad session uuid"}, 2)
+    data = sys.stdin.buffer.read(MAX_TAR + 1)
+    if len(data) > MAX_TAR: out({"ok": False, "error": "export larger than 1 GiB"}, 2)
+    os.makedirs(INBOX, exist_ok=True)
+    tmp = os.path.join(INBOX, f".{uuid}.tmp-{os.getpid()}")
+    final = os.path.join(INBOX, uuid)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
+            tf.extractall(tmp, filter="data")
+        man_p = os.path.join(tmp, "manifest.json")
+        if not os.path.isfile(man_p) or not os.path.isfile(os.path.join(tmp, "conversation.json")):
+            raise ValueError("export missing manifest.json or conversation.json")
+        man = json.load(open(man_p))
+        if man.get("uuid") != uuid: raise ValueError("manifest uuid mismatch")
+        for f in man.get("files", []):
+            fp = os.path.normpath(os.path.join(tmp, f["path"]))
+            if not fp.startswith(tmp + os.sep): raise ValueError("path escapes export dir")
+            h = hashlib.sha256(open(fp, "rb").read()).hexdigest()
+            if h != f["sha256"]: raise ValueError(f"sha256 mismatch: {f['path']}")
+        old = None
+        if os.path.exists(final):
+            old = os.path.join(INBOX, f".{uuid}.old-{int(time.time())}")
+            os.rename(final, old)
+        os.rename(tmp, final)
+        if old: shutil.rmtree(old, ignore_errors=True)
+        out({"ok": True, "uuid": uuid, "exported_at": man.get("exported_at"), "images": len(man.get("images", [])), "bytes": len(data)})
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        out({"ok": False, "error": str(e)[:300]}, 3)
+
+if __name__ == "__main__":
+    try: main(sys.argv[1:])
+    except Exception as e: out({"ok": False, "error": str(e)[:300]}, 4)

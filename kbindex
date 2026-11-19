@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# kbindex wrapper (wq#4955): deterministic term->file index compiler for fleet-intel.
+# Usage: kbindex build | validate | build --check | build --dry-run | explain <term> [--json]
+export KBINDEX_ROOT="${KBINDEX_ROOT:-/home/lumen/fleet-intel}"
+export PYTHONPATH="/home/lumen/fleet-intel/tools${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m kbindex "$@"

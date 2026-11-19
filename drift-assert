@@ -16,7 +16,7 @@ Design notes:
   last run (state file), so a persistent known-and-accepted drift does not
   spam nightly. Full report always written to disk.
 - SSH via the fleet key; per-node timeout; a node the inventory says is
-  intentionally offline (parked hathor/wadjet, bench khepri) is skipped, not failed.
+  intentionally offline (parked hathor, bench khepri) is skipped, not failed.
 - wq#1456: HOSTS and SKIP_HOSTS come from the fleet inventory (DESIGN_SOT.md);
   GOLDEN stays the per-node policy (WHICH fact to assert) but names no host the
   inventory does not know — a decommissioned box (nephthys) has no ssh path there,

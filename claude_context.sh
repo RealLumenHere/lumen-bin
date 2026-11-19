@@ -102,6 +102,13 @@ if [ "$1" = "--core" ]; then
     python3 /home/lumen/minerva/memory/context_builder.py --out /home/lumen/claude_memory.md 2>/dev/null \
         || echo "WARN: context_builder failed; using existing claude_memory.md (wq#3647)"
     python3 context_selector.py 'session start core context'
+    # wq#backfill: print LATEST.md so Commander sessions also get last-session context
+    if [ -f /home/lumen/fleet-intel/sessions/LATEST.md ]; then
+        echo
+        echo "===== LATEST SESSION (fleet-intel/sessions/LATEST.md) ====="
+        cat /home/lumen/fleet-intel/sessions/LATEST.md
+        echo "===== END LATEST SESSION ====="
+    fi
 elif [ "$1" = "--stats" ]; then
     shift
     python3 context_selector.py "$@" --stats
