@@ -41,13 +41,23 @@ else
 fi
 unset K
 echo ""
-echo "Ollama nodes (models served):"
-for h in isis hathor khepri nephthys; do
+echo "Ollama endpoints (models served; derived from LiteLLM api_base, wq#5129):"
+# Derived, not hardcoded: every distinct :11434 api_base the gateway routes to. The old
+# hardcoded isis/hathor/khepri/nephthys list probed nodes retired 2026-10-22.
+LCFG=/home/lumen/agent/litellm_config.yaml
+bases=$(grep -oE 'api_base:[[:space:]]*"?http://[^[:space:]"]+:11434' "$LCFG" 2>/dev/null | sed -E 's/.*(http:[^"]+).*/\1/' | sort -u)
+[ -z "$bases" ] && echo "  (none found in $LCFG)"
+for base in $bases; do
+  ip=${base#http://}; ip=${ip%%:*}
+  case "$ip" in
+    172.17.0.1|127.0.0.1|localhost) h="lumen" ;;
+    *) h=$(tailscale status 2>/dev/null | awk -v ip="$ip" '$1==ip{print $2; exit}'); h=${h:-$ip} ;;
+  esac
   printf "  %-9s " "$h:"
-  out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" "curl -s -m 5 http://localhost:11434/api/tags" 2>/dev/null)
+  out=$(curl -s -m 5 "$base/api/tags" 2>/dev/null)
   if [ -n "$out" ]; then
     echo "$out" | python3 -c 'import sys,json;m=[x["name"] for x in json.load(sys.stdin).get("models",[])];print(len(m),"models:",", ".join(m))' 2>/dev/null || echo "up (unparsed)"
   else
-    echo "unreachable"
+    echo "unreachable ($base)"
   fi
 done
