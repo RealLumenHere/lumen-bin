@@ -218,3 +218,26 @@ def test_slash_joined_raid_serials_each_checked(lv, monkeypatch):
         ("sdc", 1, "disk", "CCCCC333")), "")}))
     v = "md0 sn AAAAA111/BBBBB222/CCCCC333 raid5"
     assert lv.probe_node_storage("lumen", [_fact("storage", v)])[("lumen", "storage")] == (v, None)
+
+
+def test_wq5026_na_writes_no_row_and_closed_subject_skips_every_probe(lv, monkeypatch):
+    """wq#5026: an inapplicable value is `n/a` (no fact_verifications row, so not BLOCKED);
+    a retired subject is skipped for every probe except node_liveness."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE fact_verifications (id, fact_id, subject, predicate, probe,"
+                 " observed, outcome, ts, detail)")
+    monkeypatch.setattr(lv, "migrate", lambda c: None)
+    monkeypatch.setattr(lv, "closed_subjects", lambda c: {"p3": "retired"})
+    called = []
+    monkeypatch.setitem(lv.PROBES, "plug_map", lambda s, f: called.append(s) or {})
+    monkeypatch.setitem(lv.PROBES, "node_liveness",
+                        lambda s, f: {(s, x["predicate"]): ("offline", None) for x in f})
+    batches = {("service_state", "lumen"): [_fact("status", "LIVE")],
+               ("plug_map", "p3"): [_fact("powers_node", "hathor", "p3")],
+               ("node_liveness", "p3"): [_fact("availability", "offline", "p3")]}
+    r = lv.sweep(conn, None, dry_run=True, batches=batches)
+    assert r["counts"]["n/a"] == 1 and r["counts"]["skipped"] == 1
+    assert r["counts"]["unknown"] == 0 and r["counts"]["confirmed"] == 1
+    assert called == []
+    assert conn.execute("SELECT COUNT(*) FROM fact_verifications").fetchone()[0] == 0

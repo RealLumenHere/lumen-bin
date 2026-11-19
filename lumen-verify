@@ -50,6 +50,13 @@ WQ = "/home/lumen/bin/wq"
 
 CLASS_DEFAULTS = {"status": 3, "config": 14, "identity": 90}
 
+# wq#5026: a probe that cannot apply to a fact's VALUE (free-text `status` is not a unit
+# name, a prose url is not a URL, a described ssh_user is not a login) is not a probe
+# failure. Such an observation starts with NA_PREFIX; the sweep counts it as `n/a` and writes
+# NO fact_verifications row, so the fact reads as unprobed (UNVERIFIABLE) instead of as a
+# failing probe (BLOCKED in the wq#5008 taxonomy). 107 of 212 unknowns were this.
+NA_PREFIX = "N/A: "
+
 MIGRATION_SQL = (
     ("state_facts", "source_kind", "TEXT"),
     ("state_facts", "verify_recipe", "TEXT"),
@@ -237,7 +244,7 @@ def probe_fleet_inventory(subject, facts):
         elif f["predicate"] == "ssh_user":
             user = f["value"]
             if not SSH_USER_RE.fullmatch(user or ""):
-                result[key] = (None, f"value {(user or '')[:40]!r} is not a login name")
+                result[key] = (None, f"{NA_PREFIX}value {(user or '')[:40]!r} is not a login name")
             elif subject == "lumen":
                 rc, out, err = run(["id", "-un"])
                 result[key] = (user, None) if rc == 0 and out.strip() == user else (
@@ -315,7 +322,7 @@ def probe_service_state(subject, facts):
         key = (subject, f["predicate"])
         unit = f["value"]
         if not UNIT_NAME_RE.fullmatch(unit or ""):
-            result[key] = (None, f"value {unit[:40]!r} is not a systemd unit name")
+            result[key] = (None, f"{NA_PREFIX}value {unit[:40]!r} is not a systemd unit name")
             continue
         argv = ["systemctl", "is-active", unit]
         rc, out, err = run(argv if subject == "lumen" else _ssh_argv(subject, argv))
@@ -615,7 +622,7 @@ def probe_endpoint_live(subject, facts):
         key = (subject, f["predicate"])
         url = _endpoint_url(subject, f)
         if url is None:
-            result[key] = (None, f"value {f['value'][:40]!r} is not a probeable "
+            result[key] = (None, f"{NA_PREFIX}value {f['value'][:40]!r} is not a probeable "
                                  f"{f['predicate']}")
             continue
         try:
@@ -743,6 +750,10 @@ def reconcile(conn, fact, probe_id, observed, error, now):
 
 SSH_PROBES = frozenset({"fleet_inventory", "service_state", "node_storage", "os_kernel",
                         "node_identity"})
+# wq#5026: a closed (retired/decommissioned) subject is skipped for EVERY probe except
+# node_liveness (still a real observation of a dead box). plug_map/endpoint_live/
+# tailscale_ip used to keep logging `unknown` for retired plugs and boxes forever.
+CLOSED_SUBJECT_PROBES_KEPT = frozenset({"node_liveness"})
 
 
 def closed_subjects(conn):
@@ -774,11 +785,11 @@ def sweep(conn, registry, now=None, dry_run=False, batches=None):
     migrate(conn)
     if batches is None:
         batches = due_facts(conn, registry, now)
-    counts = {"confirmed": 0, "superseded": 0, "unknown": 0, "skipped": 0}
+    counts = {"confirmed": 0, "superseded": 0, "unknown": 0, "skipped": 0, "n/a": 0}
     detail = []
     closed = closed_subjects(conn)
     for (probe_id, subject), facts in batches.items():
-        if probe_id in SSH_PROBES and subject in closed:
+        if subject in closed and probe_id not in CLOSED_SUBJECT_PROBES_KEPT:
             # wq#2150: a retired/decommissioned node cannot answer; ssh would only
             # time out and log an unknown per fact per sweep. Nothing was checked.
             for f in facts:
@@ -795,6 +806,12 @@ def sweep(conn, registry, now=None, dry_run=False, batches=None):
                              for f in facts}
         for f in facts:
             observed, error = observations.get((subject, f["predicate"]), (None, "no observation"))
+            if error and str(error).startswith(NA_PREFIX):
+                counts["n/a"] += 1
+                detail.append({"subject": subject, "predicate": f["predicate"], "probe": probe_id,
+                               "value": f["value"], "observed": None, "outcome": "n/a",
+                               "error": error})
+                continue
             if dry_run:
                 outcome = "unknown" if (error or observed is None) else (
                     "confirmed" if observed == f["value"] else "superseded"
