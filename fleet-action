@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""wq#5010: fleet action registry entry point.
+  fleet-action list | schema <name> | pins [--write] | <name> '<json>' [--approved KEY]
+  fleet-action mcp                      # stdio MCP server (refuses on pin drift)
+  fleet-action http [--port 8765]       # loopback HTTP surface
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from fleet_actions import adapters  # noqa: E402
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    if argv[:1] == ["mcp"]:
+        adapters.mcp_stdio_main()
+    elif argv[:1] == ["http"]:
+        port = int(argv[argv.index("--port") + 1]) if "--port" in argv else 8765
+        srv = adapters.serve_http(port=port)
+        print(f"fleet-actions http on 127.0.0.1:{port}", file=sys.stderr)
+        srv.serve_forever()
+    else:
+        sys.exit(adapters.cli_main(argv))
