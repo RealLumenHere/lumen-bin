@@ -16,6 +16,7 @@
 #   lumen-pr gitlock <repo-path> scope|status|acquire|release   # wq#532a, mostly for tests
 #   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] [--head REV] <path>...  # wq#771/wq#792 guard
 #   lumen-pr ffprimary <repo-path> [--head REV]  # wq#1536: ff the primary tree to origin/main, or say why not
+#   lumen-pr suite  <repo-path> <pr>|--head REV [--status|--rerun|--gate] [--wait SEC]  # wq#5133 required suite
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
 # trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
@@ -1365,6 +1366,11 @@ cmd_land() {
   local pr_files; pr_files=$(pr_changed_files "$pr" "$head_sha")
   dirty_target_guard refuse "PR #$pr" "$pr_files" "$head_sha"
 
+  # wq#5133: the repo's required test suite (lumen-pr-suites.conf) must have PASSED on this exact
+  # head. A read of a result stamp — the ~20-min run itself lives in a lumen-run unit, started
+  # here if nothing has run yet. Before the CI wait and the lock, for the same reason as wq#771.
+  suite_gate "$pr" "$head_sha" "$head_ref"
+
   # Wait for checks. A repo with no CI yet has nothing to wait for; say so loudly
   # rather than silently treating 'no checks' as 'green'.
   local waited=0 total
@@ -1482,6 +1488,214 @@ cmd_land() {
   trap cleanup_on_exit EXIT
 }
 
+# --- wq#5133: a repo's full test suite as a REQUIRED landing check ----------------------------
+# WHY: wq#5030 found the foreman harness suite red on clean main (23 failures) and every PR was
+# being judged "no new failures vs baseline" by hand, so a red baseline hid real regressions.
+# Once the suite was green (b065f315), the fix is to make green a precondition of landing.
+#
+# Shape, and why it is not just "run pytest inside land":
+#   - the suite takes ~20 min. A land started from a Commander shell dies when Commander
+#     recycles (episode d65a39411849), so the run goes under lumen-run (a systemd unit), and
+#     land itself only READS a result stamp. Land stays a seconds-long operation.
+#   - the stamp is keyed by the PR HEAD SHA. A push to the branch makes the old result
+#     irrelevant automatically: there is no stamp for the new head.
+#   - the run tests the head MERGED onto origin/<default> as of the run, i.e. what the squash
+#     would actually put on main, not the branch in isolation. If main moves afterwards, land
+#     warns (and names the base it was tested on) but does not force a fresh 20-min run.
+#   - gating is pytest rc==0: zero failures and zero errors. Skips are fine (the 7 mask_replay
+#     pins are expected skips). NOT "no new failures vs baseline" — that is what wq#5030 killed.
+#   - which repos and which command: lumen-pr-suites.conf next to this script (tracked, so a
+#     change to the gate is itself a reviewed PR). A repo with no line there is unaffected.
+#   - no override flag, same reasoning as wq#1282: a red suite is a real reason not to land.
+SUITES_CONF=${LUMEN_PR_SUITES_CONF:-$BIN_DIR/lumen-pr-suites.conf}
+SUITE_STATE=${LUMEN_PR_SUITE_STATE:-/home/lumen/.local/state/lumen-pr/suite}
+SUITE_WT_ROOT=${LUMEN_PR_SUITE_WT_ROOT:-/home/lumen/scratch/lumen-pr-suite}
+SUITE_RUN=${LUMEN_PR_SUITE_RUN:-/home/lumen/bin/lumen-run}
+
+suite_cmd_for() { # suite_cmd_for <slug> -> configured command on stdout; rc 1 if the repo has none
+  [ -r "$SUITES_CONF" ] || return 1
+  awk -v s="$1" '
+    /^[[:space:]]*(#|$)/ { next }
+    $1 == s { $1 = ""; sub(/^[[:space:]]+/, ""); print; found = 1; exit }
+    END { exit !found }' "$SUITES_CONF"
+}
+
+suite_stamp() { printf '%s/%s/%s.result' "$SUITE_STATE" "${SLUG//\//__}" "$1"; }
+suite_field() { sed -n "s/^$2=//p" "$1" | head -1; }
+
+# A run in flight for this head: the .running marker names its unit. lumen-run status answers
+# RUNNING while it lives; anything else means the runner died without writing a result (OOM,
+# reboot) and the marker is stale.
+suite_running_unit() { # suite_running_unit <head_sha> -> unit on stdout if a run is live
+  local marker unit; marker="$(suite_stamp "$1")"; marker="${marker%.result}.running"
+  [ -r "$marker" ] || return 1
+  unit=$(suite_field "$marker" unit)
+  if [ "$unit" = inline ] || { [ -n "$unit" ] && [ "$("$SUITE_RUN" status "$unit" 2>/dev/null)" = RUNNING ]; }; then
+    printf '%s' "$unit"; return 0
+  fi
+  rm -f "$marker"; return 1
+}
+
+suite_report() { # suite_report <stamp>
+  printf '  result  : %s\n' "$( [ "$(suite_field "$1" rc)" = 0 ] && echo PASS || echo "FAIL (rc=$(suite_field "$1" rc))")"
+  printf '  summary : %s\n' "$(suite_field "$1" summary)"
+  printf '  head    : %s\n  base    : %s\n' "$(suite_field "$1" head)" "$(suite_field "$1" base)"
+  printf '  finished: %s\n  log     : %s\n' "$(suite_field "$1" finished)" "$(suite_field "$1" log)"
+}
+
+# suite_start <head_sha> <cmd>: build <head merged onto origin/default> in a throwaway linked
+# worktree and launch the runner. Caller has fetched. Prints the unit name (or "inline").
+suite_start() {
+  local head_sha="$1" cmd="$2" stamp base wt unit marker
+  stamp=$(suite_stamp "$head_sha"); marker="${stamp%.result}.running"
+  base=$(git -C "$REPO_PATH" rev-parse --verify -q "origin/$DEFAULT_BRANCH^{commit}") \
+    || die "cannot resolve origin/$DEFAULT_BRANCH in $REPO_PATH"
+  mkdir -p "$(dirname "$stamp")" "$SUITE_WT_ROOT" || die "cannot create $SUITE_STATE / $SUITE_WT_ROOT"
+  wt="$SUITE_WT_ROOT/${SLUG//\//__}-${head_sha:0:12}-$(date +%s)-$$"
+  git -C "$REPO_PATH" worktree add -q --detach "$wt" "$base" >/dev/null 2>&1 \
+    || die "could not create suite worktree $wt"
+  if ! git -C "$wt" -c user.name=lumen-pr-suite -c user.email=lumen-pr-suite@localhost \
+         -c commit.gpgsign=false merge -q --no-edit --no-ff "$head_sha" >/dev/null 2>&1; then
+    git -C "$REPO_PATH" worktree remove --force "$wt" >/dev/null 2>&1
+    printf 'rc=merge-conflict\nhead=%s\nbase=%s\ncmd=%s\nsummary=head does not merge cleanly onto origin/%s\nfinished=%s\nlog=\n' \
+      "$head_sha" "$base" "$cmd" "$DEFAULT_BRANCH" "$(date -u +%FT%TZ)" > "$stamp.tmp.$$" && mv "$stamp.tmp.$$" "$stamp"
+    die "head ${head_sha:0:10} does not merge cleanly onto origin/$DEFAULT_BRANCH — rebase it; the suite was not run"
+  fi
+  rm -f "$stamp"   # a re-run must never leave an older verdict readable for this head
+  if [ "${LUMEN_PR_SUITE_INLINE:-0}" = 1 ]; then
+    printf 'unit=inline\nstarted=%s\n' "$(date -u +%FT%TZ)" > "$marker"
+    "$BIN_DIR/lumen-pr" _suite-run "$wt" "$stamp" "$head_sha" "$base" "$REPO_PATH" "$cmd" >/dev/null 2>&1
+    printf 'inline'; return 0
+  fi
+  unit=$("$SUITE_RUN" start --name "suite-${SLUG##*/}-${head_sha:0:8}" --mem 8G --timeout-stop-sec 90 -- \
+           "$BIN_DIR/lumen-pr" _suite-run "$wt" "$stamp" "$head_sha" "$base" "$REPO_PATH" "$cmd" \
+           | sed -n 's/^UNIT=//p')
+  if [ -z "$unit" ]; then
+    git -C "$REPO_PATH" worktree remove --force "$wt" >/dev/null 2>&1
+    die "lumen-run did not start the suite (no UNIT= line)"
+  fi
+  printf 'unit=%s\nstarted=%s\nworktree=%s\n' "$unit" "$(date -u +%FT%TZ)" "$wt" > "$marker"
+  printf '%s' "$unit"
+}
+
+# The runner, inside the unit. No need_repo: it is handed everything, and it must write a
+# result even when the command crashes, so the land side never waits on a silent death.
+cmd_suite_run() {
+  local wt="$1" stamp="$2" head="$3" base="$4" repo="$5" cmd="$6" log rc started summary
+  [ -n "$cmd" ] || die "usage: lumen-pr _suite-run <wt> <stamp> <head> <base> <repo> <cmd>"
+  log="${stamp%.result}.log"; started=$(date -u +%FT%TZ)
+  ( cd "$wt" && exec bash -c "$cmd" ) >"$log" 2>&1; rc=$?
+  # pytest's closing line, -q or not: "N passed, M skipped in 1234.5s" (=-bars stripped).
+  summary=$(grep -E '[0-9]+ (passed|failed|errors?|skipped|deselected)|no tests ran' "$log" \
+            | grep -E ' in [0-9.]+s' | tail -1 | sed -E 's/^=+ *//; s/ *=+$//')
+  [ -n "$summary" ] || summary="no pytest summary line (see log)"
+  printf 'rc=%s\nhead=%s\nbase=%s\ncmd=%s\nsummary=%s\nstarted=%s\nfinished=%s\nlog=%s\n' \
+    "$rc" "$head" "$base" "$cmd" "$summary" "$started" "$(date -u +%FT%TZ)" "$log" > "$stamp.tmp.$$" \
+    && mv "$stamp.tmp.$$" "$stamp"
+  rm -f "${stamp%.result}.running"
+  git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+# suite_head_local <head_sha> <head_ref>: make sure the PR head is a local object (a branch
+# pushed from another clone is not, until fetched).
+suite_head_local() {
+  git -C "$REPO_PATH" cat-file -e "$1^{commit}" 2>/dev/null && return 0
+  [ -n "${2:-}" ] && git -C "$REPO_PATH" fetch -q origin "$2" 2>/dev/null
+  git -C "$REPO_PATH" cat-file -e "$1^{commit}" 2>/dev/null \
+    || die "PR head ${1:0:10} is not available locally even after fetching '$2'"
+}
+
+# suite_gate <pr> <head_sha> <head_ref>: called by land, before the CI wait and the git lock.
+# Pass -> note and return. Anything else -> die with the one command that moves it forward.
+# No result and nothing running -> START the run, so an agent's land is also the trigger:
+# one command to re-run later, not a second tool to learn.
+suite_gate() {
+  local pr="$1" head_sha="$2" head_ref="$3" cmd stamp rc unit base now_base
+  cmd=$(suite_cmd_for "$SLUG") || return 0
+  stamp=$(suite_stamp "$head_sha")
+  if [ -r "$stamp" ]; then
+    rc=$(suite_field "$stamp" rc)
+    if [ "$rc" = 0 ]; then
+      base=$(suite_field "$stamp" base)
+      note "required suite PASSED on head ${head_sha:0:10} merged onto ${base:0:10}: $(suite_field "$stamp" summary) (wq#5133)"
+      now_base=$(git -C "$REPO_PATH" rev-parse -q --verify "origin/$DEFAULT_BRANCH" 2>/dev/null)
+      [ -n "$now_base" ] && [ "$now_base" != "$base" ] && \
+        note "  note: origin/$DEFAULT_BRANCH moved since the run (${base:0:10} -> ${now_base:0:10}); landing on the head's own result"
+      return 0
+    fi
+    suite_report "$stamp" >&2
+    die "PR #$pr: required suite FAILED on head ${head_sha:0:10} — not landing (wq#5133: zero failures, not no-new-failures).
+      Fix the failures and push; a new head gets a fresh run on the next land. Same head again: lumen-pr suite $REPO_PATH $pr --rerun"
+  fi
+  if unit=$(suite_running_unit "$head_sha"); then
+    die "PR #$pr: required suite still RUNNING for head ${head_sha:0:10} ($unit). Re-run this land when it finishes;
+      watch: lumen-pr suite $REPO_PATH $pr --status   (or: lumen-run wait $unit)"
+  fi
+  suite_head_local "$head_sha" "$head_ref"
+  unit=$(suite_start "$head_sha" "$cmd") || exit 1
+  if [ "$unit" = inline ] && [ -r "$stamp" ]; then suite_gate "$pr" "$head_sha" "$head_ref"; return; fi
+  die "PR #$pr: no suite result for head ${head_sha:0:10}; $SLUG requires '$cmd' to pass (wq#5133).
+      STARTED it now as $unit (~20 min). Re-run this same land when it finishes;
+      watch: lumen-pr suite $REPO_PATH $pr --status   (or: lumen-run wait $unit)"
+}
+
+cmd_suite() {
+  need_repo "${1:-}"; shift 2>/dev/null || true
+  local pr="" head="" mode=start waitsecs=0 cmd head_sha head_ref="" stamp unit
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head)   head="${2:-}"; shift 2 ;;
+      --status) mode=status; shift ;;
+      --rerun)  mode=rerun; shift ;;
+      # --gate: run the REAL suite_gate land runs, with no merge after it ("would this land?").
+      # Exists so the gate is drivable offline by the test gate and by an agent before it asks.
+      --gate)   mode=gate; shift ;;
+      --wait)   waitsecs="${2:-3600}"; shift 2 ;;
+      -*)       die "unknown flag for suite: $1" ;;
+      *)        pr="$1"; shift ;;
+    esac
+  done
+  { [ -n "$pr" ] || [ -n "$head" ]; } || die "usage: lumen-pr suite <repo-path> <pr-number>|--head REV [--status|--rerun|--gate] [--wait SEC]"
+  if ! cmd=$(suite_cmd_for "$SLUG"); then
+    [ "$mode" = gate ] && { note "suite gate: $SLUG has no required suite — land is not gated by one"; return 0; }
+    die "no required suite configured for $SLUG in $SUITES_CONF — nothing to run"
+  fi
+  git -C "$REPO_PATH" fetch -q origin || die "fetch from origin failed in $REPO_PATH"
+  if [ -n "$pr" ]; then
+    broker pr-view "$pr" || broker_fail "PR fetch"
+    head_sha=$(rget '.head_sha'); head_ref=$(rget '.head_ref')
+  else
+    head_sha=$(git -C "$REPO_PATH" rev-parse -q --verify "${head}^{commit}") || die "--head '$head' does not resolve"
+  fi
+  stamp=$(suite_stamp "$head_sha")
+  printf 'suite   : %s\nrepo    : %s  head %s\n' "$cmd" "$SLUG" "$head_sha"
+  if [ "$mode" = gate ]; then
+    suite_gate "${pr:-head}" "$head_sha" "$head_ref"
+    note "suite gate: PASS — land would proceed past this check"; return 0
+  fi
+  if [ "$mode" = status ]; then
+    if [ -r "$stamp" ]; then suite_report "$stamp"; [ "$(suite_field "$stamp" rc)" = 0 ]; return; fi
+    if unit=$(suite_running_unit "$head_sha"); then printf '  result  : RUNNING (%s)\n' "$unit"; return 3; fi
+    printf '  result  : NONE (start it: lumen-pr suite %s %s)\n' "$REPO_PATH" "${pr:---head $head}"; return 4
+  fi
+  if unit=$(suite_running_unit "$head_sha"); then
+    note "already running for this head: $unit"
+  elif [ -r "$stamp" ] && [ "$mode" != rerun ]; then
+    note "result already recorded for this head (use --rerun to run it again):"; suite_report "$stamp"
+    [ "$(suite_field "$stamp" rc)" = 0 ]; return
+  else
+    suite_head_local "$head_sha" "$head_ref"
+    unit=$(suite_start "$head_sha" "$cmd") || exit 1
+    note "started: $unit"
+  fi
+  [ "$waitsecs" -gt 0 ] 2>/dev/null || { note "check: lumen-pr suite $REPO_PATH ${pr:---head $head} --status"; return 0; }
+  local waited=0
+  while [ ! -r "$stamp" ] && [ "$waited" -lt "$waitsecs" ]; do sleep 15; waited=$((waited + 15)); done
+  [ -r "$stamp" ] || die "no result after ${waitsecs}s (still running: $unit)"
+  suite_report "$stamp"; [ "$(suite_field "$stamp" rc)" = 0 ]
+}
+
 cmd_check() {
   need_repo "${1:-}"
   local branch; branch=$(git -C "$REPO_PATH" branch --show-current)
@@ -1578,7 +1792,12 @@ case "${1:-}" in
   # wq#1536: local ff of the primary to origin/main, the step `land` runs last. No forge
   # write (the fence guards pushes), so SCOPE_OP=none like the inspections above.
   ffprimary) shift; SCOPE_OP=none cmd_ffprimary "$@" ;;
+  # wq#5133: run / inspect the repo's required landing suite. Reads the forge, writes no forge
+  # state (the result stamp is local), so SCOPE_OP=none like the inspections above.
+  suite) shift; SCOPE_OP=none cmd_suite "$@" ;;
+  # internal: the runner lumen-run executes inside the unit. Not for hand use.
+  _suite-run) shift; cmd_suite_run "$@" ;;
   ''|-h|--help|help)
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (start|commit|open|comment|land|check|gitlock|dirtycheck|ffprimary)" ;;
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown subcommand '$1' (start|commit|open|comment|land|check|gitlock|dirtycheck|ffprimary|suite)" ;;
 esac
