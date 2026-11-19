@@ -2367,6 +2367,30 @@ def _worktree_of(path):
     absolve = lambda p: os.path.realpath(p if os.path.isabs(p) else os.path.join(d, p))
     return top, absolve(gitdir) != absolve(common)
 
+def _content_landed(root, rel, ref):
+    """wq#5132: does the working copy of `rel` hold bytes that `ref` has carried? (True, why)
+    when it matches ref's blob, or matches a blob ref's history introduced (a primary tree
+    that is merely behind is not unlanded work); (False, what-is-wrong) otherwise; (None, why)
+    when git cannot say — fail open, like every other durability check here."""
+    h = _git(root, "hash-object", "--", rel)
+    if h is None or h.returncode != 0:
+        return None, f"could not hash {rel}"
+    wt = h.stdout.strip()
+    b = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}:{rel}")
+    if b is None:
+        return None, "git unavailable"
+    if b.returncode == 0 and b.stdout.strip() == wt:
+        return True, f"matches {ref}"
+    lg = _git(root, "log", "-1", "--format=%h", f"--find-object={wt}", ref, "--", rel)
+    if lg is None:
+        return None, "git unavailable"
+    if lg.returncode == 0 and lg.stdout.strip():
+        return True, f"content landed on {ref} in {lg.stdout.strip()} (tree is behind)"
+    st = _git(root, "status", "--porcelain", "--", rel)
+    if st is not None and st.returncode == 0 and st.stdout.strip():
+        return False, "uncommitted edits"
+    return False, "edits committed only off main"
+
 def evidence_durability(abs_path):
     """Would this citation still resolve from a clean checkout, or only from the tree the
     closer happened to be standing in? Returns (verdict, why) — 'durable', 'ephemeral'
@@ -2384,7 +2408,7 @@ def _durability(abs_path):
     rel = os.path.relpath(os.path.realpath(abs_path), os.path.realpath(root))
     if rel.startswith(".."):
         return "unknown", f"resolved outside the worktree {root} it sits under", False
-    checked, saw_git = [], False
+    checked, saw_git, tracked_on = [], False, []
     for ref in MAIN_REFS:
         rv = _git(root, "rev-parse", "--verify", "--quiet", ref)
         if rv is None:
@@ -2397,7 +2421,20 @@ def _durability(abs_path):
         if e is None:
             return "unknown", "git unavailable", False
         if e.returncode == 0:
-            return "durable", f"{rel} is on {ref} of {root}", True
+            # wq#5132: the PATH being on main used to be the whole check, so a tracked file
+            # edited live in a primary tree (wq#4905 action_gate.py, wq#4912
+            # claude_settings_audit.py) counted as durable AND landed. The cited bytes must be
+            # bytes main has carried.
+            lv, lwhy = _content_landed(root, rel, ref)
+            if lv is None:
+                return "unknown", lwhy, False
+            if lv:
+                return "durable", f"{rel} is on {ref} of {root}", True
+            tracked_on.append((ref, lwhy))
+    if tracked_on:
+        ref, lwhy = tracked_on[0]
+        return "ephemeral", (f"{rel} is tracked on {ref} of {root} but the cited copy carries "
+                             f"{lwhy} — those bytes never landed (wq#5132)"), False
     if not checked:
         return ("unknown", f"no main/master ref in {root}" if saw_git else "git unavailable", False)
     if not linked:
@@ -2843,6 +2880,122 @@ def _sha_on_main(sha):
             if a is not None and a.returncode == 0:
                 return True, f"{sha} is on {ref} of {repo}"
     return (False, f"{sha} exists but is on no main ref") if seen else (None, f"no repo here has {sha}")
+
+# wq#5132: files the ticket TEXT names. Anchored paths (with a '/') are resolved on the box;
+# bare basenames only ever match a cited path by tail, never stat()ed on their own.
+_TICKET_FILE_RE = re.compile(
+    r"(?<![\w@:/.~-])(~?/?(?:[\w.-]+/)*[\w-][\w.-]*\.(?:py|sh|js|mjs|cjs|ts|rs|go|ya?ml|toml"
+    r"|json|md|service|timer|conf|sql|rb|lua|c|h))(?![\w/-])")
+
+def _ticket_named_files(title, detail):
+    out = []
+    for m in _TICKET_FILE_RE.finditer(f"{title or ''}\n{detail or ''}"):
+        tok = m.group(1)
+        if tok.startswith("~/"):
+            tok = "/home/lumen/" + tok[2:]
+        if tok not in out:
+            out.append(tok)
+    return out
+
+def _resolve_named(tok):
+    """First existing primary-tree path the anchored token can mean, else None."""
+    if "/" not in tok:
+        return None
+    cands = [tok] if os.path.isabs(tok) else (
+        [os.path.join("/home/lumen", tok)] + [os.path.join(r, tok) for r in _primary_repo_roots()])
+    for cand in cands:
+        if "/worktrees/" in cand or not os.path.isfile(cand):
+            continue
+        return os.path.realpath(cand)
+    return None
+
+def _tracked(root, rel):
+    r = _git(root, "ls-files", "--error-unmatch", "--", rel)
+    return None if r is None else r.returncode == 0
+
+def _main_ref(root):
+    for ref in MAIN_REFS:
+        rv = _git(root, "rev-parse", "--verify", "--quiet", ref)
+        if rv is not None and rv.returncode == 0:
+            return ref
+    return None
+
+def ticket_edit_check(ticket_id, notes):
+    """wq#5132 (class from wq#5029: wq#4905/wq#4912 closed done with their code only as
+    uncommitted edits in the foreman primary tree). Returns (verdict, why):
+      'dirty'    — a tracked file the ticket names (anchored path) has uncommitted edits in a
+                   primary checkout: the work is sitting there unlanded, or someone else's is
+                   and this close would bless it;
+      'unlanded' — the notes cite, as evidence, a tracked file the ticket names, and main has
+                   no commit touching it since the ticket was filed and no commit naming
+                   wq#<id>: the citation is of a file nobody changed;
+      'ok' / 'unknown' (fail open)."""
+    c = conn()
+    try:
+        row = c.execute("SELECT title, detail, created_at FROM tasks WHERE id=?",
+                        (ticket_id,)).fetchone()
+    finally:
+        c.close()
+    if not row:
+        return "ok", ""
+    title, detail, created_at = row
+    named = _ticket_named_files(title, detail)
+    if not named:
+        return "ok", ""
+    dirty = []
+    for tok in named:
+        p = _resolve_named(tok)
+        if not p:
+            continue
+        root, linked = _worktree_of(p)
+        if not root or linked:
+            continue
+        rel = os.path.relpath(p, os.path.realpath(root))
+        if _tracked(root, rel) is not True:
+            continue
+        st = _git(root, "status", "--porcelain", "--", rel)
+        if st is not None and st.returncode == 0 and st.stdout.strip():
+            dirty.append(p)
+    if dirty:
+        return "dirty", ("ticket-named file(s) carry uncommitted edits in a primary tree: " +
+                         ", ".join(dirty))
+    try:
+        filed = datetime.datetime.strptime(created_at, FMT).replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return "unknown", "ticket has no parseable created_at"
+    tails = ["/" + t.lstrip("./") if "/" in t else "/" + t for t in named]
+    for raw in (notes or "").split():
+        tok = re.sub(r":\d+(-\d+)?$", "", raw.strip(".,;:()[]\"'"))
+        if not os.path.isabs(tok) or not os.path.isfile(tok):
+            continue
+        real = os.path.realpath(tok)
+        if not any(real.endswith(t) or tok.endswith(t) for t in tails):
+            continue
+        root, _linked = _worktree_of(real)
+        if not root:
+            continue
+        rel = os.path.relpath(real, os.path.realpath(root))
+        if _tracked(root, rel) is not True:
+            continue
+        ref = _main_ref(root)
+        if not ref:
+            return "unknown", f"no main ref in {root}"
+        lg = _git(root, "log", "-1", "--format=%ct %h", ref, "--", rel)
+        gr = _git(root, "log", "-1", "--format=%h", "-E",
+                  f"--grep=wq#{ticket_id}([^0-9]|$)", ref)
+        if lg is None or gr is None:
+            return "unknown", "git unavailable"
+        if gr.returncode == 0 and gr.stdout.strip():
+            return "ok", f"{gr.stdout.strip()} on {ref} names wq#{ticket_id}"
+        parts = lg.stdout.split()
+        if lg.returncode == 0 and parts and int(parts[0]) >= filed:
+            return "ok", f"{rel} changed on {ref} in {parts[1]} after the ticket was filed"
+        last = parts[1] if len(parts) > 1 else "never"
+        return "unlanded", (f"cited {real} is a file this ticket names, but {ref} of {root} has "
+                            f"not touched it since the ticket was filed (last: {last}) and no "
+                            f"commit on {ref} names wq#{ticket_id}")
+    return "ok", ""
 
 def landing_proof(notes, pr_verdicts=None):
     """wq#1702 (D2): does anything in `notes` prove the work LANDED? Scans every citation, not
@@ -3292,6 +3445,21 @@ def cmd_done(a):
               f"Produce it and land it on main, or record why it is not there with "
               f"--unlanded \"<reason>\".")
         sys.exit(7)
+    # wq#5132: the ticket's own named files — dirty in a primary tree, or cited unchanged.
+    if not getattr(a, "unlanded", None):
+        tv, twhy = ticket_edit_check(a.id, notes)
+        if tv in ("dirty", "unlanded"):
+            eprint(f"REFUSED: wq#5132 unlanded-edit gate — task {a.id} not closed. {twhy}. "
+                  f"wq#4905 and wq#4912 closed done this way: '10/10 tests pass' on edits that "
+                  f"lived only in the primary tree, then failed 4 tests once someone landed "
+                  f"them (wq#5029). Land the change (`lumen-pr land`) and cite the merged PR or "
+                  f"the commit on main. If the dirty file is someone else's unrelated work, or "
+                  f"this ticket legitimately changes nothing, say so on the record with "
+                  f"--unlanded \"<reason>\".")
+            sys.exit(11)
+        if tv == "unknown" and twhy:
+            print(f"WARNING: wq#5132 unlanded-edit gate could not verify ({twhy}). "
+                  f"Closing anyway.")
     pr_verdicts = {}  # url -> (verdict, why), so the landing check below never re-asks the forge
     if dv == "unknown":
         print(f"WARNING: wq#1673 deliverable gate could not verify ({dwhy}). Closing anyway.")
