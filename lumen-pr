@@ -70,6 +70,9 @@ CONV_TYPES='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
 SUBJECT_RE="^(${CONV_TYPES})(\([a-z0-9._-]+\))?!?: .{1,60}$"
 BRANCH_RE="^(${CONV_TYPES})/[a-z0-9][a-z0-9-]*$"
 FOOTER_ASSIST='Assisted-by: Claude (Anthropic) via Lumen Industries automation'
+# wq#5138 phase 1: DCO sign-off on every lumen-pr commit; token-engine forwards it into the
+# squash body, so the Anubis commit-check (wq#5014) can later require it.
+FOOTER_SIGNOFF='Signed-off-by: Lumen Industries <lumen@lumennode.uk>'
 
 die() { printf 'lumen-pr: %s\n' "$*" >&2; exit 1; }
 note() { printf 'lumen-pr: %s\n' "$*"; }
@@ -1171,6 +1174,9 @@ $(cat "$body_file")"
 Refs: $refs"
   msg="$msg
 $FOOTER_ASSIST"
+  # wq#5138: skip when the caller's body already signs off (no duplicate trailer).
+  grep -q '^Signed-off-by:' <<<"$msg" || msg="$msg
+$FOOTER_SIGNOFF"
   # wq#657: record HEAD before the commit so we can detect a silent no-op — git
   # commit exits 0 in some edge cases without actually creating a commit (e.g.
   # empty diff after rebase, or an amend that collapses to the same tree).
