@@ -533,6 +533,18 @@ def init():
         requested_at TEXT, decided_by TEXT, decided_at TEXT, reason TEXT,
         expires_at TEXT, consumed_at TEXT, consumed_lease TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_grant_requests_ticket ON grant_requests(ticket_id)")
+    # wq#5166: durable claim receipts. claimed_by is cleared on block/frank_gated/release/
+    # awaiting_grant/reap, which erased the only proof memoryd's I-7 check had that an agent ever
+    # held a ticket (episodes for 4993/4934/5041/5140 expired in the spool). One row per claim
+    # write, inserted in the SAME transaction as the UPDATE that sets claimed_by, never updated or
+    # deleted. ADDITIVE and inert: auto-created like grant_requests; nothing in wq reads it, and
+    # memoryd (Kernel.ticket_claimed_by_ever) fails open to claimed_by alone when it is absent.
+    # Not backfillable: history before this table existed is gone.
+    c.execute("""CREATE TABLE IF NOT EXISTS claim_receipts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL,
+        agent TEXT NOT NULL, claimed_at TEXT NOT NULL, fence INTEGER,
+        kind TEXT NOT NULL DEFAULT 'claim')""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_claim_receipts_ticket ON claim_receipts(ticket_id,id)")
     cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
     # wq#4761: awaiting_grant parking. resume_session is the CLI session id the dispatcher
     # resumes with `--resume <sid>` after approval; grant_req points at the grant_requests row
@@ -629,6 +641,19 @@ def lease_set_sql(c, owner, expires):
     hand-rolled UPDATE."""
     if not lease_fenced(c): return "", []
     return ", lease_owner=?, lease_expires_at=?", [owner, epoch_of(expires)]
+def write_claim_receipt(c, tid, agent, at, fence=None, kind="claim"):
+    """wq#5166: append the claim receipt INSIDE the caller's open transaction, so a claim and its
+    receipt commit or roll back together. Table missing (an init() that has not run yet on this
+    DB) is the only tolerated failure: the claim must never fail because the audit row could not
+    be written, and memoryd treats a missing table as "no receipts" (claimed_by alone)."""
+    try:
+        c.execute("INSERT INTO claim_receipts(ticket_id, agent, claimed_at, fence, kind) "
+                  "VALUES (?,?,?,?,?)", (int(tid), agent, at, fence, kind))
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):
+            raise
+
+
 def lease_clear_sql(c):
     return ", lease_owner=NULL, lease_expires_at=NULL" if lease_fenced(c) else ""
 def fence_of(c, tid):
@@ -1550,6 +1575,7 @@ def cmd_liveness_close(a):
         c.execute(f"UPDATE tasks SET status='done', done_at=?, notes=?, claimed_by=?, lease_expires=NULL, "
                   f"lease_ttl=NULL, block_reason=NULL, blocked_at=NULL, hold_by=NULL, hold_expires=NULL{clr} "
                   f"WHERE id=?", (now(), notes, caller, a.id))
+        write_claim_receipt(c, a.id, caller, now(), kind="liveness-close")  # wq#5166
     c.execute("COMMIT"); c.close()
     print(f"liveness-closed wq#{a.id} ({lane}/{st} -> {to}): {verdict[:160]}")
 # --- end wq#1478 helpers ---
@@ -1966,6 +1992,7 @@ def cmd_claim(a):
         c.execute("""UPDATE tasks SET status='claimed', claimed_by=?, claimed_at=?, lease_expires=?,
                      lease_ttl=?, hold_by=NULL, hold_expires=NULL WHERE id=?""",
                   (agent, t_now, lease, a.ttl, pick))
+    write_claim_receipt(c, pick, agent, t_now, fence)  # wq#5166: same txn as the claim
     if picked_subs:
         acquire_subs(c, picked_subs, agent, prov, f"wq#{pick}")
     c.execute("COMMIT")
