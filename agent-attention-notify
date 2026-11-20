@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""agent-attention-notify — phone push (ntfy) when an interactive Claude Code session is
+blocked waiting for Frank (wq#5012; pattern from the muxflow/Hermux extractions wq#4972/4979).
+
+Wired as a Claude Code `Notification` hook (async). Reads the hook JSON on stdin:
+  permission_prompt, elicitation_dialog, elicitation_url_dialog, agent_needs_input
+      -> BLOCKED: the session cannot continue until Frank answers. Priority high.
+  idle_prompt
+      -> WAITING: the turn ended and the session has sat idle for input. Priority default,
+         throttled harder (it fires after every unanswered turn).
+  anything else (auth_success, agent_completed, quota_*, plugin_notification, ...) -> ignored.
+
+Never in the way of the session: always exits 0, never reads stdin past one JSON object, and
+hands delivery to a detached `ntfy-send` (the fleet publish choke point: delivery-verified,
+aq_gate silences apply; priority high stays on Lumen's own ntfy, only urgent mirrors to the
+public out-of-band topic). What leaves the box: host, a session label (WQ_AGENT or the cwd's
+last path part), an 8-char session id prefix, the notification type, and Claude Code's own
+notification text (masked through mask-secrets, capped at 160 chars). Never tool input,
+prompt text, terminal output or the transcript.
+
+Skipped on purpose:
+  - non-interactive sessions (`claude -p`, fworkers): no controlling TTY on the claude
+    process, and park.py already pushes a card for a parked fworker round (wq#5009);
+  - WQ_AGENT=fworker-*: same reason, belt and braces;
+  - the same (session, kind) inside its throttle window (BLOCKED 5 min, WAITING 30 min);
+  - kill switch: touch ~/.config/agent-attention/DISABLED.
+
+Log (no message text): ~/.local/state/agent-attention/log.jsonl. Exit status is always 0.
+"""
+import fcntl
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.environ.get("AGENT_ATTENTION_CONF", os.path.join(HOME, ".config", "agent-attention"))
+STATE_DIR = os.environ.get("AGENT_ATTENTION_STATE", os.path.join(HOME, ".local", "state", "agent-attention"))
+NTFY_BIN = os.environ.get("AGENT_ATTENTION_NTFY_BIN", "/home/lumen/bin/ntfy-send")
+MASK_BIN = os.environ.get("AGENT_ATTENTION_MASK_BIN", "/home/lumen/bin/mask-secrets")
+TOPIC = os.environ.get("AGENT_ATTENTION_TOPIC", "lumen-fleet")
+
+BLOCKED = {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"}
+WAITING = {"idle_prompt"}
+THROTTLE_S = {"blocked": 300, "waiting": 1800}
+PRIORITY = {"blocked": "high", "waiting": "default"}
+MSG_CAP = 160
+STATE_KEEP_S = 86400
+
+
+def log(row):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        row = dict(row, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        with open(os.path.join(STATE_DIR, "log.jsonl"), "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _claude_ancestor():
+    """(pid, argv) of the nearest ancestor that is the claude CLI, or (None, None).
+    Hook commands may run under a shell, so the direct parent is not reliably claude."""
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            break
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+            with open("/proc/%d/stat" % pid) as fh:
+                ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if any(os.path.basename(a) in ("claude", "claude.exe") or a.endswith("/claude-code/cli.js")
+               for a in argv[:2]):
+            return pid, argv
+        pid = ppid
+    return None, None
+
+
+def interactive():
+    """True when the claude process behind this hook is an interactive session: not
+    `-p/--print`, and its stdin is a terminal (the hook's own stdin is the JSON pipe)."""
+    if os.environ.get("AGENT_ATTENTION_ASSUME_TTY") in ("0", "1"):
+        return os.environ["AGENT_ATTENTION_ASSUME_TTY"] == "1"
+    pid, argv = _claude_ancestor()
+    if pid is None or any(a in ("-p", "--print") for a in argv):
+        return False
+    try:
+        target = os.readlink("/proc/%d/fd/0" % pid)
+    except OSError:
+        return False
+    return target.startswith("/dev/pts/") or target.startswith("/dev/tty")
+
+
+def throttled(key, window, now):
+    """Check-and-set under a lock: True if `key` fired inside `window` seconds."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, "throttle.json")
+    with open(path + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            with open(path) as fh:
+                seen = json.load(fh)
+        except (OSError, ValueError):
+            seen = {}
+        if now - seen.get(key, 0) < window:
+            return True
+        seen = {k: t for k, t in seen.items() if now - t < STATE_KEEP_S}
+        seen[key] = now
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(seen, fh)
+        os.replace(tmp, path)
+    return False
+
+
+def masked(text):
+    text = " ".join((text or "").split())[: MSG_CAP * 2]
+    try:
+        out = subprocess.run([MASK_BIN], input=text, capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            text = out.stdout.strip()
+        else:
+            text = "(notification text withheld: mask-secrets failed)"
+    except (OSError, subprocess.SubprocessError):
+        text = "(notification text withheld: mask-secrets unavailable)"
+    return text[:MSG_CAP]
+
+
+def publish(prio, title, body):
+    """Detached: the hook returns at once; ntfy-send's own exit is logged by nobody, which
+    is fine because ntfy-send verifies delivery and pages through aq on its own failures."""
+    try:
+        subprocess.Popen([NTFY_BIN, "-t", TOPIC, "-p", prio, "-T", title, "--quiet", body],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        return True
+    except OSError:
+        return False
+
+
+def main():
+    try:
+        event = json.loads(sys.stdin.read(1 << 20) or "{}")
+    except ValueError:
+        log({"decision": "skip", "why": "bad json"})
+        return
+    if not isinstance(event, dict) or event.get("hook_event_name") != "Notification":
+        return
+    ntype = str(event.get("notification_type") or "")
+    kind = "blocked" if ntype in BLOCKED else "waiting" if ntype in WAITING else None
+    sid = str(event.get("session_id") or "")[:8] or "nosession"
+    agent = os.environ.get("WQ_AGENT", "")
+    label = agent or os.path.basename(str(event.get("cwd") or "").rstrip("/")) or "?"
+    base = {"type": ntype, "session": sid, "label": label}
+    if kind is None:
+        return log(dict(base, decision="skip", why="type not tracked"))
+    if os.path.exists(os.path.join(CONF_DIR, "DISABLED")):
+        return log(dict(base, decision="skip", why="DISABLED"))
+    if agent.startswith("fworker-"):
+        return log(dict(base, decision="skip", why="fworker (park.py notifies)"))
+    if not interactive():
+        return log(dict(base, decision="skip", why="non-interactive"))
+    if throttled("%s|%s" % (sid, kind), THROTTLE_S[kind], time.time()):
+        return log(dict(base, decision="skip", why="throttled"))
+    host = socket.gethostname().split(".")[0]
+    head = "Agent BLOCKED" if kind == "blocked" else "Agent waiting"
+    title = "%s: %s/%s" % (head, host, label)
+    body = "%s\n%s · session %s · %s" % (masked(event.get("message")), host, sid, ntype)
+    ok = publish(PRIORITY[kind], title[:120], body)
+    log(dict(base, decision="sent" if ok else "error", why="" if ok else "ntfy-send not runnable",
+             prio=PRIORITY[kind]))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # a notifier must never surface as a hook error
+        log({"decision": "error", "why": "%s: %s" % (type(exc).__name__, str(exc)[:200])})
+    sys.exit(0)
