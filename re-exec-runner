@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""re-exec-runner — per-tool execution envelope on the RE runner host (wq#5200).
+
+Deployed by `re-orchestrate runner-deploy` to maksoor:~/.local/lib/re-orchestrate/re-exec.
+Lumen never runs this locally; the router ships a spec over ssh:
+
+    ssh maksoor '~/.local/lib/re-orchestrate/re-exec run' < spec.json
+
+Envelope (all enforced here, on the host that runs the tool):
+  * memory   : systemd --user scope, MemoryMax + MemorySwapMax=0 (OOM -> status killed)
+  * pids     : TasksMax
+  * time     : watchdog; on expiry the whole scope cgroup is stopped -> status timeout
+  * disk     : watchdog du of the run dir; over budget -> scope stopped -> status killed
+  * network  : bwrap --unshare-net, unconditionally. A spec asking for network is refused.
+  * target   : bind-mounted read-only; root fs read-only; rw only run dir, $HOME, spec rw_paths
+  * partial  : stdout/stderr stream to files; whatever the tool wrote before a kill is kept
+
+Prints one JSON object (run.json) on stdout. Exit 0 = runner worked (tool status is in JSON).
+"""
+import hashlib, json, os, re, secrets, shutil, signal, subprocess, sys, time, zipfile
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+WORK_ROOT = "/data/re-work"
+HOME = os.path.expanduser("~")
+EM = {3: "x86", 62: "x86_64", 40: "arm", 183: "aarch64", 8: "mips", 20: "ppc", 21: "ppc64", 243: "riscv",
+      94: "xtensa", 83: "avr"}
+MANIFEST_MAX = 20000
+MANIFEST_LIST = 3000
+HASH_MAX_FILES = 2000
+HASH_MAX_BYTES = 64 * 1024 * 1024
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def fail(msg, **extra):
+    print(json.dumps({"runner": VERSION, "status": "error", "runner_error": msg, **extra}))
+    sys.exit(0)
+
+
+def dir_bytes(path):
+    total = 0
+    for root, dirs, files in os.walk(path, onerror=lambda e: None):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def cgroup_of(unit, tries=20):
+    for _ in range(tries):
+        try:
+            cg = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit],
+                                capture_output=True, text=True, timeout=5).stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            cg = ""
+        if cg:
+            return "/sys/fs/cgroup" + cg
+        if tries > 1:
+            time.sleep(0.1)
+    return None
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def oom_kills(cg):
+    try:
+        with open(os.path.join(cg, "memory.events")) as f:
+            for line in f:
+                k, v = line.split()
+                if k == "oom_kill":
+                    return int(v)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _alive(pid):
+    """True while pid exists (zombie counts as gone); never reaps."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ", 1)[1][0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def stop_scope(unit, proc):
+    subprocess.run(["systemctl", "--user", "kill", "--signal=SIGTERM", unit], capture_output=True, timeout=10)
+    for _ in range(50):
+        if _alive(proc.pid) is False:
+            break
+        time.sleep(0.1)
+    if _alive(proc.pid):
+        subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL", unit], capture_output=True, timeout=10)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def sniff(path):
+    try:
+        with open(path, "rb") as f:
+            h = f.read(20)
+    except OSError:
+        return None
+    if h[:4] == b"\x7fELF" and len(h) >= 20:
+        e = "<" if h[5] == 1 else ">"
+        et, em = int.from_bytes(h[16:18], "little" if e == "<" else "big"), int.from_bytes(h[18:20], "little" if e == "<" else "big")
+        return {"elf": True, "arch": EM.get(em, f"em_{em}"), "elf_type": {1: "rel", 2: "exec", 3: "dyn", 4: "core"}.get(et, str(et))}
+    return None
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(1 << 20), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+def manifest(out):
+    files, total, hashed = [], 0, 0
+    count = 0
+    for root, dirs, fnames in os.walk(out, onerror=lambda e: None):
+        dirs.sort()
+        for fn in sorted(fnames):
+            p = os.path.join(root, fn)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if not os.path.isfile(p) or os.path.islink(p):
+                continue
+            count += 1
+            total += st.st_size
+            if count > MANIFEST_MAX:
+                continue
+            ent = {"path": os.path.relpath(p, out), "size": st.st_size}
+            s = sniff(p)
+            if s:
+                ent.update(s)
+            if hashed < HASH_MAX_FILES and st.st_size <= HASH_MAX_BYTES:
+                try:
+                    ent["sha256"] = sha256(p); hashed += 1
+                except OSError:
+                    pass
+            files.append(ent)
+    elfs = [f for f in files if f.get("elf")]
+    return {"file_count": count, "total_bytes": total, "truncated": count > MANIFEST_LIST,
+            "files": files[:MANIFEST_LIST], "elf_files": elfs[:2000]}
+
+
+def tail(path, n=4096):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def under(path, root):
+    rp = os.path.realpath(path)
+    return rp == root or rp.startswith(root.rstrip("/") + "/")
+
+
+def render(argv, subs):
+    out = []
+    for a in argv:
+        for k, v in subs.items():
+            a = a.replace("{" + k + "}", v)
+        if re.search(r"\{[a-z_]+\}", a):
+            fail(f"unrendered placeholder in argv: {a}")
+        out.append(a)
+    return out
+
+
+def cmd_run(spec):
+    for k in ("analysis_id", "tool", "workdir", "target", "argv"):
+        if k not in spec:
+            fail(f"spec missing '{k}'")
+    iso = spec.get("isolation", {})
+    if iso.get("network"):
+        fail("network isolation may not be disabled (RE isolation rule): spec refused")
+    wd = os.path.realpath(spec["workdir"])
+    if not under(wd, WORK_ROOT):
+        fail(f"workdir must be under {WORK_ROOT}: {wd}")
+    target = os.path.realpath(spec["target"])
+    if not os.path.exists(target):
+        fail(f"target not found on runner: {target}")
+    lim = spec.get("limits", {})
+    timeout = int(lim.get("timeout_s", 300))
+    mem = int(lim.get("memory_bytes", 4 << 30))
+    disk = int(lim.get("disk_bytes", 10 << 30))
+    tasks = int(lim.get("tasks_max", 2048))
+
+    out, tmp = os.path.join(wd, "out"), os.path.join(wd, "tmp")
+    for d in (out, tmp):
+        os.makedirs(d, exist_ok=True)
+    subs = {"target": target, "out": out, "workdir": wd, "aid": spec["analysis_id"], "input": target}
+
+    member = spec.get("input_member")  # e.g. APK member to unpack before the tool sees it
+    if member:
+        try:
+            with zipfile.ZipFile(target) as zf:
+                names = [n for n in zf.namelist() if n == member or n.endswith("/" + member) or n.endswith(member)]
+                if not names:
+                    fail(f"input_member '{member}' not in archive", status_hint="missing_input")
+                os.makedirs(os.path.join(out, "input"), exist_ok=True)
+                dst = os.path.join(out, "input", os.path.basename(names[0]))
+                with zf.open(names[0]) as src, open(dst, "wb") as fo:
+                    shutil.copyfileobj(src, fo)
+                subs["input"] = dst
+        except zipfile.BadZipFile:
+            fail("input_member requested but target is not a zip/apk")
+
+    argv = render(spec["argv"], subs)
+    exe = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0], path=os.environ.get("PATH", "") + f":{HOME}/.local/bin:{HOME}/.cargo/bin")
+    if not exe or not os.path.exists(exe):
+        print(json.dumps({"runner": VERSION, "status": "error", "missing_tool": True, "argv": argv,
+                          "runner_error": f"tool executable not found: {argv[0]}"}))
+        return
+    argv[0] = exe
+
+    unit = re.sub(r"[^A-Za-z0-9_.-]", "_", f"re-{spec['tool']}-{spec['analysis_id']}")[:180] + "-" + secrets.token_hex(3) + ".scope"
+    bw = ["bwrap", "--ro-bind", "/", "/", "--dev-bind" if iso.get("devices") else "--dev", "/dev"]
+    if iso.get("devices"):
+        bw.append("/dev")
+    bw += ["--proc", "/proc", "--tmpfs", "/tmp", "--bind", wd, wd]
+    if iso.get("home_rw", True):
+        bw += ["--bind", HOME, HOME]
+    for p in iso.get("rw_paths", []):
+        if os.path.exists(p):
+            bw += ["--bind", p, p]
+    for p in [target] + iso.get("ro_paths", []):
+        if os.path.exists(p):
+            bw += ["--ro-bind", p, p]
+    bw += ["--unshare-net", "--unshare-ipc", "--die-with-parent", "--new-session", "--chdir", out,
+           "--setenv", "TMPDIR", tmp, "--setenv", "HOME", HOME,
+           "--setenv", "PATH", f"{HOME}/.local/bin:{HOME}/.cargo/bin:/opt/re-venv/bin:/usr/local/bin:/usr/bin:/bin"]
+    for k, v in (spec.get("env") or {}).items():
+        bw += ["--setenv", str(k), str(v)]
+    cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}",
+           "-p", f"MemoryMax={mem}", "-p", "MemorySwapMax=0", "-p", f"TasksMax={tasks}", "--"] + bw + ["--"] + argv
+
+    stdout_name = spec.get("stdout_file") or "stdout.log"
+    so_path = os.path.join(out, stdout_name)
+    se_path = os.path.join(wd, "stderr.log")
+    started, t0 = now(), time.monotonic()
+    with open(so_path, "wb") as so, open(se_path, "wb") as se:
+        proc = subprocess.Popen(cmd, stdout=so, stderr=se, stdin=subprocess.DEVNULL, start_new_session=True)
+        cg = None
+        peak, killed_reason, disk_used, next_du, du_cost = 0, None, 0, 0.0, 0.5
+        rc, maxrss, oom_seen = None, 0, 0
+        while True:
+            pid, st, ru = os.wait4(proc.pid, os.WNOHANG)
+            if pid:  # reaped by us so rusage (ru_maxrss of the waited tree) is ours to read
+                rc, maxrss = os.waitstatus_to_exitcode(st), ru.ru_maxrss * 1024
+                proc.returncode = rc
+                break
+            if cg is None:
+                cg = cgroup_of(unit, tries=1)
+            time.sleep(0.5)
+            el = time.monotonic() - t0
+            if cg:
+                cur = read_int(os.path.join(cg, "memory.peak")) or read_int(os.path.join(cg, "memory.current")) or 0
+                peak = max(peak, cur)
+            if el >= next_du:
+                s = time.monotonic()
+                disk_used = dir_bytes(wd)
+                du_cost = time.monotonic() - s
+                next_du = el + max(2.0, du_cost * 5)
+                if disk_used > disk and not killed_reason:
+                    killed_reason = f"disk limit exceeded ({disk_used} > {disk} bytes)"
+                    stop_scope(unit, proc)
+            if not killed_reason and el > timeout:
+                killed_reason = f"timeout after {timeout}s"
+                stop_scope(unit, proc)
+            if cg:
+                oom_seen = max(oom_seen, oom_kills(cg))
+        oom = oom_kills(cg) if cg else 0
+        oom = max(oom, oom_seen)
+        peak = max(peak, maxrss)
+    elapsed = round(time.monotonic() - t0, 2)
+    disk_used = dir_bytes(wd)
+
+    if killed_reason and killed_reason.startswith("timeout"):
+        status = "timeout"
+    elif killed_reason or oom or (rc in (137, -9) and peak >= mem * 0.9):
+        status = "killed"
+        killed_reason = killed_reason or f"memory limit exceeded (MemoryMax={mem}, oom_kill={oom})"
+    elif rc == 0:
+        status = "ok"
+    else:
+        status = "error"
+    man = manifest(out)
+    res = {
+        "runner": VERSION, "host": os.uname().nodename, "analysis_id": spec["analysis_id"], "tool": spec["tool"],
+        "status": status, "exit_code": rc, "killed_reason": killed_reason,
+        "partial_output": status in ("timeout", "killed") and man["file_count"] > 0,
+        "started_at": started, "finished_at": now(), "elapsed_s": elapsed,
+        "resources": {"peak_memory_bytes": peak or None, "disk_bytes": disk_used, "oom_kills": oom,
+                      "limits": {"timeout_s": timeout, "memory_bytes": mem, "disk_bytes": disk, "tasks_max": tasks}},
+        "isolation": {"network": "unshared", "target": "read-only bind", "root_fs": "read-only",
+                      "devices": "host /dev" if iso.get("devices") else "minimal /dev", "unit": unit},
+        "argv": argv, "workdir": wd, "stdout_file": so_path, "stderr_file": se_path,
+        "stderr_tail": tail(se_path), "manifest": man,
+    }
+    with open(os.path.join(wd, "run.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    print(json.dumps(res))
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return
+    c = sys.argv[1]
+    if c == "version":
+        print(json.dumps({"runner": VERSION, "sha256": sha256(os.path.realpath(__file__)), "host": os.uname().nodename,
+                          "work_root": WORK_ROOT, "bwrap": shutil.which("bwrap"), "systemd_run": shutil.which("systemd-run")}))
+    elif c == "run":
+        try:
+            spec = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            fail(f"bad spec JSON: {e}")
+        cmd_run(spec)
+    elif c == "manifest":
+        print(json.dumps(manifest(sys.argv[2])))
+    else:
+        fail(f"unknown command {c}")
+
+
+if __name__ == "__main__":
+    main()

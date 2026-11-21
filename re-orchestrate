@@ -1,0 +1,1093 @@
+#!/usr/bin/env python3
+"""re-orchestrate — Limpet Capability Router (wq#5200). Router on Lumen, tools on Maksoor.
+
+  investigation request -> fingerprint -> tool selection (registry) -> permission gate
+  -> resource-limited run on the runner (re-exec) -> evidence envelope + index
+
+Commands (all output JSON unless --human):
+  re-orchestrate plan <target> [--describe TEXT] [--deep]        structured investigation plan
+  re-orchestrate plan --describe "unknown firmware from a Rockchip device"   plan from a description only
+  re-orchestrate run  <target> --project P [--stages a,b] [--tools x,y] [--deep]
+                      [--approve x,y] [--approve-class write|hw_read] [--frank-ticket N]
+                      [--timeout S] [--mem MB] [--disk MB] [--dry-run] [--no-state]
+  re-orchestrate fingerprint <target>
+  re-orchestrate gate <tool> [--approve ...] [--frank-ticket N]  permission decision only
+  re-orchestrate search <term>                                   evidence index (sha/project/format/vendor/aid)
+  re-orchestrate runner-check | runner-deploy                    runner on maksoor (sha-pinned)
+
+<target> is a local path on Lumen, or maksoor:/abs/path for a file already on the runner.
+
+Registry : /home/lumen/re/toolkit-expansion/capability-registry.json (wq#5187; orchestration blocks merged by
+           foreman ops/wq5200-re-orchestrator/registry_merge_wq5200.py)
+Evidence : /home/lumen/re/evidence/<project>/<analysis_id>/  (+ index.jsonl, lumen_state re-<project>.last_analysis)
+"""
+import argparse, datetime, hashlib, importlib.machinery, importlib.util, json, os, re, shlex, subprocess, sys, time
+from pathlib import Path
+
+VERSION = "1.0.0"
+HERE = Path(os.path.realpath(__file__)).parent
+REGISTRY_PATH = os.environ.get("RE_REGISTRY", "/home/lumen/re/toolkit-expansion/capability-registry.json")
+EVIDENCE_ROOT = Path(os.environ.get("RE_EVIDENCE_ROOT", "/home/lumen/re/evidence"))
+LIMPET_MCP_LIB = "/home/lumen/projects/limpet/lib/mcp"
+LUMEN_STATE = "/home/lumen/minerva/lumen_state.py"
+STATE_REGEN = "/home/lumen/bin/state-regen"
+REMOTE_LIB = ".local/lib/re-orchestrate"
+RUNNER_FILES = {"re-exec": HERE / "re-exec-runner", "re-fingerprint": HERE / "re-fingerprint"}
+PULL_EXCLUDES = ["tmp/", "out/extract/", "out/jadx/", "out/blutter/", "out/gdre/", "out/ghidra_proj*", "out/input/"]
+CLASSES = ("read", "write", "hw_read", "hw_write", "network")
+
+BUILTIN_ORCH = {  # used only if the registry lacks the merged block (e.g. after a wq#5187 regen)
+    "runner": {"host": "maksoor", "ssh": "maksoor", "work_root": "/data/re-work"},
+    "defaults": {"limits": {"timeout_s": 300, "memory_mb": 4096, "disk_mb": 10240, "tasks_max": 2048}},
+    "stage_order": ["extract", "runtime_recovery", "static", "capability", "forensics",
+                    "firmware_analysis", "dynamic", "symbolic", "fuzzing", "hardware"],
+    "stages": {s: {"mode": m, "auto": a} for s, m, a in [
+        ("extract", "first_success", True), ("runtime_recovery", "all", True), ("static", "first_success", True),
+        ("capability", "all", True), ("forensics", "first_success", True), ("firmware_analysis", "first_success", False),
+        ("dynamic", "first_success", False), ("symbolic", "first_success", False), ("fuzzing", "first_success", False),
+        ("hardware", "first_success", False)]},
+    "category_action_class": {"fuzzing": "write", "emulation_user": "write", "emulation_system": "write",
+                              "debugging": "write", "dynamic_instrumentation": "write", "hardware_flash": "hw_write",
+                              "hardware_debug": "hw_read", "hardware_capture": "hw_read", "network_mitm": "network"},
+    "category_stage": {"firmware_extraction": "extract", "runtime_decompilation": "runtime_recovery",
+                       "malware_analysis": "capability", "memory_forensics": "forensics", "fuzzing": "fuzzing",
+                       "symbolic_execution": "symbolic", "emulation_user": "dynamic", "emulation_system": "dynamic"},
+    "usb_hardware_ids": {},
+}
+GENERIC_FORMATS = {"raw", "firmware", "any", "binary"}
+DESCRIBE_FORMATS = [(r"\bapk\b|android app", "APK"), (r"firmware|flash dump|spi dump|nand|emmc|rom dump|bootloader", "firmware"),
+                    (r"memory dump|ram dump|vmem|lime", "memory_dump"), (r"\belf\b|linux binary", "ELF"),
+                    (r"\bexe\b|\bdll\b|windows binary|\bpe\b", "PE"), (r"\bdex\b", "DEX"), (r"\bjar\b", "JAR"),
+                    (r"\bpyc\b", "PYC"), (r"godot|\.pck\b", "Godot_PCK"), (r"mach-?o|macos binary", "Mach-O")]
+DESCRIBE_VENDORS = ["rockchip", "allwinner", "mediatek", "qualcomm", "amlogic", "broadcom", "hisilicon", "realtek",
+                    "samsung", "nxp", "espressif", "st", "nordic", "ingenic", "ti", "nvidia", "intel"]
+
+
+# ------------------------------------------------------------------ util
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(t=None):
+    return (t or utcnow()).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def out(obj, human=None, args=None):
+    if args is not None and getattr(args, "human", False) and human:
+        print(human(obj))
+    else:
+        print(json.dumps(obj, indent=2, default=str))
+
+
+def die(msg, code=2, **extra):
+    print(json.dumps({"error": msg, **extra}, indent=2))
+    sys.exit(code)
+
+
+def load_registry():
+    with open(REGISTRY_PATH) as f:
+        reg = json.load(f)
+    reg.setdefault("orchestration", None)
+    return reg
+
+
+def orch_of(reg):
+    return reg.get("orchestration") or BUILTIN_ORCH
+
+
+def load_fingerprinter():
+    loader = importlib.machinery.SourceFileLoader("re_fingerprint", str(HERE / "re-fingerprint"))
+    spec = importlib.util.spec_from_loader("re_fingerprint", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def safe_name(s):
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", s or "").strip("-.")
+    return s[:80] or "default"
+
+
+# ------------------------------------------------------------------ runner (ssh)
+class Runner:
+    def __init__(self, orch):
+        r = orch.get("runner", {})
+        self.host = r.get("ssh") or r.get("host") or "maksoor"
+        self.name = r.get("host") or self.host
+        self.work_root = r.get("work_root", "/data/re-work")
+
+    def ssh(self, cmd, data=None, timeout=60):
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", self.host, cmd]
+        return subprocess.run(argv, input=data, capture_output=True, timeout=timeout)
+
+    def reachable(self):
+        try:
+            return self.ssh("true", timeout=20).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def remote_shas(self):
+        files = " ".join(f"$HOME/{REMOTE_LIB}/{n}" for n in RUNNER_FILES)
+        p = self.ssh(f"sha256sum {files} 2>/dev/null", timeout=30)
+        shas = {}
+        for line in p.stdout.decode().splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                shas[os.path.basename(parts[1])] = parts[0]
+        return shas
+
+    def check(self):
+        local = {n: hashlib.sha256(p.read_bytes()).hexdigest() for n, p in RUNNER_FILES.items()}
+        if not self.reachable():
+            return {"host": self.name, "reachable": False, "in_sync": False, "local": local}
+        remote = self.remote_shas()
+        return {"host": self.name, "reachable": True, "in_sync": all(remote.get(n) == s for n, s in local.items()),
+                "local": local, "remote": remote}
+
+    def deploy(self):
+        for n, p in RUNNER_FILES.items():
+            dst = f"$HOME/{REMOTE_LIB}/{n}"
+            r = self.ssh(f"mkdir -p $HOME/{REMOTE_LIB} && cat > {dst}.tmp && chmod 755 {dst}.tmp && mv {dst}.tmp {dst}",
+                         data=p.read_bytes(), timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(f"deploy {n} failed: {r.stderr.decode()[:300]}")
+        return self.check()
+
+    def ensure(self):
+        st = self.check()
+        if not st["reachable"]:
+            raise RuntimeError(f"runner {self.name} unreachable over ssh")
+        if not st["in_sync"]:
+            st = self.deploy()
+            st["redeployed"] = True
+        return st
+
+    def stage(self, local_path, sha, project):
+        d = f"{self.work_root}/{project}/_targets/{sha}"
+        dst = f"{d}/{os.path.basename(local_path)}"
+        p = self.ssh(f"sha256sum {shlex.quote(dst)} 2>/dev/null", timeout=120)
+        if p.returncode == 0 and p.stdout.decode().split()[:1] == [sha]:
+            return dst, "reused"
+        self.ssh(f"mkdir -p {shlex.quote(d)}", timeout=30)
+        r = subprocess.run(["rsync", "-a", "--partial", "-e", "ssh -o BatchMode=yes", local_path, f"{self.host}:{dst}"],
+                           capture_output=True, timeout=3600)
+        if r.returncode != 0:
+            raise RuntimeError(f"staging rsync failed: {r.stderr.decode()[:300]}")
+        p = self.ssh(f"sha256sum {shlex.quote(dst)}", timeout=600)
+        if p.stdout.decode().split()[:1] != [sha]:
+            raise RuntimeError("staged target sha256 mismatch")
+        return dst, "copied"
+
+    def run(self, spec, timeout):
+        p = self.ssh(f"$HOME/{REMOTE_LIB}/re-exec run", data=json.dumps(spec).encode(), timeout=timeout)
+        lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith("{")]
+        if not lines:
+            return {"status": "error", "runner_error": f"no runner output (ssh rc={p.returncode}): "
+                                                       f"{p.stderr.decode(errors='replace')[-400:]}"}
+        return json.loads(lines[-1])
+
+    def pull(self, workdir, local_dir):
+        local_dir.mkdir(parents=True, exist_ok=True)
+        argv = ["rsync", "-a", "--max-size=50m", "-e", "ssh -o BatchMode=yes"]
+        argv += ["--include=out/apktool/", "--include=out/apktool/AndroidManifest.xml", "--include=out/apktool/apktool.yml",
+                 "--exclude=out/apktool/**"]
+        argv += [f"--exclude={x}" for x in PULL_EXCLUDES]
+        argv += [f"{self.host}:{workdir}/", str(local_dir) + "/"]
+        r = subprocess.run(argv, capture_output=True, timeout=1800)
+        return r.returncode == 0, r.stderr.decode(errors="replace")[-300:]
+
+    def lsusb(self):
+        try:
+            p = self.ssh("lsusb 2>/dev/null", timeout=20)
+            return p.stdout.decode(errors="replace")
+        except subprocess.TimeoutExpired:
+            return ""
+
+    def fingerprint(self, path):
+        p = self.ssh(f"python3 $HOME/{REMOTE_LIB}/re-fingerprint {shlex.quote(path)} --compact", timeout=600)
+        if p.returncode != 0:
+            raise RuntimeError(f"remote fingerprint failed: {p.stdout.decode()[-300:]} {p.stderr.decode()[-300:]}")
+        return json.loads(p.stdout)
+
+
+# ------------------------------------------------------------------ fingerprint + description hints
+def parse_describe(text):
+    t = (text or "").lower()
+    fmt = next((f for rx, f in DESCRIBE_FORMATS if re.search(rx, t)), None)
+    vendors = [v for v in DESCRIBE_VENDORS if re.search(rf"\b{v}\b", t)]
+    socs = re.findall(r"\b(rk3\d{3}|mt\d{4}|msm\d{4}|sm\d{4}|s905\w*|allwinner h\d+|esp32\w*|stm32\w+)\b", t)
+    arch = next((a for rx, a in [(r"aarch64|arm64", "aarch64"), (r"\barm\b|armv7|cortex-a", "arm"), (r"cortex-m", "arm"),
+                                 (r"mips", "mips"), (r"x86[_-]64|amd64", "x86_64"), (r"risc-?v", "riscv")]
+                 if re.search(rx, t)), None)
+    return {"text": text, "format": fmt, "vendors": vendors, "socs": socs, "arch": arch,
+            "unknown": bool(re.search(r"unknown|unidentified|mystery", t))}
+
+
+def merge_declared(fp, dec):
+    if not dec:
+        return fp
+    fp = dict(fp)
+    fp["declared_hints"] = dec
+    if fp.get("format") in (None, "unknown") and dec["format"]:
+        fp["format"], fp["format_source"] = dec["format"], "declared"
+    if not fp.get("arch") and dec["arch"]:
+        fp["arch"] = dec["arch"]
+        fp.setdefault("conditions", []).extend([f"arch:{dec['arch']}"] + ([] if dec["arch"] in ("x86", "x86_64") else ["arch:non_x86"]))
+    have = {v["vendor"] for v in fp.get("vendor_hints", [])}
+    for v in dec["vendors"]:
+        if v not in have:
+            fp.setdefault("vendor_hints", []).append({"vendor": v, "confidence": 0.75, "socs": dec["socs"], "evidence": ["declared"]})
+    return fp
+
+
+def described_only_fingerprint(dec):
+    cond = []
+    if dec["arch"]:
+        cond = [f"arch:{dec['arch']}"] + ([] if dec["arch"] in ("x86", "x86_64") else ["arch:non_x86"])
+    return {"fingerprinter": "declared", "path": None, "sha256": None, "size": None, "format": dec["format"] or "unknown",
+            "subformat": None, "confidence": 0.3, "arch": dec["arch"], "os": None, "vendor_hints": [], "embedded_formats": [],
+            "conditions": cond, "warnings": ["no file: plan built from description only"]}
+
+
+def fingerprint_target(target, runner, args):
+    if target.startswith(f"{runner.name}:") or target.startswith(f"{runner.host}:"):
+        runner.ensure()
+        fp = runner.fingerprint(target.split(":", 1)[1])
+        fp["remote_path"] = target.split(":", 1)[1]
+        return fp
+    if not os.path.isfile(target):
+        die(f"target not found: {target}")
+    return load_fingerprinter().fingerprint(target, use_binwalk=not getattr(args, "no_binwalk", False))
+
+
+# ------------------------------------------------------------------ tool selection
+def detect_hardware(runner, orch):
+    txt = runner.lsusb()
+    ids = orch.get("usb_hardware_ids", {})
+    found = []
+    for line in txt.splitlines():
+        m = re.search(r"ID ([0-9a-f]{4}):([0-9a-f]{4})\s*(.*)", line)
+        if not m:
+            continue
+        vid, pid, desc = m.groups()
+        label = ids.get(f"{vid}:{pid}") or ids.get(vid)
+        if label:
+            found.append({"usb_id": f"{vid}:{pid}", "class": label, "lsusb": desc.strip()[:80]})
+    return found
+
+
+def tool_orch(entry, orch):
+    o = dict(entry.get("orchestration") or {})
+    cat = entry.get("category")
+    o.setdefault("action_class", orch.get("category_action_class", {}).get(cat, "read"))
+    o.setdefault("stage", orch.get("category_stage", {}).get(cat, "static"))
+    o.setdefault("runner", orch.get("runner", {}).get("host", "maksoor"))
+    return o
+
+
+def resolve_limits(orch, o, args):
+    lim = dict(orch.get("defaults", {}).get("limits", {}))
+    lim.update(o.get("limits") or {})
+    if args is not None:
+        if getattr(args, "timeout", None):
+            lim["timeout_s"] = args.timeout
+        if getattr(args, "mem", None):
+            lim["memory_mb"] = args.mem
+        if getattr(args, "disk", None):
+            lim["disk_mb"] = args.disk
+    return {"timeout_s": int(lim.get("timeout_s", 300)), "memory_mb": int(lim.get("memory_mb", 4096)),
+            "disk_mb": int(lim.get("disk_mb", 10240)), "tasks_max": int(lim.get("tasks_max", 2048))}
+
+
+def build_plan(fp, reg, deep=False, hardware=None, args=None):
+    orch, tools = orch_of(reg), reg.get("tools", {})
+    runner_host = orch.get("runner", {}).get("host", "maksoor")
+    fmt, arch = fp.get("format") or "unknown", fp.get("arch")
+    cond = list(fp.get("conditions") or []) + (["deep"] if deep else [])
+    vendors = [v["vendor"] for v in fp.get("vendor_hints", []) if v.get("confidence", 0) >= 0.7][:1]
+    routing = reg.get("routing", {})
+    rule = next((r for r in routing.get("rules", []) if r["format"] == fmt), None)
+    base_chain = list(rule["chain"]) if rule else list(routing.get("default_chain", []))
+    cands, member_followups, applied = {}, [], []
+
+    def add(t, score, reason):
+        c = cands.setdefault(t, {"tool": t, "base": score, "reasons": []})
+        c["base"] = max(c["base"], score)
+        c["reasons"].append(reason)
+
+    for i, t in enumerate(base_chain):
+        add(t, 0.5 - 0.02 * i, f"routing rule '{fmt}' chain[{i}]" if rule else f"default chain[{i}] (no rule for '{fmt}')")
+    for aug in (rule or {}).get("augments", []):
+        if aug["condition"] in cond:
+            applied.append(aug["condition"])
+            for t in aug["add"]:
+                add(t, 0.8, f"augment '{aug['condition']}'" + (f": {aug['note']}" if aug.get("note") else ""))
+    # heuristics past the routing table (evidence-driven)
+    osn = fp.get("os")
+    if fmt == "firmware":
+        add("emba", 0.45, "whole-image firmware security analysis")
+        if osn in ("linux", "android", "openwrt") or "embedded_filesystem" in cond:
+            add("qiling", 0.35, "emulate extracted userland binaries (rootfs)")
+        if osn in ("freertos", "zephyr", "threadx", "nuttx", "rt-thread", "esp-idf") or (not osn and arch in ("arm",) and "embedded_filesystem" not in cond):
+            add("renode", 0.5, f"MCU/RTOS firmware ({osn or 'bare-metal?'}): full-system emulation")
+        for v, t in (("rockchip", "rkdeveloptool"), ("mediatek", "mtkclient"), ("qualcomm", "edl")):
+            if v in vendors:
+                add(t, 0.45, f"vendor '{v}': device read/flash path")
+        add("flashrom", 0.25, "SPI flash read-back/verify path")
+        add("openocd", 0.25, "JTAG/SWD access for live debug/dump")
+    if fmt in ("ELF", "PE", "Mach-O"):
+        add("angr", 0.35 if not deep else 0.8, "symbolic execution / CFG (on demand)")
+        etype = (fp.get("elf") or {}).get("type")
+        if fmt == "ELF" and etype in ("executable", "shared_object"):
+            add("afl++", 0.3, "coverage-guided fuzzing (QEMU mode for non-x86 / closed source)")
+            if arch == "x86_64":
+                add("honggfuzz", 0.25, "alternative fuzzer (x86_64)")
+    if fmt == "unknown":
+        add("binwalk", 0.35, "unknown format: signature scan / carve")
+        add("unblob", 0.4, "unknown format: carve + extract")
+        add("rizin", 0.2, "unknown format: raw disassembly probe")
+    for hw in (hardware or []) if fmt == "firmware" else []:
+        cls = hw["class"].split()[0].lower()
+        for k, t in (("rockchip", "rkdeveloptool"), ("mediatek", "mtkclient"), ("qualcomm", "edl"), ("ch341a", "flashrom"),
+                     ("ftdi", "openocd"), ("st-link/v2", "openocd"), ("segger", "openocd"), ("fx2lafw", "sigrok-cli"),
+                     ("black", "openocd"), ("raspberry", "openocd")):
+            if cls.startswith(k.split()[0]):
+                add(t, 0.6, f"hardware present on runner: {hw['usb_id']} {hw['class']}")
+
+    stage_order = orch.get("stage_order", BUILTIN_ORCH["stage_order"])
+    stage_cfg = orch.get("stages", BUILTIN_ORCH["stages"])
+    today = datetime.date.today()
+    resolved = []
+    for t, c in cands.items():
+        e = tools.get(t)
+        r = {"tool": t, "reasons": c["reasons"], "registered": e is not None}
+        if not e:
+            r.update(score=round(c["base"] - 0.5, 3), executable=False, skip_reason="not in capability registry",
+                     stage="static", action_class="read")
+            resolved.append(r)
+            continue
+        o = tool_orch(e, orch)
+        tf = set(e.get("target_formats") or [])
+        archs = set(e.get("architectures") or [])
+        score = c["base"]
+        fmt_ok = (not tf or fmt in tf or (fmt in ("firmware", "unknown") and bool(tf & GENERIC_FORMATS))
+                  or o["stage"] in ("hardware", "firmware_analysis"))
+        if fmt in tf:
+            score += 0.1
+        arch_ok = True
+        if o["stage"] == "hardware" or "n/a" in archs:
+            pass  # probe/programmer support is about the chip, not the target's CPU arch
+        elif arch and archs and not (archs & {"any", arch}) and not any(a in archs for a in ("dalvik", "jvm", "godot", "python_bytecode", "hermes_bytecode")):
+            arch_ok = False
+            score -= 0.3
+        elif arch and arch in archs:
+            score += 0.05
+        try:
+            if e.get("verified") and (today - datetime.date.fromisoformat(e["verified"])).days <= 30:
+                score += 0.05
+        except ValueError:
+            pass
+        inv = o.get("invocation")
+        on_runner = runner_host in (e.get("hosts") or {}) and o.get("runner", runner_host) == runner_host
+        r.update(name=e.get("name", t), version=e.get("version"), stage=o["stage"], action_class=o["action_class"],
+                 runner=o.get("runner"), hosts=list((e.get("hosts") or {}).keys()), note=o.get("note"),
+                 limits=resolve_limits(orch, o, args), parse=o.get("parse", "generic"))
+        if not fmt_ok:
+            member_followups.append({"tool": t, "reason": "; ".join(c["reasons"]),
+                                     "why_not_direct": f"{t} takes {sorted(tf)}, target is {fmt}: run on extracted members"})
+            continue
+        skip = None
+        if not arch_ok:
+            skip = f"arch '{arch}' not in {t} architectures {sorted(archs)}"
+        elif not on_runner:
+            skip = f"not installed on runner '{runner_host}' (hosts: {r['hosts']}, runner: {o.get('runner')})"
+        elif not inv:
+            skip = "no headless invocation registered: plan-only (use interactively)"
+        r.update(score=round(score - (0.2 if skip else 0), 3), executable=skip is None, skip_reason=skip)
+        if inv:
+            r["invocation"] = inv
+        resolved.append(r)
+
+    stages = []
+    for s in stage_order:
+        cs = sorted([r for r in resolved if r.get("stage") == s], key=lambda r: -r["score"])
+        if not cs:
+            continue
+        cfg = stage_cfg.get(s, {})
+        for i, c in enumerate(cs):
+            c["rank"] = i + 1
+            c["gate_preview"] = gate_decision(c["tool"], c["action_class"], args=None)["decision"]
+        stages.append({"stage": s, "mode": cfg.get("mode", "first_success"), "auto": cfg.get("auto", False),
+                       "purpose": cfg.get("purpose"), "candidates": cs})
+
+    def chain_conf(chain):
+        sc = [next((r["score"] for r in resolved if r["tool"] == t), 0) for t in chain]
+        return round(fp.get("confidence", 0.5) * (sum(min(1, max(0, x)) for x in sc) / len(sc)), 3) if sc else 0
+
+    specific, opt_in = [], []
+    for st in stages:
+        ex = [c["tool"] for c in st["candidates"] if c["executable"]]
+        if st["auto"]:
+            specific += ex if st["mode"] == "all" else ex[:1]
+        else:
+            opt_in.append(st["candidates"][0]["tool"])
+    fallbacks = {st["stage"]: [c["tool"] for c in st["candidates"][1:] if c["executable"]]
+                 for st in stages if st["auto"] and st["mode"] == "first_success"}
+    fallbacks = {k: v for k, v in fallbacks.items() if v}
+    chains, seen = [], set()
+    variants = [("specific", specific), ("generic", base_chain)]
+    if not rule:
+        variants.append(("default", routing.get("default_chain", [])))
+    for label, ch in variants:
+        key = tuple(ch)
+        if ch and key not in seen:
+            seen.add(key)
+            chains.append({"label": label, "chain": ch, "confidence": chain_conf(ch),
+                           **({"fallbacks_by_stage": fallbacks, "opt_in": opt_in} if label == "specific" else {})})
+    chains.sort(key=lambda c: -c["confidence"])
+    for i, c in enumerate(chains):
+        c["rank"] = i + 1
+
+    return {"router": f"re-orchestrate {VERSION}", "registry_version": reg.get("version"),
+            "orchestration_source": "registry" if reg.get("orchestration") else "builtin-fallback",
+            "target": {k: fp.get(k) for k in ("path", "remote_path", "sha256", "size", "format", "subformat", "arch", "os",
+                                              "confidence", "conditions")},
+            "vendor_hints": fp.get("vendor_hints", [])[:5],
+            "routing_rule": fmt if rule else None, "augments_applied": applied,
+            "ranked_chains": chains, "stages": stages, "member_followups": member_followups,
+            "hardware_present": hardware or [],
+            "limitations": (rule or {}).get("limitations"),
+            "permission_policy": orch.get("permission_policy"),
+            "auto_stages": [s["stage"] for s in stages if s["auto"]]}
+
+
+# ------------------------------------------------------------------ permission gate
+def wq_show(ticket):
+    try:
+        p = subprocess.run(["wq", "show", str(ticket)], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    if p.returncode != 0:
+        return None, p.stdout[-300:] + p.stderr[-300:]
+    rec = {}
+    for line in p.stdout.splitlines():
+        m = re.match(r"^(\w+)\s*:\s?(.*)$", line)
+        if m:
+            rec[m.group(1)] = m.group(2)
+    return rec, None
+
+
+def verify_frank(ticket, tool):
+    if not ticket:
+        return False, "hw_write requires --frank-ticket <wq id> carrying Frank's approval"
+    rec, err = wq_show(ticket)
+    if rec is None:
+        return False, f"wq#{ticket} unreadable: {err}"
+    resp = (rec.get("frank_response") or "").strip()
+    if not resp or resp == "None":
+        return False, f"wq#{ticket} has no frank_response (Frank answers via `wq answer`)"
+    if not re.match(r"^(approve|approved|yes|go|ok)\b", resp, re.I):
+        return False, f"wq#{ticket} frank_response is not an approval: {resp[:80]!r}"
+    blob = " ".join(rec.get(k, "") for k in ("title", "detail", "decision_prompt", "frank_response")).lower()
+    if tool.lower() not in blob:
+        return False, f"wq#{ticket} approval does not name tool '{tool}'"
+    ts = rec.get("response_ts")
+    try:
+        age = utcnow() - datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=datetime.timezone.utc)
+        if age.days > 7:
+            return False, f"wq#{ticket} approval is {age.days}d old (max 7d)"
+    except (AttributeError, ValueError):
+        return False, f"wq#{ticket} response_ts unreadable: {ts!r}"
+    return True, f"Frank approved via wq#{ticket} ({resp[:60]!r} @ {ts})"
+
+
+def gate_decision(tool, cls, args=None):
+    approve = set(getattr(args, "approve_list", []) or [])
+    approve_cls = set(getattr(args, "approve_class_list", []) or [])
+    ticket = getattr(args, "frank_ticket", None)
+    if cls == "network":
+        return {"tool": tool, "action_class": cls, "decision": "blocked", "why": "network operations are blocked (RE isolation rule)"}
+    if cls == "read":
+        return {"tool": tool, "action_class": cls, "decision": "allow", "why": "read: auto-approved"}
+    if cls in ("write", "hw_read"):
+        if tool in approve or cls in approve_cls:
+            return {"tool": tool, "action_class": cls, "decision": "allow", "why": f"{cls}: explicitly approved by caller"}
+        return {"tool": tool, "action_class": cls, "decision": "needs_approval",
+                "why": f"{cls}: pass --approve {tool} (or --approve-class {cls})"}
+    if cls == "hw_write":
+        if args is None:
+            return {"tool": tool, "action_class": cls, "decision": "needs_frank", "why": "hw_write: Frank approval required"}
+        ok, why = verify_frank(ticket, tool)
+        return {"tool": tool, "action_class": cls, "decision": "allow" if ok else "needs_frank", "why": why}
+    return {"tool": tool, "action_class": cls, "decision": "blocked", "why": f"unknown action class '{cls}'"}
+
+
+# ------------------------------------------------------------------ normalizers -> envelope fields
+def jload(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def norm_rizin(raw, env):
+    o = raw / "out"
+    info = jload(o / "info.json") or {}
+    if info:
+        env["findings"].append({"kind": "binary_info", "severity": "info",
+                                "summary": f"{info.get('bintype')} {info.get('arch')}/{info.get('bits')} {info.get('machine', '')}",
+                                "evidence": {k: info.get(k) for k in ("os", "lang", "stripped", "static", "canary", "nx", "pic",
+                                                                      "relro", "intrp", "compiler") if k in info}})
+    for s in (jload(o / "symbols.json") or [])[:5000]:
+        env["symbols"].append({"name": s.get("name") or s.get("realname"), "addr": hex(s.get("vaddr", 0)),
+                               "type": s.get("type"), "size": s.get("size")})
+    for s in (jload(o / "imports.json") or [])[:3000]:
+        env["symbols"].append({"name": s.get("name"), "addr": hex(s.get("plt", 0) or 0), "type": "import", "size": None})
+    funcs = jload(o / "functions.json") or []
+    names = {f.get("offset"): f.get("name") for f in funcs}
+    for f in funcs[:5000]:
+        env["functions"].append({"name": f.get("name"), "addr": hex(f.get("offset", 0)), "size": f.get("size")})
+        for cr in (f.get("callrefs") or []):
+            dst = cr.get("to", cr.get("addr"))  # rizin >= 0.7: from/to; older: addr
+            if cr.get("type") in ("CALL", "call") and dst is not None and len(env["call_edges"]) < 20000:
+                env["call_edges"].append({"src": f.get("name"), "dst": names.get(dst, hex(dst)), "kind": "call",
+                                          "site": hex(cr["from"]) if isinstance(cr.get("from"), int) else None})
+    for s in (jload(o / "strings.json") or [])[:5000]:
+        env["strings"].append({"addr": hex(s.get("vaddr", 0)), "value": (s.get("string") or "")[:500], "encoding": s.get("type")})
+    if not funcs:
+        env["warnings"].append("rizin produced no function list")
+
+
+def norm_capa(raw, env):
+    d = jload(raw / "out" / "capa.json")
+    if not d:
+        env["warnings"].append("capa.json missing/unparseable")
+        return
+    for name, r in (d.get("rules") or {}).items():
+        meta = r.get("meta", {})
+        locs = []
+        for m in (r.get("matches") or [])[:10]:
+            if isinstance(m, list) and m and isinstance(m[0], dict):
+                locs.append(hex(m[0].get("value", 0)) if isinstance(m[0].get("value"), int) else str(m[0].get("value")))
+        ns = meta.get("namespace") or ""
+        sev = "medium" if ns.startswith(("anti-analysis", "host-interaction/process/inject", "persistence", "collection",
+                                         "communication")) else "info"
+        env["findings"].append({"kind": "capability", "severity": sev, "summary": name, "location": locs,
+                                "evidence": {"namespace": ns, "attack": [a.get("id") for a in meta.get("attack", [])],
+                                             "mbc": [m.get("id") for m in meta.get("mbc", [])]}})
+
+
+def norm_unblob(raw, env, run):
+    d = jload(raw / "out" / "unblob-report.json")
+    chunks = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            if "handler_name" in x:
+                chunks.append(x)
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(d)
+    for c in chunks[:500]:
+        env["findings"].append({"kind": "extracted_chunk", "severity": "info",
+                                "summary": f"{c.get('handler_name')} @ {c.get('start_offset')}..{c.get('end_offset')}",
+                                "location": c.get("start_offset"),
+                                "evidence": {k: c.get(k) for k in ("size", "is_encrypted", "extraction_reports") if k in c}})
+    norm_tree(raw, env, run)
+
+
+def norm_binwalk(raw, env, run):
+    log = raw / "out" / "binwalk.log"
+    try:
+        for line in log.read_text(errors="replace").splitlines():
+            m = re.match(r"^(\d+)\s+0x[0-9A-Fa-f]+\s+(.+)$", line)
+            if m and len(env["findings"]) < 500:
+                env["findings"].append({"kind": "signature", "severity": "info", "summary": m.group(2)[:240],
+                                        "location": int(m.group(1))})
+    except OSError:
+        env["warnings"].append("binwalk.log missing")
+    norm_tree(raw, env, run)
+
+
+def norm_goresym(raw, env, run):
+    d = jload(raw / "out" / "goresym.json")
+    if not d:
+        env["warnings"].append("goresym.json missing/unparseable")
+        return
+    bi = d.get("BuildInfo") or {}
+    env["findings"].append({"kind": "go_build", "severity": "info",
+                            "summary": f"Go {d.get('Version') or bi.get('GoVersion')} module {(bi.get('Main') or {}).get('Path')}",
+                            "evidence": {"deps": [x.get("Path") for x in (bi.get("Deps") or [])][:200]}})
+    for f in (d.get("UserFunctions") or [])[:5000] + (d.get("StdFunctions") or [])[:2000]:
+        env["functions"].append({"name": f.get("FullName"), "addr": hex(f.get("Start", 0)), "size": (f.get("End", 0) - f.get("Start", 0)) or None})
+
+
+def norm_apktool(raw, env, run):
+    mf = raw / "out" / "apktool" / "AndroidManifest.xml"
+    try:
+        x = mf.read_text(errors="replace")
+    except OSError:
+        env["warnings"].append("decoded AndroidManifest.xml not pulled")
+        norm_tree(raw, env, run)
+        return
+    pkg = re.search(r'package="([^"]+)"', x)
+    perms = re.findall(r'uses-permission[^>]*android:name="([^"]+)"', x)
+    exported = re.findall(r'<(activity|service|receiver|provider)[^>]*android:exported="true"[^>]*android:name="([^"]+)"', x)
+    env["findings"].append({"kind": "android_manifest", "severity": "info", "summary": f"package {pkg.group(1) if pkg else '?'}",
+                            "evidence": {"permissions": perms[:200], "exported": [f"{a}:{b}" for a, b in exported][:200],
+                                         "debuggable": 'android:debuggable="true"' in x}})
+    if 'android:debuggable="true"' in x:
+        env["findings"].append({"kind": "android_manifest", "severity": "medium", "summary": "application is debuggable"})
+    norm_tree(raw, env, run)
+
+
+def norm_volatility(raw, env, run):
+    d = jload(raw / "out" / "vol-banners.json")
+    for row in (d or [])[:200]:
+        env["findings"].append({"kind": "os_banner", "severity": "info", "summary": str(row.get("Banner"))[:240],
+                                "location": row.get("Offset")})
+    if not d:
+        env["warnings"].append("no volatility banners (unsupported image or symbols unavailable offline)")
+
+
+def norm_json_generic(raw, env, run):
+    so = Path(run.get("stdout_file", "")).name
+    d = jload(raw / "out" / so) if so else None
+    if d is not None:
+        env["findings"].append({"kind": "tool_report", "severity": "info", "summary": f"{env['tool']} JSON report",
+                                "evidence": d if len(json.dumps(d)) < 200000 else {"truncated": True, "keys": list(d)[:50] if isinstance(d, dict) else None}})
+    norm_tree(raw, env, run)
+
+
+def norm_ghidra(raw, env, run):
+    log = raw / "out" / "ghidra.log"
+    try:
+        t = log.read_text(errors="replace")
+        m = re.findall(r"(ANALYZING all memory and code|Import succeeded|REPORT: Analysis succeeded.*)", t)
+        env["findings"].append({"kind": "ghidra_headless", "severity": "info", "summary": "; ".join(sorted(set(m))) or "see ghidra.log"})
+    except OSError:
+        env["warnings"].append("ghidra.log missing")
+
+
+def norm_tree(raw, env, run):
+    man = run.get("manifest") or {}
+    env["findings"].append({"kind": "output_tree", "severity": "info",
+                            "summary": f"{man.get('file_count', 0)} files / {man.get('total_bytes', 0)} bytes written",
+                            "evidence": {"elf_files": len(man.get("elf_files") or []), "truncated": man.get("truncated")}})
+
+
+def norm_generic(raw, env, run):
+    so = Path(run.get("stdout_file", "")).name
+    try:
+        t = (raw / "out" / so).read_text(errors="replace")[-4000:] if so else ""
+    except OSError:
+        t = ""
+    if t:
+        env["findings"].append({"kind": "stdout_tail", "severity": "info", "summary": t[-500:]})
+    norm_tree(raw, env, run)
+
+
+NORMALIZERS = {"rizin": lambda r, e, run: norm_rizin(r, e), "capa": lambda r, e, run: norm_capa(r, e),
+               "unblob": norm_unblob, "binwalk": norm_binwalk, "goresym": norm_goresym, "apktool": norm_apktool,
+               "volatility": norm_volatility, "json_generic": norm_json_generic, "ghidra": lambda r, e, run: norm_ghidra(r, e),
+               "tree": norm_tree, "generic": norm_generic}
+
+
+def file_hashes(root, cap=500):
+    outl = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and len(outl) < cap:
+            h = hashlib.sha256(p.read_bytes()).hexdigest() if p.stat().st_size <= 64 << 20 else None
+            outl.append({"path": str(p.relative_to(root)), "sha256": h, "size": p.stat().st_size})
+    return outl
+
+
+def validate_envelope(env, schema):
+    missing = [k for k in (schema or {}).get("required", []) if env.get(k) in (None, "")]
+    enum = ((schema or {}).get("properties", {}).get("status") or {}).get("enum")
+    errs = [f"missing {k}" for k in missing]
+    if enum and env.get("status") not in enum:
+        errs.append(f"status {env.get('status')!r} not in {enum}")
+    return errs
+
+
+def limpet_evidence_block(tool, runner_name, argv, started, finished, rc, err):
+    try:
+        if LIMPET_MCP_LIB not in sys.path:
+            sys.path.insert(0, LIMPET_MCP_LIB)
+        import evidence as lev  # limpet lib/mcp/evidence.py (wq#3964)
+        blk = lev.build_evidence(tool, {"kind": "re-orchestrate", "server": runner_name, "tool": tool, "git_sha": None,
+                                        "untrusted_output": True}, {"argv": argv}, started, finished,
+                                 result={"exit_code": rc}, error=err)
+        return blk, lev
+    except Exception as e:  # limpet tree absent: keep running, note it
+        return {"error": f"limpet evidence lib unavailable: {e}"}, None
+
+
+# ------------------------------------------------------------------ execution
+def run_candidate(c, fp, aid, project, runner, target_on_runner, reg, args, adir, gate_log):
+    tool = c["tool"]
+    dec = gate_decision(tool, c["action_class"], args)
+    dec.update(ts=iso(), analysis_id=aid, stage=c["stage"])
+    with open(gate_log, "a") as f:
+        f.write(json.dumps(dec) + "\n")
+    rec = {"tool": tool, "stage": c["stage"], "gate": dec}
+    if dec["decision"] != "allow":
+        rec["status"] = "blocked" if dec["decision"] == "blocked" else dec["decision"]
+        return rec
+    inv = c.get("invocation")
+    if getattr(args, "argv_override", None) and tool in (args.tools_list or []):
+        inv = {**(inv or {}), "argv": args.argv_override}
+    if not c["executable"] and not (inv and getattr(args, "argv_override", None)):
+        rec.update(status="plan_only", why=c.get("skip_reason"))
+        return rec
+    lim = c["limits"]
+    workdir = f"{runner.work_root}/{project}/{aid}/{safe_name(tool)}"
+    spec = {"analysis_id": aid, "tool": tool, "workdir": workdir, "target": target_on_runner, "argv": inv["argv"],
+            "stdout_file": inv.get("stdout"), "env": inv.get("env"), "input_member": inv.get("input_member"),
+            "limits": {"timeout_s": lim["timeout_s"], "memory_bytes": lim["memory_mb"] << 20,
+                       "disk_bytes": lim["disk_mb"] << 20, "tasks_max": lim["tasks_max"]},
+            "isolation": {"network": False, "rw_paths": inv.get("rw_paths", []), "devices": bool(inv.get("devices"))}}
+    if getattr(args, "dry_run", False):
+        rec.update(status="dry_run", spec=spec)
+        return rec
+    started = iso()
+    try:
+        run = runner.run(spec, timeout=lim["timeout_s"] + 300)
+    except subprocess.TimeoutExpired:
+        run = {"status": "timeout", "runner_error": "ssh session exceeded limit+300s", "started_at": started, "finished_at": iso()}
+    raw = adir / "raw" / safe_name(tool)
+    pulled, pull_err = runner.pull(workdir, raw) if run.get("workdir") else (False, "no workdir")
+    status = run.get("status", "error")
+    env = {"target": {"path": fp.get("path") or fp.get("remote_path"), "runner_path": target_on_runner,
+                      "sha256": fp.get("sha256"), "size": fp.get("size"), "format": fp.get("format"),
+                      "arch": fp.get("arch"), "conditions": fp.get("conditions")},
+           "tool": tool, "tool_version": str(c.get("version") or "unknown"), "host": run.get("host", runner.name),
+           "analysis_id": aid, "timestamp": iso(), "started_at": run.get("started_at", started),
+           "finished_at": run.get("finished_at", iso()), "status": status,
+           "findings": [], "symbols": [], "functions": [], "call_edges": [], "strings": [], "warnings": [],
+           "evidence_paths": [], "hashes": {"target_sha256": fp.get("sha256"), "outputs": []},
+           "resources": {"elapsed_s": run.get("elapsed_s"), **(run.get("resources") or {})},
+           "execution": {"exit_code": run.get("exit_code"), "killed_reason": run.get("killed_reason"),
+                         "partial_output": run.get("partial_output"), "isolation": run.get("isolation"),
+                         "argv": run.get("argv"), "runner_error": run.get("runner_error"),
+                         "missing_tool": run.get("missing_tool", False)},
+           "gate": dec}
+    if run.get("killed_reason"):
+        env["warnings"].append(run["killed_reason"])
+    if run.get("runner_error"):
+        env["warnings"].append(run["runner_error"])
+    if status != "ok" and run.get("stderr_tail"):
+        env["warnings"].append("stderr: " + run["stderr_tail"][-800:])
+    if pulled:
+        try:
+            NORMALIZERS.get(c.get("parse", "generic"), norm_generic)(raw, env, run)
+        except Exception as e:  # a parser bug must not lose the run
+            env["warnings"].append(f"normalizer {c.get('parse')} failed: {type(e).__name__}: {e}")
+        env["hashes"]["outputs"] = file_hashes(raw)
+        env["evidence_paths"].append(str(raw))
+    elif run.get("workdir"):
+        env["warnings"].append(f"evidence pull failed: {pull_err}")
+    if run.get("workdir"):
+        env["evidence_paths"].append(f"{runner.name}:{run['workdir']}")
+    substantive = [f for f in env["findings"] if f.get("kind") not in ("output_tree", "stdout_tail")]
+    tree_out = c.get("parse") in ("tree", "unblob", "binwalk", "apktool") and (run.get("manifest") or {}).get("file_count", 0) > 0
+    if status == "error" and run.get("exit_code") not in (0, None) and (substantive or env["functions"] or env["symbols"] or tree_out):
+        env["status"] = "partial"  # tool exited non-zero but produced parseable analysis output
+    blk, lev = limpet_evidence_block(tool, runner.name, run.get("argv") or inv["argv"], env["started_at"],
+                                     env["finished_at"], run.get("exit_code"), run.get("runner_error"))
+    env["_meta"] = {"evidence": blk}
+    if lev is not None:
+        lev.EvidenceLog(str(adir)).append(blk)
+    errs = validate_envelope(env, reg.get("output_envelope"))
+    if errs:
+        env["warnings"].append("envelope schema: " + "; ".join(errs))
+    with open(adir / f"{safe_name(tool)}.json", "w") as f:
+        json.dump(env, f, indent=1)
+    rec.update(status=env["status"], exit_code=run.get("exit_code"), elapsed_s=run.get("elapsed_s"),
+               envelope=str(adir / f"{safe_name(tool)}.json"), killed_reason=run.get("killed_reason"),
+               counts={k: len(env[k]) for k in ("findings", "symbols", "functions", "call_edges", "strings")},
+               manifest=run.get("manifest"), workdir=run.get("workdir"))
+    return rec
+
+
+INTEREST = [(r"/(s?bin|usr/s?bin)/", 3), (r"httpd|lighttpd|nginx|boa|goahead|uhttpd|mini_httpd", 4), (r"telnetd|dropbear|sshd", 3),
+            (r"\.cgi$|/cgi-bin/", 4), (r"\.ko$", 2), (r"busybox", 1), (r"upgrade|update|fw|ota|flash", 3),
+            (r"/(lib|usr/lib)/.*\.so", 1), (r"libapp\.so|libil2cpp\.so|libflutter\.so", 4)]
+
+
+def next_steps(runs, plan, project, runner):
+    steps = []
+    for r in runs:
+        man = r.get("manifest") or {}
+        if r.get("stage") != "extract" or not man.get("elf_files"):
+            continue
+        scored = []
+        for e in man["elf_files"]:
+            s = sum(w for rx, w in INTEREST if re.search(rx, "/" + e["path"]))
+            scored.append((s, e.get("size", 0), e))
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        for s, _, e in scored[:15]:
+            p = f"{r['workdir']}/out/{e['path']}"
+            steps.append({"kind": "analyze_extracted_elf", "interest": s, "arch": e.get("arch"), "elf_type": e.get("elf_type"),
+                          "path": f"{runner.name}:{p}",
+                          "command": f"re-orchestrate run {runner.name}:{shlex.quote(p)} --project {project}"})
+    for mf in plan.get("member_followups", []):
+        steps.append({"kind": "member_tool", **mf})
+    for st in plan["stages"]:
+        if st["auto"]:
+            continue
+        top = st["candidates"][0]
+        steps.append({"kind": "opt_in_stage", "stage": st["stage"], "tool": top["tool"], "action_class": top["action_class"],
+                      "gate": top["gate_preview"], "executable": top["executable"], "skip_reason": top.get("skip_reason"),
+                      "purpose": st.get("purpose")})
+    return steps
+
+
+def record_state(project, aid, summary, adir):
+    res = {}
+    try:
+        p = subprocess.run(["python3", LUMEN_STATE, "ingest", f"re-{project}", "last_analysis", aid,
+                            "--valid-from", datetime.date.today().isoformat(), "--source", f"wq#5200 re-orchestrate {adir}",
+                            "--source-kind", "observed", "--note", summary[:400],
+                            "--new-predicate", "wq#5200: per-project pointer to the latest RE evidence dir"],
+                           capture_output=True, text=True, timeout=60)
+        res["ingest_rc"], res["ingest"] = p.returncode, (p.stdout + p.stderr)[-300:]
+        if p.returncode == 0 and os.access(STATE_REGEN, os.X_OK):
+            subprocess.Popen([STATE_REGEN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            res["state_regen"] = "started (detached)"
+    except (OSError, subprocess.SubprocessError) as e:
+        res["error"] = str(e)
+    return res
+
+
+def cmd_run(args):
+    reg = load_registry()
+    orch = orch_of(reg)
+    runner = Runner(orch)
+    project = safe_name(args.project)
+    try:
+        rstat = runner.ensure()
+    except RuntimeError as e:
+        die(str(e), code=3)
+    fp = merge_declared(fingerprint_target(args.target, runner, args), parse_describe(args.describe) if args.describe else None)
+    hw = detect_hardware(runner, orch)
+    plan = build_plan(fp, reg, deep=args.deep, hardware=hw, args=args)
+    sha = fp.get("sha256") or hashlib.sha256(args.target.encode()).hexdigest()
+    aid = f"{utcnow():%Y%m%dT%H%M%S}-{sha[:12]}"
+    adir = EVIDENCE_ROOT / project / aid
+    adir.mkdir(parents=True, exist_ok=True)
+    (adir / "fingerprint.json").write_text(json.dumps(fp, indent=1, default=list))
+    (adir / "plan.json").write_text(json.dumps(plan, indent=1, default=str))
+    if fp.get("remote_path"):
+        target_on_runner, staged = fp["remote_path"], "remote"
+    elif args.dry_run:
+        target_on_runner, staged = f"{runner.work_root}/{project}/_targets/{sha}/{os.path.basename(args.target)}", "dry_run"
+    else:
+        target_on_runner, staged = runner.stage(os.path.abspath(args.target), sha, project)
+    want_stages = args.stages_list or plan["auto_stages"]
+    if args.tools_list and not args.stages_list:
+        want_stages = [s["stage"] for s in plan["stages"]]
+    gate_log = adir / "gate.jsonl"
+    runs = []
+    for st in plan["stages"]:
+        if st["stage"] not in want_stages:
+            continue
+        cands = [c for c in st["candidates"] if not args.tools_list or c["tool"] in args.tools_list]
+        for c in cands:
+            rec = run_candidate(c, fp, aid, project, runner, target_on_runner, reg, args, adir, gate_log)
+            runs.append(rec)
+            if st["mode"] == "first_success" and rec.get("status") in ("ok", "partial", "dry_run"):
+                break  # stage satisfied; remaining candidates were fallbacks
+    for t in args.tools_list or []:  # explicitly requested tools the plan never proposed still pass the gate
+        if not any(r["tool"] == t for r in runs):
+            e = reg["tools"].get(t)
+            if not e:
+                runs.append({"tool": t, "status": "unknown_tool"})
+                continue
+            o = tool_orch(e, orch)
+            c = {"tool": t, "stage": o["stage"], "action_class": o["action_class"], "invocation": o.get("invocation"),
+                 "executable": bool(o.get("invocation")) and orch["runner"]["host"] in (e.get("hosts") or {}),
+                 "skip_reason": None if o.get("invocation") else "no headless invocation registered",
+                 "limits": resolve_limits(orch, o, args), "version": e.get("version"), "parse": o.get("parse", "generic")}
+            runs.append(run_candidate(c, fp, aid, project, runner, target_on_runner, reg, args, adir, gate_log))
+    steps = next_steps(runs, plan, project, runner)
+    statuses = {r["tool"]: r.get("status") for r in runs}
+    summary = f"{fp.get('format')}/{fp.get('subformat')} {fp.get('arch')} " + \
+              ",".join(f"{t}={s}" for t, s in statuses.items())
+    index = {"analysis_id": aid, "project": project, "created": iso(), "router": f"re-orchestrate {VERSION}",
+             "runner": rstat, "target": plan["target"], "staged": {"path": target_on_runner, "how": staged},
+             "vendor_hints": plan["vendor_hints"], "ranked_chains": plan["ranked_chains"], "runs": runs,
+             "next_steps": steps, "evidence_dir": str(adir)}
+    if not args.dry_run:
+        index["lumen_state"] = record_state(project, aid, summary, adir) if not args.no_state else "skipped (--no-state)"
+    (adir / "index.json").write_text(json.dumps(index, indent=1, default=str))
+    if not args.dry_run:
+        with open(EVIDENCE_ROOT / "index.jsonl", "a") as f:
+            f.write(json.dumps({"ts": iso(), "project": project, "analysis_id": aid, "sha256": fp.get("sha256"),
+                                "format": fp.get("format"), "subformat": fp.get("subformat"), "arch": fp.get("arch"),
+                                "os": fp.get("os"), "vendors": [v["vendor"] for v in plan["vendor_hints"]],
+                                "target": fp.get("path") or fp.get("remote_path"), "tools": statuses,
+                                "evidence_dir": str(adir)}) + "\n")
+    out(index, human_run, args)
+    blocked_all = runs and all(r.get("status") in ("blocked", "needs_approval", "needs_frank") for r in runs)
+    sys.exit(4 if blocked_all else 0)
+
+
+# ------------------------------------------------------------------ human views
+def human_plan(p):
+    t = p["target"]
+    lines = [f"Target : {t.get('path') or t.get('remote_path') or '(described)'}",
+             f"Format : {t['format']}/{t.get('subformat')}  arch={t.get('arch')} os={t.get('os')} conf={t.get('confidence')}",
+             f"Vendor : {', '.join(v['vendor'] + ('(' + '/'.join(v['socs'][:3]) + ')' if v.get('socs') else '') for v in p['vendor_hints']) or '-'}",
+             f"Traits : {', '.join(t.get('conditions') or []) or '-'}", ""]
+    for c in p["ranked_chains"]:
+        lines.append(f"Chain #{c['rank']} [{c['label']}] conf={c['confidence']}: {' -> '.join(c['chain'])}")
+    lines.append("")
+    for st in p["stages"]:
+        lines.append(f"[{st['stage']}] mode={st['mode']} auto={st['auto']}")
+        for c in st["candidates"]:
+            flag = "" if c["executable"] else f"  (plan-only: {c.get('skip_reason')})"
+            lines.append(f"   {c['rank']}. {c['tool']:<14} score={c['score']:<6} class={c['action_class']:<8} gate={c['gate_preview']}{flag}")
+    for m in p["member_followups"]:
+        lines.append(f"   member: {m['tool']} -- {m['why_not_direct']}")
+    if p["hardware_present"]:
+        lines.append("Hardware on runner: " + ", ".join(f"{h['usb_id']} {h['class']}" for h in p["hardware_present"]))
+    return "\n".join(lines)
+
+
+def human_run(i):
+    lines = [f"Analysis {i['analysis_id']}  project={i['project']}  evidence={i['evidence_dir']}"]
+    for r in i["runs"]:
+        lines.append(f"  {r['tool']:<14} {r.get('status'):<14} {r.get('elapsed_s') or '':>8}s  {r.get('counts') or r.get('why') or r['gate'].get('why') if 'gate' in r else ''}")
+    for s in i["next_steps"][:12]:
+        lines.append(f"  next: {s.get('command') or s.get('why_not_direct') or (s.get('stage', '') + ' ' + s.get('tool', '') + ' gate=' + str(s.get('gate')))}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ commands
+def cmd_plan(args):
+    reg = load_registry()
+    orch = orch_of(reg)
+    runner = Runner(orch)
+    dec = parse_describe(args.describe) if args.describe else None
+    if args.target:
+        fp = merge_declared(fingerprint_target(args.target, runner, args), dec)
+    elif dec:
+        fp = described_only_fingerprint(dec)
+        fp = merge_declared(fp, dec)
+    else:
+        die("plan needs a target and/or --describe")
+    hw = [] if args.no_hw else detect_hardware(runner, orch)
+    plan = build_plan(fp, reg, deep=args.deep, hardware=hw, args=args)
+    if args.with_fingerprint:
+        plan["fingerprint"] = fp
+    out(plan, human_plan, args)
+
+
+def cmd_fingerprint(args):
+    runner = Runner(orch_of(load_registry()))
+    print(json.dumps(fingerprint_target(args.target, runner, args), indent=2, default=list))
+
+
+def cmd_gate(args):
+    reg = load_registry()
+    e = reg["tools"].get(args.tool)
+    if not e:
+        die(f"tool '{args.tool}' not in registry")
+    o = tool_orch(e, orch_of(reg))
+    out(gate_decision(args.tool, o["action_class"], args))
+
+
+def cmd_search(args):
+    p = EVIDENCE_ROOT / "index.jsonl"
+    term = args.term.lower()
+    hits = []
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            hay = " ".join(str(r.get(k, "")) for k in ("project", "analysis_id", "sha256", "format", "subformat", "arch", "os",
+                                                         "target")).lower() + " " + " ".join(r.get("vendors") or [])
+            if term in hay:
+                hits.append(r)
+    out({"term": args.term, "count": len(hits), "results": hits[-200:]})
+
+
+def csv(s):
+    return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Limpet Capability Router (wq#5200)", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p, target_required=True):
+        p.add_argument("target", nargs=None if target_required else "?")
+        p.add_argument("--describe", help="free-text description of the target (augments / substitutes the fingerprint)")
+        p.add_argument("--deep", action="store_true", help="include symbolic/taint tools (angr, triton)")
+        p.add_argument("--no-binwalk", action="store_true")
+        p.add_argument("--human", action="store_true")
+        p.add_argument("--timeout", type=int)
+        p.add_argument("--mem", type=int, help="memory MiB")
+        p.add_argument("--disk", type=int, help="disk MiB")
+        p.add_argument("--approve", default="", help="comma list of tools approved for write/hw_read")
+        p.add_argument("--approve-class", default="", help="comma list of classes approved (write,hw_read)")
+        p.add_argument("--frank-ticket", type=int, help="wq id carrying Frank's approval (hw_write)")
+
+    p = sub.add_parser("plan"); common(p, target_required=False)
+    p.add_argument("--no-hw", action="store_true", help="skip lsusb hardware probe on the runner")
+    p.add_argument("--with-fingerprint", action="store_true")
+    p = sub.add_parser("run"); common(p)
+    p.add_argument("--project", required=True)
+    p.add_argument("--stages", default="")
+    p.add_argument("--tools", default="")
+    p.add_argument("--argv", help="JSON argv for a single --tools entry with no registered invocation (still gated)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-state", action="store_true")
+    p = sub.add_parser("fingerprint"); p.add_argument("target"); p.add_argument("--no-binwalk", action="store_true")
+    p = sub.add_parser("gate"); p.add_argument("tool")
+    p.add_argument("--approve", default=""); p.add_argument("--approve-class", default="")
+    p.add_argument("--frank-ticket", type=int)
+    p = sub.add_parser("search"); p.add_argument("term")
+    sub.add_parser("runner-check"); sub.add_parser("runner-deploy")
+    sub.add_parser("version")
+    a = ap.parse_args()
+    a.approve_list = csv(getattr(a, "approve", ""))
+    a.approve_class_list = [c for c in csv(getattr(a, "approve_class", "")) if c in ("write", "hw_read")]
+    a.stages_list = csv(getattr(a, "stages", ""))
+    a.tools_list = csv(getattr(a, "tools", ""))
+    a.argv_override = None
+    if getattr(a, "argv", None):
+        if len(a.tools_list) != 1:
+            die("--argv needs exactly one --tools entry")
+        a.argv_override = json.loads(a.argv)
+        if not isinstance(a.argv_override, list) or not all(isinstance(x, str) for x in a.argv_override):
+            die("--argv must be a JSON list of strings")
+    if a.cmd == "plan":
+        cmd_plan(a)
+    elif a.cmd == "run":
+        cmd_run(a)
+    elif a.cmd == "fingerprint":
+        cmd_fingerprint(a)
+    elif a.cmd == "gate":
+        cmd_gate(a)
+    elif a.cmd == "search":
+        cmd_search(a)
+    elif a.cmd == "runner-check":
+        out(Runner(orch_of(load_registry())).check())
+    elif a.cmd == "runner-deploy":
+        out(Runner(orch_of(load_registry())).deploy())
+    elif a.cmd == "version":
+        out({"re-orchestrate": VERSION, "registry": REGISTRY_PATH, "evidence_root": str(EVIDENCE_ROOT)})
+
+
+if __name__ == "__main__":
+    main()

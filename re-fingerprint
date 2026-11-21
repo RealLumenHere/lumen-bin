@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""re-fingerprint — RE target fingerprinter (wq#5200, Limpet capability router stage 1).
+
+Input : a file path.
+Output: JSON {format, arch, os, vendor_hints, embedded_formats, ...} on stdout.
+
+Sources, in order of trust:
+  1. container/header parsers (ELF, PE, Mach-O, APK/ZIP, DEX, FDT/DTB, Android boot,
+     Rockchip RKFW/RKAF/RKNS, uImage, Android sparse, LiME, Windows crash dump)
+  2. signature sweep over the whole file (offset, validated) -> embedded_formats,
+     recursing into gzip/xz/lzma/bzip2/zstd payloads up to --depth (nested firmware)
+  3. `file -b` and `binwalk` signature scan (when installed; read-only, timed)
+  4. vendor / OS strings (U-Boot, Linux version, Android build props, RTOS banners, SoC ids)
+
+`format` uses re-route's vocabulary (ELF PE Mach-O APK DEX JAR HBC PYC Godot_PCK firmware
+memory_dump unknown) and `conditions` matches routing.rules augments in
+/home/lumen/re/toolkit-expansion/capability-registry.json, so a fingerprint routes 1:1.
+
+Read-only: never writes, never executes the target.
+"""
+import argparse, bz2, hashlib, json, lzma, math, os, re, shutil, struct, subprocess, sys, zipfile, zlib
+from pathlib import Path
+
+VERSION = "1.0.0"
+SCAN_CAP_DEFAULT = 256 * 1024 * 1024
+CHUNK = 8 * 1024 * 1024
+OVERLAP = 4096
+MAX_HITS = 400
+INFLATE_CAP = 64 * 1024 * 1024
+
+EM = {3: "x86", 62: "x86_64", 40: "arm", 183: "aarch64", 8: "mips", 10: "mips", 20: "ppc", 21: "ppc64",
+      243: "riscv", 94: "xtensa", 83: "avr", 2: "sparc", 43: "sparcv9", 50: "ia64", 42: "superh",
+      164: "hexagon", 258: "loongarch", 92: "openrisc", 106: "blackfin", 88: "m32r", 4: "m68k"}
+PE_MACHINE = {0x14c: "x86", 0x8664: "x86_64", 0x1c0: "arm", 0x1c4: "arm", 0xaa64: "aarch64",
+              0x200: "ia64", 0x5064: "riscv", 0x5032: "riscv"}
+MACHO_CPU = {7: "x86", 0x01000007: "x86_64", 12: "arm", 0x0100000c: "aarch64", 18: "ppc", 0x01000012: "ppc64"}
+HBC_MAGIC = bytes.fromhex("c61fbc03c103191f")
+ET = {1: "relocatable", 2: "executable", 3: "shared_object", 4: "core"}
+
+try:
+    from compression import zstd as _zstd  # Python >= 3.14
+except Exception:  # pragma: no cover
+    _zstd = None
+
+
+def u32le(b, o=0):
+    return struct.unpack_from("<I", b, o)[0]
+
+
+def u32be(b, o=0):
+    return struct.unpack_from(">I", b, o)[0]
+
+
+def read_at(path, off, n):
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            return f.read(n)
+    except OSError:
+        return b""
+
+
+# ---------------------------------------------------------------- header parsers
+def parse_elf(b):
+    if len(b) < 52 or b[:4] != b"\x7fELF":
+        return None
+    cls, data = b[4], b[5]
+    e = "<" if data == 1 else ">"
+    bits = 64 if cls == 2 else 32
+    e_type, e_machine = struct.unpack_from(e + "HH", b, 16)
+    info = {"bits": bits, "endianness": "little" if data == 1 else "big", "type": ET.get(e_type, str(e_type)),
+            "machine": e_machine, "arch": EM.get(e_machine, f"em_{e_machine}"), "osabi": b[7]}
+    try:
+        if bits == 64:
+            phoff, shoff = struct.unpack_from(e + "QQ", b, 32)
+            phentsize, phnum, shentsize, shnum, shstrndx = struct.unpack_from(e + "HHHHH", b, 54)
+        else:
+            phoff, shoff = struct.unpack_from(e + "II", b, 28)
+            phentsize, phnum, shentsize, shnum, shstrndx = struct.unpack_from(e + "HHHHH", b, 42)
+        info.update(_phdr_shdr(b, e, bits, phoff, phentsize, phnum, shoff, shentsize, shnum, shstrndx))
+    except struct.error:
+        info["truncated_header"] = True
+    return info
+
+
+def _phdr_shdr(b, e, bits, phoff, phentsize, phnum, shoff, shentsize, shnum, shstrndx):
+    out = {"interp": None, "sections": [], "stripped": None}
+    for i in range(min(phnum, 64)):
+        o = phoff + i * phentsize
+        if o + phentsize > len(b):
+            break
+        p_type = struct.unpack_from(e + "I", b, o)[0]
+        if p_type == 3:  # PT_INTERP
+            if bits == 64:
+                p_off, p_filesz = struct.unpack_from(e + "Q", b, o + 8)[0], struct.unpack_from(e + "Q", b, o + 32)[0]
+            else:
+                p_off, p_filesz = struct.unpack_from(e + "I", b, o + 4)[0], struct.unpack_from(e + "I", b, o + 16)[0]
+            if p_off + p_filesz <= len(b):
+                out["interp"] = b[p_off:p_off + p_filesz].rstrip(b"\0").decode("latin1")
+    if shoff and shnum and shstrndx < shnum and shoff + shnum * shentsize <= len(b):
+        def sh(i):
+            o = shoff + i * shentsize
+            if bits == 64:
+                name, = struct.unpack_from(e + "I", b, o)
+                off, size = struct.unpack_from(e + "QQ", b, o + 24)
+            else:
+                name, = struct.unpack_from(e + "I", b, o)
+                off, size = struct.unpack_from(e + "II", b, o + 16)
+            return name, off, size
+        _, stroff, strsize = sh(shstrndx)
+        strtab = b[stroff:stroff + strsize]
+        names = []
+        for i in range(min(shnum, 512)):
+            n, _, _ = sh(i)
+            end = strtab.find(b"\0", n)
+            names.append(strtab[n:end if end >= 0 else None].decode("latin1"))
+        out["sections"] = [n for n in names if n]
+        out["stripped"] = ".symtab" not in names
+    return out
+
+
+def parse_pe(b):
+    if len(b) < 0x40 or b[:2] != b"MZ":
+        return None
+    lfanew = u32le(b, 0x3C)
+    if lfanew + 24 > len(b) or b[lfanew:lfanew + 4] != b"PE\0\0":
+        return None
+    machine, nsec = struct.unpack_from("<HH", b, lfanew + 4)
+    opt_size, chars = struct.unpack_from("<HH", b, lfanew + 20)
+    opt = lfanew + 24
+    magic = struct.unpack_from("<H", b, opt)[0] if opt + 2 <= len(b) else 0
+    info = {"machine": machine, "arch": PE_MACHINE.get(machine, f"pe_{machine:#x}"),
+            "bits": 64 if magic == 0x20B else 32, "dll": bool(chars & 0x2000), "endianness": "little"}
+    sub_off = opt + 68
+    if sub_off + 2 <= len(b):
+        info["subsystem"] = {1: "native", 2: "windows_gui", 3: "windows_cui", 10: "efi_application",
+                             11: "efi_boot_driver", 12: "efi_runtime_driver"}.get(
+            struct.unpack_from("<H", b, sub_off)[0], "other")
+    return info
+
+
+def parse_macho(b):
+    if len(b) < 8:
+        return None
+    m = b[:4]
+    if m in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf"):
+        cpu = u32be(b, 4); e = "big"
+    elif m in (b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"):
+        cpu = u32le(b, 4); e = "little"
+    elif m == b"\xca\xfe\xba\xbe":
+        n = u32be(b, 4)
+        if not 0 < n < 20:  # java class files share this magic; nfat_arch is small for Mach-O
+            return None
+        cpus = [MACHO_CPU.get(u32be(b, 8 + 20 * i), "other") for i in range(n) if 8 + 20 * i + 4 <= len(b)]
+        return {"fat": True, "arch": cpus[0] if cpus else None, "archs": cpus, "endianness": "big"}
+    else:
+        return None
+    return {"fat": False, "arch": MACHO_CPU.get(cpu, "other"), "bits": 64 if m[3] in (0xcf, 0xfe) and m in (b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe") else 32,
+            "endianness": e}
+
+
+def parse_fdt(b, off=0):
+    """Minimal flattened-device-tree walk: root `model` + `compatible`."""
+    try:
+        if b[off:off + 4] != b"\xd0\x0d\xfe\xed":
+            return None
+        total, o_struct, o_strings, _, version = struct.unpack_from(">IIIII", b, off + 4)
+        if not (64 <= total <= 64 * 1024 * 1024) or o_struct >= total or o_strings >= total or version > 32:
+            return None
+        blob = b[off:off + total]
+        p, depth, props = o_struct, 0, {}
+        while p + 4 <= len(blob):
+            tok = u32be(blob, p); p += 4
+            if tok == 1:  # BEGIN_NODE
+                end = blob.find(b"\0", p); p = (end + 4) & ~3; depth += 1
+            elif tok == 2:
+                depth -= 1
+                if depth <= 0:
+                    break
+            elif tok == 3:
+                ln, nameoff = struct.unpack_from(">II", blob, p); p += 8
+                val = blob[p:p + ln]; p = (p + ln + 3) & ~3
+                if depth == 1:
+                    ne = blob.find(b"\0", o_strings + nameoff)
+                    name = blob[o_strings + nameoff:ne].decode("latin1")
+                    if name in ("model", "compatible"):
+                        props[name] = [s.decode("latin1") for s in val.split(b"\0") if s]
+            elif tok == 4:
+                continue
+            elif tok == 9:
+                break
+            else:
+                break
+        return {"total_size": total, "model": (props.get("model") or [None])[0], "compatible": props.get("compatible", [])}
+    except (struct.error, ValueError):
+        return None
+
+
+def parse_apk(path):
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return None
+    info = {"entries": len(names), "android": "AndroidManifest.xml" in names, "jar": "META-INF/MANIFEST.MF" in names,
+            "abis": sorted({n.split("/")[1] for n in names if n.startswith("lib/") and n.count("/") >= 2}),
+            "native_libs": sorted({n.rsplit("/", 1)[-1] for n in names if n.startswith("lib/") and n.endswith(".so")})[:80],
+            "dex": sum(1 for n in names if re.fullmatch(r"classes\d*\.dex", n)), "frameworks": []}
+    fw = info["frameworks"]
+    libs = set(info["native_libs"])
+    if "libflutter.so" in libs or "libapp.so" in libs:
+        fw.append("flutter")
+    if "libil2cpp.so" in libs or any(n.endswith("global-metadata.dat") for n in names):
+        fw.append("unity_il2cpp")
+    elif "libmono.so" in libs or "libmonobdwgc-2.0.so" in libs:
+        fw.append("unity_mono")
+    if "libmonodroid.so" in libs or any(n.startswith("assemblies/") for n in names):
+        fw.append("xamarin")
+    if any(n.endswith("index.android.bundle") for n in names):
+        fw.append("react_native")
+        if "libhermes.so" in libs:
+            fw.append("hermes")
+    if any(n.endswith(".pck") for n in names) or "libgodot_android.so" in libs:
+        fw.append("godot")
+    if any(n.startswith("assets/www/") for n in names):
+        fw.append("cordova")
+    if any(n.startswith("kotlin/") for n in names):
+        fw.append("kotlin")
+    info["_names"] = names
+    return info
+
+
+# ---------------------------------------------------------------- signature sweep
+def _v_squash_le(b, i):
+    return len(b) >= i + 96 and 1 <= struct.unpack_from("<H", b, i + 28)[0] <= 4  # s_major
+def _v_squash_be(b, i):
+    return len(b) >= i + 96 and 1 <= struct.unpack_from(">H", b, i + 28)[0] <= 4
+def _v_gzip(b, i):
+    return len(b) > i + 10 and b[i + 3] & 0xE0 == 0 and b[i + 9] in (0, 3, 7, 11, 255)
+def _v_uimage(b, i):
+    return len(b) >= i + 64 and 0 < u32be(b, i + 12) < 512 * 1024 * 1024
+def _v_dtb(b, i):
+    return parse_fdt(b, i) is not None
+def _v_elf(b, i):
+    return len(b) >= i + 20 and b[i + 4] in (1, 2) and b[i + 5] in (1, 2) and b[i + 6] == 1
+def _v_pe(b, i):
+    if len(b) < i + 0x40:
+        return False
+    lf = u32le(b, i + 0x3C)
+    return lf < 4096 and b[i + lf:i + lf + 4] == b"PE\0\0"
+def _v_lzma(b, i):
+    if len(b) < i + 13:
+        return False
+    dsize = struct.unpack_from("<Q", b, i + 5)[0]
+    return dsize == 0xFFFFFFFFFFFFFFFF or 0 < dsize < 1 << 32
+def _v_zimage(b, i):  # matched at magic offset 0x24
+    return True
+def _v_jffs2(b, i):
+    return len(b) >= i + 12 and u32le(b, i + 4) < 1 << 24
+def _v_krnl(b, i):
+    return len(b) >= i + 12 and 0 < u32le(b, i + 4) < 512 * 1024 * 1024
+
+
+def _v_ext(b, i):
+    sb = i + 0x400  # superblock; magic sits at sb+0x38
+    if len(b) < sb + 0x60:
+        return False
+    log_bs, = struct.unpack_from("<I", b, sb + 24)
+    state, = struct.unpack_from("<H", b, sb + 0x3A)
+    rev, = struct.unpack_from("<I", b, sb + 0x4C)
+    inodes, blocks = struct.unpack_from("<II", b, sb)
+    return log_bs <= 6 and state in (1, 2, 3) and rev <= 1 and 0 < inodes <= blocks * 64 and blocks > 0
+
+
+# (regex, name, kind, validator, delta) — delta: magic offset inside the structure (start = hit - delta)
+SIGS = [
+    (rb"hsqs", "squashfs_le", "filesystem", _v_squash_le, 0),
+    (rb"sqsh", "squashfs_be", "filesystem", _v_squash_be, 0),
+    (rb"\x45\x3d\xcd\x28", "cramfs", "filesystem", None, 0),
+    (rb"\x85\x19(?:\x01\xe0|\x02\xe0|\x03\x20)", "jffs2", "filesystem", _v_jffs2, 0),
+    (rb"UBI#\x01", "ubi", "filesystem", None, 0),
+    (rb"\x31\x18\x10\x06", "ubifs", "filesystem", None, 0),
+    (rb"\x3a\xff\x26\xed", "android_sparse", "filesystem", None, 0),
+    (rb"070701|070702", "cpio", "filesystem", None, 0),
+    (rb"ANDROID!", "android_boot", "boot_image", None, 0),
+    (rb"VNDRBOOT", "android_vendor_boot", "boot_image", None, 0),
+    (rb"\x27\x05\x19\x56", "uimage", "boot_image", _v_uimage, 0),
+    (rb"\xd0\x0d\xfe\xed", "fdt_dtb", "device_tree", _v_dtb, 0),
+    (rb"\xd7\xb7\xab\x1e", "android_dtbo_table", "device_tree", None, 0),
+    (rb"RKFW", "rockchip_rkfw", "vendor_container", None, 0),
+    (rb"KRNL", "rockchip_krnl", "vendor_container", _v_krnl, 0),
+    (rb"RKAF", "rockchip_rkaf", "vendor_container", None, 0),
+    (rb"RKNS", "rockchip_idblock_v2", "bootloader", None, 0),
+    (rb"RKSS", "rockchip_idblock_signed", "bootloader", None, 0),
+    (rb"eGON\.BT0", "allwinner_boot0", "bootloader", None, 4),
+    (rb"HDR0", "trx", "vendor_container", None, 0),
+    (rb"_FVH", "uefi_firmware_volume", "uefi", None, 0x28),
+    (rb"\x5a\xa5\xf0\x0f", "intel_flash_descriptor", "uefi", None, 0x10),
+    (rb"\x18\x28\x6f\x01", "linux_arm_zimage", "kernel", _v_zimage, 0x24),
+    (rb"ARMd", "linux_arm64_image", "kernel", None, 0x38),
+    (rb"HdrS", "linux_x86_bzimage", "kernel", None, 0x202),
+    (rb"\x1f\x8b\x08", "gzip", "compressed", _v_gzip, 0),
+    (rb"\xfd7zXZ\x00", "xz", "compressed", None, 0),
+    (rb"\x5d\x00\x00[\x00\x01\x02\x04\x08\x10\x20\x40\x80]\x00", "lzma", "compressed", _v_lzma, 0),
+    (rb"\x28\xb5\x2f\xfd", "zstd", "compressed", None, 0),
+    (rb"BZh[1-9]1AY&SY", "bzip2", "compressed", None, 0),
+    (rb"\x04\x22\x4d\x18", "lz4", "compressed", None, 0),
+    (rb"7z\xbc\xaf\x27\x1c", "7z", "archive", None, 0),
+    (rb"PK\x03\x04", "zip", "archive", None, 0),
+    (rb"ustar", "tar", "archive", None, 257),
+    (rb"\x7fELF", "elf", "executable", _v_elf, 0),
+    (rb"MZ", "pe", "executable", _v_pe, 0),
+    (rb"\x53\xef", "ext2_3_4", "filesystem", _v_ext, 0x438),
+]
+SIG_RES = [re.compile(s[0], re.S) for s in SIGS]
+NOISY = {"lzma", "gzip", "pe", "ext2_3_4", "jffs2", "zip", "lz4", "cramfs", "ubifs"}
+
+STRING_HINTS = [
+    # (regex, field, value-or-None(use match), note)
+    (rb"Linux version (\d+\.\d+[\w.+-]*)", "os", "linux", "kernel banner"),
+    (rb"U-Boot (?:SPL )?(\d{4}\.\d{2}[\w.-]*)", "bootloader", "u-boot", "u-boot banner"),
+    (rb"ro\.build\.version\.release=([\w.]+)", "os", "android", "build.prop"),
+    (rb"ro\.product\.board=([\w.-]+)", "board", None, "build.prop"),
+    (rb"OpenWrt|LEDE Reboot", "os", "openwrt", "distro string"),
+    (rb"BusyBox v(\d[\w.]+)", "userland", "busybox", "busybox banner"),
+    (rb"FreeRTOS(?: Kernel)? ?V?(\d[\w.]*)", "os", "freertos", "rtos banner"),
+    (rb"Zephyr OS|zephyr_version|\*\*\* Booting Zephyr", "os", "zephyr", "rtos banner"),
+    (rb"VxWorks", "os", "vxworks", "rtos banner"),
+    (rb"ThreadX|Azure RTOS", "os", "threadx", "rtos banner"),
+    (rb"RT-Thread", "os", "rt-thread", "rtos banner"),
+    (rb"NuttX", "os", "nuttx", "rtos banner"),
+    (rb"QNX Neutrino|procnto", "os", "qnx", "rtos banner"),
+    (rb"ESP-IDF v?(\d[\w.-]*)|esp-idf", "os", "esp-idf", "espressif sdk"),
+]
+VENDOR_HINTS = [
+    (rb"\b(rk3[0-9]{3}[a-z]?|rk2[0-9]{3}|rv11[0-9]{2}|px30)\b", "rockchip"),
+    (rb"[Rr]ockchip|ROCKCHIP", "rockchip"),
+    (rb"\b(sun[4-9]i|sun50i|sun8i)[\w-]*", "allwinner"),
+    (rb"[Aa]llwinner", "allwinner"),
+    (rb"\b(mt[0-9]{4}[a-z]?)\b|[Mm]edia[Tt]ek|MEDIATEK|BRLYT|EMMC_BOOT", "mediatek"),
+    (rb"\b(msm[0-9]{4}|sdm[0-9]{3}|sm[0-9]{4}|apq[0-9]{4}|ipq[0-9]{4}|qcs[0-9]{3,4})\b|[Qq]ualcomm|QUALCOMM", "qualcomm"),
+    (rb"\b(meson[\w-]*|s905[\w]*|s912|a311d)\b|[Aa]mlogic", "amlogic"),
+    (rb"\b(bcm[0-9]{4,5}[a-z]?)\b|[Bb]roadcom", "broadcom"),
+    (rb"\b(hi35[0-9]{2}[\w]*|hi37[0-9]{2})\b|[Hh]i[Ss]ilicon", "hisilicon"),
+    (rb"\b(rtl[0-9]{4}[a-z]?)\b|[Rr]ealtek", "realtek"),
+    (rb"\b(exynos[0-9]*)\b", "samsung"),
+    (rb"\b(imx[0-9][\w]*|i\.MX[0-9][\w]*)\b|NXP Semiconductors", "nxp"),
+    (rb"\b(esp32[\w-]*|esp8266)\b|[Ee]spressif", "espressif"),
+    (rb"\b(stm32[a-z][0-9][\w]*)\b|STMicroelectronics", "st"),
+    (rb"\b(nrf5[0-9]{3})\b|Nordic Semiconductor", "nordic"),
+    (rb"[Ii]ngenic|\b(t3[01]|x[12]000)\b(?=.*ingenic)", "ingenic"),
+    (rb"\b(rt3[0-9]{3}|rt5350|mt7620|mt7621|mt7628)\b|Ralink", "mediatek_ralink"),
+    (rb"\b(am335x|am62x|omap[0-9]+)\b|Texas Instruments", "ti"),
+    (rb"\b(tegra[0-9]*|t[12][0-9]{2})\b(?=.*tegra)|NVIDIA Tegra", "nvidia"),
+]
+STR_RE_SCAN = 64 * 1024 * 1024
+
+
+def _iter_matches(data):
+    per = []
+    for idx, rx in enumerate(SIG_RES):
+        n = 0
+        for m in rx.finditer(data):
+            per.append((m.start(), idx))
+            n += 1
+            if n >= 2000:  # pathological repeats (padding, tables): stop counting this signature
+                break
+    per.sort()
+    return per
+
+
+def sweep(data, base, depth, maxdepth, hits, top_format):
+    for mstart, idx in _iter_matches(data):
+        if len(hits) >= MAX_HITS:
+            return
+        _, name, kind, validator, delta = SIGS[idx]
+        start = mstart - delta
+        if start < 0:
+            continue
+        if base + start == 0 and depth == 0 and name in ("elf", "pe", "zip"):
+            continue  # that's the top-level container itself
+        try:
+            if validator and not validator(data, start if delta == 0 else start):
+                continue
+        except (struct.error, IndexError):
+            continue
+        h = {"offset": base + start, "format": name, "kind": kind, "depth": depth, "source": "signature"}
+        if name in NOISY:
+            h["confidence"] = "low"
+        if name == "fdt_dtb":
+            h["dtb"] = parse_fdt(data, start)
+        if name == "elf":
+            e = parse_elf(data[start:start + 4096])
+            if e:
+                h["arch"], h["elf_type"] = e["arch"], e["type"]
+        hits.append(h)
+        if kind == "compressed" and depth < maxdepth and name in ("gzip", "xz", "lzma", "bzip2", "zstd"):
+            inner = inflate(name, data[start:start + INFLATE_CAP * 2])
+            if inner and len(inner) > 512:
+                h["inflated_size"] = len(inner)
+                h["inner_sha256"] = hashlib.sha256(inner).hexdigest()
+                sub = []
+                sweep(inner, 0, depth + 1, maxdepth, sub, None)
+                for s in sub:
+                    s["parent_offset"] = base + start
+                    s["parent_format"] = name
+                h["children"] = sub[:60]
+                h["_inner"] = inner
+
+
+def inflate(name, blob):
+    try:
+        if name == "gzip":
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            return d.decompress(blob, INFLATE_CAP)
+        if name in ("xz", "lzma"):
+            d = lzma.LZMADecompressor(format=lzma.FORMAT_XZ if name == "xz" else lzma.FORMAT_ALONE)
+            return d.decompress(blob, max_length=INFLATE_CAP)
+        if name == "bzip2":
+            return bz2.BZ2Decompressor().decompress(blob, max_length=INFLATE_CAP)
+        if name == "zstd" and _zstd is not None:
+            return _zstd.ZstdDecompressor().decompress(blob, max_length=INFLATE_CAP)
+    except Exception:
+        return None
+    return None
+
+
+def sweep_file(path, cap, maxdepth):
+    hits, size = [], os.path.getsize(path)
+    with open(path, "rb") as f:
+        off = 0
+        while off < min(size, cap) and len(hits) < MAX_HITS:
+            f.seek(off)
+            data = f.read(CHUNK + OVERLAP)
+            if not data:
+                break
+            sub = []
+            sweep(data, off, 0, maxdepth, sub, None)
+            seen = {(h["offset"], h["format"]) for h in hits}
+            hits.extend(h for h in sub if (h["offset"], h["format"]) not in seen and h["offset"] < off + CHUNK)
+            off += CHUNK
+    return hits, size > cap
+
+
+PRINTABLE = re.compile(rb"[\x20-\x7e]{6,}")
+
+
+def printable(blob):
+    return b"\n".join(PRINTABLE.findall(blob))
+
+
+def strings_hints(blobs):
+    os_hints, vendors, misc = {}, {}, {}
+    for raw in blobs:
+        blob = printable(raw)
+        for rx, field, value, note in STRING_HINTS:
+            m = re.search(rx, blob)
+            if not m:
+                continue
+            ver = next((g.decode("latin1") for g in m.groups() if g), None) if m.groups() else None
+            if field == "os":
+                os_hints.setdefault(value, {"name": value, "version": ver, "evidence": note})
+            else:
+                misc.setdefault(field, {"value": value or ver, "version": ver if value else None, "evidence": note})
+        for rx, vendor in VENDOR_HINTS:
+            ms = list(re.finditer(rx, blob))
+            if not ms:
+                continue
+            v = vendors.setdefault(vendor, {"vendor": vendor, "matches": 0, "socs": set(), "evidence": "strings"})
+            v["matches"] += len(ms)
+            for m in ms[:50]:
+                g = next((x for x in m.groups() if x), None) if m.groups() else None
+                if g:
+                    v["socs"].add(g.decode("latin1").lower())
+    return os_hints, vendors, misc
+
+
+def entropy_profile(path, size):
+    if size == 0:
+        return {"overall": 0.0, "high_entropy_ratio": 0.0, "blocks_sampled": 0}
+    from collections import Counter
+    blk, n = 65536, min(64, max(1, size // 65536))
+    step = max(1, (size - blk) // max(1, n - 1)) if size > blk else 1
+    ents = []
+    with open(path, "rb") as f:
+        for i in range(n):
+            f.seek(min(i * step, max(0, size - blk)))
+            d = f.read(blk)
+            if not d:
+                break
+            c = Counter(d).values()
+            ents.append(-sum((k / len(d)) * math.log2(k / len(d)) for k in c))
+    return {"overall": round(sum(ents) / len(ents), 3) if ents else 0.0,
+            "high_entropy_ratio": round(sum(1 for e in ents if e > 7.5) / len(ents), 3) if ents else 0.0,
+            "blocks_sampled": len(ents)}
+
+
+def run_file_cmd(path):
+    if not shutil.which("file"):
+        return None
+    try:
+        return subprocess.run(["file", "-b", path], capture_output=True, text=True, timeout=30).stdout.strip() or None
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def run_binwalk(path, timeout):
+    if not shutil.which("binwalk"):
+        return None, "binwalk not installed"
+    try:
+        p = subprocess.run(["binwalk", "-B", path], capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "HOME": os.environ.get("HOME", "/tmp")})
+    except subprocess.TimeoutExpired:
+        return None, f"binwalk timed out after {timeout}s"
+    except OSError as e:
+        return None, f"binwalk failed: {e}"
+    out = []
+    for line in p.stdout.splitlines():
+        m = re.match(r"^(\d+)\s+0x[0-9A-Fa-f]+\s+(.+)$", line)
+        if m:
+            out.append({"offset": int(m.group(1)), "description": m.group(2).strip()[:240], "source": "binwalk"})
+    return out[:MAX_HITS], None
+
+
+# ---------------------------------------------------------------- top-level classification
+def classify(path, head, apk, elf, pe, macho, hits, file_desc):
+    """-> (format, subformat). format uses re-route's vocabulary."""
+    ext = Path(path).suffix.lower()
+    if elf:
+        return ("memory_dump", "elf_core") if elf.get("type") == "core" else ("ELF", elf.get("type"))
+    if pe:
+        return "PE", pe.get("subsystem")
+    if macho:
+        return "Mach-O", "fat" if macho.get("fat") else "thin"
+    if apk:
+        if apk["android"]:
+            return "APK", None
+        if apk["jar"] or ext in (".jar", ".war", ".ear"):
+            return "JAR", None
+    if head[:4] == b"GDPC":
+        return "Godot_PCK", None
+    if head[:8] == HBC_MAGIC:
+        return "HBC", None
+    if head[:4] == b"dex\n":
+        return "DEX", None
+    if ext in (".pyc", ".pyo") or (len(head) >= 4 and head[2:4] == b"\r\n" and
+                                   (3000 <= struct.unpack_from("<H", head)[0] <= 4000 or
+                                    62000 <= struct.unpack_from("<H", head)[0] <= 62300)):
+        return "PYC", None
+    if head[:4] == b"EMiL":
+        return "memory_dump", "lime"
+    if head[:8] in (b"PAGEDUMP", b"PAGEDU64"):
+        return "memory_dump", "windows_crashdump"
+    if head[:4] in (b"hibr", b"HIBR", b"wake", b"WAKE"):
+        return "memory_dump", "windows_hiberfil"
+    top = {h["format"] for h in hits if h["offset"] == 0}
+    for name in ("rockchip_rkfw", "rockchip_rkaf", "rockchip_krnl", "android_dtbo_table", "android_boot", "android_vendor_boot", "uimage", "trx",
+                 "android_sparse", "ubi", "squashfs_le", "squashfs_be", "cramfs", "fdt_dtb",
+                 "intel_flash_descriptor", "rockchip_idblock_v2", "rockchip_idblock_signed"):
+        if name in top:
+            return "firmware", name
+    if any(h["format"] == "uefi_firmware_volume" for h in hits):
+        return "firmware", "uefi"
+    strong = {"filesystem", "boot_image", "kernel", "device_tree", "vendor_container", "bootloader", "uefi"}
+    if any(h["kind"] in strong and h.get("confidence") != "low" for h in hits):
+        return "firmware", "composite"
+    if any(c["kind"] in strong and c.get("confidence") != "low" for h in hits for c in h.get("children", [])):
+        return "firmware", "compressed_payload"
+    if ext in (".vmem", ".lime", ".mem", ".dmp", ".core", ".raw") and not hits:
+        return "memory_dump", "raw"
+    if ext in (".bin", ".img", ".fw", ".rom", ".dump", ".flash", ".trx", ".chk", ".ubi", ".hex"):
+        return "firmware", "raw_blob"
+    if file_desc and re.search(r"firmware|boot ?loader|filesystem|u-boot", file_desc, re.I):
+        return "firmware", "file_magic"
+    return "unknown", None
+
+
+def build_conditions(fmt, arch, elf, pe, apk, data_scan, hits):
+    cond = []
+    if arch:
+        cond.append(f"arch:{arch}")
+        if arch not in ("x86", "x86_64"):
+            cond.append("arch:non_x86")
+    d = data_scan or b""
+    go = b"go.buildinfo" in d or b".gopclntab" in d or b"runtime.main" in d or \
+        bool(elf and (".gopclntab" in elf.get("sections", []) or ".go.buildinfo" in elf.get("sections", [])))
+    if fmt == "ELF":
+        if go:
+            cond.append("go_buildinfo_section_or_pclntab")
+        if b"_kDartVmSnapshotInstructions" in d or b"libflutter" in d:
+            cond.append("libflutter_or_libapp_pair")
+        if b"il2cpp" in d or b"global-metadata.dat" in d:
+            cond.append("il2cpp_metadata_nearby")
+    elif fmt in ("PE", "Mach-O"):
+        if go:
+            cond.append("go_buildinfo")
+        if fmt == "PE":
+            if b"#Strings" in d and b"BSJB" in d:
+                cond.append("dotnet_metadata")
+            if b"il2cpp" in d:
+                cond.append("il2cpp_metadata_nearby")
+            if b"GDPC" in d:
+                cond.append("godot_pck_embedded")
+    elif fmt == "APK" and apk:
+        fw = apk["frameworks"]
+        if "flutter" in fw:
+            cond.append("flutter_libapp")
+        if "unity_il2cpp" in fw:
+            cond.append("il2cpp_metadata")
+        if "hermes" in fw or any(n.endswith(".hbc") for n in apk.get("_names", [])):
+            cond.append("hermes_bytecode")
+        if "godot" in fw:
+            cond.append("godot_pck_embedded")
+        if apk["native_libs"]:
+            cond.append("native_libs")
+    if any(h["format"] in ("uefi_firmware_volume", "intel_flash_descriptor") for h in hits):
+        cond.append("uefi_volume")
+    if fmt == "firmware":
+        if any(h["kind"] == "filesystem" and h.get("confidence") != "low" for h in hits):
+            cond.append("embedded_filesystem")
+        if any(h["kind"] == "kernel" for h in hits) or any(c["kind"] == "kernel" for h in hits for c in h.get("children", [])):
+            cond.append("embedded_kernel")
+        if any(h["format"] == "elf" for h in hits):
+            cond.append("embedded_elf")
+    return cond
+
+
+def fingerprint(path, scan_cap=SCAN_CAP_DEFAULT, depth=2, use_binwalk=True, binwalk_timeout=120):
+    path = os.path.abspath(path)
+    size = os.path.getsize(path)
+    sha, md5 = hashlib.sha256(), hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha.update(chunk); md5.update(chunk)
+    head = read_at(path, 0, 1 << 20)
+    elf, pe, macho = parse_elf(head), parse_pe(head), parse_macho(head)
+    apk = parse_apk(path) if head[:4] == b"PK\x03\x04" else None
+    hits, truncated = sweep_file(path, scan_cap, depth)
+    if apk:
+        hits = [h for h in hits if h["format"] != "zip"]
+        use_binwalk = False
+    file_desc = run_file_cmd(path)
+    bw, bw_note = run_binwalk(path, binwalk_timeout) if use_binwalk else (None, "disabled")
+    fmt, sub = classify(path, head, apk, elf, pe, macho, hits, file_desc)
+
+    scan = read_at(path, 0, STR_RE_SCAN)
+    blobs = [scan] + [h.pop("_inner") for h in hits if "_inner" in h]
+    for h in hits:
+        for c in h.get("children", []):
+            c.pop("_inner", None)
+    os_h, vend, misc = strings_hints(blobs)
+
+    arch = bits = endian = None
+    if elf:
+        arch, bits, endian = elf["arch"], elf["bits"], elf["endianness"]
+    elif pe:
+        arch, bits, endian = pe["arch"], pe["bits"], "little"
+    elif macho:
+        arch, bits, endian = macho.get("arch"), macho.get("bits"), macho.get("endianness")
+    elif apk and apk["abis"]:
+        abi_arch = {"arm64-v8a": "aarch64", "armeabi-v7a": "arm", "armeabi": "arm", "x86": "x86", "x86_64": "x86_64"}
+        archs = [abi_arch.get(a, a) for a in apk["abis"]]
+        arch = "aarch64" if "aarch64" in archs else archs[0]
+    else:
+        embedded = [h.get("arch") for h in hits if h.get("arch")] + \
+                   [c.get("arch") for h in hits for c in h.get("children", []) if c.get("arch")]
+        if embedded:
+            arch = max(set(embedded), key=embedded.count)
+        elif any(h["format"] == "linux_arm64_image" for h in hits):
+            arch = "aarch64"
+        elif any(h["format"] == "linux_arm_zimage" for h in hits):
+            arch = "arm"
+
+    # vendor hints: header-derived first (high confidence), then strings
+    vendor_hints = []
+    def add_vendor(vendor, evidence, conf, soc=None, offset=None):
+        for v in vendor_hints:
+            if v["vendor"] == vendor:
+                if evidence not in v["evidence"]:
+                    v["evidence"].append(evidence)
+                v["confidence"] = max(v["confidence"], conf)
+                if soc and soc not in v["socs"]:
+                    v["socs"].append(soc)
+                return
+        vendor_hints.append({"vendor": vendor, "confidence": conf, "socs": [soc] if soc else [], "evidence": [evidence],
+                             **({"offset": offset} if offset is not None else {})})
+    for h in hits:
+        if h["format"].startswith("rockchip_"):
+            add_vendor("rockchip", f"{h['format']}@{h['offset']:#x}", 0.95 if h["offset"] == 0 else 0.8)
+        elif h["format"] == "allwinner_boot0":
+            add_vendor("allwinner", f"eGON.BT0@{h['offset']:#x}", 0.9)
+        elif h["format"] == "intel_flash_descriptor":
+            add_vendor("intel", f"flash descriptor@{h['offset']:#x}", 0.7)
+        elif h["format"] == "trx":
+            add_vendor("broadcom", f"TRX HDR0@{h['offset']:#x}", 0.5)
+        dtb = h.get("dtb") or {}
+        for comp in (dtb.get("compatible") or []):
+            if "," in comp:
+                add_vendor(comp.split(",")[0], f"dtb compatible '{comp}'@{h['offset']:#x}", 0.9, soc=comp.split(",")[1])
+    for v in vend.values():
+        conf = min(0.85, 0.3 + 0.05 * v["matches"])
+        for soc in sorted(v["socs"])[:6] or [None]:
+            add_vendor(v["vendor"], f"strings x{v['matches']}", round(conf, 2), soc=soc)
+    vendor_hints.sort(key=lambda v: -v["confidence"])
+
+    os_name = None
+    if elf:
+        os_name = "android" if (elf.get("interp") or "").startswith("/system/bin/linker") else \
+            ("linux" if elf.get("interp") or elf.get("osabi") in (0, 3) else None)
+    elif pe:
+        os_name = "uefi" if (pe.get("subsystem") or "").startswith("efi") else "windows"
+    elif macho:
+        os_name = "darwin"
+    elif fmt in ("APK", "DEX", "HBC"):
+        os_name = "android"
+    for pref in ("android", "openwrt", "linux", "zephyr", "freertos", "threadx", "vxworks", "qnx", "nuttx", "rt-thread", "esp-idf"):
+        if pref in os_h and (os_name is None or (os_name == "linux" and pref in ("android", "openwrt"))):
+            os_name = pref
+            break
+
+    dtbs = [h["dtb"] for h in hits if h.get("dtb")] + [c["dtb"] for h in hits for c in h.get("children", []) if c.get("dtb")]
+    data_scan = scan if fmt in ("ELF", "PE", "Mach-O") else None
+    conditions = build_conditions(fmt, arch, elf, pe, apk, data_scan, hits)
+    ent = entropy_profile(path, size)
+    warnings = []
+    if truncated:
+        warnings.append(f"signature sweep capped at {scan_cap} bytes of {size}")
+    if ent["high_entropy_ratio"] > 0.9 and fmt in ("firmware", "unknown") and not any(h["kind"] == "compressed" for h in hits[:5]):
+        warnings.append("near-uniform high entropy without a known compression header: likely encrypted/obfuscated image")
+        conditions.append("likely_encrypted")
+    if bw_note and use_binwalk:
+        warnings.append(bw_note)
+
+    confidence = 0.95 if fmt in ("ELF", "PE", "Mach-O", "APK", "DEX", "HBC", "JAR") else \
+        0.85 if sub and sub not in ("raw_blob", "file_magic", "raw") else 0.6 if fmt != "unknown" else 0.2
+
+    apk_out = {k: v for k, v in apk.items() if not k.startswith("_")} if apk else None
+    return {
+        "fingerprinter": f"re-fingerprint {VERSION}",
+        "path": path, "size": size, "sha256": sha.hexdigest(), "md5": md5.hexdigest(),
+        "format": fmt, "subformat": sub, "confidence": confidence,
+        "file_magic": file_desc,
+        "arch": arch, "bits": bits, "endianness": endian,
+        "os": os_name, "os_hints": list(os_h.values()),
+        "vendor_hints": vendor_hints,
+        "embedded_formats": hits,
+        "binwalk": bw,
+        "device_trees": dtbs[:10],
+        "conditions": conditions,
+        "entropy": ent,
+        "elf": {k: v for k, v in elf.items() if k != "sections"} | {"section_count": len(elf.get("sections", []))} if elf else None,
+        "pe": pe, "macho": macho, "apk": apk_out,
+        "strings_misc": misc,
+        "warnings": warnings,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description="RE target fingerprinter (wq#5200)")
+    ap.add_argument("file")
+    ap.add_argument("--scan-cap", type=int, default=SCAN_CAP_DEFAULT, help="max bytes signature-swept (default 256MiB)")
+    ap.add_argument("--depth", type=int, default=2, help="recursion depth into compressed payloads (default 2)")
+    ap.add_argument("--no-binwalk", action="store_true")
+    ap.add_argument("--binwalk-timeout", type=int, default=120)
+    ap.add_argument("--compact", action="store_true", help="single-line JSON")
+    a = ap.parse_args()
+    if not os.path.isfile(a.file):
+        print(json.dumps({"error": f"not a file: {a.file}"}))
+        sys.exit(2)
+    fp = fingerprint(a.file, a.scan_cap, a.depth, not a.no_binwalk, a.binwalk_timeout)
+    print(json.dumps(fp, separators=(",", ":"), default=list) if a.compact else json.dumps(fp, indent=2, default=list))
+
+
+if __name__ == "__main__":
+    main()
