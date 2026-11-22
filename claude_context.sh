@@ -15,11 +15,48 @@
 #   /home/lumen/bin/claude_context.sh "your query here"        # full context for query
 #   /home/lumen/bin/claude_context.sh --stats "your query"     # just the stats
 #   /home/lumen/bin/claude_context.sh --core                    # core sections only (~2K tok)
+#   /home/lumen/bin/claude_context.sh --host-check              # host guard line only (wq#4933)
 #
 # This is what Claude should use at session start INSTEAD of reading the full memory file.
 # Saves ~90% tokens per session.
+
+# wq#4933: host guard. On 2026-11-05, mid-migration of Commander from Horus to Lumen, the
+# mcp-horus tunnel had two live cloudflared replicas (Horus and Lumen), each in front of its
+# own dc-gateway. Cloudflare does no traffic steering between replicas of one tunnel, so
+# consecutive start_process calls in one session landed on horus or lumen at random, and a
+# "local" reading (tailscale status, ip addr, known_hosts) was attributed to the wrong box.
+# Lumen is now the sole carrier (wq#4921, lumen_state commander.topology), but a standby
+# replica that serves its own DC would bring the split back. So boot prints which host
+# actually answered and warns loudly when it is not the expected carrier.
+# CLAUDE_CONTEXT_EXPECT_HOST overrides the expected hostname (tests, a deliberate failover).
+host_guard() {
+    local expect=${CLAUDE_CONTEXT_EXPECT_HOST:-lumen}
+    local host user
+    host=$(hostname 2>/dev/null || uname -n)
+    user=$(id -un 2>/dev/null)
+    if [ "$host" = "$expect" ]; then
+        echo "===== HOST: $host (user $user) — expected Commander carrier ====="
+        echo "Commander can route a call to any live tunnel replica (wq#4933): if a later call's"
+        echo "output looks wrong, run 'hostname' in that same call before trusting local output."
+    else
+        echo "===== WARN HOST: $host (user $user) — NOT the expected carrier '$expect' (wq#4933) ====="
+        echo "This call ran on $host. Either Commander failed over, or two tunnel replicas are"
+        echo "live with separate DCs (split routing: calls alternate between hosts)."
+        echo "Until resolved: ssh-wrap every Lumen command (address: lumen_state.py current lumen),"
+        echo "print 'hostname' with any local-looking check, and verify the topology:"
+        echo "  ssh lumen@100.117.66.102 'python3 /home/lumen/foreman/ops/wq4921-commander-lumen/verify_topology.py --min-conns 4'"
+    fi
+    echo
+}
+
+if [ "$1" = "--host-check" ]; then
+    host_guard
+    exit 0
+fi
+
 cd /home/lumen/minerva/context
 if [ "$1" = "--core" ]; then
+    host_guard
     # wq#1127: wq#1116 fixed collisions between two REGISTERED orchestrators but left the
     # anonymous-boot hole open — nothing at the wq chokepoint can tell two unregistered
     # same-host drivers apart (wq#594's docstring), so refuse to hand back a --core context
@@ -103,6 +140,7 @@ if [ "$1" = "--core" ]; then
         || echo "WARN: context_builder failed; using existing claude_memory.md (wq#3647)"
     python3 context_selector.py 'session start core context'
     # wq#backfill: print LATEST.md so Commander sessions also get last-session context
+    # (folded into the tracked copy by wq#4933; it had been hand-added to the live copy only).
     if [ -f /home/lumen/fleet-intel/sessions/LATEST.md ]; then
         echo
         echo "===== LATEST SESSION (fleet-intel/sessions/LATEST.md) ====="
