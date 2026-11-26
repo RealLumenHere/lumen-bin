@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# cass-index-nightly — wq#4870. Nightly full cass index of the Claude Code session
+# archive (/home/lumen/.claude/projects ONLY) into /scratch/cass (xfs on md1).
+# Run by lumen-cass-index.service (oneshot, Nice=10, idle IO). Fail-closed on:
+#   1. binary sha256 drift (cass 0.10.0 linux-amd64, GitHub release asset digest
+#      638ea8a8...c4681 for the tarball; binary inside pinned below)
+#   2. data dir not on /scratch xfs (never root fs, never tmpfs)
+#   3. any connector other than claude_code enabled in ~/.config/cass/sources.toml
+#   4. any indexed source_path outside /home/lumen/.claude/projects (post-index)
+# Manual run: systemctl start lumen-cass-index.service ; journalctl -u lumen-cass-index
+set -euo pipefail
+
+CASS=/home/lumen/bin/cass
+CASS_SHA256=d221153d8e0a79ae37eb492855d32cd2aadb98e707c74c37445f779a46c626dd
+SCOPE=/home/lumen/.claude/projects
+export XDG_DATA_HOME=/scratch/cass/share
+export CASS_AUTO_REFRESH=0 CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1 TUI_HEADLESS=1 CASS_NO_COLOR=1
+DATA="$XDG_DATA_HOME/coding-agent-search"
+
+die() { echo "cass-index-nightly: FAIL: $*" >&2; exit "${2:-1}"; }
+
+# 1. pin
+echo "$CASS_SHA256  $CASS" | sha256sum -c --quiet - || die "sha256 drift on $CASS (expected $CASS_SHA256)" 3
+
+# 2. storage
+mkdir -p "$DATA"
+fstype=$(findmnt -n -o FSTYPE -T "$DATA")
+target=$(findmnt -n -o TARGET -T "$DATA")
+[[ "$target" == /scratch && "$fstype" == xfs ]] || die "$DATA resolves to $target ($fstype), want /scratch xfs" 4
+
+# 3. connector scope
+caps=$(mktemp); trap 'rm -f "$caps"' EXIT
+"$CASS" capabilities --json > "$caps"
+"$CASS" sources agents list --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["disabled_agents"]
+caps = json.load(open(sys.argv[1]))["connectors"]
+enabled = sorted(set(caps) - set(d))
+if enabled != ["claude_code"]:
+    sys.exit("enabled connectors %s != [claude_code]" % enabled)
+' "$caps" || die "connector scope check failed" 5
+
+# 4. index
+t0=$(date +%s)
+"$CASS" index --full --json --no-progress-events
+echo "cass-index-nightly: index --full took $(( $(date +%s) - t0 ))s"
+
+# 5. post-index scope assert: every source_path column value must live under SCOPE
+python3 -I - "$DATA/agent_search.db" "$SCOPE" <<'PY'
+import sqlite3, sys
+db, scope = sys.argv[1], sys.argv[2].rstrip("/") + "/"
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+tabs = [r[0] for r in con.execute("select name from sqlite_master where type='table'")]
+checked, bad = 0, []
+for t in tabs:
+    cols = [r[1] for r in con.execute(f'pragma table_info("{t}")')]
+    if "source_path" not in cols:
+        continue
+    for (p,) in con.execute(f'select distinct source_path from "{t}" where source_path is not null'):
+        checked += 1
+        if not str(p).startswith(scope):
+            bad.append((t, p))
+if bad:
+    print(f"OUT-OF-SCOPE source_path ({len(bad)}):", bad[:10], file=sys.stderr)
+    sys.exit(6)
+if checked == 0:
+    sys.exit("no source_path rows found: index empty or schema changed")
+print(f"cass-index-nightly: scope OK ({checked} distinct source_path under {scope})")
+PY
+
+"$CASS" status --json --stale-threshold 90000 | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print("cass-index-nightly: status", json.dumps({k: d.get(k) for k in ("healthy","status","index","database","recommended_action") if k in d})[:800])'

@@ -13,6 +13,8 @@ source to its best reachable path:
   github  repos/issues/code        -> authenticated GitHub REST API (token via lumen-github-identity.sh)
   hn      hacker news              -> HN Algolia API (stories + comments)
   so      stackoverflow            -> StackExchange API
+  sessions  fleet's own Claude Code session transcripts -> local cass lexical index
+            (/scratch/cass, rebuilt nightly by lumen-cass-index.timer, wq#4870)
 
 Contract (every sub-command, always):
   Prints ONE json object: {"source","ok","query"|"url","results"|"content","error","cached"}
@@ -974,6 +976,62 @@ def cmd_read(args):
                   url=payload["url"], http=payload["http"], bytes=payload["bytes"], cached=False))
 
 
+# ---------- sessions (wq#4870) ----------
+CASS_BIN = os.environ.get("FLEET_CASS_BIN", "/home/lumen/bin/cass")
+CASS_XDG_DATA = os.environ.get("FLEET_CASS_XDG_DATA", "/scratch/cass/share")
+
+
+def cmd_sessions(args):
+    """Search the fleet's own Claude Code session archive (~/.claude/projects) via cass.
+
+    Local, no network, no cache (the index is the cache). Index is built nightly by
+    lumen-cass-index.timer -> /home/lumen/bin/cass-index-nightly. CASS_AUTO_REFRESH=0
+    so a search never spawns a detached background reindex. A stale or missing index is
+    reported as ok:false, never as an empty "no findings" result.
+    """
+    if not os.access(CASS_BIN, os.X_OK):
+        emit(envelope("sessions", False, query=args.query, error=f"cass not installed at {CASS_BIN}"))
+    env = dict(os.environ, XDG_DATA_HOME=CASS_XDG_DATA, CASS_AUTO_REFRESH="0",
+               CODING_AGENT_SEARCH_NO_UPDATE_PROMPT="1", TUI_HEADLESS="1", CASS_NO_COLOR="1")
+    try:
+        st = subprocess.run([CASS_BIN, "status", "--json", "--stale-threshold", str(2 * 86400)],
+                            capture_output=True, text=True, timeout=30, env=env)
+        status = json.loads(st.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        emit(envelope("sessions", False, query=args.query, error=f"cass status failed: {e}"))
+    idx = status.get("index") or {}
+    if not idx.get("exists") or idx.get("stale") or not idx.get("fresh", True):
+        emit(envelope("sessions", False, query=args.query,
+                      error=f"cass index not fresh (exists={idx.get('exists')} stale={idx.get('stale')} "
+                            f"last_indexed_at={idx.get('last_indexed_at')}); "
+                            "check: systemctl status lumen-cass-index.service"))
+    cmd = [CASS_BIN, "search", args.query, "--json", "--limit", str(args.n),
+           "--max-content-length", str(args.snippet)]
+    if args.workspace:
+        cmd += ["--workspace", args.workspace]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+        d = json.loads(r.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        emit(envelope("sessions", False, query=args.query, error=f"cass search failed: {e}"))
+    if r.returncode != 0:
+        emit(envelope("sessions", False, query=args.query,
+                      error=f"cass search exit {r.returncode}: {(r.stderr or '').strip()[:300]}"))
+    hits = d.get("hits") or []
+    results = [{
+        "source_path": h.get("source_path"),
+        "line_number": h.get("line_number"),
+        "workspace": h.get("workspace"),
+        "title": (h.get("title") or "")[:200],
+        "snippet": h.get("snippet") or h.get("content") or "",
+        "score": h.get("score"),
+        "created_at": h.get("created_at"),
+    } for h in hits]
+    emit(envelope("sessions", True, {"results": results}, query=args.query,
+                  total_matches=d.get("total_matches"),
+                  index_last_indexed_at=idx.get("last_indexed_at"), cached=False))
+
+
 # ---------- main ----------
 def build_parser():
     p = argparse.ArgumentParser(prog="fleet-search",
@@ -1004,6 +1062,13 @@ def build_parser():
             sp.add_argument("--threads", type=int, default=3, help="with --deep: how many top threads to read (default 3)")
             sp.add_argument("--depth", type=int, default=None, help="with --deep: max comment nesting depth to keep")
         sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("sessions", help="search fleet Claude Code session transcripts (local cass index, wq#4870)")
+    sp.add_argument("query")
+    sp.add_argument("--n", type=int, default=10, help="max results (default 10)")
+    sp.add_argument("--workspace", default=None, help="filter by session workspace path, e.g. /home/lumen/foreman")
+    sp.add_argument("--snippet", type=int, default=400, help="truncate snippet/content to N chars (default 400)")
+    sp.set_defaults(func=cmd_sessions)
 
     rp = sub.add_parser("read", help="fetch + extract a URL (old.reddit-aware)")
     rp.add_argument("url")
