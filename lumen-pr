@@ -17,6 +17,7 @@
 #   lumen-pr dirtycheck <repo-path> [--mode refuse|warn] [--head REV] <path>...  # wq#771/wq#792 guard
 #   lumen-pr ffprimary <repo-path> [--head REV]  # wq#1536: ff the primary tree to origin/main, or say why not
 #   lumen-pr suite  <repo-path> <pr>|--head REV [--status|--rerun|--gate] [--wait SEC]  # wq#5133 required suite
+#   lumen-pr landcheck <repo-path> [REV] [--no-fetch]  # wq#5342: landed commit has no Co-authored-by
 #
 # wq#532a: `land` takes the repo git lock ITSELF, around the merge only, and releases it in a
 # trap. There is no shell idiom left for a caller to get wrong. The dispatch used to tell every
@@ -363,6 +364,39 @@ lint_no_coauthor() { # lint_no_coauthor <text> <label>   (wq#4798: house rule is
     die "$label carries a Co-authored-by trailer (wq#4798)"
   fi
   return 0
+}
+
+# wq#5342: lint_no_coauthor checks the text THIS tool writes. It never saw the commit that
+# actually LANDS. Every squash land on ccc and claude-foreman main carried
+# "Co-authored-by: Lumen Industries <lumen@lumennode.uk>", which no branch commit and no
+# merge_message_field had. Gitea adds it at merge time: [repository.pull-request]
+# ADD_CO_COMMITTER_TRAILERS (default true) appends the trailer whenever the merging user's
+# signature ("lumen <...>", no full name) differs from the squash author ("Lumen Industries <...>").
+# The token-engine daemon already sends an explicit merge_message_field, and Gitea appends the
+# trailer after that message, so a message override cannot remove it. The fix is
+# ADD_CO_COMMITTER_TRAILERS = false in Anubis /etc/gitea/app.ini (set 2026-11-25, wq#5342).
+# This check catches the trailer if it ever comes back (Gitea reinstall or config rollback,
+# a new forge), so it does not take a verify pass 8 commits later to find it. It cannot UNDO a
+# landed trailer, because that needs a force-push to main, which is banned. land therefore
+# finishes its local cleanup, reports the trailer, and exits non-zero.
+landed_coauthor_check() { # landed_coauthor_check <tree> <rev>  -> 0 clean | 1 trailer | 2 unreadable
+  local t="$1" rev="$2" body sha
+  sha=$(git -C "$t" rev-parse -q --verify "${rev}^{commit}" 2>/dev/null) || {
+    note "WARNING: cannot resolve $rev in $t, so the landed-commit Co-authored-by check did not run (wq#5342)" >&2
+    return 2; }
+  body=$(git -C "$t" log -1 --format=%B "$sha")
+  if ! printf '%s\n' "$body" | grep -qiE '^co-authored-by:'; then
+    note "landed commit ${sha:0:10} ($rev) carries no Co-authored-by trailer (wq#5342)"
+    return 0
+  fi
+  printf 'lumen-pr: LANDED commit %s (%s) carries a Co-authored-by trailer, which the house rule bans (wq#4798/wq#5342):\n' \
+    "${sha:0:10}" "$rev" >&2
+  printf '%s\n' "$body" | grep -inE '^co-authored-by:' | head -5 | sed 's/^/    /' >&2
+  printf '  No branch commit had it (lint_no_coauthor and the daemon refuse those), so the FORGE added it\n' >&2
+  printf '  at merge time. On Gitea that is [repository.pull-request] ADD_CO_COMMITTER_TRAILERS: it must be\n' >&2
+  printf '  false in Anubis /etc/gitea/app.ini (then: sudo systemctl restart gitea). Do NOT rewrite main to\n' >&2
+  printf '  remove it (no force-push). Fix the forge config and file a wq ticket naming this commit.\n' >&2
+  return 1
 }
 
 lint_secrets() { # lint_secrets <label> <text>   (wq#4600: never publish a secret literal in a commit, PR or comment)
@@ -1459,6 +1493,13 @@ cmd_land() {
   # worktree and leaves it parked on the merged branch.
   commondir=$(cd "$REPO_PATH" && cd "$(git rev-parse --git-common-dir)" && pwd)
   git -C "$REPO_PATH" fetch -q origin
+  # wq#5342: check the commit that actually landed. We still hold the repo git lock, so no
+  # other lumen-pr land can have moved origin/$DEFAULT_BRANCH: its tip is the squash or merge
+  # commit this land just made. A trailer here does not undo the merge. It makes land exit
+  # non-zero AFTER the local cleanup below, so nobody can miss it. Rc 2 (tip unreadable) is
+  # warned about inside the function, not fatal.
+  local landed_coauthor=0
+  landed_coauthor_check "$REPO_PATH" "origin/$DEFAULT_BRANCH" || [ $? = 2 ] || landed_coauthor=1
   if [ "$gitdir" != "$commondir" ]; then
     note "linked worktree — leaving it on '$cur'. Clean up with: git -C $REPO_PATH worktree remove $REPO_PATH"
     # wq#1536: this `return` used to be the whole story, so the PRIMARY never moved and every
@@ -1472,6 +1513,7 @@ cmd_land() {
     fi
     gitlock_release
     trap - EXIT INT TERM
+    [ "$landed_coauthor" = 0 ] || die "PR #$pr IS MERGED, but the landed commit carries a Co-authored-by trailer (see above). Do not re-land. Fix the forge config (wq#5342)"
     return 0
   fi
   if [ "$cur" = "$head_ref" ]; then
@@ -1486,6 +1528,7 @@ cmd_land() {
   # keep the EXIT trap: the lock is released (idempotent) but the broker grant
   # (wq#2273) still needs removing when the process ends.
   trap cleanup_on_exit EXIT
+  [ "$landed_coauthor" = 0 ] || die "PR #$pr IS MERGED, but the landed commit carries a Co-authored-by trailer (see above). Do not re-land. Fix the forge config (wq#5342)"
 }
 
 # --- wq#5133: a repo's full test suite as a REQUIRED landing check ----------------------------
@@ -1774,6 +1817,21 @@ cmd_ffprimary() {
   ff_primary_after_land "$primary" "$head_sha"
 }
 
+cmd_landcheck() { # wq#5342: the landed-commit trailer check on its own. Read-only; no forge call.
+  need_repo "${1:-}"; shift 2>/dev/null || true
+  local rev="" fetch=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-fetch) fetch=0; shift ;;
+      -*) die "unknown flag '$1' (usage: lumen-pr landcheck <repo-path> [REV] [--no-fetch])" ;;
+      *)  rev="$1"; shift ;;
+    esac
+  done
+  [ -n "$rev" ] || rev="origin/$DEFAULT_BRANCH"
+  if [ "$fetch" = 1 ]; then git -C "$REPO_PATH" fetch -q origin || die "fetch from origin failed in $REPO_PATH"; fi
+  landed_coauthor_check "$REPO_PATH" "$rev"
+}
+
 case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   commit) shift; cmd_commit "$@" ;;
@@ -1795,9 +1853,12 @@ case "${1:-}" in
   # wq#5133: run / inspect the repo's required landing suite. Reads the forge, writes no forge
   # state (the result stamp is local), so SCOPE_OP=none like the inspections above.
   suite) shift; SCOPE_OP=none cmd_suite "$@" ;;
+  # wq#5342: does the landed commit (default origin/<default>) carry a Co-authored-by trailer?
+  # Read-only like check/ffprimary. land runs the same function after every merge.
+  landcheck) shift; SCOPE_OP=none cmd_landcheck "$@" ;;
   # internal: the runner lumen-run executes inside the unit. Not for hand use.
   _suite-run) shift; cmd_suite_run "$@" ;;
   ''|-h|--help|help)
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (start|commit|open|comment|land|check|gitlock|dirtycheck|ffprimary|suite)" ;;
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown subcommand '$1' (start|commit|open|comment|land|check|gitlock|dirtycheck|ffprimary|suite|landcheck)" ;;
 esac
