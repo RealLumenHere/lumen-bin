@@ -34,7 +34,7 @@ Secret-bearing Environment= values are REDACTED in the stored copies; the
 MANIFEST hashes the REAL on-disk content, so drift is still detected without
 plaintext secrets ever entering the repo.
 """
-import os, sys, json, hashlib, subprocess, re, datetime
+import os, sys, json, hashlib, subprocess, re, datetime, pwd
 
 SYS  = os.environ.get("UNIT_DRIFT_SYS", "/etc/systemd/system")  # env override is for tests
 REPO = os.environ.get("UNIT_DRIFT_REPO", "/home/lumen/fleet-units")  # env override is for tests
@@ -128,8 +128,58 @@ def scan():
             units[name] = {"kind": "file", "sha256": sha(read_bytes(full))}
     return {"units": units, "dropins": dropins, "enable": enable}
 
+def _repo_owner():
+    """wq#5329: (uid, gid) to hand repo work to, or None when nothing needs handing over
+    (not running as root, REPO missing, or REPO itself root-owned)."""
+    if os.geteuid() != 0:
+        return None
+    try:
+        st = os.stat(REPO)
+    except OSError:
+        return None
+    if st.st_uid == 0:
+        return None
+    return st.st_uid, st.st_gid
+
 def git(*args):
-    return subprocess.run(["git","-C",REPO,*args], capture_output=True, text=True)
+    """wq#5329: ops/*/install.sh run accept via `lumen-run --root`; git then refused the
+    lumen-owned repo (safe.directory, "dubious ownership"). Two halves:
+      1. -c safe.directory=<REPO> on every call (command-line scope is honoured);
+      2. as root, run git AS the repo owner, so new objects/index/refs stay owner-owned
+         and the repo-local identity/HOME are the owner's, not root's."""
+    cmd = ["git", "-c", "safe.directory=" + os.path.realpath(REPO), "-C", REPO, *args]
+    own = _repo_owner()
+    if own is None:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    uid, gid = own
+    env = dict(os.environ)
+    try:
+        pw = pwd.getpwuid(uid)
+        env["HOME"], env["USER"], env["LOGNAME"] = pw.pw_dir, pw.pw_name, pw.pw_name
+    except KeyError:
+        env["HOME"] = REPO          # never leave git reading root's unreadable ~/.gitconfig
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=REPO, env=env,
+                          user=uid, group=gid, extra_groups=[])
+
+def restore_repo_ownership():
+    """wq#5329: as root, snapshot/accept write units/, dropins/, MANIFEST.json and
+    enable-state.tsv (and may mkdir) as root. Hand every uid-0 entry under REPO back to
+    the repo owner. Only root-owned entries are touched; lchown never follows a symlink.
+    Returns the number of entries fixed."""
+    own = _repo_owner()
+    if own is None:
+        return 0
+    uid, gid = own
+    fixed = 0
+    for root, dirs, files in os.walk(REPO):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                if os.lstat(p).st_uid == 0:
+                    os.lchown(p, uid, gid); fixed += 1
+            except OSError:
+                pass
+    return fixed
 
 def load_manifest():
     r = git("show", "HEAD:MANIFEST.json")
@@ -463,8 +513,15 @@ def cmd_show():
 def main():
     a = sys.argv[1:]
     if not a: print(__doc__); return 2
-    if a[0] == "snapshot":      return cmd_snapshot()
-    if a[0] == "accept":        return cmd_accept(a[1:])
+    if a[0] in ("snapshot", "accept"):
+        # wq#5329: the repo-writing commands; finally so a mid-write crash as root
+        # still leaves no root-owned files behind in the lumen-owned repo
+        try:
+            return cmd_snapshot() if a[0] == "snapshot" else cmd_accept(a[1:])
+        finally:
+            n = restore_repo_ownership()
+            if n:
+                print("unit-drift: restored owner on %d root-owned path(s) in %s (wq#5329)" % (n, REPO))
     if a[0] == "check":         return cmd_check(digest="--digest" in a,
                                                    quiet=("--quiet" in a or "--no-notify" in a))
     if a[0] == "apply":         return cmd_apply()
