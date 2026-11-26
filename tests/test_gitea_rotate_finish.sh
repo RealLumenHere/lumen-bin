@@ -36,6 +36,21 @@ setup_sandbox(){
   export GITEA_ROTATE_ENGINE_DIR="$SBOX/engine"
   export GITEA_ROTATE_ENGINE_FILE="$SBOX/engine/gitea-lumen.token"
   export GITEA_ROTATE_REPOS="$SBOX/repo"
+  # wq#5238: hermetic stand-ins for the broker's scope table and its client.
+  export GITEA_ROTATE_TE_LIB="$SBOX/te-lib"
+  export GITEA_ROTATE_TE_CLIENT="$SBOX/te-lib/te_client.py"
+  export GITEA_ROTATE_TE_GRANT_DIR="$SBOX/events"
+  mkdir -p "$SBOX/te-lib" "$SBOX/events"
+  cat > "$SBOX/te-lib/token_engine_daemon.py" <<'PYEOF'
+GITEA_SCOPE_PROBES = {"write:issue": ("POST", "/repos/{slug}/issues/0/comments"),
+                      "write:repository": ("PATCH", "/repos/{slug}/pulls/0")}
+def gitea_required_scopes():
+    return ["write:issue", "write:repository", "write:user"]
+PYEOF
+  cat > "$SBOX/te-lib/te_client.py" <<'PYEOF'
+import json, sys
+print(json.dumps({"ok": True, "rule": "grant:token_engine", "result": {"failing": ""}}))
+PYEOF
   printf 'GITEA_PASSWORD=sandboxpw\nGITEA_TOKEN=placeholder000000000000000000000\n' > "$GITEA_ROTATE_ENV_FILE"
   printf 'http://lumen:oldtok123456789012345678901234@100.121.17.5%%3a3000\n' > "$GITEA_ROTATE_CRED_FILE"
   printf 'oldtok123456789012345678901234' > "$GITEA_ROTATE_SEC_FILE"
@@ -65,6 +80,11 @@ if [[ "\$args" == *"-X DELETE"* ]]; then
   echo -n 204
   exit 0
 fi
+if [[ "\$args" == *"/issues/0/comments"* ]]; then
+  # wq#5238 scope probe: 403 when the test says the new token lacks write:issue
+  if [ -n "\${FAKE_PROBE_403:-}" ]; then echo -n 403; else echo -n 404; fi
+  exit 0
+fi
 if [[ "\$args" == *"Authorization: token FAKE_NEW_TOKEN_1234567890123456789"* ]]; then
   # new token validates
   for a in "\$@"; do
@@ -89,7 +109,7 @@ EOF
 
   cat > "$FAKEBIN/ssh" <<'EOF'
 #!/usr/bin/env bash
-echo "ssh-called" >> "$SBOX/ssh-calls.log" 2>/dev/null || true
+echo "ssh-called $*" >> "$SBOX/ssh-calls.log" 2>/dev/null || true
 echo "FAKE_NEW_TOKEN_1234567890123456789"
 EOF
   chmod +x "$FAKEBIN/ssh"
@@ -191,6 +211,52 @@ if echo "$out" | grep -q "old token now HTTP 401"; then
   ok "confirmed old value 401s"
 else
   bad "did not confirm old-token 401"
+fi
+if grep -q -- "--scopes write:issue,write:repository,write:user " "$SBOX/ssh-calls.log" 2>/dev/null; then
+  ok "minted the broker table's scope union, write:issue included (wq#5238)"
+else
+  bad "mint scopes not taken from the broker table: $(cat "$SBOX/ssh-calls.log" 2>/dev/null)"
+fi
+if echo "$out" | grep -q "OK   write:issue" && echo "$out" | grep -q "OK   broker scope-selftest"; then
+  ok "new token probed per scope, broker self-test passed"
+else
+  bad "scope probe / broker self-test not reported: $out"
+fi
+teardown_sandbox
+
+# --- test 3 (wq#5238): new token lacking a verb scope is never written ----
+t "new token failing the write:issue probe: refused before any copy is written"
+setup_sandbox
+write_fakes '[{"id":42,"name":"lumen-fleet-old"}]'
+out=$(FAKE_PROBE_403=1 run_script 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "fails the write:issue probe"; then
+  ok "refused citing the write:issue probe"
+else
+  bad "expected write:issue probe refusal, got rc=$rc: $out"
+fi
+if grep -q "FAKE_NEW_TOKEN" "$GITEA_ROTATE_SEC_FILE" "$GITEA_ROTATE_ENGINE_FILE" 2>/dev/null; then
+  bad "a copy was written despite the failed probe"
+else
+  ok "no copy written"
+fi
+if [ -f "$SBOX/delete-calls.log" ] && grep -q "/tokens/42" "$SBOX/delete-calls.log"; then
+  bad "the OLD row was deleted despite the failed probe"
+else
+  ok "old row untouched"
+fi
+teardown_sandbox
+
+# --- test 4 (wq#5238): no readable scope table means no mint -------------
+t "unreadable broker scope table: refuses before minting"
+setup_sandbox
+write_fakes '[{"id":42,"name":"lumen-fleet-old"}]'
+rm -f "$SBOX/te-lib/token_engine_daemon.py"
+out=$(run_script 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "could not read the required scope set" \
+    && [ ! -f "$SBOX/ssh-calls.log" ]; then
+  ok "refused, mint never attempted"
+else
+  bad "expected refusal before mint, got rc=$rc: $out"
 fi
 teardown_sandbox
 

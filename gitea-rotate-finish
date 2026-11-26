@@ -31,6 +31,13 @@ ENGINE_DIR=${GITEA_ROTATE_ENGINE_DIR:-/var/lib/token-engine/secrets}
 ENGINE_FILE=${GITEA_ROTATE_ENGINE_FILE:-$ENGINE_DIR/gitea-lumen.token}
 # wq#3565: lumen-messenger-cc moved to /scratch/fleet/projects under wq#3532.
 REPOS=${GITEA_ROTATE_REPOS:-"/home/lumen/bin /home/lumen/messenger /home/lumen/minerva /scratch/fleet/projects/lumen-messenger-cc /home/lumen/foreman"}
+# wq#5238: the scope set and its probes are read from the broker's own per-verb table
+# (token_engine_daemon.GITEA_VERB_SCOPES), never kept here. Imported, not executed:
+# running an older daemon file with an unknown flag would fall through to main().
+TE_LIB=${GITEA_ROTATE_TE_LIB:-/usr/local/lib/token-engine}
+TE_CLIENT=${GITEA_ROTATE_TE_CLIENT:-$TE_LIB/te_client.py}
+TE_GRANT_DIR=${GITEA_ROTATE_TE_GRANT_DIR:-/home/lumen/foreman/events}
+PROBE_REPO=${GITEA_ROTATE_PROBE_REPO:-lumen/claude-foreman}
 LOCK_SCOPE=gitea-lumen-token
 LOCK_TTL=${GITEA_ROTATE_LOCK_TTL:-15}
 HOLDER=${GITEA_ROTATE_HOLDER:-gitea-rotate-finish-$$}
@@ -67,10 +74,22 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/require-vault-backup
 require_vault_backup "gitea-token" "$SECFILE" || exit $?
 # --- end gate ---
 
+# wq#5238: the 10-23 rotation minted from a list hardcoded on the line below
+# (write:repository,write:user) and silently dropped the write:issue that wq#1727 had
+# added by hand, so every lumen/* pr-comment 403'd. The set now comes from the one
+# table the broker asserts, and the new value is probed for each scope before use.
+te_table(){ python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import token_engine_daemon as D; exec(sys.argv[2])' "$TE_LIB" "$1" 2>/dev/null; }
+SCOPES=$(te_table 'print(",".join(D.gitea_required_scopes()))')
+[[ "$SCOPES" =~ ^[a-z_]+:[a-z_]+(,[a-z_]+:[a-z_]+)*$ ]] \
+  || die "could not read the required scope set from $TE_LIB/token_engine_daemon.py (got '${SCOPES:-nothing}'). Refusing to mint a token that could drop a verb's scope (wq#5238); deploy token-engine first (install.sh --daemon-only). Nothing changed."
+PROBES=$(te_table 'for s, (m, q) in sorted(D.GITEA_SCOPE_PROBES.items()): print(s, m, q)')
+[ -n "$PROBES" ] || die "could not read the scope probes from $TE_LIB — nothing changed"
+echo "   scopes (broker per-verb table): $SCOPES"
+
 echo "2) minting a new token on Anubis ..."
 NEWNAME="lumen-fleet-$STAMP"
 NEW=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$ANUBIS" \
-  "sudo -u gitea gitea admin user generate-access-token -c /etc/gitea/app.ini -w /var/lib/gitea --username $GUSER --token-name $NEWNAME --scopes write:repository,write:user --raw" 2>/dev/null | tr -d '[:space:]')
+  "sudo -u gitea gitea admin user generate-access-token -c /etc/gitea/app.ini -w /var/lib/gitea --username $GUSER --token-name $NEWNAME --scopes $SCOPES --raw" 2>/dev/null | tr -d '[:space:]')
 [ ${#NEW} -ge 30 ] || die "mint failed or returned a short value — nothing changed"
 echo "   minted $NEWNAME (len=${#NEW})"
 
@@ -79,6 +98,29 @@ CODE=$(curl -sS -o "/tmp/grf.$$.json" --max-time 10 -w '%{http_code}' -H "Author
 WHO=$(jq -r '.login // "?"' "/tmp/grf.$$.json" 2>/dev/null); rm -f "/tmp/grf.$$.json"
 [ "$CODE" = 200 ] && [ "$WHO" = "$GUSER" ] || die "new token failed to validate (HTTP $CODE, login=$WHO) — nothing changed"
 echo "   OK: authenticates as $WHO"
+
+# Remove the just-minted row when the new value is refused before anything was written.
+retire_new(){
+  local id
+  id=$(curl -sS --max-time 15 -u "$GUSER:$P" "http://$HOST/api/v1/users/$GUSER/tokens" \
+       | jq -r --arg n "$NEWNAME" '.[]? | select(.name == $n) | .id' 2>/dev/null | head -1)
+  [ -n "$id" ] && curl -sS -o /dev/null --max-time 10 -u "$GUSER:$P" -X DELETE \
+       "http://$HOST/api/v1/users/$GUSER/tokens/$id" && echo "   removed new row $NEWNAME (id=$id)"
+}
+
+echo "3b) probing the new token for every scope a broker verb needs ..."
+while read -r SC M PTH; do
+  [ -n "$SC" ] || continue
+  PTH=${PTH//\{slug\}/$PROBE_REPO}
+  DATA=(); [ "$M" = GET ] || DATA=(-H 'Content-Type: application/json' -d '{}')
+  PC=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' -X "$M" "${DATA[@]}" \
+       -H "Authorization: token $NEW" "http://$HOST/api/v1$PTH")
+  case "$PC" in
+    401|403) retire_new
+             die "new token fails the $SC probe (HTTP $PC on $M $PTH): minted without a scope a broker verb needs. Nothing written." ;;
+  esac
+  echo "   OK   $SC (HTTP $PC, non-mutating)"
+done <<< "$PROBES"
 
 OLD=$(tr -d '\n\r ' < "$SECFILE" 2>/dev/null || true)
 
@@ -152,6 +194,30 @@ if command -v lumen-pr >/dev/null 2>&1; then
     echo "   FAIL broker (lumen-pr check) — token-engine may need a moment to pick up $ENGINE_FILE"
     FAIL=1
   fi
+fi
+
+# wq#5238: the broker re-probes the store copy it actually serves, per verb.
+if [ -f "$TE_CLIENT" ] && GD=$(mktemp -d -p "$TE_GRANT_DIR" te-grf.XXXXXX 2>/dev/null); then
+  chmod 755 "$GD"
+  jq -n --arg e "$(date -u -d '+10 min' +%Y-%m-%dT%H:%M:%SZ)" \
+    '{ticket:"adhoc-gitea-rotate", expires:$e, grants:[{kind:"token_engine", node:"daemon"}]}' > "$GD/grant.json"
+  chmod 644 "$GD/grant.json"
+  ST=$(python3 "$TE_CLIENT" --verb scope-selftest --ticket adhoc-gitea-rotate \
+       --worker gitea-rotate-finish --grant-file "$GD/grant.json" \
+       --grant-sha "$(sha256sum "$GD/grant.json" | awk '{print $1}')" 2>/dev/null)
+  rm -rf "$GD"
+  STOK=$(printf '%s' "$ST" | jq -r '.ok // false' 2>/dev/null)
+  STRULE=$(printf '%s' "$ST" | jq -r '.rule // ""' 2>/dev/null)
+  STFAIL=$(printf '%s' "$ST" | jq -r '.result.failing // "?"' 2>/dev/null)
+  if [ "$STOK" = true ] && [ -z "$STFAIL" ]; then
+    echo "   OK   broker scope-selftest (every verb's scope present)"
+  elif [ "$STRULE" = verb_unknown ]; then
+    echo "   WARN broker has no scope-selftest verb yet — deploy token-engine (wq#5238)"
+  else
+    echo "   FAIL broker scope-selftest [${STRULE:-no frame}] failing=${STFAIL:-?}"; FAIL=1
+  fi
+else
+  echo "   SKIP broker scope-selftest (no te_client at $TE_CLIENT or no grant dir)"
 fi
 
 [ "$FAIL" = 0 ] || die "one or more consumers failed with the new token — investigate before deleting the old one. Old token row is UNTOUCHED."
